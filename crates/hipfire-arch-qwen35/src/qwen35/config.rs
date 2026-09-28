@@ -102,6 +102,10 @@ pub struct MaskEmbedOverride<'a> {
 pub enum DflashFusionCtx {
     Off,
     ChainVerify,
+    /// claude v3: MTP verify. Admits only the bit-exact S5 GDN-pre-tape and
+    /// S6 FA-prep single-launch fusions; every other `ChainVerify` route
+    /// (F16 producers, residual GEMM variants) stays on the `Off` path.
+    MtpVerify,
 }
 
 #[derive(Clone, Copy)]
@@ -1640,4 +1644,17 @@ mod tests {
         let cfg4 = from_config_value(&inner4).unwrap();
         assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
     }
+}
+
+
+/// claude v3: MTP verify may use the S5 GDN-pre-tape fusion (`CLAUDE_MTP_FUSE_GDN=0` disables).
+pub fn claude_mtp_fuse_gdn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_MTP_FUSE_GDN").as_deref() != Ok("0"))
+}
+
+/// claude v3: MTP verify may use the S6 FA-prep fusion (`CLAUDE_MTP_FUSE_FA=0` disables).
+pub fn claude_mtp_fuse_fa() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_MTP_FUSE_FA").as_deref() != Ok("0"))
 }

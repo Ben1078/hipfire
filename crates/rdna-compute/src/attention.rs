@@ -214,6 +214,22 @@ fn flash_rows_per_block(batch_size: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// claude v3: context ceiling for the gfx11 GQA-fused Q8 FA2 prefill route.
+/// Upstream admits it only for `max_ctx_len <= 32768` (the range its oracle
+/// covered); the kernel itself has no context-sized state (64-bit K/V offsets,
+/// fixed LDS), so we admit up to the model's positions. `CLAUDE_FA2_MAX_CTX`
+/// overrides (set 32768 to restore upstream behaviour).
+pub fn claude_fa2_max_ctx() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CLAUDE_FA2_MAX_CTX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 64)
+            .unwrap_or(262_144)
+    })
+}
+
 pub fn claude_rows_small() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CLAUDE_ROWS_SMALL").as_deref() != Ok("0"))
@@ -3663,7 +3679,7 @@ impl Gpu {
             && head_dim == 256
             && (64..=8192).contains(&batch_size)
             && (batch_size <= 512 || batch_size % 512 == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && (64..=claude_fa2_max_ctx()).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
                 q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
@@ -3712,7 +3728,7 @@ impl Gpu {
             && n_kv_heads == 4
             && head_dim == 256
             && self.fa2_gfx11_batch_admitted(batch_size)
-            && (64..=32768).contains(&max_ctx_len)
+            && (64..=claude_fa2_max_ctx()).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
                 q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
@@ -5689,11 +5705,12 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > claude_fa2_max_ctx() {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= max_ctx_len <= {}, got {max_ctx_len}",
+                    claude_fa2_max_ctx()
                 ),
             ));
         }
@@ -19978,6 +19995,243 @@ impl Gpu {
             self.hip.launch_kernel(func, [nh as u32, rows as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)?;
         }
         Ok(())
+    }
+
+    /// claude v3: can `claude_attn4` (WMMA split-K) serve this verify attention block?
+    pub fn claude_attn4_ok(&self, rows: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_ATTN4").as_deref() == Ok("0"));
+        !off
+            && (1..=4).contains(&rows)
+            && head_dim == 256
+            && n_kv_heads == 4
+            && n_heads == 24
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// claude v3: WMMA split-K verify attention (`kernels/src/claude_attn4.hip`,
+    /// FA2-class numerics) + the 8-warp reduce. `Ok(false)` = not applicable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_attn4(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        rows: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.claude_attn4_ok(rows, head_dim, n_heads, n_kv_heads) {
+            return Ok(false);
+        }
+        let stride = 2 + head_dim;
+        let cap_tiles = partials.numel() / (rows.max(1) * n_heads * stride);
+        let mut span = self.claude_attn3_span(max_ctx_len, n_kv_heads);
+        while max_ctx_len.div_ceil(span) > cap_tiles {
+            if span >= 4096 {
+                return Ok(false);
+            }
+            span += 32;
+        }
+        let max_tiles = max_ctx_len.div_ceil(span).max(1);
+        self.bind_thread()?;
+        let name: &str = "claude_attn4";
+        if !self.functions.contains_key(name) {
+            let src = format!("#define CLAUDE_A4_KERNEL {name}\n{}", kernels::CLAUDE_ATTN4_SRC);
+            self.ensure_kernel(name, &src, name)?;
+        }
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let sp = span as i32;
+        let mt = max_tiles as i32;
+        let bo = 0i32;
+        let rv = rows as i32;
+        self.launch_maybe_blob(
+            name,
+            [n_kv_heads as u32, max_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &sp as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+                &bo as *const _ as *mut c_void,
+                &rv as *const _ as *mut c_void,
+            ],
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_f32(sc);
+                b.push_i32(sp);
+                b.push_i32(mt);
+                b.push_i32(bo);
+                b.push_i32(rv);
+                b
+            },
+        )?;
+        self.claude_attn_reduce_launch(p_ptr, o_ptr, pos_ptr, nh, head_dim as i32, sp, mt, 0, rows)?;
+        Ok(true)
+    }
+
+    /// claude v3: can `claude_attn3` serve this verify attention block?
+    /// (q8_0 KV, head_dim 256, 6 q heads per kv head, 1..=4 rows, gfx1100.)
+    pub fn claude_attn3_ok(&self, rows: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_ATTN3").as_deref() == Ok("0"));
+        !off
+            && (1..=4).contains(&rows)
+            && head_dim == 256
+            && n_kv_heads > 0
+            && n_heads == 6 * n_kv_heads
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// claude v3: span size (keys per block) for `claude_attn3`; multiple of 32.
+    pub fn claude_attn3_span(&self, max_ctx_len: usize, n_kv_heads: usize) -> usize {
+        static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        if let Some(s) = *ENV.get_or_init(|| {
+            std::env::var("CLAUDE_ATTN3_SPAN").ok().and_then(|v| v.parse::<usize>().ok()).filter(|s| *s >= 32 && *s % 32 == 0)
+        }) {
+            return s;
+        }
+        // ~320 blocks (2 per CU x 96 CUs, ~1.7 rounds) measured best at 42K.
+        let per_head = (max_ctx_len * n_kv_heads.max(1)).div_ceil(320).max(1);
+        (per_head.div_ceil(32) * 32).clamp(64, 512)
+    }
+
+    /// claude v3: LDS-staged, GQA-shared verify attention
+    /// (`kernels/src/claude_attn3.hip`) + the 8-warp reduce. `Ok(false)` = not applicable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_attn3(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        rows: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.claude_attn3_ok(rows, head_dim, n_heads, n_kv_heads) {
+            return Ok(false);
+        }
+        let stride = 2 + head_dim;
+        let cap_tiles = partials.numel() / (rows.max(1) * n_heads * stride);
+        let mut span = self.claude_attn3_span(max_ctx_len, n_kv_heads);
+        while max_ctx_len.div_ceil(span) > cap_tiles {
+            if span >= 4096 {
+                return Ok(false);
+            }
+            span += 32;
+        }
+        let max_tiles = max_ctx_len.div_ceil(span).max(1);
+        self.bind_thread()?;
+        static NAME_CELL: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        let (name, defines) = NAME_CELL.get_or_init(|| {
+            let skip = std::env::var("CLAUDE_ATTN3_SKIP").unwrap_or_default();
+            let qku = std::env::var("CLAUDE_ATTN3_QKU").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| [1, 2, 4, 8].contains(u)).unwrap_or(2);
+            let pvu = std::env::var("CLAUDE_ATTN3_PVU").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| [1, 2, 4, 8].contains(u)).unwrap_or(4);
+            let mut d = format!("#define A3_QK_UNROLL {qku}\n#define A3_PV_UNROLL {pvu}\n");
+            let mut n = format!("claude_attn3_u{qku}_{pvu}");
+            for (c, def) in [('Q', "A3_SKIP_QK"), ('P', "A3_SKIP_PV"), ('L', "A3_SKIP_LOAD")] {
+                if skip.contains(c) {
+                    d.push_str(&format!("#define {def} 1\n"));
+                    n.push_str(&format!("_skip{c}"));
+                }
+            }
+            (n, d)
+        });
+        let name: &str = name.as_str();
+        if !self.functions.contains_key(name) {
+            let src = format!("{defines}#define CLAUDE_A3_KERNEL {name}\n{}", kernels::CLAUDE_ATTN3_SRC);
+            self.ensure_kernel(name, &src, name)?;
+        }
+        const NAME: &str = "claude_attn3";
+        let _ = NAME;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sc = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
+        let sp = span as i32;
+        let mt = max_tiles as i32;
+        let bo = 0i32;
+        let rv = rows as i32;
+        self.launch_maybe_blob(
+            name,
+            [n_kv_heads as u32, max_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &sp as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+                &bo as *const _ as *mut c_void,
+                &rv as *const _ as *mut c_void,
+            ],
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_f32(sc);
+                b.push_i32(sp);
+                b.push_i32(mt);
+                b.push_i32(bo);
+                b.push_i32(rv);
+                b
+            },
+        )?;
+        self.claude_attn_reduce_launch(p_ptr, o_ptr, pos_ptr, nh, head_dim as i32, sp, mt, 0, rows)?;
+        Ok(true)
     }
 
     /// claude: can `claude_attn_gqa` serve this verify attention block?

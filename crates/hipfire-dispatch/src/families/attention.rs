@@ -1139,19 +1139,44 @@ fn dispatch_attend(
                         io.physical_cap,
                         fp,
                     )),
-                    (None, None) => hip!(gpu.attention_flash_q8_0(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.pos_buf,
-                        seq_len,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.physical_cap,
-                        fp,
-                    )),
+                    (None, None) => {
+                        // claude v3: the plain full-causal single-row decode on
+                        // the 24/4/256 shape (the MTP draft head) may take the
+                        // WMMA split-K `claude_attn4`; it declines (Ok(false))
+                        // under graph capture / redline recording, off-shape,
+                        // or with CLAUDE_DRAFT_ATTN4=0.
+                        if io.tree_bias.is_none()
+                            && hip!(gpu.claude_draft_attn4(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.pos_buf,
+                                seq_len,
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.physical_cap,
+                                fp,
+                            ))?
+                        {
+                            Ok(())
+                        } else {
+                            hip!(gpu.attention_flash_q8_0(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.pos_buf,
+                                seq_len,
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.physical_cap,
+                                fp,
+                            ))
+                        }
+                    }
                     (None, Some(_)) => {
                         return Err(DispatchError::Hip(
                             "output_awq_scale without output_gate".into(),
@@ -2118,7 +2143,7 @@ fn dispatch_attend(
                     && io.head_dim == 256
                     && (64..=8192).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && (64..=rdna_compute::attention::claude_fa2_max_ctx()).contains(&io.max_ctx_len)
                     && io.max_ctx_len
                         .checked_mul(4 * (256 / 32) * 34)
                         .is_some_and(|bytes| {

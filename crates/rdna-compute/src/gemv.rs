@@ -80,6 +80,59 @@ fn awq_norm_kernel() -> (&'static str, &'static str, u32) {
     )
 }
 
+/// claude: producer twins that also emit the int8 activation quantization read
+/// by `claude_q8x_gemv*` (`Gpu::claude_q8x_project`). Bodies are the runtime
+/// sources of `fused_rmsnorm_mq_rotate_awq` (AWQ defines resolved),
+/// `fused_silu_mul_mq_rotate_awq` and `rotate_x_mq_awq` plus the
+/// `claude_q8x_quant` expressions, so x_rot, xq and dx are all bit-identical
+/// to the original producer followed by the standalone quant.
+const CLAUDE_RMSNORM_ROTATE_Q8_SRC: &str =
+    include_str!("../../../kernels/src/claude_rmsnorm_rotate_q8.hip");
+const CLAUDE_SILU_ROTATE_Q8_SRC: &str =
+    include_str!("../../../kernels/src/claude_silu_rotate_q8.hip");
+const CLAUDE_ROTATE_Q8_SRC: &str = include_str!("../../../kernels/src/claude_rotate_q8.hip");
+
+thread_local! {
+    /// claude: int8 activation scratch `(xq, dx)` (8 x 32768 int8 + 8 x 1024 f32
+    /// block scales) shared by `claude_q8x_project` and the fused q8 producers.
+    static CLAUDE_Q8X_SCRATCH: std::cell::RefCell<Option<(GpuTensor, GpuTensor)>> =
+        const { std::cell::RefCell::new(None) };
+    /// claude: `(x_rot ptr, k, batch)` whose int8 quantization a fused producer
+    /// left in `CLAUDE_Q8X_SCRATCH`. Cleared when that buffer is rewritten
+    /// (`invalidate_x_caches_for` and the scratch-delegated rotate wrappers),
+    /// replaced by the next fused producer, and consumed (hit or miss) by the
+    /// next `claude_q8x_project`.
+    static CLAUDE_Q8_PREQUANT: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// claude: in-process A/B override of `CLAUDE_Q8_FUSE` (0 = env, 1 = on, 2 = off).
+static CLAUDE_Q8_FUSE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn claude_q8_prequant_set(x_rot: *mut c_void, k: usize, batch: usize) {
+    CLAUDE_Q8_PREQUANT.with(|c| c.set(Some((x_rot as usize, k, batch))));
+}
+
+/// claude: `ptr` is being rewritten; drop a prequant entry that describes it.
+fn claude_q8_prequant_clear_for(ptr: *mut c_void) {
+    CLAUDE_Q8_PREQUANT.with(|c| {
+        if matches!(c.get(), Some((p, _, _)) if p == ptr as usize) {
+            c.set(None);
+        }
+    });
+}
+
+/// claude: true iff the prequant entry is exactly `(x, k, batch)`. Always
+/// clears it: the caller either consumes the scratch or overwrites it.
+fn claude_q8_prequant_take(x: *mut c_void, k: usize, batch: usize) -> bool {
+    CLAUDE_Q8_PREQUANT.with(|c| c.take()) == Some((x as usize, k, batch))
+}
+
+fn claude_q8_fuse_check_enabled() -> bool {
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECK.get_or_init(|| std::env::var("CLAUDE_Q8_FUSE_CHECK").as_deref() == Ok("1"))
+}
+
 /// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
 /// GEMVs to the 4-way-unroll gfx11_dgpu twin rather than the gfx1151 kernel.
 ///
@@ -2623,6 +2676,14 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_q8_fuse_eligible(k, batch_size) {
+            let (xq, dx) = self.claude_q8x_scratch()?;
+            self.claude_rmsnorm_rotate_q8_batched(
+                x, weight, awq_scale, x_rot, xq, dx, k, eps, batch_size,
+            )?;
+            claude_q8_prequant_set(x_rot.buf.as_ptr(), k, batch_size);
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
         let (module, source, shared_mem) = awq_norm_kernel();
@@ -3088,6 +3149,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_q8_fuse_eligible(k, batch_size) {
+            let (xq, dx) = self.claude_q8x_scratch()?;
+            self.claude_silu_rotate_q8_batched(gate, up, awq_scale, x_rot, xq, dx, k, batch_size)?;
+            claude_q8_prequant_set(x_rot.buf.as_ptr(), k, batch_size);
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
@@ -4277,6 +4344,8 @@ impl Gpu {
     /// `dst_ptr` since the caches key on raw pointer equality and have
     /// no way to detect data changes otherwise.
     pub(crate) fn invalidate_x_caches_for(&mut self, dst_ptr: *mut c_void) {
+        // claude: the int8 prequant of `dst_ptr` (fused q8 producers) is stale too.
+        claude_q8_prequant_clear_for(dst_ptr);
         self.scratch.invalidate_x_caches_for(dst_ptr)
     }
 
@@ -5658,6 +5727,8 @@ impl Gpu {
     pub fn rotate_x_mq_128(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("gemv_mq4g128", kernels::GEMV_MQ4G128_SRC, "mq_rotate_x_128")?;
+        // claude: scratch.rs only clears its own x caches.
+        claude_q8_prequant_clear_for(x_rot.buf.as_ptr());
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_128(
@@ -5691,6 +5762,8 @@ impl Gpu {
             kernels::ROTATE_X_MQ_AWQ_SRC,
             "rotate_x_mq_awq",
         )?;
+        // claude: scratch.rs only clears its own x caches.
+        claude_q8_prequant_clear_for(x_rot.buf.as_ptr());
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_awq(
@@ -5721,12 +5794,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_q8_fuse_eligible(k, batch_size) {
+            let (xq, dx) = self.claude_q8x_scratch()?;
+            self.claude_rotate_q8_batched(x, awq_scale, x_rot, xq, dx, k, batch_size)?;
+            claude_q8_prequant_set(x_rot.buf.as_ptr(), k, batch_size);
+            return Ok(());
+        }
         // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel(
             "rotate_x_mq_awq",
             kernels::ROTATE_X_MQ_AWQ_SRC,
             "rotate_x_mq_awq",
         )?;
+        // claude: scratch.rs only clears its own x caches.
+        claude_q8_prequant_clear_for(x_rot.buf.as_ptr());
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_awq_batched(
@@ -8896,23 +8977,10 @@ impl Gpu {
         Ok(())
     }
 
-    /// claude: quantize `x` [batch x k] to int8 once, then one int8-dot GEMV per weight.
-    pub fn claude_q8x_project(
-        &mut self,
-        outs: &[(&GpuTensor, &GpuTensor, usize)],
-        x: &GpuTensor,
-        k: usize,
-        batch: usize,
-        residual: bool,
-    ) -> HipResult<()> {
-        thread_local! {
-            static SCRATCH: std::cell::RefCell<Option<(GpuTensor, GpuTensor)>> =
-                const { std::cell::RefCell::new(None) };
-        }
-        assert!((1..=8).contains(&batch), "claude_q8x_project: batch {batch}");
-        assert!(k % 256 == 0 && k <= 32768, "claude_q8x_project: k {k}");
-        self.bind_thread()?;
-        let (xq_ptr, dx_ptr) = SCRATCH.with(|cell| -> HipResult<_> {
+    /// claude: the shared int8 activation scratch `(xq, dx)` device pointers,
+    /// allocated on first use (room for batch 8 x k 32768).
+    fn claude_q8x_scratch(&mut self) -> HipResult<(*mut c_void, *mut c_void)> {
+        CLAUDE_Q8X_SCRATCH.with(|cell| -> HipResult<_> {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
                 let xq = self.alloc_tensor(&[8 * 32768 / 4], DType::F32)?;
@@ -8921,32 +8989,370 @@ impl Gpu {
             }
             let (xq, dx) = slot.as_ref().unwrap();
             Ok((xq.buf.as_ptr(), dx.buf.as_ptr()))
-        })?;
+        })
+    }
+
+    /// claude: whether a `[batch x k]` projection input will be consumed by
+    /// `claude_q8x_project` (the `claude_small_batch` gates: gfx1100, batch
+    /// 2..=8, not recording / capturing, q8x kernel selected), so its producer
+    /// may emit the int8 quantization itself. `CLAUDE_Q8_FUSE=0` disables.
+    pub fn claude_q8_fuse_eligible(&self, k: usize, batch: usize) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = match CLAUDE_Q8_FUSE_OVERRIDE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => *ON.get_or_init(|| std::env::var("CLAUDE_Q8_FUSE").as_deref() != Ok("0")),
+        };
+        static Q8X: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let q8x = *Q8X.get_or_init(|| {
+            !matches!(std::env::var("CLAUDE_XBATCH_KERNEL").as_deref(), Ok("rb") | Ok("old"))
+        });
+        on && q8x
+            && k % 256 == 0
+            && k <= 32768
+            && batch <= 8
+            && self.arch.as_str() == "gfx1100"
+            && self.claude_xbatch_eligible(batch)
+    }
+
+    /// claude: in-process A/B hook for tests and benches: `Some(on)` overrides
+    /// `CLAUDE_Q8_FUSE` for every thread, `None` restores the env setting.
+    pub fn claude_q8_fuse_override(&mut self, on: Option<bool>) {
+        let v = match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        CLAUDE_Q8_FUSE_OVERRIDE.store(v, Ordering::Relaxed);
+    }
+
+    /// claude: test hook: whether the shared int8 scratch holds the fused
+    /// quantization of `x` `[batch x k]`, i.e. the next `claude_q8x_project`
+    /// on it will skip its quant launch.
+    pub fn claude_q8_prequant_pending(&self, x: &GpuTensor, k: usize, batch: usize) -> bool {
+        CLAUDE_Q8_PREQUANT.with(|c| c.get()) == Some((x.buf.as_ptr() as usize, k, batch))
+    }
+
+    /// claude: standalone `claude_q8x_quant` of `x` `[batch x k]` into the
+    /// `xq` (`[batch][k/256][32]` uint2) / `dx` (`[batch][k/32]` f32) buffers.
+    pub fn claude_q8x_quant_into(
+        &mut self,
+        x: &GpuTensor,
+        xq: *mut c_void,
+        dx: *mut c_void,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "claude_q8x_quant_into: k {k}");
+        self.bind_thread()?;
         const QUANT: &str = "claude_q8x_quant";
         if !self.functions.contains_key(QUANT) {
             let src = format!("#define CLAUDE_Q8X_QUANT 1\n{}", kernels::CLAUDE_Q8X_SRC);
             self.ensure_kernel(QUANT, &src, QUANT)?;
         }
-        {
-            let func = &self.functions[QUANT];
-            let x_ptr = x.buf.as_ptr();
-            let k_val = k as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &x_ptr as *const _ as *mut c_void,
-                &xq_ptr as *const _ as *mut c_void,
-                &dx_ptr as *const _ as *mut c_void,
-                &k_val as *const _ as *mut c_void,
-            ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [(k / 256) as u32, batch as u32, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
+        let func = &self.functions[QUANT];
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &xq as *const _ as *mut c_void,
+            &dx as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(k / 256) as u32, batch as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// claude: `fused_rmsnorm_rotate_mq_awq_batched` that also writes the int8
+    /// quantization of `x_rot` into `xq`/`dx` (bit-identical to
+    /// `claude_q8x_quant_into(x_rot)`). Does not record a prequant entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_rmsnorm_rotate_q8_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        xq: *mut c_void,
+        dx: *mut c_void,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "claude_rmsnorm_rotate_q8_batched: k {k}");
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        const NAME: &str = "claude_rmsnorm_rotate_q8";
+        self.ensure_kernel(NAME, CLAUDE_RMSNORM_ROTATE_Q8_SRC, NAME)?;
+        let (_, _, shared_mem) = awq_norm_kernel();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut xqp = xq;
+        let mut dxp = dx;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut xqp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 4 + 2 * 256 * 4 + k + k / 8) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", NAME, bytes);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(xqp);
+                b.push_ptr(dxp);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// claude: `fused_silu_mul_rotate_mq_awq_batched` that also writes the int8
+    /// quantization of `x_rot` into `xq`/`dx` (bit-identical to
+    /// `claude_q8x_quant_into(x_rot)`). Does not record a prequant entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_silu_rotate_q8_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        xq: *mut c_void,
+        dx: *mut c_void,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "claude_silu_rotate_q8_batched: k {k}");
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        const NAME: &str = "claude_silu_rotate_q8";
+        self.ensure_kernel(NAME, CLAUDE_SILU_ROTATE_Q8_SRC, NAME)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut xqp = xq;
+        let mut dxp = dx;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut xqp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 4 + 2 * 256 * 4 + k + k / 8) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", NAME, bytes);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up_p);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(xqp);
+                b.push_ptr(dxp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// claude: `rotate_x_mq_awq_batched` that also writes the int8 quantization
+    /// of `x_rot` into `xq`/`dx` (bit-identical to `claude_q8x_quant_into(x_rot)`).
+    /// Does not record a prequant entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_rotate_q8_batched(
+        &mut self,
+        x: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        xq: *mut c_void,
+        dx: *mut c_void,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "claude_rotate_q8_batched: k {k}");
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        const NAME: &str = "claude_rotate_q8";
+        self.ensure_kernel(NAME, CLAUDE_ROTATE_Q8_SRC, NAME)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut xp = x.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut xqp = xq;
+        let mut dxp = dx;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xqp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 3 + 2 * 256 * 4 + k + k / 8) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", NAME, bytes);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xqp);
+                b.push_ptr(dxp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// claude: `CLAUDE_Q8_FUSE_CHECK=1` A/B: on a prequant hit, re-run the
+    /// standalone quant of `x` into a temporary scratch and compare its bytes
+    /// with what the fused producer left in the shared scratch (first 40 hits);
+    /// misses (standalone quant ran) are logged too (first 16).
+    fn claude_q8_fuse_check(&mut self, x: &GpuTensor, k: usize, batch: usize, fused: bool) -> HipResult<()> {
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static MISSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if !fused {
+            if MISSES.fetch_add(1, Ordering::Relaxed) < 16 {
+                eprintln!("[claude-q8-fuse-check] k={k} b={batch} miss (standalone quant ran)");
             }
+            return Ok(());
+        }
+        if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+            return Ok(());
+        }
+        let xq_bytes = batch * k;
+        let dx_bytes = batch * (k / 32) * 4;
+        let tq = self.alloc_tensor(&[xq_bytes / 4], DType::F32)?;
+        let td = self.alloc_tensor(&[dx_bytes / 4], DType::F32)?;
+        self.claude_q8x_quant_into(x, tq.buf.as_ptr(), td.buf.as_ptr(), k, batch)?;
+        self.hip.device_synchronize()?;
+        let mut fq = vec![0u8; xq_bytes];
+        let mut fd = vec![0u8; dx_bytes];
+        let mut sq = vec![0u8; xq_bytes];
+        let mut sd = vec![0u8; dx_bytes];
+        CLAUDE_Q8X_SCRATCH.with(|cell| -> HipResult<()> {
+            let slot = cell.borrow();
+            let (xq, dx) = slot.as_ref().expect("claude q8x scratch");
+            self.hip.memcpy_dtoh(&mut fq, &xq.buf)?;
+            self.hip.memcpy_dtoh(&mut fd, &dx.buf)
+        })?;
+        self.hip.memcpy_dtoh(&mut sq, &tq.buf)?;
+        self.hip.memcpy_dtoh(&mut sd, &td.buf)?;
+        let xq_mismatch = fq.iter().zip(&sq).filter(|(a, b)| a != b).count();
+        let dx_mismatch = fd.chunks_exact(4).zip(sd.chunks_exact(4)).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "[claude-q8-fuse-check] k={k} b={batch} xq_mismatch={xq_mismatch} dx_mismatch={dx_mismatch}"
+        );
+        self.free_tensor(tq)?;
+        self.free_tensor(td)?;
+        Ok(())
+    }
+
+    /// claude: quantize `x` [batch x k] to int8 once, then one int8-dot GEMV per weight.
+    /// The quant launch is skipped when a fused producer (`claude_*_rotate_q8`)
+    /// already left exactly this buffer's quantization in the shared scratch.
+    pub fn claude_q8x_project(
+        &mut self,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        assert!((1..=8).contains(&batch), "claude_q8x_project: batch {batch}");
+        assert!(k % 256 == 0 && k <= 32768, "claude_q8x_project: k {k}");
+        self.bind_thread()?;
+        let (xq_ptr, dx_ptr) = self.claude_q8x_scratch()?;
+        let fused = claude_q8_prequant_take(x.buf.as_ptr(), k, batch);
+        if !fused {
+            self.claude_q8x_quant_into(x, xq_ptr, dx_ptr, k, batch)?;
+        }
+        if claude_q8_fuse_check_enabled() {
+            self.claude_q8_fuse_check(x, k, batch, fused)?;
         }
         struct Cfg {
             lds: bool,

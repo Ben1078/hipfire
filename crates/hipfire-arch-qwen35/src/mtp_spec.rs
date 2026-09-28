@@ -541,6 +541,17 @@ pub struct MtpSpecState {
     pub verify_capacity: usize,
     /// Lazily allocated batched kv-only scratch for the accepted-row refresh.
     pub claude_refresh: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
+    /// claude `CLAUDE_MTP_ASYNC`: one 16-byte device buffer
+    /// `[idx0, idx1, logp0, logp1]` the p_min top-2 kernel writes into, so a
+    /// single blocking D2H per draft step replaces the two 8-byte reads of
+    /// `mtp_topk_idx` + `mtp_topk_logp`. Allocated only when the switch is on.
+    claude_topk_pack: Option<GpuTensor>,
+    /// claude `CLAUDE_MTP_ASYNC`: `(cur_pos, n_verify)` of the latest shared
+    /// verify whose trunk forward left `verify_tokens` in
+    /// `trunk_pbs.tokens[..n_verify]` (HFQ4G256/Q8_0 embeddings) and
+    /// `cur_pos..cur_pos + n_verify` in `trunk_pbs.positions[..n_verify]`
+    /// (one batched PBS chunk); `None` when that is not guaranteed.
+    claude_verify_pbs: Option<(usize, usize)>,
 
     /// Optional draft-confidence cutoff for [`spec_step_mtp_compressed_serial`].
     /// When `p_min > 0`, the K-chain truncates early at step k if the draft's
@@ -663,6 +674,13 @@ impl MtpSpecState {
         // allocated — only used when state.p_min > 0).
         let mtp_topk_idx = gpu.alloc_tensor(&[2], DType::F32)?;
         let mtp_topk_logp = gpu.alloc_tensor(&[2], DType::F32)?;
+        // claude CLAUDE_MTP_ASYNC: packed [idx0, idx1, logp0, logp1] target for
+        // the p_min top-2 kernel (one D2H per draft step instead of two).
+        let claude_topk_pack = if mtp_head::claude_mtp_async() {
+            Some(gpu.alloc_tensor(&[4], DType::F32)?)
+        } else {
+            None
+        };
 
         // GPU sampling scratches (always allocated; only used when temp > 0).
         // All are tiny so the unconditional alloc is fine.
@@ -695,6 +713,8 @@ impl MtpSpecState {
             mtp_token_embed,
             mtp_positions,
             claude_refresh: None,
+            claude_topk_pack,
+            claude_verify_pbs: None,
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -814,6 +834,28 @@ impl MtpSpecState {
         )
     }
 
+    /// claude `CLAUDE_MTP_ASYNC`: [`Self::capture_prev_hidden_from_verify_row`]
+    /// enqueued on the active stream (`memcpy_dtod_at_auto`) instead of a
+    /// blocking null-stream `hipMemcpy`. Same bytes. Every consumer of
+    /// `prev_hidden` (the next cycle's MTP head forward) is stream-ordered
+    /// behind it, and host reads that follow are blocking null-stream copies,
+    /// which wait for the (blocking, `hipStreamCreate`) active stream. Without
+    /// an active stream this is the synchronous copy.
+    pub fn capture_prev_hidden_from_verify_row_ordered(
+        &self,
+        gpu: &Gpu,
+        row: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        gpu.memcpy_dtod_at_auto(
+            &self.prev_hidden.buf,
+            0,
+            &self.verify_hidden.buf,
+            row * dim * 4,
+            dim * 4,
+        )
+    }
+
     /// Drafter-local reset for a fresh conversation. Zeros the MTP head KV
     /// (stale absolute positions from the prior turn must not be re-read) and
     /// destroys any captured proposal graph (its node positions are turn-stale).
@@ -857,6 +899,9 @@ impl MtpSpecState {
         }
         let _ = gpu.free_tensor(self.mtp_topk_idx);
         let _ = gpu.free_tensor(self.mtp_topk_logp);
+        if let Some(pack) = self.claude_topk_pack {
+            let _ = gpu.free_tensor(pack);
+        }
         let _ = gpu.free_tensor(self.mtp_sample_result);
         let _ = gpu.free_tensor(self.mtp_sample_repeat_buf);
         let _ = gpu.free_tensor(self.mtp_gather_idx_draft);
@@ -1416,6 +1461,24 @@ fn mtp_shared_verify_accept_rollback(
         gpu.arch.as_str(),
         /* moe_router_logits_present — dense trunk: arm never matched */ true,
     );
+    // claude CLAUDE_MTP_ASYNC: can the accepted-row refresh read this verify's
+    // inputs straight from trunk_pbs? The forward takes its batched PBS path
+    // exactly when the tape is captured (the tape replay below already relies
+    // on that; the forward evaluates the same predicate with the MoE flag
+    // `trunk_pbs.moe_router_logits_batch.is_some()`, which only matters for
+    // MoE models) and the KV cache is not plain F32 (its only other gate here).
+    // In one chunk (n_verify <= prefill max batch; trunk_pbs holds
+    // verify_capacity + 1 >= n_verify rows) it uploads
+    // trunk_pbs.tokens[i] = verify_tokens[i] (HFQ4G256/Q8_0 embeddings) and
+    // trunk_pbs.positions[i] = cur_pos + i for i < n_verify, and nothing
+    // writes trunk_pbs again before the refresh (lm_head, accept, capture,
+    // DN restore + tape replay do not touch it).
+    state.claude_verify_pbs = None;
+    let claude_pbs_inputs = mtp_head::claude_mtp_async()
+        && tape_captured
+        && (state.trunk_pbs.moe_router_logits_batch.is_some() || target.config.num_experts == 0)
+        && (target.kv_cache.quantized || target.kv_cache.quant_q8 || target.kv_cache.quant_hfq4)
+        && n_verify <= qwen35::prefill_max_batch(gpu);
     let verify_tape: Option<&mut GdnTape> = if tape_captured {
         Some(&mut state.trunk_gdn_tape)
     } else {
@@ -1441,8 +1504,12 @@ fn mtp_shared_verify_accept_rollback(
         None,
         None,
         false,
-        qwen35::DflashFusionCtx::Off,
+        // claude v3: admit the bit-exact single-launch GDN-pre / FA-prep fusions.
+        qwen35::DflashFusionCtx::MtpVerify,
     )?;
+    if claude_pbs_inputs {
+        state.claude_verify_pbs = Some((cur_pos, n_verify));
+    }
 
     claude_note(8, claude_t_enq.elapsed().as_secs_f64());
     claude_mark(gpu, Some(2))?;
@@ -1537,7 +1604,12 @@ fn mtp_shared_verify_accept_rollback(
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    if mtp_head::claude_mtp_async() && !effective_use_sampling {
+        // claude CLAUDE_MTP_ASYNC: stream-ordered instead of a blocking hipMemcpy.
+        state.capture_prev_hidden_from_verify_row_ordered(gpu, prev_hidden_row, dim)?;
+    } else {
+        state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    }
     claude_mark(gpu, Some(5))?;
 
     // ── 3. KV / DN rollback (or skip on full accept) ─────────────────
@@ -1679,6 +1751,54 @@ fn mtp_accept_refresh_mode() -> u8 {
         Ok("2") => 2,
         _ => 0,
     })
+}
+
+/// `CLAUDE_MTP_ASYNC_CHECK=1` (validation aid, default off; adds two blocking
+/// reads per refresh): read the device-resident refresh inputs back and compare
+/// them with the host values. On a mismatch, log it and fall back to the host
+/// uploads. `check_tokens` is false when the verify does not upload token ids
+/// (embeddings other than HFQ4G256/Q8_0).
+fn claude_check_refresh_views(
+    gpu: &Gpu,
+    views: Option<(GpuTensor, GpuTensor)>,
+    tokens: &[u32],
+    positions: &[i32],
+    check_tokens: bool,
+) -> HipResult<Option<(GpuTensor, GpuTensor)>> {
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    if !*CHECK.get_or_init(|| claude_env_flag("CLAUDE_MTP_ASYNC_CHECK")) {
+        return Ok(views);
+    }
+    let Some((t, p)) = views else {
+        return Ok(None);
+    };
+    let words = |b: &[u8]| -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let mut pb = vec![0u8; positions.len() * 4];
+    gpu.hip.memcpy_dtoh(&mut pb, &p.buf)?;
+    let dev_p: Vec<i32> = words(&pb).into_iter().map(|w| w as i32).collect();
+    let mut ok = dev_p == positions;
+    let mut dev_t: Vec<u32> = Vec::new();
+    if check_tokens {
+        let mut tb = vec![0u8; tokens.len() * 4];
+        gpu.hip.memcpy_dtoh(&mut tb, &t.buf)?;
+        dev_t = words(&tb);
+        ok &= dev_t == tokens;
+    }
+    if ok {
+        FIRST.call_once(|| {
+            eprintln!("[claude-mtp-async-check] device refresh inputs match the host values")
+        });
+        return Ok(Some((t, p)));
+    }
+    eprintln!(
+        "[claude-mtp-async-check] MISMATCH device tokens {dev_t:?} positions {dev_p:?} vs host tokens {tokens:?} positions {positions:?}; using host uploads"
+    );
+    Ok(None)
 }
 
 /// DS4-style Qwen MTP prefill fill.
@@ -3044,6 +3164,9 @@ pub fn spec_step_mtp_compressed_serial_with_k(
         DraftMode::Sampled | DraftMode::SampledPMin { .. }
     );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
+    // claude CLAUDE_MTP_ASYNC: greedy / p_min draft steps write their MTP
+    // position with hipStreamWriteValue32 instead of a blocking H2D.
+    let claude_async_draft = mtp_head::claude_mtp_async() && !use_sampling;
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,
         _ => f32::NEG_INFINITY,
@@ -3196,7 +3319,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             // rmsnorm + trunk-lm_head GEMV manually below.
             if use_full_vocab {
                 if k == 0 {
-                    mtp_head::mtp_head_forward_block_only(
+                    mtp_head::mtp_head_forward_block_only_xfer(
                         gpu,
                         head,
                         &state.mtp_scratch,
@@ -3206,10 +3329,11 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         next_token_embed,
                         cur_pos + k,
                         trunk_weights,
+                        claude_async_draft,
                     )?;
                 } else {
                     let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_block_only(
+                    mtp_head::mtp_head_forward_block_only_xfer(
                         gpu,
                         head,
                         &state.mtp_scratch,
@@ -3219,6 +3343,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         next_token_embed,
                         cur_pos + k,
                         trunk_weights,
+                        claude_async_draft,
                     )?;
                 }
                 // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
@@ -3239,7 +3364,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 )?;
             } else if use_device_token_chain {
                 if k == 0 {
-                    mtp_head::mtp_head_forward_block_only(
+                    mtp_head::mtp_head_forward_block_only_xfer(
                         gpu,
                         head,
                         &state.mtp_scratch,
@@ -3249,10 +3374,11 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         next_token_embed,
                         cur_pos + k,
                         trunk_weights,
+                        claude_async_draft,
                     )?;
                 } else {
                     let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_block_only(
+                    mtp_head::mtp_head_forward_block_only_xfer(
                         gpu,
                         head,
                         &state.mtp_scratch,
@@ -3262,6 +3388,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         next_token_embed,
                         cur_pos + k,
                         trunk_weights,
+                        claude_async_draft,
                     )?;
                 }
                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
@@ -3422,26 +3549,53 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 }
             } else if use_p_min {
                 // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
-                gpu.topk_logsumexp_batched_f32(
-                    logits_for_argmax,
-                    &state.mtp_topk_idx,
-                    &state.mtp_topk_logp,
-                    argmax_vocab,
-                    /* k */ 2,
-                    /* b */ 1,
-                )?;
-                let mut idx_host: [i32; 2] = [0, 0];
-                let mut logp_host: [f32; 2] = [0.0, 0.0];
+                let (idx_host, logp_host): ([i32; 2], [f32; 2]) = if let Some(pack) =
+                    state.claude_topk_pack.as_ref()
                 {
-                    let idx_bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, 8)
-                    };
-                    gpu.hip.memcpy_dtoh(idx_bytes, &state.mtp_topk_idx.buf)?;
-                    let logp_bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(logp_host.as_mut_ptr() as *mut u8, 8)
-                    };
-                    gpu.hip.memcpy_dtoh(logp_bytes, &state.mtp_topk_logp.buf)?;
-                }
+                    // claude CLAUDE_MTP_ASYNC: the same kernel writes idx and
+                    // logp back to back into one 16-byte buffer
+                    // ([idx0, idx1, logp0, logp1]), so ONE blocking D2H replaces
+                    // the two 8-byte reads. idx is needed after every step (it
+                    // is the draft token the host feeds forward and verifies),
+                    // so the last step's read stays; logp rides along for free.
+                    gpu.topk_logsumexp_batched_f32(
+                        logits_for_argmax,
+                        &pack.sub_offset(0, 2),
+                        &pack.sub_offset(2, 2),
+                        argmax_vocab,
+                        /* k */ 2,
+                        /* b */ 1,
+                    )?;
+                    let mut raw = [0u8; 16];
+                    gpu.hip.memcpy_dtoh(&mut raw, &pack.buf)?;
+                    let w = |i: usize| [raw[4 * i], raw[4 * i + 1], raw[4 * i + 2], raw[4 * i + 3]];
+                    (
+                        [i32::from_ne_bytes(w(0)), i32::from_ne_bytes(w(1))],
+                        [f32::from_ne_bytes(w(2)), f32::from_ne_bytes(w(3))],
+                    )
+                } else {
+                    gpu.topk_logsumexp_batched_f32(
+                        logits_for_argmax,
+                        &state.mtp_topk_idx,
+                        &state.mtp_topk_logp,
+                        argmax_vocab,
+                        /* k */ 2,
+                        /* b */ 1,
+                    )?;
+                    let mut idx_host: [i32; 2] = [0, 0];
+                    let mut logp_host: [f32; 2] = [0.0, 0.0];
+                    {
+                        let idx_bytes: &mut [u8] = unsafe {
+                            std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, 8)
+                        };
+                        gpu.hip.memcpy_dtoh(idx_bytes, &state.mtp_topk_idx.buf)?;
+                        let logp_bytes: &mut [u8] = unsafe {
+                            std::slice::from_raw_parts_mut(logp_host.as_mut_ptr() as *mut u8, 8)
+                        };
+                        gpu.hip.memcpy_dtoh(logp_bytes, &state.mtp_topk_logp.buf)?;
+                    }
+                    (idx_host, logp_host)
+                };
                 draft_idx = idx_host[0] as usize;
                 assert!(
                     draft_idx < argmax_vocab,
@@ -3570,8 +3724,53 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             }
             let positions: Vec<i32> = (cur_pos + 1..cur_pos + 1 + n).map(|p| p as i32).collect();
             let hidden = state.verify_hidden.sub_offset(0, n * dim);
+            // claude CLAUDE_MTP_ASYNC (greedy / p_min): this cycle's verify
+            // batch scratch already holds these inputs on the device. It got
+            // verify_tokens = [last_committed, candidates..] and
+            // cur_pos, cur_pos + 1, .. (see `claude_verify_pbs`); committed[..n]
+            // (n = advance - 1) is the accepted draft prefix -- the bonus /
+            // EOS-stop token is always last, never inside it -- so slots 1..=n
+            // are exactly the refresh's tokens and positions cur_pos+1..=cur_pos+n.
+            // Both facts are re-checked here; otherwise upload as before.
+            let claude_async = mtp_head::claude_mtp_async() && !use_sampling;
+            let n_verify = result.drafts_generated + 1;
+            let pbs_views = if claude_async
+                && state.claude_verify_pbs == Some((cur_pos, n_verify))
+                && n < n_verify
+                && result.committed[..n] == candidates[..n]
+            {
+                Some((
+                    state.trunk_pbs.tokens.sub_offset(1, n),
+                    state.trunk_pbs.positions.sub_offset(1, n),
+                ))
+            } else {
+                None
+            };
+            let pbs_views = claude_check_refresh_views(
+                gpu,
+                pbs_views,
+                &result.committed[..n],
+                &positions,
+                matches!(
+                    tw.embd_format,
+                    llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
+                ),
+            )?;
+            let xfer = match pbs_views.as_ref() {
+                Some((tokens_dev, positions_dev)) => mtp_head::MtpBatchedXfer {
+                    // Only the Q8_0 batched embedding reads device token ids.
+                    tokens: (tw.embd_format == llama::EmbeddingFormat::Q8_0).then_some(tokens_dev),
+                    positions: Some(positions_dev),
+                    ordered: true,
+                },
+                None => mtp_head::MtpBatchedXfer {
+                    tokens: None,
+                    positions: None,
+                    ordered: claude_async,
+                },
+            };
             let (scratch, rot) = state.claude_refresh.as_mut().unwrap();
-            mtp_head::mtp_head_forward_block_batched(
+            mtp_head::mtp_head_forward_block_batched_xfer(
                 gpu,
                 head,
                 scratch,
@@ -3583,6 +3782,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 tw,
                 Some(&*rot),
                 true,
+                xfer,
             )?;
         } else {
             for j in 0..n {

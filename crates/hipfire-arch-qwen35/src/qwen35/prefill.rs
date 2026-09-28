@@ -6328,7 +6328,8 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // (kill switch, non-sequential batch, non-GQA route, tape absence or
     // overflow, ineligible shapes/arch) runs the pre-change sequence below
     // launch-for-launch.
-    if fusion == DflashFusionCtx::ChainVerify
+    if (fusion == DflashFusionCtx::ChainVerify
+        || (fusion == DflashFusionCtx::MtpVerify && crate::qwen35::config::claude_mtp_fuse_gdn()))
         && !gpu.flags.gdn_pre_fuse_off
         && matches!(batch_semantics, BatchSemantics::Sequential)
         && config.linear_num_key_heads < n_v_heads
@@ -8319,7 +8320,8 @@ fn batch_chunk_full_attn_prepare(
     let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
-    let fa_prep_fused_ok = fusion == DflashFusionCtx::ChainVerify
+    let fa_prep_fused_ok = (fusion == DflashFusionCtx::ChainVerify
+        || (fusion == DflashFusionCtx::MtpVerify && crate::qwen35::config::claude_mtp_fuse_fa()))
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.fa_batch_fuse_off
         && !gpu.flags.rope_interleaved_legacy
@@ -8798,7 +8800,7 @@ fn batch_chunk_fa_attend(
             && stride == WIDENED_COMMIT_ROWS
             && (64..=8192).contains(&n)
             && (n <= WIDENED_COMMIT_ROWS || n % WIDENED_COMMIT_ROWS == 0)
-            && (64..=32768).contains(&max_ctx_len)
+            && (64..=rdna_compute::attention::claude_fa2_max_ctx()).contains(&max_ctx_len)
             && start_pos.checked_add(n) == Some(max_ctx_len)
             && max_ctx_len <= kv_cache.physical_cap
             && tree_verify.is_none();
@@ -8876,7 +8878,18 @@ fn batch_chunk_fa_attend(
         && tree_verify.is_none()
         && !batch_semantics.is_independent()
         && gpu.claude_attn_gqa_ok(n, config.head_dim, config.n_heads, config.n_kv_heads);
-    if multirow || claude_gqa {
+    // claude v3: LDS-staged GQA-shared verify attention (preferred when applicable).
+    let claude_a3 = kv_cache.quant_q8
+        && !kv_cache.quant_fp8
+        && tree_verify.is_none()
+        && !batch_semantics.is_independent()
+        && gpu.claude_attn3_ok(n, config.head_dim, config.n_heads, config.n_kv_heads);
+    let claude_a4 = kv_cache.quant_q8
+        && !kv_cache.quant_fp8
+        && tree_verify.is_none()
+        && !batch_semantics.is_independent()
+        && gpu.claude_attn4_ok(n, config.head_dim, config.n_heads, config.n_kv_heads);
+    if multirow || claude_gqa || claude_a3 || claude_a4 {
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
@@ -8896,6 +8909,40 @@ fn batch_chunk_fa_attend(
             config.head_dim,
             n,
         )?;
+        if claude_a4
+            && gpu.claude_attn4(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                max_ctx_len,
+                n,
+                &s.flash_partials,
+            )?
+        {
+            return Ok(());
+        }
+        if claude_a3
+            && gpu.claude_attn3(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                max_ctx_len,
+                n,
+                &s.flash_partials,
+            )?
+        {
+            return Ok(());
+        }
         if claude_gqa
             && gpu.claude_attn_gqa(
                 &pbs.fa_q_batch,

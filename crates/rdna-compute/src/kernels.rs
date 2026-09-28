@@ -1953,6 +1953,10 @@ pub const GEMV_MQ4CG256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4c
 pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2.hip");
 /// claude: GQA-shared speculative-verify attention (q8_0 KV, head_dim 256).
 pub const CLAUDE_ATTN_GQA_SRC: &str = include_str!("../../../kernels/src/claude_attn_gqa.hip");
+/// claude v3: WMMA split-K verify attention (q8_0 KV, 24/4 heads, head_dim 256).
+pub const CLAUDE_ATTN4_SRC: &str = include_str!("../../../kernels/src/claude_attn4.hip");
+/// claude v3: LDS-staged GQA-shared verify attention (q8_0 KV, head_dim 256).
+pub const CLAUDE_ATTN3_SRC: &str = include_str!("../../../kernels/src/claude_attn3.hip");
 /// claude: 8-warp split-K attention reduce (head_dim 256).
 pub const CLAUDE_ATTN_REDUCE_SRC: &str = include_str!("../../../kernels/src/claude_attn_reduce.hip");
 /// claude: two-stage full-vocab argmax and top-2 + logsumexp.

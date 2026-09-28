@@ -71,6 +71,28 @@ use hipfire_runtime::llama::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
+/// `CLAUDE_MTP_ASYNC` (default on; `CLAUDE_MTP_ASYNC=0` restores the previous
+/// calls exactly): pure-transport removal of blocking host round-trips from the
+/// greedy MTP decode step (`spec_step_mtp_compressed_serial_with_k` and its
+/// shared verify) -- stream-ordered D2D copies and position writes instead of
+/// blocking `hipMemcpy`, the verify batch's device-resident tokens/positions
+/// for the accepted-row refresh, one merged top-2 readback per p_min draft
+/// step. Same kernels, same order, same values. Read once per process.
+pub(crate) fn claude_mtp_async() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = !matches!(
+            std::env::var("CLAUDE_MTP_ASYNC").as_deref().map(str::trim),
+            Ok("0" | "false" | "off" | "no")
+        );
+        eprintln!(
+            "[claude] CLAUDE_MTP_ASYNC={}",
+            if on { "on" } else { "off" }
+        );
+        on
+    })
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1463,6 +1485,41 @@ pub fn mtp_head_forward_block_only(
     pos: usize,
     trunk_weights: &Qwen35Weights,
 ) -> HipResult<()> {
+    mtp_head_forward_block_only_xfer(
+        gpu,
+        head,
+        scratch,
+        kv,
+        next_token,
+        prev_hidden,
+        next_token_embed,
+        pos,
+        trunk_weights,
+        false,
+    )
+}
+
+/// claude `CLAUDE_MTP_ASYNC`: [`mtp_head_forward_block_only`] with a choice of
+/// how the 4-byte position reaches `scratch.pos_buf`. `stream_pos = false` is
+/// the original blocking `hipMemcpy` H2D. `stream_pos = true` enqueues the same
+/// i32 with `hipStreamWriteValue32` on the active stream: ordered after every
+/// earlier reader of `pos_buf` on that stream (the previous draft step's RoPE /
+/// attention) and before this step's kernels, with the value captured at
+/// enqueue time, so no host buffer has to outlive the call. Falls back to the
+/// blocking upload when no stream is installed.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_block_only_xfer(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    next_token_embed: Option<&GpuTensor>,
+    pos: usize,
+    trunk_weights: &Qwen35Weights,
+    stream_pos: bool,
+) -> HipResult<()> {
     let cfg = &head.config;
     let n_embd = cfg.n_embd;
 
@@ -1480,8 +1537,36 @@ pub fn mtp_head_forward_block_only(
 
     // Upload position scalar for the RoPE / attention kernels.
     let pos_i32 = pos as i32;
-    gpu.hip
-        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    // claude CLAUDE_MTP_ASYNC: stream-ordered write; if the runtime ever rejects
+    // it, say so once and use the blocking upload from then on.
+    static CLAUDE_WRITE_VALUE_FAILED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let streamed = match gpu.active_stream.as_ref() {
+        Some(stream)
+            if stream_pos
+                && !CLAUDE_WRITE_VALUE_FAILED.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            match gpu
+                .hip
+                .stream_write_value32(stream, &scratch.pos_buf, pos_i32 as u32, 0)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    CLAUDE_WRITE_VALUE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[claude] hipStreamWriteValue32 failed ({e}); MTP position writes \
+                         fall back to the blocking upload"
+                    );
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+    if !streamed {
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    }
 
     mtp_head_forward_block_only_with_pos_buf(
         gpu,
@@ -2291,6 +2376,56 @@ pub(crate) fn mtp_prompt_fill_uses_batched(
             .all(weight_gemm_batched_supported)
 }
 
+/// claude `CLAUDE_MTP_ASYNC`: input transport for
+/// [`mtp_head_forward_block_batched_xfer`]. [`MtpBatchedXfer::LEGACY`] is the
+/// original call sequence of [`mtp_head_forward_block_batched`].
+#[derive(Clone, Copy)]
+pub struct MtpBatchedXfer<'a> {
+    /// `[n]` i32 token ids already resident on the device and equal to
+    /// `next_tokens` (e.g. a view of the verify batch's `pbs.tokens`). Only the
+    /// Q8_0 batched embedding reads device token ids. `None` = upload.
+    pub tokens: Option<&'a GpuTensor>,
+    /// `[n]` i32 positions already resident on the device and equal to
+    /// `positions` (e.g. a view of the verify batch's `pbs.positions`).
+    /// `None` = upload into `scratch.positions`.
+    pub positions: Option<&'a GpuTensor>,
+    /// Stream-ordered transport: the internal D2D copies are enqueued on the
+    /// active stream (`memcpy_dtod_at_auto`) instead of blocking the host, and
+    /// the token upload nothing reads (non-Q8_0 embeddings embed per token from
+    /// the host ids) is skipped. Every consumer is a stream-ordered kernel of
+    /// this forward.
+    pub ordered: bool,
+}
+
+impl MtpBatchedXfer<'_> {
+    /// Blocking uploads and copies, exactly as before `CLAUDE_MTP_ASYNC`.
+    pub const LEGACY: Self = Self {
+        tokens: None,
+        positions: None,
+        ordered: false,
+    };
+}
+
+/// D2D copy for the batched forward: stream-ordered (`memcpy_dtod_at_auto`,
+/// itself the blocking copy when no stream is installed) when `ordered`, else
+/// the original blocking null-stream `hipMemcpy`.
+fn claude_dtod(
+    gpu: &Gpu,
+    ordered: bool,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    size: usize,
+) -> HipResult<()> {
+    if ordered {
+        gpu.memcpy_dtod_at_auto(dst, dst_offset, src, src_offset, size)
+    } else {
+        gpu.hip
+            .memcpy_dtod_at(dst, dst_offset, src, src_offset, size)
+    }
+}
+
 /// Batched MTP head block forward (Task 11b).
 ///
 /// Runs the NextN concat + eh_proj + gated-Q attention + SwiGLU FFN over
@@ -2348,6 +2483,42 @@ pub fn mtp_head_forward_block_batched(
     rotated_x_scratch: Option<&GpuTensor>,
     kv_only: bool,
 ) -> HipResult<()> {
+    mtp_head_forward_block_batched_xfer(
+        gpu,
+        head,
+        scratch,
+        kv,
+        next_tokens,
+        prev_hiddens_stacked,
+        positions,
+        n,
+        trunk_weights,
+        rotated_x_scratch,
+        kv_only,
+        MtpBatchedXfer::LEGACY,
+    )
+}
+
+/// claude `CLAUDE_MTP_ASYNC`: [`mtp_head_forward_block_batched`] with explicit
+/// input transport (see [`MtpBatchedXfer`]); `MtpBatchedXfer::LEGACY` is the
+/// original call sequence. The kernels, their order and the values they read
+/// are the same in every mode; only where the token ids / positions are read
+/// from and whether the host blocks on the internal copies change.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_block_batched_xfer(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &mut Qwen35MtpHeadBatchedScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_tokens: &[u32],
+    prev_hiddens_stacked: &GpuTensor,
+    positions: &[i32],
+    n: usize,
+    trunk_weights: &Qwen35Weights,
+    rotated_x_scratch: Option<&GpuTensor>,
+    kv_only: bool,
+    xfer: MtpBatchedXfer<'_>,
+) -> HipResult<()> {
     let cfg = &head.config;
     let w = &head.weights;
     let dim = cfg.n_embd;
@@ -2375,19 +2546,45 @@ pub fn mtp_head_forward_block_batched(
             kv.max_seq,
         );
     }
+    if let Some(t) = xfer.tokens {
+        assert!(
+            t.numel() >= n,
+            "xfer.tokens has {} elems < n={n}",
+            t.numel()
+        );
+    }
+    if let Some(p) = xfer.positions {
+        assert!(
+            p.numel() >= n,
+            "xfer.positions has {} elems < n={n}",
+            p.numel()
+        );
+    }
 
     // Reuse the raw i32 positions buffer for token ids during embedding, then
     // overwrite it with absolute positions before RoPE/KV writes.
-    let token_bytes =
-        unsafe { std::slice::from_raw_parts(next_tokens.as_ptr() as *const u8, n * 4) };
-    gpu.hip.memcpy_htod(&scratch.positions.buf, token_bytes)?;
+    // claude CLAUDE_MTP_ASYNC: a device view in `xfer` replaces either upload;
+    // `xfer.ordered` also skips the token upload nothing reads (only the Q8_0
+    // batched embedding reads device token ids).
+    let q8_embed = trunk_weights.embd_format == EmbeddingFormat::Q8_0;
+    let token_ids: &GpuTensor = match xfer.tokens {
+        Some(t) => t,
+        None => {
+            if q8_embed || !xfer.ordered {
+                let token_bytes =
+                    unsafe { std::slice::from_raw_parts(next_tokens.as_ptr() as *const u8, n * 4) };
+                gpu.hip.memcpy_htod(&scratch.positions.buf, token_bytes)?;
+            }
+            &scratch.positions
+        }
+    };
 
     let tok_embd_view = scratch.tok_embd.sub_offset(0, n * dim);
-    if trunk_weights.embd_format == EmbeddingFormat::Q8_0 {
+    if q8_embed {
         gpu.embedding_lookup_q8_batched(
             &trunk_weights.token_embd,
             &tok_embd_view,
-            &scratch.positions,
+            token_ids,
             n,
             dim,
         )?;
@@ -2398,10 +2595,16 @@ pub fn mtp_head_forward_block_batched(
         }
     }
 
-    let position_bytes =
-        unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
-    gpu.hip
-        .memcpy_htod(&scratch.positions.buf, position_bytes)?;
+    let positions_dev: &GpuTensor = match xfer.positions {
+        Some(p) => p,
+        None => {
+            let position_bytes =
+                unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
+            gpu.hip
+                .memcpy_htod(&scratch.positions.buf, position_bytes)?;
+            &scratch.positions
+        }
+    };
 
     // ── 2. Batched RMSNorm both inputs to NextN projection ───────────────
     let e_norm_view = scratch.e_norm.sub_offset(0, n * dim);
@@ -2420,14 +2623,18 @@ pub fn mtp_head_forward_block_batched(
     // ── 3. Build concat = [e_norm | h_norm] per slot ─────────────────────
     // Layout: concat[i] = [e_norm[i, 0..dim], h_norm[i, 0..dim]] (length 2*dim).
     for i in 0..n {
-        gpu.hip.memcpy_dtod_at(
+        claude_dtod(
+            gpu,
+            xfer.ordered,
             &scratch.concat.buf,
             i * 2 * dim_bytes,
             &scratch.e_norm.buf,
             i * dim_bytes,
             dim_bytes,
         )?;
-        gpu.hip.memcpy_dtod_at(
+        claude_dtod(
+            gpu,
+            xfer.ordered,
             &scratch.concat.buf,
             i * 2 * dim_bytes + dim_bytes,
             &scratch.h_norm.buf,
@@ -2449,8 +2656,15 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     // Save residual (inpSA) for the post-attn add.
-    gpu.hip
-        .memcpy_dtod_at(&scratch.residual.buf, 0, &scratch.cur.buf, 0, n * dim_bytes)?;
+    claude_dtod(
+        gpu,
+        xfer.ordered,
+        &scratch.residual.buf,
+        0,
+        &scratch.cur.buf,
+        0,
+        n * dim_bytes,
+    )?;
 
     // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
     let tmp_view = scratch.tmp.sub_offset(0, n * dim);
@@ -2505,7 +2719,7 @@ pub fn mtp_head_forward_block_batched(
     gpu.rope_partial_interleaved_f32_batched(
         &q_view,
         &k_view,
-        &scratch.positions,
+        positions_dev,
         cfg.n_head,
         cfg.n_head_kv,
         cfg.head_dim,
@@ -2526,7 +2740,7 @@ pub fn mtp_head_forward_block_batched(
     gpu.kv_cache_write_q8_0_batched(
         &kv.inner.k_gpu[0],
         &k_view,
-        &scratch.positions,
+        positions_dev,
         cfg.n_head_kv,
         cfg.head_dim,
         n,
@@ -2534,7 +2748,7 @@ pub fn mtp_head_forward_block_batched(
     gpu.kv_cache_write_q8_0_batched(
         &kv.inner.v_gpu[0],
         &v_view,
-        &scratch.positions,
+        positions_dev,
         cfg.n_head_kv,
         cfg.head_dim,
         n,
@@ -2549,8 +2763,15 @@ pub fn mtp_head_forward_block_batched(
     let attn_out_view = scratch.attn_out.sub_offset(0, n * q_dim);
     if cfg.n_head == cfg.n_head_kv {
         // No GQA expansion: attn_out := V row-by-row.
-        gpu.hip
-            .memcpy_dtod_at(&scratch.attn_out.buf, 0, &scratch.v.buf, 0, n * kv_dim * 4)?;
+        claude_dtod(
+            gpu,
+            xfer.ordered,
+            &scratch.attn_out.buf,
+            0,
+            &scratch.v.buf,
+            0,
+            n * kv_dim * 4,
+        )?;
     } else {
         let ratio = cfg.n_head / cfg.n_head_kv;
         assert!(
@@ -2565,7 +2786,9 @@ pub fn mtp_head_forward_block_batched(
                 let kv_h = h / ratio;
                 let src_off = (i * kv_dim + kv_h * cfg.head_dim) * 4;
                 let dst_off = (i * q_dim + h * cfg.head_dim) * 4;
-                gpu.hip.memcpy_dtod_at(
+                claude_dtod(
+                    gpu,
+                    xfer.ordered,
                     &scratch.attn_out.buf,
                     dst_off,
                     &scratch.v.buf,
@@ -2629,7 +2852,9 @@ pub fn mtp_head_forward_block_batched(
     }
 
     // ── 10. Snapshot post-FFN hidden into t_mtp_outs ─────────────────────
-    gpu.hip.memcpy_dtod_at(
+    claude_dtod(
+        gpu,
+        xfer.ordered,
         &scratch.t_mtp_outs.buf,
         0,
         &scratch.ffn_out.buf,
