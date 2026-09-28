@@ -6547,8 +6547,11 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC: &str = concat!
 /// reductions, full-P reconstruction, PV even/odd dimension ownership).
 /// F4b: the body reads f16 Q from Gpu-owned scratch (one aligned 16-byte
 /// load per 8 dims, no cvt); `attention_fa2_q_preconvert_gfx11` in this
-/// same file fills the scratch from f32 Q ahead of the body. JIT-only via
-/// the `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a default path.
+/// same file fills the scratch from f32 Q ahead of the body. On exact
+/// gfx1100 the launcher builds the `HIPFIRE_FA2_GFX1100` variant with
+/// `-mcumode` (entry symbols `attention_q8_0_fa2_gqa_gfx1100` /
+/// `attention_fa2_q_preconvert_gfx1100`). JIT-only via the
+/// `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
 

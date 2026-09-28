@@ -154,6 +154,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
 | `HIPFIRE_GFX11_FA2_PREFILL` | GQA-fused FA2 prefill on gfx1100/gfx1151 (Qwen NH24/NKV4/HD256, N 64..512 step 16, ctx 64..32768) — default ON (`kernel.gfx11_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
 | `HIPFIRE_FA2_FILL` | Warp-specialized K/V fill in that FA2 kernel on gfx1100/gfx1151 (bit-exact; helper waves dequantize the next K/V tile while compute waves run QK/PV) — default ON; `=0` restores the all-wave per-tile fill |
+| `HIPFIRE_GFX1100_FA2_R3` | Exact-gfx1100 variant of that FA2 fill body (bit-exact; CU mode, bank-conflict-free helper plane stores, O rescale skipped when alpha is exactly 1, heaviest q tiles first; symbols `attention_q8_0_fa2_gqa_gfx1100` / `attention_fa2_q_preconvert_gfx1100`) — default ON; `=0` restores the shared gfx11 body |
 | `HIPFIRE_GFX12_FA2_PREFILL` | GQA-fused FA2 prefill on exact gfx1201 (same Qwen NH24/NKV4/HD256 envelope) — default ON (`kernel.gfx12_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
 | `HIPFIRE_GFX12_FA_PACKET` | Packet-minimal Q128 FA2 body on exact gfx1201 (same Qwen envelope as `HIPFIRE_GFX12_FA2_PREFILL`) — default ON (`kernel.gfx12_fa_packet`); `=0` opts out to the byte-identical route-N body |
 | `HIPFIRE_ATTN_QRESIDENT_V2` | Bit-exact v2 schedule of the gfx1201 register-resident-Q FA2 prefill kernel (same Qwen envelope; only where `kernel.attn_qresident` selects the Q-resident route) — default ON (`kernel.attn_qresident_v2`); `=0` restores the byte-identical v1 Q-resident kernel |
@@ -615,6 +616,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_FA2_R3` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX11_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX11_MMQ_X128` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |

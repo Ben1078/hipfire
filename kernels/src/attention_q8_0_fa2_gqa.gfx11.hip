@@ -106,6 +106,25 @@
 #endif
 #define FA2_FILL (HIPFIRE_FA2_FILL && FA2_Q16 && HIPFIRE_FA2_KT == 32)
 
+// Exact-gfx1100 variant of the FILL path (the launcher defines HIPFIRE_FA2_GFX1100=1 on
+// gfx1100 only and compiles it with -mcumode; `HIPFIRE_GFX1100_FA2_R3=0` opts out).
+// Bit-exact to the FILL path: the plane contents, every compute-wave value and the
+// op order are unchanged. What changes:
+//  - helper plane stores are bank-conflict-free: a helper wave's lanes cover 16 key
+//    pairs (V) / 16 keys (K) instead of one, and half the lanes store the (d & 1)
+//    neighbour dim first, so one ds_store touches 32 banks (the incumbent V store
+//    touched 4, i.e. 8-way conflicts that stalled the compute waves' fragment reads);
+//  - the O rescale is skipped when every lane's alpha is exactly 1.0f (O * 1.0f == O);
+//  - sacc starts from opaque zeros (no hoisted 8-VGPR zero vector) and Q fragments
+//    load unconditionally from a clamped row (rows >= batch are masked to -inf, so
+//    their Q values never reach a stored output);
+//  - work items are dispatched heaviest (longest causal prefix) first;
+//  - entry symbols end in _gfx1100.
+#ifndef HIPFIRE_FA2_GFX1100
+#define HIPFIRE_FA2_GFX1100 0
+#endif
+#define FA2_R3 (HIPFIRE_FA2_GFX1100 && FA2_FILL)
+
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -265,6 +284,46 @@ __device__ __forceinline__ void fa2_fill_v_store(uint32_t* Vdw, int slot, uint32
     }
 }
 
+#if FA2_R3
+// Helper slot maps (hl = helper thread 0..63). V slot ((m*8+b)<<2)|wq: the lanes of a
+// helper wave cover the 16 key pairs m = hl & 15 (the incumbent's wave covered one), so
+// (m + S(d & 15)) & 15 spreads a store over 16 banks; wq = hl >> 4. K slot k*8+b: lanes
+// cover 16 keys (16 distinct S(k)) and two blocks 32 banks apart.
+__device__ __forceinline__ int fa2_r3_vslot(int hl, int s)
+{
+    return ((((hl & 15) * 8 + s) << 2) | (hl >> 4));
+}
+__device__ __forceinline__ int fa2_r3_kslot(int hl, int t)
+{
+    const int k = (hl & 15) + 16 * (hl >> 5);
+    const int b = (t & 1) + 2 * ((hl >> 4) & 1) + 4 * (t >> 1);
+    return k * 8 + b;
+}
+// fa2_fill_v_store for V slot fa2_r3_vslot(hl, s) at Vs = Vdw + s*512 (block b = s adds
+// 512 dwords). voff[i*4+c] is the lane's dword offset of dim (2wq+i)*4 + (c ^ flip) in
+// block 0: lanes with flip = 1 store the (d & 1)-neighbour dim, i.e. the other 16-bank
+// group, in the same instruction.
+__device__ __forceinline__ void fa2_r3_fill_v_store(uint32_t* Vs, const int* voff, uint32_t s01,
+                                                    const uint32_t* u, int flip)
+{
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t xl =
+            __builtin_amdgcn_perm(u[2 + i], u[i], 0x05010400u) ^ 0x80808080u;
+        const uint32_t xh =
+            __builtin_amdgcn_perm(u[2 + i], u[i], 0x07030602u) ^ 0x80808080u;
+        uint32_t dw[4];
+        dw[0] = fa2_pk_deq2(xl, 0x04010400u, s01);
+        dw[1] = fa2_pk_deq2(xl, 0x04030402u, s01);
+        dw[2] = fa2_pk_deq2(xh, 0x04010400u, s01);
+        dw[3] = fa2_pk_deq2(xh, 0x04030402u, s01);
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            Vs[voff[i * 4 + c]] = flip ? dw[c ^ 1] : dw[c];
+    }
+}
+#endif
+
 // K fragment for WMMA A: key row `key`, dim chunk dc (four aligned b64s).
 __device__ __forceinline__ half16_t fa2_fill_kfrag(const uint32_t* Kdw, int key, int dc)
 {
@@ -286,6 +345,25 @@ __device__ __forceinline__ half16_t fa2_fill_kfrag(const uint32_t* Kdw, int key,
     return kf;
 }
 
+#if FA2_R3
+// Q fragment dc of the lane's query row. The R3 row is clamped to the batch, so the
+// loads need no exec mask or zero fill (rows >= batch are masked to -inf in softmax).
+__device__ __forceinline__ half16_t fa2_r3_qfrag(const _Float16* __restrict__ q16,
+                                                 unsigned qq_base, int dc)
+{
+    const half8_t* qd = (const half8_t*)(q16 + qq_base + (unsigned)(dc * 16));
+    const half8_t lo = qd[0];
+    const half8_t hi = qd[1];
+    half16_t qf;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        qf[e] = lo[e];
+        qf[8 + e] = hi[e];
+    }
+    return qf;
+}
+#endif
+
 // Compute-wave QK(t) for both KT32 subtiles (qshare2) and softmax/PV(t),
 // split at the phase barrier. Bodies are the incumbent KT32 path verbatim
 // (the incumbent keeps its inline copy: hoisting it into these helpers
@@ -294,6 +372,28 @@ __device__ __forceinline__ void fa2_fill_qk(
     const _Float16* __restrict__ q16, const uint32_t* Kdw, unsigned qq_base,
     bool qok_ml, int ml, bool do0, bool do1, float8_t& sacc0, float8_t& sacc1)
 {
+#if FA2_R3
+    // Opaque zeros: the compiler cannot hoist a zero vector across the tile loop.
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        float z0, z1;
+        asm volatile("v_mov_b32 %0, 0" : "=v"(z0));
+        asm volatile("v_mov_b32 %0, 0" : "=v"(z1));
+        sacc0[e] = z0;
+        sacc1[e] = z1;
+    }
+    (void)qok_ml;
+    for (int dc = 0; dc < 16; ++dc) {
+        const half16_t qf = fa2_r3_qfrag(q16, qq_base, dc);
+        if (do0)
+            sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                fa2_fill_kfrag(Kdw, ml, dc), qf, sacc0);
+        if (do1)
+            sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                fa2_fill_kfrag(Kdw, 16 + ml, dc), qf, sacc1);
+        asm volatile("" ::: "memory");
+    }
+#else
     sacc0 = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     sacc1 = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int dc = 0; dc < 16; ++dc) {
@@ -322,6 +422,7 @@ __device__ __forceinline__ void fa2_fill_qk(
         // Bound K/Q-load hoisting to this chunk.
         asm volatile("" ::: "memory");
     }
+#endif
 }
 
 __device__ __forceinline__ void fa2_fill_softmax_pv(
@@ -373,6 +474,10 @@ __device__ __forceinline__ void fa2_fill_softmax_pv(
             prow[2 * j] = (_Float16)e0;
             prow[2 * j + 1] = (_Float16)e1;
         }
+#if FA2_R3
+        // Every lane's alpha is exactly 1.0f (no row max moved): O * 1.0f == O.
+        if (__builtin_amdgcn_ballot_w32(alpha != 1.0f))
+#endif
 #pragma unroll
         for (int dc = 0; dc < 16; ++dc)
             Ofr[dc] *= alpha;
@@ -462,7 +567,11 @@ __device__ __forceinline__ void fa2_gqa_body(
         h_ml = 6 * kv_h + (FA2_Q16 ? wave : (wave << 1) + (ml >> 3));
         qr_ml = q_base + (FA2_Q16 ? ml : (ml & 7));
         qok_ml = qr_ml < batch_size;
+#if FA2_R3
+        qq_base = (unsigned)min(qr_ml, batch_size - 1) * 6144u + (unsigned)h_ml * 256u;
+#else
         qq_base = (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+#endif
 #pragma unroll
         for (int dc = 0; dc < 16; ++dc)
             Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -513,7 +622,11 @@ __device__ __forceinline__ void fa2_gqa_body(
     if (!fill_compute) {
 #pragma unroll
         for (int s = 0; s < FA2_FILL_HV; ++s)
+#if FA2_R3
+            fa2_fill_v_load(v_cache, 0, seq_len, kv_blk, fa2_r3_vslot(hl, s),
+#else
             fa2_fill_v_load(v_cache, 0, seq_len, kv_blk, hl + s * FA2_FILL_HT,
+#endif
                             rv_s[s], rv_u + s * 4);
     }
     // Tile 0 K: one slot per thread (all eight waves).
@@ -542,6 +655,22 @@ __device__ __forceinline__ void fa2_gqa_body(
             __syncthreads();  // B2: K(t+1) in plane; V(t) consumed
         }
     } else {
+#if FA2_R3
+        // The lane's eight V store offsets (block 0) for fa2_r3_fill_v_store.
+        int voff[8];
+        {
+            const int m = hl & 15;
+            const int wq = hl >> 4;
+            const int fl = (hl >> 4) & 1;
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d0 = (2 * wq + i) * 4 + (c ^ fl);
+                    voff[i * 4 + c] = d0 * 16 + ((m + fa2_swiz(d0 & 15)) & 15);
+                }
+        }
+#endif
         uint32_t rk_s[FA2_FILL_HK];
         uint32_t rk_u[FA2_FILL_HK * 8];
         for (int tile = 0; ; ++tile) {
@@ -553,20 +682,36 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                 for (int t = 0; t < FA2_FILL_HK; ++t)
                     fa2_fill_k_load(k_cache, ktile + KT, seq_len, kv_blk,
+#if FA2_R3
+                                    fa2_r3_kslot(hl, t), rk_s[t], rk_u + t * 8);
+#else
                                     hl + t * FA2_FILL_HT, rk_s[t], rk_u + t * 8);
+#endif
             }
 #pragma unroll
             for (int s = 0; s < FA2_FILL_HV; ++s)
+#if FA2_R3
+                fa2_r3_fill_v_store(Vdw + s * 512, voff, rv_s[s], rv_u + s * 4, (hl >> 4) & 1);
+#else
                 fa2_fill_v_store(Vdw, hl + s * FA2_FILL_HT, rv_s[s], rv_u + s * 4);
+#endif
             __syncthreads();  // B1
             if (next) {
 #pragma unroll
                 for (int s = 0; s < FA2_FILL_HV; ++s)
                     fa2_fill_v_load(v_cache, ktile + KT, seq_len, kv_blk,
+#if FA2_R3
+                                    fa2_r3_vslot(hl, s), rv_s[s], rv_u + s * 4);
+#else
                                     hl + s * FA2_FILL_HT, rv_s[s], rv_u + s * 4);
+#endif
 #pragma unroll
                 for (int t = 0; t < FA2_FILL_HK; ++t)
+#if FA2_R3
+                    fa2_fill_k_store(Kdw, fa2_r3_kslot(hl, t), rk_s[t], rk_u + t * 8);
+#else
                     fa2_fill_k_store(Kdw, hl + t * FA2_FILL_HT, rk_s[t], rk_u + t * 8);
+#endif
             }
             __syncthreads();  // B2
         }
@@ -1275,6 +1420,8 @@ __device__ __forceinline__ void fa2_gqa_body(
 // each launcher resolve its own module's build.
 #if HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
+#elif FA2_R3
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx1100
 #else
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx11
 #endif
@@ -1325,7 +1472,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
 
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
-extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void attention_q8_0_fa2_gqa_gfx11(
+#if FA2_R3
+#define HIPFIRE_FA2_BODY_SYM attention_q8_0_fa2_gqa_gfx1100
+#else
+#define HIPFIRE_FA2_BODY_SYM attention_q8_0_fa2_gqa_gfx11
+#endif
+extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void HIPFIRE_FA2_BODY_SYM(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -1339,10 +1491,19 @@ extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void att
 {
     if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
         return;
+#if FA2_R3
+    // Heaviest first: the linear dispatch order (x fastest over grid [G, 4]) walks the
+    // q tiles from the last (longest causal prefix) down, four KV heads per tile, so
+    // the final dispatch round holds the lightest work items.
+    const unsigned lin = blockIdx.x + gridDim.x * blockIdx.y;
+    const int kv_h = (int)(lin & 3u);
+    const int q_base = (int)(gridDim.x - 1u - (lin >> 2)) * 16;
+#else
     const int kv_h = blockIdx.y;
     if (kv_h >= 4)
         return;
     const int q_base = blockIdx.x * (HIPFIRE_FA2_Q16 ? 16 : 8);
+#endif
     if (q_base >= batch_size)
         return;
     fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,

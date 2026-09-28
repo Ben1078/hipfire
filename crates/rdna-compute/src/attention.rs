@@ -5884,29 +5884,43 @@ impl Gpu {
                 "attention_q8_0_fa2_gqa_gfx11 KV prefix exceeds cache capacity",
             ));
         }
-        let module = "attention_q8_0_fa2_gqa_gfx11";
         // The 16-query screen passed on these two exact cards only.
         let q16_tile = matches!(self.arch.as_str(), "gfx1100" | "gfx1151");
+        // Warp-specialized K/V fill: bit-exact, screened +30% FA2 on
+        // gfx1100 and gfx1151 (the Q16 cards). `HIPFIRE_FA2_FILL=0`
+        // restores the all-wave fill.
+        let fill = q16_tile && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
+        // Exact-gfx1100 variant of the fill body (bit-exact): CU mode,
+        // bank-conflict-free helper plane stores, O rescale skipped when
+        // alpha == 1.0f, opaque sacc zeros with clamped Q rows, heaviest q
+        // tiles dispatched first; its own entry symbols. Kernel -24.7% at
+        // N4096@4096 and -28.5% at N4096@0 on a real H2 layer.
+        // `HIPFIRE_GFX1100_FA2_R3=0` restores the shared gfx11 body.
+        let r3 = fill
+            && self.arch == "gfx1100"
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", true);
+        let (module, preconvert) = if r3 {
+            ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
+        } else {
+            ("attention_q8_0_fa2_gqa_gfx11", "attention_fa2_q_preconvert_gfx11")
+        };
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
         // archs for both K modes; the KT64 path was removed.
         // F4b: the body reads f16 Q from Gpu-owned scratch (pre-converted on
         // the same stream just below); the entry symbol and the pre-convert
         // symbol both resolve out of this module's source.
-        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx11";
-        // Warp-specialized K/V fill: bit-exact, screened +30% FA2 on
-        // gfx1100 and gfx1151 (the Q16 cards). `HIPFIRE_FA2_FILL=0`
-        // restores the all-wave fill.
-        let fill = q16_tile && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
-        if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
+        if !self.functions.contains_key(module) || !self.functions.contains_key(preconvert) {
             let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}",
+                "{}#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}{}",
+                if r3 { "// HIPFIRE_COMPILER_FLAGS: -mcumode\n" } else { "" },
                 u8::from(q16_tile),
                 u8::from(fill),
+                if r3 { "#define HIPFIRE_FA2_GFX1100 1\n" } else { "" },
                 kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
             );
             self.ensure_kernel(module, &src, module)?;
-            self.ensure_kernel(module, &src, PRECONVERT)?;
+            self.ensure_kernel(module, &src, preconvert)?;
         }
         // claude fa2 body variant (same kernarg ABI, grid, block and LDS as
         // the upstream Q16/fill body; the upstream pre-convert is reused).
@@ -5995,18 +6009,13 @@ impl Gpu {
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
             batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            "attention_q8_0_fa2_gqa_gfx11",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", module, bytes);
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
         // the body against the scratch. Both via launch_maybe_blob so graph
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
         // the old f32 Q slot: same offset 0, same size).
         self.launch_fa2_q_preconvert_gfx11(
-            PRECONVERT,
+            preconvert,
             q.buf.as_ptr(),
             q16_ptr,
             std::ptr::null(),
