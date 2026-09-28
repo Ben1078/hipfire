@@ -2628,7 +2628,10 @@ impl WeightSource for HfqSource<'_> {
         // MAP_POPULATE measured identical totals (it relocates the same
         // soft-fault work out of the upload loop into one serial stall).
         #[cfg(unix)]
-        if n_devices == 1 && self.hfq.evicts_page_cache() {
+        if n_devices == 1
+            && (self.hfq.evicts_page_cache()
+                || hipfire_config::developer_var("HIPFIRE_QWEN_PREAD_LOAD").as_deref() == Ok("1"))
+        {
             self.hfq.drop_mmap();
         }
         let _ = n_devices;

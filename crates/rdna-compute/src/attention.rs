@@ -203,10 +203,20 @@ fn wmma_fa_min_batch() -> usize {
 /// at 4, 0.85x at 2 — so a block never takes fewer than 4 rows and the caller
 /// keeps batches under 4 on the batched kernel.
 fn flash_rows_per_block(batch_size: usize) -> usize {
+    // claude: 2-3 row verify blocks use the 4-row kernel (masked rows) instead of
+    // falling back to the per-row batched kernel. CLAUDE_ROWS_SMALL=0 disables.
+    if (2..4).contains(&batch_size) && claude_rows_small() {
+        return 4;
+    }
     [8usize, 4]
         .into_iter()
         .find(|&r| r <= batch_size)
         .unwrap_or(0)
+}
+
+pub fn claude_rows_small() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_ROWS_SMALL").as_deref() != Ok("0"))
 }
 
 impl Gpu {
@@ -6962,27 +6972,29 @@ impl Gpu {
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
                 ];
-                self.launch_maybe_blob(
-                    "attention_flash_asym_reduce_batched",
-                    [n_heads as u32, chunk as u32, 1],
-                    [32, 1, 1],
-                    0,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(p_ptr);
-                        b.push_ptr(o_ptr);
-                        b.push_ptr(pos_ptr);
-                        b.push_i32(nh);
-                        b.push_i32(hd);
-                        b.push_i32(ts);
-                        b.push_i32(mt);
-                        b.push_i32(bo);
-                        b.push_i32(bs);
-                        b.push_i32(bc);
-                        b
-                    },
-                )?;
+                if !self.claude_attn_reduce(p_ptr, o_ptr, pos_ptr, nh, hd, ts, mt, bo, bc, chunk)? {
+                    self.launch_maybe_blob(
+                        "attention_flash_asym_reduce_batched",
+                        [n_heads as u32, chunk as u32, 1],
+                        [32, 1, 1],
+                        0,
+                        &mut params,
+                        || {
+                            let mut b = hip_bridge::KernargBlob::new();
+                            b.push_ptr(p_ptr);
+                            b.push_ptr(o_ptr);
+                            b.push_ptr(pos_ptr);
+                            b.push_i32(nh);
+                            b.push_i32(hd);
+                            b.push_i32(ts);
+                            b.push_i32(mt);
+                            b.push_i32(bo);
+                            b.push_i32(bs);
+                            b.push_i32(bc);
+                            b
+                        },
+                    )?;
+                }
             }
             offset += chunk;
         }
@@ -8996,27 +9008,29 @@ impl Gpu {
                         &bs as *const _ as *mut c_void,
                         &bc as *const _ as *mut c_void,
                     ];
-                    self.launch_maybe_blob(
-                        "attention_flash_asym_reduce_batched",
-                        [n_heads as u32, chunk as u32, 1],
-                        [32, 1, 1],
-                        0,
-                        &mut params,
-                        || {
-                            let mut b = hip_bridge::KernargBlob::new();
-                            b.push_ptr(p_ptr);
-                            b.push_ptr(o_ptr);
-                            b.push_ptr(pos_ptr);
-                            b.push_i32(nh);
-                            b.push_i32(hd);
-                            b.push_i32(ts);
-                            b.push_i32(mt);
-                            b.push_i32(bo);
-                            b.push_i32(bs);
-                            b.push_i32(bc);
-                            b
-                        },
-                    )?;
+                    if !self.claude_attn_reduce(p_ptr, o_ptr, pos_ptr, nh, hd, ts, mt, bo, bc, chunk)? {
+                        self.launch_maybe_blob(
+                            "attention_flash_asym_reduce_batched",
+                            [n_heads as u32, chunk as u32, 1],
+                            [32, 1, 1],
+                            0,
+                            &mut params,
+                            || {
+                                let mut b = hip_bridge::KernargBlob::new();
+                                b.push_ptr(p_ptr);
+                                b.push_ptr(o_ptr);
+                                b.push_ptr(pos_ptr);
+                                b.push_i32(nh);
+                                b.push_i32(hd);
+                                b.push_i32(ts);
+                                b.push_i32(mt);
+                                b.push_i32(bo);
+                                b.push_i32(bs);
+                                b.push_i32(bc);
+                                b
+                            },
+                        )?;
+                    }
                 }
             }
             offset += chunk;
@@ -19896,5 +19910,160 @@ mod tests {
         assert_eq!(replay_stable_tile_count(2, 64, false, false), 2);
         assert_eq!(replay_stable_tile_count(2, 64, true, false), 64);
         assert_eq!(replay_stable_tile_count(2, 64, false, true), 64);
+    }
+}
+
+
+impl Gpu {
+    /// claude: 8-warp split-K reduce for the Q8 batched attention paths.
+    /// Falls back (returns false) outside head_dim 256 / causal / gfx1100.
+    #[allow(clippy::too_many_arguments)]
+    fn claude_attn_reduce(
+        &mut self,
+        p_ptr: *mut c_void,
+        o_ptr: *mut c_void,
+        pos_ptr: *mut c_void,
+        nh: i32,
+        hd: i32,
+        ts: i32,
+        mt: i32,
+        bo: i32,
+        bc: i32,
+        rows: usize,
+    ) -> HipResult<bool> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_ATTN_REDUCE").as_deref() == Ok("0"));
+        if off
+            || hd != 256
+            || bc != 0
+            || self.arch.as_str() != "gfx1100"
+            || self.replay.is_recording()
+            || self.graphs.capture_mode
+        {
+            return Ok(false);
+        }
+        self.claude_attn_reduce_launch(p_ptr, o_ptr, pos_ptr, nh, hd, ts, mt, bo, rows)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claude_attn_reduce_launch(
+        &mut self,
+        p_ptr: *mut c_void,
+        o_ptr: *mut c_void,
+        pos_ptr: *mut c_void,
+        nh: i32,
+        hd: i32,
+        ts: i32,
+        mt: i32,
+        bo: i32,
+        rows: usize,
+    ) -> HipResult<()> {
+        const NAME: &str = "claude_attn_reduce";
+        if !self.functions.contains_key(NAME) {
+            self.ensure_kernel(NAME, kernels::CLAUDE_ATTN_REDUCE_SRC, NAME)?;
+        }
+        let func = &self.functions[NAME];
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+            &bo as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [nh as u32, rows as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)?;
+        }
+        Ok(())
+    }
+
+    /// claude: can `claude_attn_gqa` serve this verify attention block?
+    pub fn claude_attn_gqa_ok(&self, rows: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_ATTN_GQA").as_deref() != Ok("1"));
+        !off
+            && (1..=4).contains(&rows)
+            && head_dim == 256
+            && n_kv_heads > 0
+            && n_heads % n_kv_heads == 0
+            && (1..=8).contains(&(n_heads / n_kv_heads))
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// claude: GQA-shared verify attention (all q-heads of a kv head and all
+    /// rows per block) + 8-warp reduce. `Ok(false)` = not applicable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_attn_gqa(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        rows: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.claude_attn_gqa_ok(rows, head_dim, n_heads, n_kv_heads) {
+            return Ok(false);
+        }
+        let nt = std::env::var("CLAUDE_ATTN_GQA_NT").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| [1, 2, 4, 8].contains(n)).unwrap_or(4);
+        let tile = 64 * nt;
+        let max_tiles = max_ctx_len.div_ceil(tile);
+        if partials.numel() < rows * n_heads * max_tiles * (2 + head_dim) {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let g = n_heads / n_kv_heads;
+        let skip = std::env::var("CLAUDE_GQA_SKIP").unwrap_or_default();
+        let name = format!("claude_attn_gqa_g{g}_t{tile}{}", if skip.is_empty() { String::new() } else { format!("_skip{skip}") });
+        if !self.functions.contains_key(name.as_str()) {
+            let src = format!(
+                "#define CLAUDE_G {g}\n#define CLAUDE_RMAX 4\n#define CLAUDE_T 64\n#define CLAUDE_NT {nt}\n{}{}#define CLAUDE_ATTN_GQA_KERNEL {name}\n{}",
+                if skip.contains('B') { "#define CLAUDE_SKIP_B 1\n" } else { "" },
+                if skip.contains('D') { "#define CLAUDE_SKIP_D 1\n" } else { "" },
+                kernels::CLAUDE_ATTN_GQA_SRC
+            );
+            self.ensure_kernel(&name, &src, &name)?;
+        }
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let sc = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
+        let mt = max_tiles as i32;
+        let rv = rows as i32;
+        {
+            let func = &self.functions[name.as_str()];
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+                &rv as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(func, [n_kv_heads as u32, max_tiles as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+        self.claude_attn_reduce_launch(p_ptr, o_ptr, pos_ptr, nh, head_dim as i32, tile as i32, mt, 0, rows)?;
+        Ok(true)
     }
 }

@@ -29711,11 +29711,11 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && batch_size >= claude_mmq_min()
         {
             // The gfx11 IU4 base entry handles partial 128-row tiles, so odd
             // prefill batches stay on the W4A4 path without host padding.
-            if self.flags.iu4_prefill_enabled() {
+            if self.flags.iu4_prefill_enabled() && !(batch_size < 64 && claude_mmq_q8()) {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
@@ -30393,11 +30393,11 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && batch_size >= claude_mmq_min()
         {
             // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
             // the incumbent full-tile Q8_1 route and odd-batch fallback.
-            if self.flags.iu4_prefill_enabled() {
+            if self.flags.iu4_prefill_enabled() && !(batch_size < 64 && claude_mmq_q8()) {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
@@ -31590,11 +31590,11 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && batch_size >= claude_mmq_min()
         {
             // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
             // the incumbent full-tile Q8_1 route and odd-batch fallback.
-            if self.flags.iu4_prefill_enabled() {
+            if self.flags.iu4_prefill_enabled() && !(batch_size < 64 && claude_mmq_q8()) {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(
                     a_gate, xq, y_gate, gate_m, k, batch_size,
@@ -33424,11 +33424,11 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && batch_size >= claude_mmq_min()
         {
             // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
             // the incumbent full-tile Q8_1 route and odd-batch fallback.
-            if self.flags.iu4_prefill_enabled() {
+            if self.flags.iu4_prefill_enabled() && !(batch_size < 64 && claude_mmq_q8()) {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
                 return Ok(());
@@ -34889,6 +34889,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_xbatch_eligible(batch_size) {
+            return self.claude_small_batch(
+                &[(a_qkv, y_qkv, qkv_m), (a_z, y_z, z_m), (a_beta, y_beta, beta_m), (a_alpha, y_alpha, alpha_m)],
+                x, k, batch_size, false,
+            );
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
@@ -34922,6 +34928,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_xbatch_eligible(batch_size) {
+            return self.claude_small_batch(&[(a_q, y_q, q_m), (a_k, y_k, k_m), (a_v, y_v, v_m)], x, k, batch_size, false);
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
@@ -34950,6 +34959,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_xbatch_eligible(batch_size) {
+            return self.claude_small_batch(&[(a_gate, y_gate, gate_m), (a_up, y_up, up_m)], x, k, batch_size, false);
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -34975,6 +34987,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.claude_xbatch_eligible(batch_size) {
+            return self.claude_small_batch(&[(a_raw, y, m)], x, k, batch_size, true);
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
         }
@@ -42274,4 +42289,18 @@ mod lds_epi_tests {
             );
         }
     }
+}
+
+/// claude: MMQ admission threshold for batched MQ4v2 projections (default 64).
+fn claude_mmq_min() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CLAUDE_MMQ_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+    })
+}
+
+/// claude: `CLAUDE_MMQ_Q8=1` uses q8_1 (not iu4) activations below 64 rows.
+fn claude_mmq_q8() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CLAUDE_MMQ_Q8").as_deref() == Ok("1"))
 }

@@ -10,6 +10,9 @@ use std::collections::HashMap;
 
 const MIN_ALLOC: usize = 256;
 
+/// `hipErrorOutOfMemory`.
+pub(crate) const HIP_ERROR_OUT_OF_MEMORY: u32 = 2;
+
 /// A pool of GPU buffers, bucketed by size.
 /// Requesting a buffer returns one from the pool (if available) or allocates new.
 /// Returning a buffer puts it back in the pool for reuse.
@@ -73,7 +76,21 @@ impl GpuPool {
         let actual = if size < MIN_ALLOC { MIN_ALLOC } else { size };
         self.total_new += 1;
         self.total_allocated += actual;
-        hip.malloc(actual)
+        match hip.malloc(actual) {
+            // Out of VRAM while freed buffers of other sizes sit idle in the
+            // pool (e.g. a long prompt after shorter ones): give them back to
+            // HIP and retry once.
+            Err(err) if err.code == HIP_ERROR_OUT_OF_MEMORY && self.has_free() => {
+                self.drain(hip);
+                hip.malloc(actual)
+            }
+            other => other,
+        }
+    }
+
+    /// Whether any freed buffer is waiting in the pool.
+    pub fn has_free(&self) -> bool {
+        self.free_lists.values().any(|list| !list.is_empty())
     }
 
     /// Return a buffer to the pool for reuse. The buffer's ACTUAL

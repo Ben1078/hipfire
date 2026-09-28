@@ -1309,6 +1309,12 @@ impl DeltaNetSnapshot {
     /// restore return). The optimized route still never allocates, uploads
     /// descriptors, reads host state, or JITs in a decode cycle.
     fn bulk_sync(gpu: &Gpu) -> HipResult<()> {
+        // claude: the bulk tables are device-resident and every consumer is
+        // stream-ordered after the copy; CLAUDE_NO_BULK_SYNC=1 skips the host wait.
+        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SKIP.get_or_init(|| std::env::var("CLAUDE_NO_BULK_SYNC").as_deref() == Ok("1")) {
+            return Ok(());
+        }
         match &gpu.active_stream {
             Some(s) => gpu.hip.stream_synchronize(s),
             None => gpu.hip.device_synchronize(),

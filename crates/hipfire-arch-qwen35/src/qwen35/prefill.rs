@@ -5367,13 +5367,32 @@ pub(crate) fn dump_hidden_localize(
     }
 }
 
+/// Rows at or above which a hidden-capturing chunk is a prompt pass, not a
+/// speculative verify. Verify batches are K+1 rows; every wide/WMMA prefill
+/// attention route already requires >= 64 rows.
+const HIDDEN_CAPTURE_PROMPT_MIN_ROWS: usize = 64;
+
+/// `CLAUDE_HIDDEN_PREFILL_LEGACY=1` restores the old rule (any hidden capture
+/// is a verify) for same-binary A/B.
+fn hidden_capture_prefill_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        std::env::var_os("CLAUDE_HIDDEN_PREFILL_LEGACY").is_some_and(|v| v == "1")
+    })
+}
+
 #[inline]
 fn prefill_dispatch_workload(
     captures_per_token_hidden: bool,
     captures_rollback_tape: bool,
     is_tree_verify: bool,
+    n_rows: usize,
 ) -> DispatchWorkload {
-    if captures_per_token_hidden || captures_rollback_tape || is_tree_verify {
+    // MTP/DFlash prompt fills also capture per-token hidden, but they are
+    // prompt-shaped; only short hidden-capturing batches are verifies.
+    let hidden_is_verify = captures_per_token_hidden
+        && (n_rows < HIDDEN_CAPTURE_PROMPT_MIN_ROWS || hidden_capture_prefill_legacy());
+    if hidden_is_verify || captures_rollback_tape || is_tree_verify {
         DispatchWorkload::SpeculativeVerify
     } else {
         DispatchWorkload::Standard
@@ -8638,6 +8657,12 @@ pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// claude: mirror of rdna_compute's CLAUDE_ROWS_SMALL switch (default on).
+fn claude_rows_small_ok() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_ROWS_SMALL").as_deref() != Ok("0"))
+}
+
 fn q8_multirow_attn_admitted(
     arch: &str,
     quant_q8: bool,
@@ -8653,7 +8678,7 @@ fn q8_multirow_attn_admitted(
     matches!(arch, "gfx1100" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
-        && (4..=32).contains(&n)
+        && ((4..=32).contains(&n) || ((2..4).contains(&n) && claude_rows_small_ok()))
         && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
         && !is_tree
         && !is_independent
@@ -8845,7 +8870,13 @@ fn batch_chunk_fa_attend(
             ctx, tree_verify, layer_idx,
         );
     }
-    if multirow {
+    // claude: GQA-shared verify attention for 1-4 rows (any context).
+    let claude_gqa = kv_cache.quant_q8
+        && !kv_cache.quant_fp8
+        && tree_verify.is_none()
+        && !batch_semantics.is_independent()
+        && gpu.claude_attn_gqa_ok(n, config.head_dim, config.n_heads, config.n_kv_heads);
+    if multirow || claude_gqa {
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
@@ -8865,6 +8896,23 @@ fn batch_chunk_fa_attend(
             config.head_dim,
             n,
         )?;
+        if claude_gqa
+            && gpu.claude_attn_gqa(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                max_ctx_len,
+                n,
+                &s.flash_partials,
+            )?
+        {
+            return Ok(());
+        }
         if gpu.attention_flash_q8_0_rows_masked(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
@@ -11621,7 +11669,7 @@ fn forward_prefill_chunk_pair(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    let dispatch_workload = prefill_dispatch_workload(per_token_hidden_out.is_some(), false, false);
+    let dispatch_workload = prefill_dispatch_workload(per_token_hidden_out.is_some(), false, false, 2 * n);
     let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
     // Mask slot is call-relative: rebase per half.
@@ -12264,6 +12312,7 @@ pub(crate) fn forward_batch_chunk_impl(
         per_token_hidden_out.is_some(),
         gdn_tape.is_some(),
         tree_verify.is_some(),
+        n,
     );
     let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
     kv_cache.require_mapped_capacity(required_tokens)?;
@@ -14751,20 +14800,34 @@ mod tests {
     #[test]
     fn speculative_verify_has_an_explicit_dispatch_workload() {
         assert_eq!(
-            prefill_dispatch_workload(false, false, false),
+            prefill_dispatch_workload(false, false, false, 4),
             DispatchWorkload::Standard
         );
         // DFlash and DSpark/MTP verify request per-token target hidden.
         assert_eq!(
-            prefill_dispatch_workload(true, false, false),
+            prefill_dispatch_workload(true, false, false, 4),
             DispatchWorkload::SpeculativeVerify
         );
         assert_eq!(
-            prefill_dispatch_workload(false, true, false),
+            prefill_dispatch_workload(true, false, false, 63),
+            DispatchWorkload::SpeculativeVerify
+        );
+        // Prompt-shaped hidden capture (MTP/DFlash prompt fill) is a prefill.
+        assert_eq!(
+            prefill_dispatch_workload(true, false, false, 64),
+            DispatchWorkload::Standard
+        );
+        assert_eq!(
+            prefill_dispatch_workload(true, false, false, 1024),
+            DispatchWorkload::Standard
+        );
+        // Rollback tapes and tree verify stay verify at any width.
+        assert_eq!(
+            prefill_dispatch_workload(false, true, false, 1024),
             DispatchWorkload::SpeculativeVerify
         );
         assert_eq!(
-            prefill_dispatch_workload(false, false, true),
+            prefill_dispatch_workload(false, false, true, 1024),
             DispatchWorkload::SpeculativeVerify
         );
     }

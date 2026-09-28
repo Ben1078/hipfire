@@ -1951,6 +1951,46 @@ pub const GEMV_MQ4CG256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4c
 /// s1/z1 for w128..255) instead of one f32 pair. Decode selects s/z by
 /// `tid < 16` (payload `gp+8+tid*4 < gp+8+64`).
 pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2.hip");
+/// claude: GQA-shared speculative-verify attention (q8_0 KV, head_dim 256).
+pub const CLAUDE_ATTN_GQA_SRC: &str = include_str!("../../../kernels/src/claude_attn_gqa.hip");
+/// claude: 8-warp split-K attention reduce (head_dim 256).
+pub const CLAUDE_ATTN_REDUCE_SRC: &str = include_str!("../../../kernels/src/claude_attn_reduce.hip");
+/// claude: two-stage full-vocab argmax and top-2 + logsumexp.
+pub const CLAUDE_REDUCE_SRC: &str = include_str!("../../../kernels/src/claude_reduce.hip");
+/// claude: int8-activation small-batch MQ4G256V2 GEMV + quantizer (defines prepended).
+pub const CLAUDE_Q8X_SRC: &str = include_str!("../../../kernels/src/claude_q8x.hip");
+/// claude: R-rows x B-inputs MQ4G256V2 GEMV body (defines prepended at load).
+pub const CLAUDE_GEMV_MQ4G256V2_RB_SRC: &str = include_str!("../../../kernels/src/claude_gemv_mq4g256v2_rb.hip");
+/// claude: x-batched MQ4G256V2 GEMV, up to 4 rows.
+pub const GEMV_MQ4G256V2_XBATCH4_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch4\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// claude: x-batched MQ4G256V2 GEMV, up to 4 rows (y +=).
+pub const GEMV_MQ4G256V2_XBATCH4_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_RESIDUAL 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch4_residual\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// claude: x-batched MQ4G256V2 GEMV, up to 8 rows.
+pub const GEMV_MQ4G256V2_XBATCH8_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 8\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch8\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// claude: x-batched MQ4G256V2 GEMV, up to 8 rows (y +=).
+pub const GEMV_MQ4G256V2_XBATCH8_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 8\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_RESIDUAL 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch8_residual\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
 /// MQ4G256V2-Lloyd (qt=52) GEMV: `-DHIPFIRE_MQ4G256V2_LUT=1` adds 8 kernel-arg
 /// dwords (16 centered f16 codebook levels, staged to LDS) and decodes nibbles
 /// through them (`w = sc*C[q] + zp'`, zp' pre-folded in the headers). Distinct

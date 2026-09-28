@@ -8873,6 +8873,394 @@ impl Gpu {
         }
     }
 
+    /// claude: route a group of small-batch MQ4v2 projections that share `x`.
+    /// `CLAUDE_XBATCH_KERNEL`: "q8x" (default, int8 activations), "rb", "old".
+    pub fn claude_small_batch(
+        &mut self,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        static Q8X: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let q8x = *Q8X.get_or_init(|| {
+            !matches!(std::env::var("CLAUDE_XBATCH_KERNEL").as_deref(), Ok("rb") | Ok("old"))
+        });
+        if q8x {
+            return self.claude_q8x_project(outs, x, k, batch, residual);
+        }
+        for &(a, y, m) in outs {
+            self.claude_gemv_mq4g256v2_xbatch(a, x, y, m, k, batch, residual)?;
+        }
+        Ok(())
+    }
+
+    /// claude: quantize `x` [batch x k] to int8 once, then one int8-dot GEMV per weight.
+    pub fn claude_q8x_project(
+        &mut self,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Option<(GpuTensor, GpuTensor)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        assert!((1..=8).contains(&batch), "claude_q8x_project: batch {batch}");
+        assert!(k % 256 == 0 && k <= 32768, "claude_q8x_project: k {k}");
+        self.bind_thread()?;
+        let (xq_ptr, dx_ptr) = SCRATCH.with(|cell| -> HipResult<_> {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                let xq = self.alloc_tensor(&[8 * 32768 / 4], DType::F32)?;
+                let dx = self.alloc_tensor(&[8 * 32768 / 32], DType::F32)?;
+                *slot = Some((xq, dx));
+            }
+            let (xq, dx) = slot.as_ref().unwrap();
+            Ok((xq.buf.as_ptr(), dx.buf.as_ptr()))
+        })?;
+        const QUANT: &str = "claude_q8x_quant";
+        if !self.functions.contains_key(QUANT) {
+            let src = format!("#define CLAUDE_Q8X_QUANT 1\n{}", kernels::CLAUDE_Q8X_SRC);
+            self.ensure_kernel(QUANT, &src, QUANT)?;
+        }
+        {
+            let func = &self.functions[QUANT];
+            let x_ptr = x.buf.as_ptr();
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &x_ptr as *const _ as *mut c_void,
+                &xq_ptr as *const _ as *mut c_void,
+                &dx_ptr as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [(k / 256) as u32, batch as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        struct Cfg {
+            lds: bool,
+            w: usize,
+            kc: usize,
+            u: usize,
+            occ: usize,
+            names: [String; 4],
+        }
+        static CFG: std::sync::OnceLock<Cfg> = std::sync::OnceLock::new();
+        let cfg = CFG.get_or_init(|| {
+            let lds = std::env::var("CLAUDE_Q8X_LDS").as_deref() == Ok("1");
+            let w = std::env::var("CLAUDE_Q8X_W").ok().and_then(|v| v.parse().ok()).filter(|w| [1, 2, 4, 8, 16].contains(w)).unwrap_or(8);
+            let kc = std::env::var("CLAUDE_Q8X_KC").ok().and_then(|v| v.parse().ok()).filter(|k| [4, 8, 16, 24, 32].contains(k)).unwrap_or(16);
+            let u = std::env::var("CLAUDE_Q8X_U").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| [2, 4, 8].contains(u)).unwrap_or(4);
+            let occ = std::env::var("CLAUDE_Q8X_OCC").ok().and_then(|v| v.parse::<usize>().ok()).filter(|o| [4, 8, 12, 16].contains(o)).unwrap_or(8);
+            let tag = if lds { format!("lds_w{w}_kc{kc}_") } else { format!("u{u}_o{occ}_") };
+            let names = [
+                format!("claude_q8x_gemv_{tag}b4"),
+                format!("claude_q8x_gemv_{tag}b4_res"),
+                format!("claude_q8x_gemv_{tag}b8"),
+                format!("claude_q8x_gemv_{tag}b8_res"),
+            ];
+            Cfg { lds, w, kc, u, occ, names }
+        });
+        let bmax = if batch <= 4 { 4 } else { 8 };
+        let name: &str = &cfg.names[if bmax == 4 { 0 } else { 2 } + if residual { 1 } else { 0 }];
+        if !self.functions.contains_key(name) {
+            let variant = if cfg.lds {
+                format!("#define CLAUDE_Q8X_GEMV_LDS 1\n#define CLAUDE_Q8X_W {}\n#define CLAUDE_Q8X_KC {}\n", cfg.w, cfg.kc)
+            } else {
+                format!("#define CLAUDE_Q8X_GEMV 1\n#define CLAUDE_Q8X_U {}\n#define CLAUDE_Q8X_OCC {}\n", cfg.u, cfg.occ)
+            };
+            let src = format!(
+                "{}#define CLAUDE_Q8X_BMAX {}\n{}#define CLAUDE_Q8X_KERNEL {}\n#define CLAUDE_Q8X_MULTI_KERNEL {}_multi\n{}",
+                variant,
+                bmax,
+                if residual { "#define CLAUDE_Q8X_RESIDUAL 1\n" } else { "" },
+                name,
+                name,
+                kernels::CLAUDE_Q8X_SRC
+            );
+            self.ensure_kernel(name, &src, name)?;
+            if !cfg.lds {
+                let multi = format!("{name}_multi");
+                self.ensure_kernel(name, &src, &multi)?;
+            }
+        }
+        static MULTI_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let multi_off = *MULTI_OFF.get_or_init(|| std::env::var("CLAUDE_Q8X_MULTI").as_deref() == Ok("0"));
+        if !cfg.lds && !multi_off && outs.len() > 1 && outs.len() <= 4 {
+            let multi = format!("{name}_multi");
+            let func = &self.functions[multi.as_str()];
+            let mut a_ptrs = [std::ptr::null_mut::<c_void>(); 4];
+            let mut y_ptrs = [std::ptr::null_mut::<c_void>(); 4];
+            let mut ms = [0i32; 4];
+            let mut total = 0usize;
+            for (i, &(a, y, m)) in outs.iter().enumerate() {
+                a_ptrs[i] = a.buf.as_ptr();
+                y_ptrs[i] = y.buf.as_ptr();
+                ms[i] = m as i32;
+                total += m;
+            }
+            let k_val = k as i32;
+            let b_val = batch as i32;
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(16);
+            for i in 0..4 {
+                params.push(&a_ptrs[i] as *const _ as *mut c_void);
+                params.push(&y_ptrs[i] as *const _ as *mut c_void);
+                params.push(&ms[i] as *const _ as *mut c_void);
+            }
+            params.push(&xq_ptr as *const _ as *mut c_void);
+            params.push(&dx_ptr as *const _ as *mut c_void);
+            params.push(&k_val as *const _ as *mut c_void);
+            params.push(&b_val as *const _ as *mut c_void);
+            unsafe {
+                self.hip.launch_kernel(func, [total as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+            return Ok(());
+        }
+        let (grid_div, block) = if cfg.lds { (cfg.w, 32 * cfg.w) } else { (1, 32) };
+        for &(a, y, m) in outs {
+            let func = &self.functions[name];
+            let a_ptr = a.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let b_val = batch as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &xq_ptr as *const _ as *mut c_void,
+                &dx_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &b_val as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [m.div_ceil(grid_div) as u32, 1, 1],
+                    [block as u32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !residual && *CHECK.get_or_init(|| std::env::var("CLAUDE_XBATCH_CHECK").as_deref() == Ok("1")) {
+            static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            for &(a, y, m) in outs {
+                if CHECKED.fetch_add(1, Ordering::Relaxed) >= 24 {
+                    break;
+                }
+                let tmp = self.alloc_tensor(&[batch * m], DType::F32)?;
+                self.claude_xbatch_old(a, x, &tmp, m, k, batch, false)?;
+                self.hip.device_synchronize()?;
+                let mut got = vec![0u8; batch * m * 4];
+                let mut want = vec![0u8; batch * m * 4];
+                self.hip.memcpy_dtoh(&mut got, &y.buf)?;
+                self.hip.memcpy_dtoh(&mut want, &tmp.buf)?;
+                let f = |v: &[u8], i: usize| f32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]);
+                let (mut max_diff, mut max_ref, mut sq_d, mut sq_r) = (0.0f32, 0.0f32, 0.0f64, 0.0f64);
+                for i in 0..batch * m {
+                    let (g, w) = (f(&got, i), f(&want, i));
+                    max_diff = max_diff.max((g - w).abs());
+                    max_ref = max_ref.max(w.abs());
+                    sq_d += ((g - w) as f64).powi(2);
+                    sq_r += (w as f64).powi(2);
+                }
+                eprintln!(
+                    "[claude-q8x-check] m={m} k={k} b={batch} max_abs_diff={max_diff:.3e} max_abs_ref={max_ref:.3e} rel_l2={:.3e}",
+                    (sq_d / sq_r.max(1e-30)).sqrt()
+                );
+                self.free_tensor(tmp)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// claude: route small batched MQ4G256V2 projections (speculative verify)
+    /// to the x-batched GEMV instead of 16-row WMMA tiles. gfx1100 only;
+    /// `CLAUDE_XBATCH=0` disables. Never used while capturing/recording.
+    pub fn claude_xbatch_eligible(&self, batch: usize) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_XBATCH").as_deref() == Ok("0"));
+        !off
+            && (2..=8).contains(&batch)
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// claude: `y[b] (+)= A . x[b]` for b in 0..batch, each weight row read once.
+    /// `x` is `[batch x k]` already FWHT-rotated, `y` is `[batch x m]`.
+    /// Default kernel: R weight rows per warp (x reuse); `CLAUDE_XBATCH_KERNEL=old`
+    /// selects the stock one-row xbatch; `CLAUDE_RB_R` in {1,2,4,8};
+    /// `CLAUDE_XBATCH_CHECK=1` compares non-residual results with the old kernel.
+    pub fn claude_gemv_mq4g256v2_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        struct Sel {
+            old: bool,
+            r: usize,
+            check: bool,
+            names: [String; 4],
+        }
+        static SEL: std::sync::OnceLock<Sel> = std::sync::OnceLock::new();
+        let sel = SEL.get_or_init(|| {
+            let old = std::env::var("CLAUDE_XBATCH_KERNEL").as_deref() == Ok("old");
+            let r = std::env::var("CLAUDE_RB_R")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|r| [1, 2, 4, 8].contains(r))
+                .unwrap_or(4);
+            let check = std::env::var("CLAUDE_XBATCH_CHECK").as_deref() == Ok("1");
+            let names = [
+                format!("claude_gemv_mq4g256v2_rb_r{r}_b4"),
+                format!("claude_gemv_mq4g256v2_rb_r{r}_b4_res"),
+                format!("claude_gemv_mq4g256v2_rb_r{r}_b8"),
+                format!("claude_gemv_mq4g256v2_rb_r{r}_b8_res"),
+            ];
+            Sel { old, r, check, names }
+        });
+        if sel.old {
+            return self.claude_xbatch_old(a_raw, x, y, m, k, batch, residual);
+        }
+        assert!((1..=8).contains(&batch), "claude_gemv_mq4g256v2_xbatch: batch {batch}");
+        assert_eq!(k % 256, 0, "claude_gemv_mq4g256v2_xbatch: k % 256");
+        self.bind_thread()?;
+        let bmax = if batch <= 4 { 4 } else { 8 };
+        let idx = if bmax == 4 { 0 } else { 2 } + if residual { 1 } else { 0 };
+        let name: &str = &sel.names[idx];
+        if !self.functions.contains_key(name) {
+            let src = format!(
+                "#define CLAUDE_RB_R {}\n#define CLAUDE_RB_BMAX {}\n{}#define CLAUDE_RB_KERNEL {}\n{}",
+                sel.r,
+                bmax,
+                if residual { "#define CLAUDE_RB_RESIDUAL 1\n" } else { "" },
+                name,
+                kernels::CLAUDE_GEMV_MQ4G256V2_RB_SRC
+            );
+            self.ensure_kernel(name, &src, name)?;
+        }
+        let func = &self.functions[name];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        let grid = m.div_ceil(sel.r) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        if sel.check && !residual {
+            static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if CHECKED.fetch_add(1, Ordering::Relaxed) < 24 {
+                let tmp = self.alloc_tensor(&[batch * m], DType::F32)?;
+                self.claude_xbatch_old(a_raw, x, &tmp, m, k, batch, false)?;
+                self.hip.device_synchronize()?;
+                let mut got = vec![0u8; batch * m * 4];
+                let mut want = vec![0u8; batch * m * 4];
+                self.hip.memcpy_dtoh(&mut got, &y.buf)?;
+                self.hip.memcpy_dtoh(&mut want, &tmp.buf)?;
+                let f = |v: &[u8], i: usize| f32::from_le_bytes([v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]]);
+                let (mut max_diff, mut max_ref) = (0.0f32, 0.0f32);
+                for i in 0..batch * m {
+                    let (g, w) = (f(&got, i), f(&want, i));
+                    max_diff = max_diff.max((g - w).abs());
+                    max_ref = max_ref.max(w.abs());
+                }
+                eprintln!(
+                    "[claude-xbatch-check] m={m} k={k} b={batch} max_abs_diff={max_diff:.3e} max_abs_ref={max_ref:.3e} rel={:.3e}",
+                    max_diff / max_ref.max(1e-30)
+                );
+                self.free_tensor(tmp)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// claude: `y[b] (+)= A . x[b]` for b in 0..batch, each weight row read once.
+    /// `x` is `[batch x k]` already FWHT-rotated, `y` is `[batch x m]`.
+    fn claude_xbatch_old(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        assert!((1..=8).contains(&batch), "claude_gemv_mq4g256v2_xbatch: batch {batch}");
+        assert_eq!(k % 256, 0, "claude_gemv_mq4g256v2_xbatch: k % 256");
+        self.bind_thread()?;
+        let (name, src) = match (batch <= 4, residual) {
+            (true, false) => ("gemv_mq4g256v2_xbatch4", kernels::GEMV_MQ4G256V2_XBATCH4_SRC),
+            (true, true) => ("gemv_mq4g256v2_xbatch4_residual", kernels::GEMV_MQ4G256V2_XBATCH4_RESIDUAL_SRC),
+            (false, false) => ("gemv_mq4g256v2_xbatch8", kernels::GEMV_MQ4G256V2_XBATCH8_SRC),
+            (false, true) => ("gemv_mq4g256v2_xbatch8_residual", kernels::GEMV_MQ4G256V2_XBATCH8_RESIDUAL_SRC),
+        };
+        self.ensure_kernel(name, src, name)?;
+        let func = &self.functions[name];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Largest `batch` `gemv_hfq4g256_xbatch` accepts. Must stay in step with
     /// `HIPFIRE_HFQ4G256_XBATCH_MAX` in `GEMV_HFQ4G256_XBATCH_SRC`, which sizes
     /// the kernel's accumulator arrays.

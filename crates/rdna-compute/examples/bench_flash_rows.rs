@@ -188,4 +188,29 @@ fn main() {
         eprintln!("FAIL: multi-row output diverges from the batched kernel");
         std::process::exit(1);
     }
+
+    // claude: GQA-shared verify attention (rows <= 4).
+    let d_out_gqa = gpu.zeros(&[batch * q_dim], DType::F32).unwrap();
+    let run_gqa = |gpu: &mut Gpu| {
+        gpu.claude_attn_gqa(
+            &d_q, &d_k, &d_v, &d_out_gqa, &d_pos, n_heads, n_kv_heads, head_dim, seq_len, batch,
+            &d_part,
+        )
+        .unwrap()
+    };
+    if run_gqa(&mut gpu) {
+        gpu.hip.device_synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            run_gqa(&mut gpu);
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let us_g = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        eprintln!("claude gqa:    {us_g:8.1} us/call   {:.0} GB/s of KV", kv_bytes / (us_g * 1e3));
+        let gqa_out = gpu.download_f32(&d_out_gqa).unwrap();
+        let max_abs = gqa_out.iter().zip(&batched_out).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("parity gqa vs batched: max_abs={max_abs:.3e} rel={:.3e}", max_abs / scale);
+    } else {
+        eprintln!("claude gqa refused this shape");
+    }
 }

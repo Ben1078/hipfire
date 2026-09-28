@@ -78,7 +78,7 @@ const DEFAULT_ROOFLINE_GBS: f64 = 960.0;
 const WARMUP: usize = 32;
 const LAUNCHES: usize = 200;
 const SAMPLES: usize = 3;
-const NS: [usize; 3] = [1, 8, 16];
+const NS: [usize; 3] = [1, 4, 16]; // claude: MTP verify is N=4
 
 const MODEL_DEFAULT: &str = "/home/kaden/.hipfire/models/qwen3.8-27b.mq4";
 

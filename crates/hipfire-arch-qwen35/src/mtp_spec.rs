@@ -539,6 +539,8 @@ pub struct MtpSpecState {
     /// `max_n`; proposal buffers (`mtp_t_outs`, `mtp_lm_*`, etc.) remain sized
     /// to `max_n` so ordinary MTP draft depth never inflates with PLD capacity.
     pub verify_capacity: usize,
+    /// Lazily allocated batched kv-only scratch for the accepted-row refresh.
+    pub claude_refresh: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
 
     /// Optional draft-confidence cutoff for [`spec_step_mtp_compressed_serial`].
     /// When `p_min > 0`, the K-chain truncates early at step k if the draft's
@@ -692,6 +694,7 @@ impl MtpSpecState {
             mtp_token_chain,
             mtp_token_embed,
             mtp_positions,
+            claude_refresh: None,
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -838,6 +841,10 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_token_chain);
         let _ = gpu.free_tensor(self.mtp_token_embed);
         let _ = gpu.free_tensor(self.mtp_positions);
+        if let Some((scratch, rot)) = self.claude_refresh {
+            scratch.free_gpu(gpu);
+            let _ = gpu.free_tensor(rot);
+        }
         if let Some(exec) = self.mtp_proposal_graph_exec {
             let _ = gpu.hip.graph_exec_destroy(exec);
         }
@@ -1415,6 +1422,8 @@ fn mtp_shared_verify_accept_rollback(
         None
     };
 
+    claude_mark(gpu, Some(1))?;
+    let claude_t_enq = Instant::now();
     qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
@@ -1435,6 +1444,8 @@ fn mtp_shared_verify_accept_rollback(
         qwen35::DflashFusionCtx::Off,
     )?;
 
+    claude_note(8, claude_t_enq.elapsed().as_secs_f64());
+    claude_mark(gpu, Some(2))?;
     let w_out = &trunk_weights.output;
     let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
     mtp_trunk_verify_lm_head(
@@ -1448,6 +1459,7 @@ fn mtp_shared_verify_accept_rollback(
         vocab,
     )?;
 
+    claude_mark(gpu, Some(3))?;
     let mut accept_count = 0usize;
     let hit_eos;
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
@@ -1520,11 +1532,13 @@ fn mtp_shared_verify_accept_rollback(
         hit_eos = accepted.hit_eos;
     }
 
+    claude_mark(gpu, Some(4))?;
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    claude_mark(gpu, Some(5))?;
 
     // ── 3. KV / DN rollback (or skip on full accept) ─────────────────
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
@@ -1572,6 +1586,7 @@ fn mtp_shared_verify_accept_rollback(
         }
     }
 
+    claude_mark(gpu, Some(6))?;
     Ok(MtpSpecResult {
         committed,
         accept_count,
@@ -1580,6 +1595,89 @@ fn mtp_shared_verify_accept_rollback(
         drafts_generated,
         chain_truncated,
         replay_skipped,
+    })
+}
+
+struct ClaudeStepTimer {
+    last: Option<Instant>,
+    acc: [f64; 9],
+    steps: u64,
+    tokens: u64,
+}
+
+static CLAUDE_STEP_TIMER: std::sync::Mutex<ClaudeStepTimer> = std::sync::Mutex::new(ClaudeStepTimer {
+    last: None,
+    acc: [0.0; 9],
+    steps: 0,
+    tokens: 0,
+});
+
+/// `CLAUDE_MTP_STEP_TIMING=1`: device-synced per-phase decode step timing.
+fn claude_step_timing() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| claude_env_flag("CLAUDE_MTP_STEP_TIMING"))
+}
+
+fn claude_mark(gpu: &mut Gpu, slot: Option<usize>) -> HipResult<()> {
+    if !claude_step_timing() {
+        return Ok(());
+    }
+    gpu.hip.device_synchronize()?;
+    let now = Instant::now();
+    let mut t = CLAUDE_STEP_TIMER.lock().unwrap();
+    if let (Some(s), Some(last)) = (slot, t.last) {
+        t.acc[s] += now.duration_since(last).as_secs_f64();
+    }
+    t.last = Some(now);
+    Ok(())
+}
+
+fn claude_note(slot: usize, dt: f64) {
+    if claude_step_timing() {
+        CLAUDE_STEP_TIMER.lock().unwrap().acc[slot] += dt;
+    }
+}
+
+fn claude_step_done(advance: usize) {
+    if !claude_step_timing() {
+        return;
+    }
+    let mut t = CLAUDE_STEP_TIMER.lock().unwrap();
+    t.steps += 1;
+    t.tokens += advance as u64;
+    if t.steps % 128 == 0 {
+        let n = t.steps as f64;
+        let ms = |i: usize| 1000.0 * t.acc[i] / n;
+        let total: f64 = (0..8).map(ms).sum();
+        eprintln!(
+            "[claude-step] steps={} tok/step={:.3} ms/step draft={:.2} snap={:.2} verify_fwd={:.2} lm_head={:.2} accept={:.2} capture={:.2} rollback={:.2} refresh={:.2} total={:.2} | verify_enqueue_cpu={:.2}",
+            t.steps, t.tokens as f64 / n, ms(0), ms(1), ms(2), ms(3), ms(4), ms(5), ms(6), ms(7), total, ms(8)
+        );
+        t.acc = [0.0; 9];
+        t.steps = 0;
+        t.tokens = 0;
+    }
+}
+
+fn claude_env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| v == "1")
+}
+
+/// `CLAUDE_MTP_FILL_LEGACY=1`: old prompt fill pairing (slot p <- hidden p).
+fn mtp_fill_legacy() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| claude_env_flag("CLAUDE_MTP_FILL_LEGACY"))
+}
+
+/// `CLAUDE_MTP_ACCEPT_REFRESH`: rewrite accepted drafts' MTP slots from the
+/// exact verify hidden instead of the head's proxy hidden.
+/// "1" = batched kv-only (default when set), "2" = serial full block, else off.
+fn mtp_accept_refresh_mode() -> u8 {
+    static F: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *F.get_or_init(|| match std::env::var("CLAUDE_MTP_ACCEPT_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
     })
 }
 
@@ -1692,7 +1790,11 @@ where
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
-    let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
+    // Rolling hidden window: row 0 carries the previous chunk's last hidden row
+    // (the fill for slot p reads hidden p-1), rows 1.. hold the current chunk.
+    // Bounded by the prefill chunk instead of the whole prompt (prompt_len x dim
+    // f32 was 2.9 GB at 140K tokens and OOMed long prompts on 24 GB cards).
+    let prompt_hidden = gpu.alloc_tensor(&[(chunk_max + 1) * dim], DType::F32)?;
     // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
     // also caps at this size; externalizing the loop exposes commit boundaries.
     let use_batched_mtp_fill = mtp_head::mtp_prompt_fill_uses_batched(
@@ -1744,9 +1846,10 @@ where
             let chunk_start_pos = start_pos + off;
             let committed_pos = start_pos + end;
 
-            // Per-chunk hidden destination: row-major slice of the full prompt buffer.
-            let chunk_hidden = prompt_hidden.sub_offset(off * dim, chunk.len() * dim);
+            // Per-chunk hidden destination: rows 1.. of the rolling window.
+            let chunk_hidden = prompt_hidden.sub_offset(dim, chunk.len() * dim);
 
+            gpu.hip.device_synchronize()?;
             let t_trunk = Instant::now();
             qwen35::forward_prefill_batch(
                 gpu,
@@ -1762,59 +1865,78 @@ where
                 None,
                 None,
             )?;
+            gpu.hip.device_synchronize()?;
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
 
             let t_mtp_fill = Instant::now();
-            if let (Some(scratch), Some(rot)) =
-                (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
-            {
-                let positions: Vec<i32> = (chunk_start_pos..committed_pos)
-                    .map(|position| position as i32)
-                    .collect();
-                mtp_head::mtp_head_forward_block_batched(
-                    gpu,
-                    head,
-                    scratch,
-                    &mut state.mtp_kv,
-                    chunk,
-                    &chunk_hidden,
-                    &positions,
-                    chunk.len(),
-                    &target.weights,
-                    Some(rot),
-                    true,
-                )?;
-            } else {
-                for (i, &token) in chunk.iter().enumerate() {
-                    let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
-                    mtp_head::mtp_head_forward_block_only(
+            // Decode writes MTP slot p from (hidden p-1, token p). Match it:
+            // slot p takes prompt hidden row p-1. The first row of this fill
+            // has no hidden p-1 here and is skipped.
+            let legacy_fill = mtp_fill_legacy();
+            let skip = if legacy_fill || off > 0 { 0 } else { 1 };
+            let n_fill = chunk.len().saturating_sub(skip);
+            let hidden_row0 = if legacy_fill { off } else { off + skip - 1 };
+            if n_fill > 0 {
+                if let (Some(scratch), Some(rot)) =
+                    (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
+                {
+                    let positions: Vec<i32> = (chunk_start_pos + skip..committed_pos)
+                        .map(|position| position as i32)
+                        .collect();
+                    // Window row r holds prompt hidden row off + r - 1.
+                    let fill_hidden =
+                        prompt_hidden.sub_offset((hidden_row0 + 1 - off) * dim, n_fill * dim);
+                    mtp_head::mtp_head_forward_block_batched(
                         gpu,
                         head,
-                        &state.mtp_scratch,
+                        scratch,
                         &mut state.mtp_kv,
-                        token,
-                        &hidden_row,
-                        None,
-                        chunk_start_pos + i,
+                        &chunk[skip..],
+                        &fill_hidden,
+                        &positions,
+                        n_fill,
                         &target.weights,
+                        Some(rot),
+                        true,
                     )?;
+                } else {
+                    for i in 0..n_fill {
+                        let hidden_row =
+                            prompt_hidden.sub_offset((hidden_row0 + 1 - off + i) * dim, dim);
+                        mtp_head::mtp_head_forward_block_only(
+                            gpu,
+                            head,
+                            &state.mtp_scratch,
+                            &mut state.mtp_kv,
+                            chunk[skip + i],
+                            &hidden_row,
+                            None,
+                            chunk_start_pos + skip + i,
+                            &target.weights,
+                        )?;
+                    }
                 }
             }
+            gpu.hip.device_synchronize()?;
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
+
+            // Carry this chunk's last hidden row into window row 0 for the next
+            // chunk's fill and for prev_hidden after the loop.
+            gpu.hip.memcpy_dtod_at(
+                &prompt_hidden.buf,
+                0,
+                &prompt_hidden.buf,
+                chunk.len() * dim_bytes,
+                dim_bytes,
+            )?;
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
             on_committed_boundary(gpu, target, committed_pos)?;
             off = end;
         }
 
-        let last = prompt_tokens.len() - 1;
-        gpu.hip.memcpy_dtod_at(
-            &state.prev_hidden.buf,
-            0,
-            &prompt_hidden.buf,
-            last * dim_bytes,
-            dim_bytes,
-        )?;
+        gpu.hip.memcpy_dtod_at(&state.prev_hidden.buf, 0, &prompt_hidden.buf, 0, dim_bytes)?;
+        eprintln!("[claude-instr] mtp_prefill tokens={} start_pos={} chunk_max={} batched_fill={} trunk_secs={:.3} mtp_fill_secs={:.3}", prompt_tokens.len(), start_pos, chunk_max, use_batched_mtp_fill, trunk_prefill_secs, mtp_prompt_fill_secs);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
             mtp_prompt_fill_secs,
@@ -2787,6 +2909,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
 ) -> HipResult<MtpSpecResult> {
     // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
     // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
+    claude_mark(gpu, None)?;
     let max_n = k.min(state.max_n);
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
@@ -3408,7 +3531,8 @@ pub fn spec_step_mtp_compressed_serial_with_k(
     // points stay byte-identical on the verify side. Sampled head path
     // stays host-driven via mtp_sampled_accept; greedy head path may use
     // the device-chain GPU accept when enabled.
-    return mtp_shared_verify_accept_rollback(
+    claude_mark(gpu, Some(0))?;
+    let result = mtp_shared_verify_accept_rollback(
         gpu,
         target,
         state,
@@ -3425,7 +3549,61 @@ pub fn spec_step_mtp_compressed_serial_with_k(
         &draft_softmaxes,
         false,
         use_device_token_chain,
-    );
+    )?;
+    let refresh_mode = mtp_accept_refresh_mode();
+    if refresh_mode != 0 && result.advance >= 2 {
+        // Accepted drafts' slots were written from the head's proxy hidden.
+        // Rewrite slot cur_pos+1+j from exact verify row j and token j.
+        let n = result.advance - 1;
+        let tw: &Qwen35Weights = &target.weights;
+        if refresh_mode == 1 {
+            if state.claude_refresh.is_none() {
+                let rows = state.verify_capacity.max(state.max_n) + 1;
+                let cfg = &head.config;
+                let widest_k = (2 * dim)
+                    .max(cfg.n_ff)
+                    .max(dim)
+                    .max(cfg.n_head * cfg.head_dim);
+                let scratch = mtp_head::Qwen35MtpHeadBatchedScratch::new(gpu, cfg, rows)?;
+                let rot = gpu.alloc_tensor(&[rows * widest_k], DType::F32)?;
+                state.claude_refresh = Some((scratch, rot));
+            }
+            let positions: Vec<i32> = (cur_pos + 1..cur_pos + 1 + n).map(|p| p as i32).collect();
+            let hidden = state.verify_hidden.sub_offset(0, n * dim);
+            let (scratch, rot) = state.claude_refresh.as_mut().unwrap();
+            mtp_head::mtp_head_forward_block_batched(
+                gpu,
+                head,
+                scratch,
+                &mut state.mtp_kv,
+                &result.committed[..n],
+                &hidden,
+                &positions,
+                n,
+                tw,
+                Some(&*rot),
+                true,
+            )?;
+        } else {
+            for j in 0..n {
+                let hidden_row = state.verify_hidden.sub_offset(j * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    result.committed[j],
+                    &hidden_row,
+                    None,
+                    cur_pos + 1 + j,
+                    tw,
+                )?;
+            }
+        }
+    }
+    claude_mark(gpu, Some(7))?;
+    claude_step_done(result.advance);
+    Ok(result)
 }
 
 /// External ngram-mod/PLD candidate verify with MTP retire-on-accept.

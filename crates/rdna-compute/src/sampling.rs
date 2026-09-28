@@ -124,6 +124,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.claude_fast_reduce_ok(n, batch_size) {
+            return self.claude_argmax_two_stage(data, result, n, batch_size);
+        }
         self.ensure_kernel(
             "argmax_f32_batched",
             kernels::ARGMAX_BATCHED_SRC,
@@ -861,6 +864,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(k >= 1 && k <= 16, "topk_batched: K={} must be in [1,16]", k);
+        if k == 2 && !raw_values && self.claude_fast_reduce_ok(vocab, b) {
+            return self.claude_top2lse_two_stage(logits, top_idx, top_out, vocab, b);
+        }
         self.ensure_kernel(
             "topk_logsumexp_batched",
             kernels::TOPK_LOGSUMEXP_BATCHED_SRC,
@@ -1766,5 +1772,128 @@ mod slot_sample_tests {
         assert_ne!(dead.rng_state(), 0);
         let live = SlotSampleParams { seed: 1234, ..dead };
         assert_eq!(live.rng_state(), 1234, "a real seed passes through");
+    }
+}
+
+
+// claude: two-stage full-vocab reductions. The stock kernels scan a 248K row
+// with a single workgroup; these split each row over CLAUDE_RED_NB blocks.
+const CLAUDE_RED_NB: usize = 128;
+
+impl Gpu {
+    fn claude_fast_reduce_ok(&self, n: usize, rows: usize) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_FAST_REDUCE").as_deref() == Ok("0"));
+        !off
+            && n >= 65_536
+            && (1..=16).contains(&rows)
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    fn claude_reduce_scratch(&mut self) -> HipResult<(*mut c_void, *mut c_void)> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Option<(GpuTensor, GpuTensor)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                let part = self.alloc_tensor(&[16 * CLAUDE_RED_NB * 6], DType::F32)?;
+                let pidx = self.alloc_tensor(&[16 * CLAUDE_RED_NB], DType::F32)?;
+                *slot = Some((part, pidx));
+            }
+            let (part, pidx) = slot.as_ref().unwrap();
+            Ok((part.buf.as_ptr() as *mut c_void, pidx.buf.as_ptr() as *mut c_void))
+        })
+    }
+
+    fn claude_reduce_kernel(&mut self, name: &str) -> HipResult<()> {
+        if !self.functions.contains_key(name) {
+            self.ensure_kernel(name, kernels::CLAUDE_REDUCE_SRC, name)?;
+        }
+        Ok(())
+    }
+
+    fn claude_argmax_two_stage(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let (pv, pi) = self.claude_reduce_scratch()?;
+        self.claude_reduce_kernel("claude_argmax_s1")?;
+        self.claude_reduce_kernel("claude_argmax_s2")?;
+        let dp = data.buf.as_ptr();
+        let rp = result.buf.as_ptr();
+        let nn = n as i32;
+        let nb = CLAUDE_RED_NB as i32;
+        {
+            let func = &self.functions["claude_argmax_s1"];
+            let mut params: Vec<*mut c_void> = vec![
+                &dp as *const _ as *mut c_void,
+                &pv as *const _ as *mut c_void,
+                &pi as *const _ as *mut c_void,
+                &nn as *const _ as *mut c_void,
+                &nb as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(func, [CLAUDE_RED_NB as u32, rows as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+        let func = &self.functions["claude_argmax_s2"];
+        let mut params: Vec<*mut c_void> = vec![
+            &pv as *const _ as *mut c_void,
+            &pi as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &nb as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [CLAUDE_RED_NB as u32, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    fn claude_top2lse_two_stage(
+        &mut self,
+        logits: &GpuTensor,
+        top_idx: &GpuTensor,
+        top_logp: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let (part, _) = self.claude_reduce_scratch()?;
+        self.claude_reduce_kernel("claude_top2lse_s1")?;
+        self.claude_reduce_kernel("claude_top2lse_s2")?;
+        let lp = logits.buf.as_ptr();
+        let ti = top_idx.buf.as_ptr();
+        let tl = top_logp.buf.as_ptr();
+        let nn = vocab as i32;
+        let nb = CLAUDE_RED_NB as i32;
+        let kk = 2i32;
+        {
+            let func = &self.functions["claude_top2lse_s1"];
+            let mut params: Vec<*mut c_void> = vec![
+                &lp as *const _ as *mut c_void,
+                &part as *const _ as *mut c_void,
+                &nn as *const _ as *mut c_void,
+                &nb as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(func, [CLAUDE_RED_NB as u32, rows as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)?;
+            }
+        }
+        let func = &self.functions["claude_top2lse_s2"];
+        let mut params: Vec<*mut c_void> = vec![
+            &part as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &tl as *const _ as *mut c_void,
+            &nb as *const _ as *mut c_void,
+            &kk as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        }
     }
 }

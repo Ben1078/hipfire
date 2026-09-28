@@ -3547,7 +3547,16 @@ impl Gpu {
                 &format!("tensor at 0x{key:x} is not a registered VMM owner"),
             )
         })?;
-        arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        if let Err(err) = arena.map_next(&self.hip, additional_bytes, access_devices) {
+            // Physical pages ran out while the buffer pool still holds freed
+            // VRAM: release the pool and retry once (mem_create failed before
+            // any state change).
+            if err.code != crate::pool::HIP_ERROR_OUT_OF_MEMORY || !self.pool.has_free() {
+                return Err(err);
+            }
+            self.pool.drain(&self.hip);
+            arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        }
         let mapped_bytes = arena.mapped_bytes();
         tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
         Ok(mapped_bytes)
