@@ -36,12 +36,13 @@
 // rides the same float4 prefetch as x/weight. Uniform builds are textually
 // unchanged.
 //
-// -DHIPFIRE_RMSNORM_P1A_BATCHED=1 (gfx1201 `_v2` IU4 symbols) keeps up to 20
-// Phase-1a row loads in flight per wave instead of one: the incumbent loop
-// waits on each x[i] before issuing x[i + 256], so a wave held a single 128-B
-// request and the sum-of-squares pass was DRAM-latency bound. Same elements,
-// same strictly sequential fma(v, v, acc) chain from +0 as the incumbent
-// loop's contraction, same reduction tree: bit-identical rms.
+// -DHIPFIRE_RMSNORM_P1A_BATCHED=1 (gfx1201 `_v2` IU4 symbols, gfx1100 `_b8`
+// IU4 symbols) keeps up to 20 Phase-1a row loads in flight per wave instead
+// of one: the incumbent loop waits on each x[i] before issuing x[i + 256], so
+// a wave held a single 128-B request and the sum-of-squares pass was
+// DRAM-latency bound. Same elements, same strictly sequential fma(v, v, acc)
+// chain from +0 as the incumbent loop's contraction, same reduction tree:
+// bit-identical rms.
 #ifdef HIPFIRE_RMSNORM_KERNEL
 /* caller (host JIT concat) already named the symbol */
 #elif defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_FP8_STREAM)
@@ -123,21 +124,48 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     // Phase 1a: accumulate sum-of-squares (same stride/order as baseline).
     float local_sum = 0.0f;
 #ifdef HIPFIRE_RMSNORM_P1A_BATCHED
-    // Load batches of 20 (K=5120 is one batch), then 8, 4, 1; the explicit
-    // fma keeps the incumbent's per-element rounding regardless of how the
-    // backend would otherwise pair two unrolled products.
+    // Batched phase-1a: same elements, same strictly sequential fma(v, v, acc)
+    // chain from +0 as the incumbent loop's contraction (the explicit fma also
+    // keeps the incumbent's per-element rounding regardless of how the backend
+    // would otherwise pair two unrolled products), same reduction tree:
+    // bit-identical rms.
+    // Batch width: 20-wide batches corrupt intermittently under sustained
+    // back-to-back pressure at N >= 2048 (single-row wrong-scale, ~5%/launch;
+    // N <= 1024 clean; serial SEQ clean over 6000 launches). Batches of <= 8
+    // with the same fence are stable over thousands of back-to-back launches
+    // (serial + single-CU) and bit-identical to SEQ, so the fp8 SHORT
+    // producers cap the cascade at 8 (`HIPFIRE_RMSNORM_P1A_MAX8`). The IU4
+    // `_v2` producers keep 20/8/4/1 (their shapes/pressures are unchanged);
+    // they need their own poisoned stress before any width change.
+    // With HIPFIRE_RMSNORM_P1A_DRAIN, a full load wait separates each batch's
+    // issue from its use, so no fma reads a load that has not retired.
+#ifdef HIPFIRE_RMSNORM_P1A_DRAIN
+#if defined(__GFX12__)
+#define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() asm volatile("s_wait_loadcnt 0x0" ::: "memory")
+#else
+#define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() asm volatile("s_waitcnt vmcnt(0)" ::: "memory")
+#endif
+#else
+#define HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER() ((void)0)
+#endif
     int i = tid;
 #define HIPFIRE_RMSNORM_P1A_STEP(B) \
     for (; i + ((B) - 1) * block_size < K; i += (B) * block_size) { \
         float vb[B]; \
         _Pragma("unroll") for (int u = 0; u < (B); ++u) vb[u] = x_b[i + u * block_size]; \
+        HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER(); \
         _Pragma("unroll") for (int u = 0; u < (B); ++u) \
             local_sum = __fmaf_rn(vb[u], vb[u], local_sum); \
     }
+#ifdef HIPFIRE_RMSNORM_P1A_MAX8
+    HIPFIRE_RMSNORM_P1A_STEP(8)
+#else
     HIPFIRE_RMSNORM_P1A_STEP(20)
     HIPFIRE_RMSNORM_P1A_STEP(8)
+#endif
     HIPFIRE_RMSNORM_P1A_STEP(4)
 #undef HIPFIRE_RMSNORM_P1A_STEP
+#undef HIPFIRE_RMSNORM_P1A_ISSUE_BARRIER
     for (; i < K; i += block_size) local_sum = __fmaf_rn(x_b[i], x_b[i], local_sum);
 #else
     for (int i = tid; i < K; i += block_size) {

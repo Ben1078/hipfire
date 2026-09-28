@@ -1734,17 +1734,22 @@ pub fn ordinary_serve_prefill_chunk_len(remaining: usize, ceiling: usize) -> Opt
 }
 ///
 /// First-prefill receipt: proves requested-vs-executed rows for the evidence
-/// log. Emitted once per process on the first chunked (multi-token) prefill.
+/// log. Emitted on the first chunked (multi-token) prefill of the process and
+/// again whenever the admitted ceiling changes, so a later memory-admission
+/// fallback is visible in the log.
 fn emit_prefill_chunk_receipt(requested: usize, admitted: usize, commit_stride: Option<usize>) {
-    static DONE: std::sync::Once = std::sync::Once::new();
-    DONE.call_once(|| match commit_stride {
+    static LAST_ADMITTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if LAST_ADMITTED.swap(admitted, std::sync::atomic::Ordering::Relaxed) == admitted {
+        return;
+    }
+    match commit_stride {
         Some(s) => eprintln!(
             "prefill_chunk: requested={requested} admitted={admitted} commit_stride={s}"
         ),
         None => eprintln!(
             "prefill_chunk: requested={requested} admitted={admitted} commit_stride=none"
         ),
-    });
+    }
 }
 ///
 /// Never form a chunk larger than the configured/capped max, the PBS
@@ -8346,7 +8351,10 @@ fn batch_chunk_full_attn_prepare(
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
     // same RoPE expression/phase, explicit old-TU FMA formation); the triattn
     // tap needs pre-RoPE Q, legacy interleaved RoPE needs its own kernel, and
-    // every other shape/arch/ctx keeps the old path.
+    // every other shape/arch/ctx keeps the old path. Admitted for DFlash
+    // chain verify and, since gfx11-1, ordinary prefill (DflashFusionCtx::Off:
+    // −325 µs per N4096 call vs the three-launch chain) unless
+    // HIPFIRE_GFX1100_FA_PREP=0.
     // HIPFIRE_FA_BATCH_FUSE_OFF=1 restores it byte-for-byte.
     // Admitted geometries are 16Q/2K and 24Q/4K (Qwen3.8-27B FA is 24/4);
     // HD must be 256 and n_rot 64.
@@ -8363,7 +8371,9 @@ fn batch_chunk_full_attn_prepare(
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
     let fa_prep_fused_ok = (fusion == DflashFusionCtx::ChainVerify
-        || (fusion == DflashFusionCtx::MtpVerify && crate::qwen35::config::claude_mtp_fuse_fa()))
+        || (fusion == DflashFusionCtx::MtpVerify && crate::qwen35::config::claude_mtp_fuse_fa())
+        || (fusion == DflashFusionCtx::Off
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true)))
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.fa_batch_fuse_off
         && !gpu.flags.rope_interleaved_legacy

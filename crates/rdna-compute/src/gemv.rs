@@ -171,6 +171,16 @@ pub(crate) fn e8_soa_experts_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_E8_SOA_EXPERTS", false)
 }
 
+
+/// Phase-1a-batched RMSNorm producers: up to 8 row loads in flight per wave
+/// instead of one, same arithmetic order (bit-identical rms). Default on;
+/// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps the single-outstanding incumbents.
+/// (Upstream beta defines this next to its fp8 producers; carried here for the
+/// gfx1100 `_b8` IU4 twins from beb3e864a.)
+fn rmsnorm_p1a_batched() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_RMSNORM_P1A_BATCHED", true)
+}
+
 impl Gpu {
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
     pub fn gemv_q4lut(
@@ -3213,6 +3223,13 @@ impl Gpu {
         result
     }
 
+    /// gfx1100 IU4 RMSNorm producers run their `_b8` batched-Phase-1a twins
+    /// (bit-identical; see `FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC`). gfx1151 and
+    /// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keep the single-outstanding incumbents.
+    fn gfx1100_rmsnorm_p1a_b8(&self) -> bool {
+        self.arch_caps.is_gfx1100() && rmsnorm_p1a_batched()
+    }
+
     /// C2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128` sidecar.
     /// `x_rot = None` skips the f32 store (emit_f32=false). `awq = Some`
     /// selects the AWQ twin symbol. Seals `reservation` into a prepared
@@ -3247,16 +3264,26 @@ impl Gpu {
             self.flush_residual_fold()?;
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (awq.is_some(), self.gfx1100_rmsnorm_p1a_b8()) {
+            (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4",
             ),
-            None => (
+            (false, false) => (
                 "fused_rmsnorm_mq_rotate_i4",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_SRC,
                 "fused_rmsnorm_mq_rotate_i4",
+            ),
+            (true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_b8",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_b8",
+            ),
+            (false, true) => (
+                "fused_rmsnorm_mq_rotate_i4_b8",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC,
+                "fused_rmsnorm_mq_rotate_i4_b8",
             ),
         };
         self.ensure_kernel(module, source, kernel)?;
@@ -4924,18 +4951,20 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
-                "gated_norm_mq_rotate_awq_i4_gfx11",
-                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC,
-                "gated_norm_mq_rotate_awq_i4_gfx11",
+        let v2 = self.arch_caps.is_gfx1100()
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true);
+        let (module, source) = match (awq.is_some(), v2) {
+            (true, false) => ("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC),
+            (false, false) => ("gated_norm_mq_rotate_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC),
+            (true, true) => (
+                "gated_norm_mq_rotate_awq_i4_gfx1100_v2",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC,
             ),
-            None => (
-                "gated_norm_mq_rotate_i4_gfx11",
-                kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC,
-                "gated_norm_mq_rotate_i4_gfx11",
-            ),
+            (false, true) => ("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC),
         };
+        let kernel = module;
+        // v2: two 256-groups (one per wave) per 64-thread workgroup.
+        let grid_x = if v2 { (k / 256).div_ceil(2) } else { k / 256 };
         self.ensure_kernel(module, source, kernel)?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -4990,7 +5019,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            [(k / 256) as u32, batch_size as u32, 1],
+            [grid_x as u32, batch_size as u32, 1],
             [64, 1, 1],
             0,
             &mut params,
