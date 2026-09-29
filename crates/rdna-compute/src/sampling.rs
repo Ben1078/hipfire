@@ -1779,6 +1779,9 @@ mod slot_sample_tests {
 // claude: two-stage full-vocab reductions. The stock kernels scan a 248K row
 // with a single workgroup; these split each row over CLAUDE_RED_NB blocks.
 const CLAUDE_RED_NB: usize = 128;
+/// claude C6: stage 2 of the top-2 + logsumexp with the partials staged in LDS
+/// (own translation unit; claude_reduce.hip is unchanged).
+const CLAUDE_TOP2_S2_LDS_SRC: &str = include_str!("../../../kernels/src/claude_top2lse_s2_lds.hip");
 
 impl Gpu {
     fn claude_fast_reduce_ok(&self, n: usize, rows: usize) -> bool {
@@ -1864,27 +1867,72 @@ impl Gpu {
         rows: usize,
     ) -> HipResult<()> {
         let (part, _) = self.claude_reduce_scratch()?;
+        self.claude_top2lse_s1_into(logits, part, vocab, rows)?;
+        let lds = Self::claude_top2_lds_enabled();
+        self.claude_top2lse_s2_from(part, top_idx, top_logp, rows, lds)
+    }
+
+    /// claude C6 `CLAUDE_TOP2_LDS` (default on; `=0` restores the one-thread
+    /// global-memory stage 2): stage 2 of the top-2 + logsumexp first copies
+    /// the row's partials into LDS with the whole block, then runs the
+    /// identical serial merge on thread 0 (`claude_top2lse_s2_lds`).
+    pub fn claude_top2_lds_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CLAUDE_TOP2_LDS").as_deref() != Ok("0"))
+    }
+
+    /// claude: stage 1 of the two-stage top-2 + logsumexp: `rows x 128`
+    /// partials `[v0, i0, v1, i1, max, sum]` of `logits` into `part`.
+    pub fn claude_top2lse_s1_into(
+        &mut self,
+        logits: &GpuTensor,
+        part: *mut c_void,
+        vocab: usize,
+        rows: usize,
+    ) -> HipResult<()> {
         self.claude_reduce_kernel("claude_top2lse_s1")?;
-        self.claude_reduce_kernel("claude_top2lse_s2")?;
         let lp = logits.buf.as_ptr();
-        let ti = top_idx.buf.as_ptr();
-        let tl = top_logp.buf.as_ptr();
         let nn = vocab as i32;
         let nb = CLAUDE_RED_NB as i32;
-        let kk = 2i32;
-        {
-            let func = &self.functions["claude_top2lse_s1"];
-            let mut params: Vec<*mut c_void> = vec![
-                &lp as *const _ as *mut c_void,
-                &part as *const _ as *mut c_void,
-                &nn as *const _ as *mut c_void,
-                &nb as *const _ as *mut c_void,
-            ];
-            unsafe {
-                self.hip.launch_kernel(func, [CLAUDE_RED_NB as u32, rows as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)?;
-            }
+        let func = &self.functions["claude_top2lse_s1"];
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &part as *const _ as *mut c_void,
+            &nn as *const _ as *mut c_void,
+            &nb as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(func, [CLAUDE_RED_NB as u32, rows as u32, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
         }
-        let func = &self.functions["claude_top2lse_s2"];
+    }
+
+    /// claude: stage 2 (serial merge of the 128 partials per row, k = 2).
+    /// `lds = false` is the original `claude_top2lse_s2` (one thread, global
+    /// loads), `lds = true` the C6 `claude_top2lse_s2_lds` (same merge, the
+    /// partials staged into LDS by 128 threads first).
+    pub fn claude_top2lse_s2_from(
+        &mut self,
+        part: *mut c_void,
+        top_idx: &GpuTensor,
+        top_logp: &GpuTensor,
+        rows: usize,
+        lds: bool,
+    ) -> HipResult<()> {
+        let name = if lds {
+            const LDS: &str = "claude_top2lse_s2_lds";
+            if !self.functions.contains_key(LDS) {
+                self.ensure_kernel(LDS, CLAUDE_TOP2_S2_LDS_SRC, LDS)?;
+            }
+            LDS
+        } else {
+            self.claude_reduce_kernel("claude_top2lse_s2")?;
+            "claude_top2lse_s2"
+        };
+        let ti = top_idx.buf.as_ptr();
+        let tl = top_logp.buf.as_ptr();
+        let nb = CLAUDE_RED_NB as i32;
+        let kk = 2i32;
+        let func = &self.functions[name];
         let mut params: Vec<*mut c_void> = vec![
             &part as *const _ as *mut c_void,
             &ti as *const _ as *mut c_void,
@@ -1892,8 +1940,9 @@ impl Gpu {
             &nb as *const _ as *mut c_void,
             &kk as *const _ as *mut c_void,
         ];
+        let block = if lds { CLAUDE_RED_NB as u32 } else { 32 };
         unsafe {
-            self.hip.launch_kernel(func, [rows as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(func, [rows as u32, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
         }
     }
 }

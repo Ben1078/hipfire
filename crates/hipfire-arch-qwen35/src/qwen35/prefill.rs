@@ -6756,20 +6756,6 @@ fn batch_chunk_delta_net_output_projection(
             n,
         )?;
     }
-    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
-        // Batched gated output norm.
-        gpu.gated_norm_f32_batched(
-            &pbs.dn_attn_out_batch,
-            &pbs.dn_z_batch,
-            &layer.norm_weight,
-            &pbs.dn_normed_batch,
-            n_v_heads,
-            config.linear_value_head_dim,
-            config.norm_eps,
-            n,
-        )?;
-    }
-
     // Batched wo + residual/partial.
     //
     // For MQ weights, the decode path's weight_gemv_residual
@@ -6778,6 +6764,7 @@ fn batch_chunk_delta_net_output_projection(
     // at quant time; math requires dot(rot(W), rot(x)) = dot(W,x)).
     // For HFQ weights no rotation is needed — the activation
     // feeds gemm_hfq{4,6}g256_residual directly.
+    // (claude C2: hoisted above the gated norm; pure dtype predicate.)
     let wo_is_mq = matches!(
         layer.wo.gpu_dtype,
         DType::MQ4G256
@@ -6794,11 +6781,53 @@ fn batch_chunk_delta_net_output_projection(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
+    // claude C2 (CLAUDE_GDN_NORM_ROTATE_FUSE): when the path below would run
+    // gated_norm_f32 -> (no IU4 / gfx12 producer) -> rotate_x_mq_awq_batched
+    // with the fused q8 producer (claude_rotate_q8), run both as ONE launch
+    // into the same buffers (dn_normed, dn_normed_rot, int8 scratch + prequant
+    // entry). Bit-exact; every failed predicate keeps the two launches.
+    let mut claude_gnr_fused = false;
+    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
+        if wo_is_mq
+            && n_v_heads * config.linear_value_head_dim == layer.wo.k
+            && !(layer.wo.gpu_dtype == DType::MQ4G256V2
+                && matches!(epilogue, BatchEpilogue::Residual)
+                && gpu.iu4_producer_sidecar_active(n, layer.wo.k))
+        {
+            if let Some(awq) = layer.wo.awq_scale.as_ref() {
+                claude_gnr_fused = gpu.claude_gated_norm_rotate_awq_prequant(
+                    &pbs.dn_attn_out_batch,
+                    &pbs.dn_z_batch,
+                    &layer.norm_weight,
+                    awq,
+                    &pbs.dn_normed_batch,
+                    &pbs.dn_normed_rot_batch,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                    n,
+                )?;
+            }
+        }
+        if !claude_gnr_fused {
+            // Batched gated output norm.
+            gpu.gated_norm_f32_batched(
+                &pbs.dn_attn_out_batch,
+                &pbs.dn_z_batch,
+                &layer.norm_weight,
+                &pbs.dn_normed_batch,
+                n_v_heads,
+                config.linear_value_head_dim,
+                config.norm_eps,
+                n,
+            )?;
+        }
+    }
     // T-B: fused rotate+quantize — x_rot feeds only the IU4 residual GEMM.
     // Skipped when the slices-4 GDN producer already emitted both outputs
     // (`dn_normed_batch` is stale there by construction).
     let mut iu4_wo_prep: Option<rdna_compute::Int4MmqPrepared> = None;
-    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
+    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() && !claude_gnr_fused {
         iu4_wo_prep = try_iu4_rotate_prepared(
             gpu,
             &layer.wo,
@@ -6823,6 +6852,7 @@ fn batch_chunk_delta_net_output_projection(
     let wo_input = if gdn_fused_prep.is_some()
         || fp8_gdn_prep.is_some()
         || iu4_wo_prep.is_some()
+        || claude_gnr_fused
     {
         &pbs.dn_normed_rot_batch
     } else if wo_is_mq {
@@ -8646,7 +8676,35 @@ fn batch_chunk_full_attn_output_projection(
             n,
         )?;
     }
+    // claude C3 (CLAUDE_FA_GATE_ROTATE_FUSE): when the path below would run
+    // sigmoid_mul_f32 -> (no IU4 / gfx12 producer) -> rotate_x_mq_awq_batched
+    // with the fused q8 producer (claude_rotate_q8), run both as ONE launch
+    // into the same buffers (attn rows 0..n in place, fa_attn_out_rot, int8
+    // scratch + prequant entry). Bit-exact; every failed predicate keeps the
+    // two launches. (Rows >= n of the verify scratch are dead: the old
+    // whole-tensor sigmoid touched them, nothing reads them.)
+    let mut claude_sr_fused = false;
     if iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
+        if fa_wo_is_mq
+            && !(layer.wo.gpu_dtype == DType::MQ4G256V2
+                && matches!(epilogue, BatchEpilogue::Residual)
+                && gpu.iu4_producer_sidecar_active(n, layer.wo.k))
+            && pbs.fa_attn_out_batch.numel() >= n * layer.wo.k
+            && pbs.fa_gate_batch.numel() >= n * layer.wo.k
+        {
+            if let Some(awq) = layer.wo.awq_scale.as_ref() {
+                claude_sr_fused = gpu.claude_sigmoid_rotate_awq_prequant(
+                    &pbs.fa_attn_out_batch,
+                    &pbs.fa_gate_batch,
+                    awq,
+                    &pbs.fa_attn_out_rot_batch,
+                    layer.wo.k,
+                    n,
+                )?;
+            }
+        }
+    }
+    if iu4_wo_prep.is_none() && fp8_wo_prep.is_none() && !claude_sr_fused {
         gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
         // T-B / slices-3: rotate+quantize once the standalone sigmoid has
         // produced the f32 input. All non-admitted routes remain unchanged.
@@ -8670,7 +8728,7 @@ fn batch_chunk_full_attn_output_projection(
             )?;
         }
     }
-    let fa_wo_input = if iu4_wo_prep.is_some() || fp8_wo_prep.is_some() {
+    let fa_wo_input = if iu4_wo_prep.is_some() || fp8_wo_prep.is_some() || claude_sr_fused {
         &pbs.fa_attn_out_rot_batch
     } else if fa_wo_is_mq {
         rotate_x_mq_batched_for(
@@ -8963,22 +9021,37 @@ fn batch_chunk_fa_attend(
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
-        gpu.kv_cache_write_q8_0_batched(
-            &kv_cache.k_gpu[layer_idx],
-            &pbs.fa_k_batch,
-            &pbs.positions,
-            config.n_kv_heads,
-            config.head_dim,
-            n,
-        )?;
-        gpu.kv_cache_write_q8_0_batched(
-            &kv_cache.v_gpu[layer_idx],
-            &pbs.fa_v_batch,
-            &pbs.positions,
-            config.n_kv_heads,
-            config.head_dim,
-            n,
-        )?;
+        // claude C1 (CLAUDE_KV_PAIR): one launch for the K and V Q8 writes
+        // (same legacy addressing and quantizer as the two calls below).
+        if gpu.claude_kv_pair_enabled() {
+            gpu.kv_cache_write_q8_0_pair_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+        } else {
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &pbs.fa_k_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+        }
         if claude_a4
             && gpu.claude_attn4(
                 &pbs.fa_q_batch,

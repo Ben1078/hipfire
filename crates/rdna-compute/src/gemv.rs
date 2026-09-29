@@ -91,6 +91,11 @@ const CLAUDE_RMSNORM_ROTATE_Q8_SRC: &str =
 const CLAUDE_SILU_ROTATE_Q8_SRC: &str =
     include_str!("../../../kernels/src/claude_silu_rotate_q8.hip");
 const CLAUDE_ROTATE_Q8_SRC: &str = include_str!("../../../kernels/src/claude_rotate_q8.hip");
+/// claude C3: sigmoid_mul_f32 + FWHT rotate (+ int8 quant) in one launch.
+const CLAUDE_SIGMOID_ROTATE_SRC: &str = include_str!("../../../kernels/src/claude_sigmoid_rotate.hip");
+/// claude C2: gated_norm_f32 + claude_rotate_q8 in one launch.
+const CLAUDE_GATED_NORM_ROTATE_Q8_SRC: &str =
+    include_str!("../../../kernels/src/claude_gated_norm_rotate_q8.hip");
 
 thread_local! {
     /// claude: int8 activation scratch `(xq, dx)` (8 x 32768 int8 + 8 x 1024 f32
@@ -9315,6 +9320,291 @@ impl Gpu {
         }
         self.invalidate_x_caches_for(xrp);
         result
+    }
+
+    /// claude C2: `gated_norm_f32_batched(x, z, weight) -> normed_out` followed by
+    /// `claude_rotate_q8_batched(normed_out, awq_scale) -> x_rot, xq, dx` in ONE
+    /// launch (`claude_gated_norm_rotate_q8`, bit-identical in all four
+    /// outputs, see the kernel header). `head_dim` must be 128 and
+    /// `n_heads * head_dim == k`, `k % 256 == 0`. Does not record a prequant
+    /// entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_gated_norm_rotate_q8_batched(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        normed_out: &GpuTensor,
+        x_rot: &GpuTensor,
+        xq: *mut c_void,
+        dx: *mut c_void,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let k = n_heads * head_dim;
+        assert!(
+            head_dim == 128 && k % 256 == 0,
+            "claude_gated_norm_rotate_q8_batched: n_heads {n_heads} head_dim {head_dim}"
+        );
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        const NAME: &str = "claude_gated_norm_rotate_q8";
+        self.ensure_kernel(NAME, CLAUDE_GATED_NORM_ROTATE_Q8_SRC, NAME)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut xp = x.buf.as_ptr();
+        let mut zp = z.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq_scale.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut np = normed_out.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut xqp = xq;
+        let mut dxp = dx;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut zp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut xqp as *mut _ as *mut c_void,
+            &mut dxp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 5 + 2 * 256 * 4 + k + k / 8) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", NAME, bytes);
+        let result = self.launch_maybe_blob(
+            NAME,
+            [n_groups, batch_size as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(zp);
+                b.push_ptr(wp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(np);
+                b.push_ptr(xrp);
+                b.push_ptr(xqp);
+                b.push_ptr(dxp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(ep);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        // Same invalidations as the two launches it replaces
+        // (gated_norm_f32_batched on `normed_out`, claude_rotate_q8 on `x_rot`).
+        self.invalidate_x_caches_for(np);
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// claude C3: `sigmoid_mul_f32(attn, gate)` (in place, rows `0..batch_size`)
+    /// followed by the FWHT rotate of `attn` into `x_rot`, in ONE launch
+    /// (`kernels/src/claude_sigmoid_rotate.hip`, bit-identical in attn rows
+    /// `0..batch_size`, `x_rot` and `xq`/`dx`). Variants:
+    /// `awq_scale` Some + `q8` Some = sigmoid_mul + `claude_rotate_q8`;
+    /// `awq_scale` Some + `q8` None = sigmoid_mul + `rotate_x_mq_awq`;
+    /// `awq_scale` None + `q8` None = sigmoid_mul + `mq_rotate_x`.
+    /// Row stride is `k` for attn, gate and x_rot. Does not record a prequant
+    /// entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_sigmoid_rotate_batched(
+        &mut self,
+        attn: &GpuTensor,
+        gate: &GpuTensor,
+        awq_scale: Option<&GpuTensor>,
+        x_rot: &GpuTensor,
+        q8: Option<(*mut c_void, *mut c_void)>,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(k % 256 == 0, "claude_sigmoid_rotate_batched: k {k}");
+        assert!(
+            awq_scale.is_some() || q8.is_none(),
+            "claude_sigmoid_rotate_batched: no non-AWQ int8 variant"
+        );
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        let (name, defines) = match (awq_scale.is_some(), q8.is_some()) {
+            (true, true) => (
+                "claude_sigmoid_rotate_q8",
+                "#define CLAUDE_SR_KERNEL claude_sigmoid_rotate_q8\n#define CLAUDE_SR_AWQ 1\n#define CLAUDE_SR_Q8 1\n",
+            ),
+            (true, false) => (
+                "claude_sigmoid_rotate_awq",
+                "#define CLAUDE_SR_KERNEL claude_sigmoid_rotate_awq\n#define CLAUDE_SR_AWQ 1\n#define CLAUDE_SR_Q8 0\n",
+            ),
+            _ => (
+                "claude_sigmoid_rotate_x",
+                "#define CLAUDE_SR_KERNEL claude_sigmoid_rotate_x\n#define CLAUDE_SR_AWQ 0\n#define CLAUDE_SR_Q8 0\n",
+            ),
+        };
+        if !self.functions.contains_key(name) {
+            let src = format!("{defines}{CLAUDE_SIGMOID_ROTATE_SRC}");
+            self.ensure_kernel(name, &src, name)?;
+        }
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let ap = attn.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let awp = awq_scale.map(|t| t.buf.as_ptr());
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(9);
+        params.push(&ap as *const _ as *mut c_void);
+        params.push(&gp as *const _ as *mut c_void);
+        if let Some(p) = awp.as_ref() {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&s1_ptr as *const _ as *mut c_void);
+        params.push(&s2_ptr as *const _ as *mut c_void);
+        params.push(&xrp as *const _ as *mut c_void);
+        if let Some((xq, dx)) = q8.as_ref() {
+            params.push(xq as *const _ as *mut c_void);
+            params.push(dx as *const _ as *mut c_void);
+        }
+        params.push(&kv as *const _ as *mut c_void);
+        let bytes = (k * 4 * 4 + 2 * 256 * 4 + if q8.is_some() { k + k / 8 } else { 0 }) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(gp);
+                if let Some(p) = awp {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_ptr(xrp);
+                if let Some((xq, dx)) = q8 {
+                    b.push_ptr(xq);
+                    b.push_ptr(dx);
+                }
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        // Same invalidations as the launches it replaces (sigmoid_mul_f32 on
+        // `attn`, the rotate on `x_rot`).
+        self.invalidate_x_caches_for(ap);
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// claude C3 `CLAUDE_FA_GATE_ROTATE_FUSE` (default on; `=0` restores the
+    /// separate `sigmoid_mul_f32` + rotate launches in the MTP verify FA layers
+    /// and the draft head). gfx1100 only.
+    pub fn claude_fa_gate_rotate_fuse_enabled(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.arch.as_str() == "gfx1100"
+            && *ON.get_or_init(|| std::env::var("CLAUDE_FA_GATE_ROTATE_FUSE").as_deref() != Ok("0"))
+    }
+
+    /// claude C3 host entry for the MTP verify FA wo input. Exactly when
+    /// `sigmoid_mul_f32` followed by `rotate_x_mq_awq_batched` would take the
+    /// fused-quant producer (`claude_q8_fuse_eligible`), runs one launch into the
+    /// same buffers (attn rows `0..batch_size` in place, `x_rot`, int8 scratch)
+    /// and records the same prequant entry for `x_rot`; returns `false`
+    /// (nothing launched) otherwise.
+    pub fn claude_sigmoid_rotate_awq_prequant(
+        &mut self,
+        attn: &GpuTensor,
+        gate: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.claude_fa_gate_rotate_fuse_enabled()
+            || k % 256 != 0
+            || awq_scale.numel() < k
+            || !self.claude_q8_fuse_eligible(k, batch_size)
+        {
+            return Ok(false);
+        }
+        let (xq, dx) = self.claude_q8x_scratch()?;
+        self.claude_sigmoid_rotate_batched(attn, gate, Some(awq_scale), x_rot, Some((xq, dx)), k, batch_size)?;
+        claude_q8_prequant_set(x_rot.buf.as_ptr(), k, batch_size);
+        Ok(true)
+    }
+
+    /// claude C2 `CLAUDE_GDN_NORM_ROTATE_FUSE` (default on; `=0` restores the
+    /// separate `gated_norm_f32` + `claude_rotate_q8` launches).
+    pub fn claude_gdn_norm_rotate_fuse_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CLAUDE_GDN_NORM_ROTATE_FUSE").as_deref() != Ok("0"))
+    }
+
+    /// claude C2 host entry for the MTP verify GDN output projection. Exactly
+    /// when `gated_norm_f32_batched` followed by `rotate_x_mq_awq_batched` would
+    /// take the fused-quant producer (`claude_q8_fuse_eligible`), runs the single
+    /// fused launch into the same buffers and records the same prequant entry
+    /// for `x_rot`; returns `false` (nothing launched) otherwise, in which case
+    /// the caller runs the original pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_gated_norm_rotate_awq_prequant(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        normed_out: &GpuTensor,
+        x_rot: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        let k = n_heads * head_dim;
+        if !Self::claude_gdn_norm_rotate_fuse_enabled()
+            || head_dim != 128
+            || k % 256 != 0
+            || awq_scale.numel() < k
+            || !self.claude_q8_fuse_eligible(k, batch_size)
+        {
+            return Ok(false);
+        }
+        let (xq, dx) = self.claude_q8x_scratch()?;
+        self.claude_gated_norm_rotate_q8_batched(
+            x, z, weight, awq_scale, normed_out, x_rot, xq, dx, n_heads, head_dim, eps, batch_size,
+        )?;
+        claude_q8_prequant_set(x_rot.buf.as_ptr(), k, batch_size);
+        Ok(true)
     }
 
     /// claude: `CLAUDE_Q8_FUSE_CHECK=1` A/B: on a prequant hit, re-run the

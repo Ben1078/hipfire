@@ -435,7 +435,9 @@ fn dispatch_kv_write(
                     ))
                 });
             }
-            if io.output_gate.is_some() {
+            // claude C1 (CLAUDE_KV_PAIR): the MTP draft head attends without
+            // an output gate; the pair kernel is the same per-block quantizer.
+            if io.output_gate.is_some() || gpu.claude_kv_pair_enabled() {
                 hip!(gpu.kv_cache_write_q8_0_pair(
                     io.k_cache,
                     io.v_cache,

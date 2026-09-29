@@ -2470,6 +2470,20 @@ impl Gpu {
         Ok(())
     }
 
+    /// claude C1 `CLAUDE_KV_PAIR` (default on; `=0` restores the separate K
+    /// and V launches): whether the MTP verify pass (`kv_cache_write_q8_0_batched`
+    /// x2) and the single-row Q8 KV write of the draft head
+    /// (`kv_cache_write_q8_0` x2) use the bit-exact paired kernels
+    /// (`kv_cache_write_q8_0_pair_batched` / [`Self::kv_cache_write_q8_0_pair`]).
+    /// The pair kernels run the same per-block quantizer statements on the same
+    /// (block, row) and only concatenate the two independent grids, so the cache
+    /// bytes are identical. gfx1100 only (the pair sources are certified there).
+    pub fn claude_kv_pair_enabled(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.arch_caps.is_gfx1100()
+            && *ON.get_or_init(|| std::env::var("CLAUDE_KV_PAIR").as_deref() != Ok("0"))
+    }
+
     /// Exact paired K/V Q8_0 cache write for single-token decode. Uses the
     /// same 32-lane block quantizer as `kv_cache_write_q8_0` and concatenates
     /// the independent K and V block grids into one dispatch.

@@ -577,6 +577,13 @@ pub struct MtpSpecState {
     /// `cur_pos..cur_pos + n_verify` in `trunk_pbs.positions[..n_verify]`
     /// (one batched PBS chunk); `None` when that is not guaranteed.
     claude_verify_pbs: Option<(usize, usize)>,
+    /// claude item 6 (`CLAUDE_VERIFY_PRESTAGE`): the verify inputs this cycle
+    /// staged on the active stream (see [`claude_prestage_begin`]); taken by
+    /// the next shared verify.
+    claude_prestage: Option<ClaudePrestage>,
+    /// claude item 6: `prefill_batch_pbs_eligible(.., n, ..)` per verify row
+    /// count `n` (weights, config and arch are fixed for this state).
+    claude_eligible_cache: Vec<Option<bool>>,
 
     /// Optional draft-confidence cutoff for [`spec_step_mtp_compressed_serial`].
     /// When `p_min > 0`, the K-chain truncates early at step k if the draft's
@@ -740,6 +747,8 @@ impl MtpSpecState {
             claude_refresh: None,
             claude_topk_pack,
             claude_verify_pbs: None,
+            claude_prestage: None,
+            claude_eligible_cache: Vec::new(),
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -1500,13 +1509,14 @@ fn mtp_shared_verify_accept_rollback(
         state.trunk_snap.save_from(&target.dn_state, gpu)?;
     }
 
-    let tape_captured = qwen35::prefill_batch_pbs_eligible(
+    // claude item 6: memoized per n_verify (CLAUDE_VERIFY_PRESTAGE).
+    let tape_captured = claude_pbs_eligible_cached(
+        state,
         trunk_weights,
         &target.config,
         &target.dn_state,
         n_verify,
         gpu.arch.as_str(),
-        /* moe_router_logits_present — dense trunk: arm never matched */ true,
     );
     // claude CLAUDE_MTP_ASYNC: can the accepted-row refresh read this verify's
     // inputs straight from trunk_pbs? The forward takes its batched PBS path
@@ -1532,8 +1542,48 @@ fn mtp_shared_verify_accept_rollback(
         None
     };
 
+    // claude item 6 (CLAUDE_VERIFY_PRESTAGE): if this cycle staged exactly
+    // these inputs on the active stream (claude_prestage_begin /
+    // _candidates) and the forward would take its batched single-chunk route
+    // (tape_captured, quantized KV, n_verify <= pbs rows and chunk limit),
+    // run that same chunk with `pre_uploaded` — forward_prefill_chunk with the
+    // same arguments minus the two blocking H2D uploads and the repeated
+    // admissibility scan; the KV mapping the wrapper does first is done here.
+    let claude_prestaged = match state.claude_prestage.take() {
+        Some(p) => {
+            p.cur_pos == cur_pos
+                && p.tokens.len() == n_verify
+                && p.tokens.as_slice() == verify_tokens.as_slice()
+                && p.positions >= n_verify
+                && tape_captured
+                && (target.kv_cache.quantized || target.kv_cache.quant_q8 || target.kv_cache.quant_hfq4)
+                && n_verify <= state.trunk_pbs.max_batch
+                && n_verify <= qwen35::prefill_max_batch(gpu)
+        }
+        None => false,
+    };
     claude_mark(gpu, Some(1))?;
     let claude_t_enq = Instant::now();
+    if claude_prestaged {
+        target.kv_cache.ensure_mapped_capacity(gpu, cur_pos + n_verify)?;
+        qwen35::forward_prefill_batch_single_chunk_captured_opts(
+            gpu,
+            trunk_weights,
+            &target.config,
+            &verify_tokens,
+            cur_pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            &state.trunk_pbs,
+            None,
+            Some(&state.verify_hidden),
+            verify_tape,
+            None,
+            false,
+            qwen35::DflashFusionCtx::MtpVerify,
+        )?;
+    } else {
     qwen35::forward_prefill_batch_with_pbs_opts(
         gpu,
         trunk_weights,
@@ -1554,6 +1604,7 @@ fn mtp_shared_verify_accept_rollback(
         // claude v3: admit the bit-exact single-launch GDN-pre / FA-prep fusions.
         qwen35::DflashFusionCtx::MtpVerify,
     )?;
+    }
     if claude_pbs_inputs {
         state.claude_verify_pbs = Some((cur_pos, n_verify));
     }
@@ -3068,6 +3119,152 @@ pub fn spec_step_mtp_compressed_serial(
 /// Budget-aware compressed-serial MTP step: draft at most `k` candidates.
 /// `k == 0` verifies `[last_committed]` only and emits the single bonus token.
 #[allow(clippy::too_many_arguments)]
+/// claude item 6: verify inputs staged stream-ordered for one cycle.
+struct ClaudePrestage {
+    cur_pos: usize,
+    /// `trunk_pbs.positions[..positions] = cur_pos..`
+    positions: usize,
+    /// host copy of `trunk_pbs.tokens[..tokens.len()]` as staged
+    tokens: Vec<u32>,
+}
+
+/// claude item 6 `CLAUDE_VERIFY_PRESTAGE` (default OFF; `=1` stages the
+/// verify tokens / positions stream-ordered and memoizes the per-cycle
+/// admissibility scan). Opt-in until the full-model check: measured on
+/// gfx1100 / ROCm 7.2, each hipStreamWriteValue32 costs ~6.6 us of GPU time
+/// (a one-wave kernel ~2.8 us), so the 5 + d writes per cycle cost ~45 us of
+/// GPU time against the two blocking H2D round trips they remove.
+fn claude_verify_prestage_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_VERIFY_PRESTAGE").as_deref() == Ok("1"))
+}
+
+/// claude item 6: `t[idx] = value` as a stream-ordered 32-bit write on the
+/// active stream (`hipStreamWriteValue32`, as the CLAUDE_MTP_ASYNC draft
+/// position write in mtp_head.rs). The value is captured at enqueue time.
+/// Returns false if there is no active stream or the runtime rejects the write
+/// (then prestaging is off for the rest of the process).
+fn claude_stream_write_i32(gpu: &mut Gpu, t: &GpuTensor, idx: usize, value: i32) -> bool {
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let Some(stream) = gpu.active_stream.as_ref() else {
+        return false;
+    };
+    let view = t.sub_offset(idx, 1);
+    match gpu.hip.stream_write_value32(stream, &view.buf, value as u32, 0) {
+        Ok(()) => true,
+        Err(e) => {
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[claude] hipStreamWriteValue32 failed ({e}); verify inputs fall back to the \
+                 blocking uploads"
+            );
+            false
+        }
+    }
+}
+
+/// claude item 6: stage this cycle's verify inputs that are known at cycle
+/// start — `trunk_pbs.positions[i] = cur_pos + i` for every row the verify can
+/// have (`i <= max_n`) and `trunk_pbs.tokens[0] = last_committed` — so the
+/// verify forward can run with `pre_uploaded` instead of two blocking
+/// `hipMemcpy` H2D uploads (each a host round trip that drains the GPU queue).
+/// The draft candidates follow in [`claude_prestage_candidates`].
+///
+/// Ordering (why this equals the uploads it replaces):
+/// * Everything in the MTP cycle — the previous cycle's verify, rollback and
+///   accepted-row refresh (which reads trunk_pbs.tokens / .positions through
+///   `claude_verify_pbs`), the draft steps, and this cycle's verify — is
+///   enqueued on `gpu.active_stream` (a blocking stream), and
+///   `hipStreamWriteValue32` on that stream executes in submission order with
+///   it. Every earlier reader of the two buffers is enqueued before these
+///   writes and so reads the old values; the verify's embedding / RoPE / KV
+///   write / attention kernels are enqueued after them (`pre_uploaded` skips
+///   the uploads) and read the staged values. The draft steps in between use
+///   the MTP head's own `pos_buf`, never these buffers.
+/// * The blocking readbacks of each draft step run on the null stream, which
+///   waits for the blocking active stream: they only add synchronization.
+/// * positions of rows >= n_verify (chain truncated by p_min) are written but
+///   dead: the verify reads rows < n_verify only (the old upload left stale
+///   values there instead).
+/// * Anything that does not line up at verify time (no active stream, a
+///   rejected write, a different cur_pos, candidate list or row count, a
+///   non-batched verify route) drops the staging and the verify takes the
+///   original upload path, whose blocking copies rewrite rows < n_verify after
+///   all earlier stream work (including any staged writes) has completed.
+fn claude_prestage_begin(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    max_n: usize,
+) {
+    state.claude_prestage = None;
+    if !claude_verify_prestage_enabled()
+        || gpu.active_stream.is_none()
+        || max_n + 1 > state.trunk_pbs.max_batch
+    {
+        return;
+    }
+    for i in 0..=max_n {
+        if !claude_stream_write_i32(gpu, &state.trunk_pbs.positions, i, (cur_pos + i) as i32) {
+            return;
+        }
+    }
+    if !claude_stream_write_i32(gpu, &state.trunk_pbs.tokens, 0, last_committed as i32) {
+        return;
+    }
+    state.claude_prestage = Some(ClaudePrestage {
+        cur_pos,
+        positions: max_n + 1,
+        tokens: vec![last_committed],
+    });
+}
+
+/// claude item 6: stage `trunk_pbs.tokens[1 + j] = candidates[j]` for the draft
+/// candidates read back since the last call (stream-ordered after that draft
+/// step's kernels, see [`claude_prestage_begin`]).
+fn claude_prestage_candidates(gpu: &mut Gpu, state: &mut MtpSpecState, candidates: &[u32]) {
+    let Some(mut p) = state.claude_prestage.take() else {
+        return;
+    };
+    while p.tokens.len() < candidates.len() + 1 {
+        let i = p.tokens.len();
+        if i >= p.positions
+            || !claude_stream_write_i32(gpu, &state.trunk_pbs.tokens, i, candidates[i - 1] as i32)
+        {
+            return; // staging dropped: the verify uploads as before
+        }
+        p.tokens.push(candidates[i - 1]);
+    }
+    state.claude_prestage = Some(p);
+}
+
+/// claude item 6: `prefill_batch_pbs_eligible` for the verify, memoized per
+/// row count (its inputs — trunk weights, config, arch, the dense MoE flag and
+/// the process configuration it reads — are fixed for this state).
+/// `CLAUDE_VERIFY_PRESTAGE=0` evaluates it every cycle as before.
+fn claude_pbs_eligible_cached(
+    state: &mut MtpSpecState,
+    weights: &Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    dn_state: &qwen35::DeltaNetState,
+    n: usize,
+    arch: &str,
+) -> bool {
+    if !claude_verify_prestage_enabled() {
+        return qwen35::prefill_batch_pbs_eligible(weights, config, dn_state, n, arch, true);
+    }
+    if state.claude_eligible_cache.len() <= n {
+        state.claude_eligible_cache.resize(n + 1, None);
+    }
+    *state.claude_eligible_cache[n].get_or_insert_with(|| {
+        qwen35::prefill_batch_pbs_eligible(weights, config, dn_state, n, arch, true)
+    })
+}
+
 pub fn spec_step_mtp_compressed_serial_with_k(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -3341,8 +3538,17 @@ pub fn spec_step_mtp_compressed_serial_with_k(
         }
     }
 
+    // claude item 6 (CLAUDE_VERIFY_PRESTAGE): stage the verify's positions and
+    // first token now, stream-ordered behind the previous cycle's work.
+    if !proposal_graph_ran && !use_device_token_chain {
+        claude_prestage_begin(gpu, state, cur_pos, last_committed, max_n);
+    } else {
+        state.claude_prestage = None;
+    }
     if !proposal_graph_ran {
         for k in 0..max_n {
+            // claude item 6: the candidate read back by step k-1.
+            claude_prestage_candidates(gpu, state, &candidates);
             let next_tok = if use_device_token_chain {
                 0
             } else if k == 0 {
@@ -3368,9 +3574,24 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             // block_only + rmsnorm + small GEMV against lm_head_draft in one
             // call. In full-vocab mode we run block_only here and do the
             // rmsnorm + trunk-lm_head GEMV manually below.
+            //
+            // claude C4a (CLAUDE_DRAFT_CLEANUP): the block writes this step's
+            // post-FFN hidden straight into row k of mtp_t_outs (read only by
+            // step k+1 as prev_hidden, and always rewritten by step k before
+            // that read), dropping the t_mtp_out -> row copy below.
+            // `claude_in_row` says where the hidden actually is.
+            let claude_out_row = if use_full_vocab
+                && k + 1 < max_n
+                && mtp_head::claude_draft_cleanup_enabled()
+            {
+                Some(state.mtp_t_outs.sub_offset(k * dim, dim))
+            } else {
+                None
+            };
+            let mut claude_in_row = false;
             if use_full_vocab {
                 if k == 0 {
-                    mtp_head::mtp_head_forward_block_only_xfer(
+                    claude_in_row = mtp_head::mtp_head_forward_block_only_xfer_out(
                         gpu,
                         head,
                         &state.mtp_scratch,
@@ -3381,10 +3602,11 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         cur_pos + k,
                         trunk_weights,
                         claude_async_draft,
+                        claude_out_row.as_ref(),
                     )?;
                 } else {
                     let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_block_only_xfer(
+                    claude_in_row = mtp_head::mtp_head_forward_block_only_xfer_out(
                         gpu,
                         head,
                         &state.mtp_scratch,
@@ -3395,14 +3617,19 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         cur_pos + k,
                         trunk_weights,
                         claude_async_draft,
+                        claude_out_row.as_ref(),
                     )?;
                 }
+                let claude_hidden: &GpuTensor = match claude_out_row.as_ref() {
+                    Some(row) if claude_in_row => row,
+                    _ => &state.mtp_scratch.t_mtp_out,
+                };
                 // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
                 // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
                 // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
                 // trunk's output dtype.
                 gpu.rmsnorm_f32(
-                    &state.mtp_scratch.t_mtp_out,
+                    claude_hidden,
                     &head.weights.shared_head_norm,
                     &state.mtp_scratch.tmp,
                     head.config.rms_norm_eps,
@@ -3700,7 +3927,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 candidates.push(token_id);
             }
 
-            if k + 1 < max_n {
+            if k + 1 < max_n && !claude_in_row {
                 gpu.memcpy_dtod_at_auto(
                     &state.mtp_t_outs.buf,
                     k * dim_bytes,
@@ -3736,6 +3963,8 @@ pub fn spec_step_mtp_compressed_serial_with_k(
     // points stay byte-identical on the verify side. Sampled head path
     // stays host-driven via mtp_sampled_accept; greedy head path may use
     // the device-chain GPU accept when enabled.
+    // claude item 6: the last candidate (the loop ends or breaks after its readback).
+    claude_prestage_candidates(gpu, state, &candidates);
     claude_mark(gpu, Some(0))?;
     let result = mtp_shared_verify_accept_rollback(
         gpu,

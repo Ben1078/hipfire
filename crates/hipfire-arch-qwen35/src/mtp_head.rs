@@ -1538,6 +1538,43 @@ pub fn mtp_head_forward_block_only_xfer(
     trunk_weights: &Qwen35Weights,
     stream_pos: bool,
 ) -> HipResult<()> {
+    mtp_head_forward_block_only_xfer_out(
+        gpu,
+        head,
+        scratch,
+        kv,
+        next_token,
+        prev_hidden,
+        next_token_embed,
+        pos,
+        trunk_weights,
+        stream_pos,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// claude C4a (`CLAUDE_DRAFT_CLEANUP`): [`mtp_head_forward_block_only_xfer`]
+/// that may produce the post-FFN hidden directly in `out` (the caller's
+/// per-step row) instead of `scratch.t_mtp_out`, which removes the
+/// `ffn_out -> t_mtp_out -> caller row` copies. Returns `true` iff the hidden
+/// was written to `out` (`scratch.t_mtp_out` is then not written); `false`
+/// means it is in `scratch.t_mtp_out` exactly as before (`out` is `None`, the
+/// cleanup is switched off, or the head has a MoE FFN).
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_block_only_xfer_out(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    next_token_embed: Option<&GpuTensor>,
+    pos: usize,
+    trunk_weights: &Qwen35Weights,
+    stream_pos: bool,
+    out: Option<&GpuTensor>,
+) -> HipResult<bool> {
     let cfg = &head.config;
     let n_embd = cfg.n_embd;
 
@@ -1586,7 +1623,8 @@ pub fn mtp_head_forward_block_only_xfer(
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
     }
 
-    mtp_head_forward_block_only_with_pos_buf(
+    let opts = ClaudeDraftOpts::from_env(gpu);
+    claude_mtp_block_forward(
         gpu,
         head,
         scratch,
@@ -1598,6 +1636,8 @@ pub fn mtp_head_forward_block_only_xfer(
         pos,
         pos + 1,
         trunk_weights,
+        out,
+        opts,
     )
 }
 
@@ -1623,6 +1663,79 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     seq_len_hint: usize,
     trunk_weights: &Qwen35Weights,
 ) -> HipResult<()> {
+    let opts = ClaudeDraftOpts::from_env(gpu);
+    claude_mtp_block_forward(
+        gpu,
+        head,
+        scratch,
+        kv,
+        next_token,
+        prev_hidden,
+        next_token_embed,
+        pos_buf,
+        pos,
+        seq_len_hint,
+        trunk_weights,
+        None,
+        opts,
+    )
+    .map(|_| ())
+}
+
+/// claude C4a `CLAUDE_DRAFT_CLEANUP` (default on; `=0` restores the old
+/// draft-step launches): see [`ClaudeDraftOpts::cleanup`].
+pub fn claude_draft_cleanup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_DRAFT_CLEANUP").as_deref() != Ok("0"))
+}
+
+/// claude: byte-exact launch reductions of the single-row draft step,
+/// resolved from the environment by the public entry points (explicit so the
+/// in-crate A/B test can run both sides in one process).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaudeDraftOpts {
+    /// C3 `CLAUDE_FA_GATE_ROTATE_FUSE`: sigmoid gate + mq_rotate_x of the wo
+    /// input as one launch (`claude_sigmoid_rotate_x`).
+    pub gate_rotate: bool,
+    /// C4a `CLAUDE_DRAFT_CLEANUP` (dense FFN heads): rotate the shared x once
+    /// for wq/wk/wv and for gate/up; keep the residual stream in the output
+    /// buffer (no `residual <- cur` copy, no `ffn_out -> t_mtp_out` copy); fold
+    /// the two residual adds into the residual GEMV where that kernel is
+    /// bit-identical (`claude_residual_gemv_exact`), else add in place.
+    pub cleanup: bool,
+}
+
+impl ClaudeDraftOpts {
+    #[allow(dead_code)] // the in-crate A/B test baseline
+    pub(crate) const OFF: Self = Self { gate_rotate: false, cleanup: false };
+
+    pub(crate) fn from_env(gpu: &Gpu) -> Self {
+        Self {
+            gate_rotate: gpu.claude_fa_gate_rotate_fuse_enabled(),
+            cleanup: gpu.arch_caps.is_gfx1100() && claude_draft_cleanup_enabled(),
+        }
+    }
+}
+
+/// The draft block body shared by the public entry points. Returns `true`
+/// iff the post-FFN hidden was written to `out` (see
+/// [`mtp_head_forward_block_only_xfer_out`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn claude_mtp_block_forward(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    next_token_embed: Option<&GpuTensor>,
+    pos_buf: &DeviceBuffer,
+    pos: usize,
+    seq_len_hint: usize,
+    trunk_weights: &Qwen35Weights,
+    out: Option<&GpuTensor>,
+    opts: ClaudeDraftOpts,
+) -> HipResult<bool> {
     let cfg = &head.config;
     let w = &head.weights;
     let n_embd = cfg.n_embd;
@@ -1638,6 +1751,21 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={}",
         kv.max_seq,
     );
+
+    // claude C4a: residual-stream buffer. With the cleanup, eh_proj writes
+    // straight into the buffer that ends up holding the post-FFN hidden
+    // (`out`, else `t_mtp_out`), both residual adds accumulate into it in
+    // place, and nothing is copied at the end. It is only ever written after
+    // `prev_hidden` / `next_token_embed` have been read (h_norm, tok_embd), so
+    // a caller that feeds the previous step's output back in stays correct.
+    let cleanup = opts.cleanup && matches!(w.ffn, Qwen35MtpFfnWeights::Dense(_));
+    let stream: &GpuTensor = if cleanup {
+        let s = out.unwrap_or(&scratch.t_mtp_out);
+        assert!(s.numel() >= n_embd, "claude draft: out buffer too small");
+        s
+    } else {
+        &scratch.cur
+    };
 
     // ── 1. Token embedding (table lookup OR caller-supplied override) ────
     let dim_bytes = n_embd * 4;
@@ -1673,19 +1801,44 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         0,
         dim_bytes,
     )?;
-    weight_gemv(gpu, &w.eh_proj, &scratch.concat, &scratch.cur)?;
+    weight_gemv(gpu, &w.eh_proj, &scratch.concat, stream)?;
 
     // Save inpSA for the attention residual (cur is about to be norm'd
-    // out-of-place into scratch.tmp).
-    gpu.memcpy_dtod_at_auto(&scratch.residual.buf, 0, &scratch.cur.buf, 0, dim_bytes)?;
+    // out-of-place into scratch.tmp). claude C4a: not needed, `stream` itself
+    // is not modified until the attention residual add.
+    if !cleanup {
+        gpu.memcpy_dtod_at_auto(&scratch.residual.buf, 0, &scratch.cur.buf, 0, dim_bytes)?;
+    }
 
     // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
-    gpu.rmsnorm_f32(&scratch.cur, &w.attn_norm, &scratch.tmp, cfg.rms_norm_eps)?;
+    gpu.rmsnorm_f32(stream, &w.attn_norm, &scratch.tmp, cfg.rms_norm_eps)?;
+
+    // claude C4a: wq/wk/wv all read `tmp`; weight_gemv re-rotated it three
+    // times into the same mq_x_rot scratch. Rotate once (same kernel, same
+    // input) and issue the three prerotated GEMVs weight_gemv would have
+    // issued. Nothing between them writes `tmp` or mq_x_rot (deinterleave and
+    // q_norm touch q_full/q/gate only).
+    let qkv_rot = cleanup
+        && claude_draft_rotate_fusable(gpu, &w.wq)
+        && claude_draft_rotate_fusable(gpu, &w.wk)
+        && claude_draft_rotate_fusable(gpu, &w.wv)
+        && w.wk.k == w.wq.k
+        && w.wv.k == w.wq.k;
+    let xr_qkv = if qkv_rot {
+        let xr = claude_mq_x_rot(gpu)?;
+        rotate_x_mq_for(gpu, &w.wq, &scratch.tmp, &xr, w.wq.k)?;
+        Some(xr)
+    } else {
+        None
+    };
 
     // Qwen3.5 gated-Q: wq emits 2 * head_dim * n_head, deinterleaved into
     // Q (head-major first half) and gate (second half) per-head. Mirror
     // qwen35.rs:2402-2414.
-    weight_gemv(gpu, &w.wq, &scratch.tmp, &scratch.q_full)?;
+    match xr_qkv.as_ref() {
+        Some(xr) => llama::weight_gemv_prerotated(gpu, &w.wq, &scratch.tmp, Some(xr), &scratch.q_full)?,
+        None => weight_gemv(gpu, &w.wq, &scratch.tmp, &scratch.q_full)?,
+    }
     gpu.deinterleave_f32(
         &scratch.q_full,
         &scratch.q,
@@ -1702,8 +1855,16 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         cfg.rms_norm_eps,
     )?;
 
-    weight_gemv(gpu, &w.wk, &scratch.tmp, &scratch.k)?;
-    weight_gemv(gpu, &w.wv, &scratch.tmp, &scratch.v)?;
+    match xr_qkv.as_ref() {
+        Some(xr) => {
+            llama::weight_gemv_prerotated(gpu, &w.wk, &scratch.tmp, Some(xr), &scratch.k)?;
+            llama::weight_gemv_prerotated(gpu, &w.wv, &scratch.tmp, Some(xr), &scratch.v)?;
+        }
+        None => {
+            weight_gemv(gpu, &w.wk, &scratch.tmp, &scratch.k)?;
+            weight_gemv(gpu, &w.wv, &scratch.tmp, &scratch.v)?;
+        }
+    }
     gpu.rmsnorm_batched(
         &scratch.k,
         &w.attn_k_norm,
@@ -1789,12 +1950,47 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     // ── 8. Apply gate (sigmoid(gate) * attn_out, in-place on attn_out) ───
-    gpu.sigmoid_mul_f32(&scratch.attn_out, &scratch.gate)?;
-
     // ── 9. Output projection + residual ──────────────────────────────────
-    weight_gemv(gpu, &w.wo, &scratch.attn_out, &scratch.o)?;
-    gpu.add_inplace_f32(&scratch.o, &scratch.residual)?;
-    // scratch.o now holds (attn_out @ wo + inpSA); this is the FFN residual base.
+    // claude C3 (CLAUDE_FA_GATE_ROTATE_FUSE): the gate and weight_gemv's
+    // mq_rotate_x of attn_out run as ONE launch (claude_sigmoid_rotate_x:
+    // sigmoid_mul_f32 + mq_rotate_x statements, bit-exact, attn_out still
+    // written in place) into the same mq_x_rot scratch, then the same
+    // GEMV weight_gemv would have dispatched on it.
+    // claude C4a: with the cleanup, `o = wo·attn; o += inpSA` becomes
+    // `stream += wo·attn` (stream holds inpSA): the residual GEMV where it is
+    // the same accumulation (claude_residual_gemv_exact), else the plain GEMV
+    // into `o` plus an in-place add into `stream`. inpSA + acc == acc + inpSA
+    // (IEEE addition commutes), so `stream` ends up bit-equal to the old `o`.
+    let gate_rot = opts.gate_rotate
+        && claude_draft_rotate_fusable(gpu, &w.wo)
+        && scratch.attn_out.numel() == w.wo.k;
+    let wo_res = cleanup && claude_residual_gemv_exact(gpu, &w.wo);
+    if gate_rot {
+        let xr = claude_mq_x_rot(gpu)?;
+        gpu.claude_sigmoid_rotate_batched(&scratch.attn_out, &scratch.gate, None, &xr, None, w.wo.k, 1)?;
+        if wo_res {
+            claude_gemv_residual_prerotated(gpu, &w.wo, &scratch.attn_out, &xr, stream)?;
+        } else {
+            llama::weight_gemv_prerotated(gpu, &w.wo, &scratch.attn_out, Some(&xr), &scratch.o)?;
+        }
+    } else {
+        gpu.sigmoid_mul_f32(&scratch.attn_out, &scratch.gate)?;
+        if wo_res {
+            llama::weight_gemv_residual(gpu, &w.wo, &scratch.attn_out, stream)?;
+        } else {
+            weight_gemv(gpu, &w.wo, &scratch.attn_out, &scratch.o)?;
+        }
+    }
+    let ffn_base: &GpuTensor = if cleanup {
+        if !wo_res {
+            gpu.add_inplace_f32(stream, &scratch.o)?;
+        }
+        stream
+    } else {
+        gpu.add_inplace_f32(&scratch.o, &scratch.residual)?;
+        &scratch.o
+    };
+    // ffn_base now holds (attn_out @ wo + inpSA); this is the FFN residual base.
 
     // ── 10. POST-attn norm + SwiGLU FFN + residual ───────────────────────
     //
@@ -1804,23 +2000,50 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     // "attn_post_norm" name reflecting its source position in the .mtp
     // metadata file).
     gpu.rmsnorm_f32(
-        &scratch.o,
+        ffn_base,
         &w.attn_post_norm,
         &scratch.tmp,
         cfg.rms_norm_eps,
     )?;
     match &w.ffn {
         Qwen35MtpFfnWeights::Dense(ffn) => {
-            weight_gemv(gpu, &ffn.gate, &scratch.tmp, &scratch.gate_ffn)?;
-            weight_gemv(gpu, &ffn.up, &scratch.tmp, &scratch.up)?;
+            // claude C4a: gate and up read the same `tmp`: rotate once.
+            if cleanup
+                && claude_draft_rotate_fusable(gpu, &ffn.gate)
+                && claude_draft_rotate_fusable(gpu, &ffn.up)
+                && ffn.up.k == ffn.gate.k
+            {
+                let xr = claude_mq_x_rot(gpu)?;
+                rotate_x_mq_for(gpu, &ffn.gate, &scratch.tmp, &xr, ffn.gate.k)?;
+                llama::weight_gemv_prerotated(gpu, &ffn.gate, &scratch.tmp, Some(&xr), &scratch.gate_ffn)?;
+                llama::weight_gemv_prerotated(gpu, &ffn.up, &scratch.tmp, Some(&xr), &scratch.up)?;
+            } else {
+                weight_gemv(gpu, &ffn.gate, &scratch.tmp, &scratch.gate_ffn)?;
+                weight_gemv(gpu, &ffn.up, &scratch.tmp, &scratch.up)?;
+            }
             gpu.silu_mul_f32(&scratch.gate_ffn, &scratch.up, &scratch.ffn_hidden)?;
-            weight_gemv(gpu, &ffn.down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-            gpu.add_inplace_f32(&scratch.ffn_out, &scratch.o)?;
+            if cleanup {
+                // stream (= o) += down·h, bit-equal to the old
+                // `ffn_out = down·h; ffn_out += o`.
+                if claude_residual_gemv_exact(gpu, &ffn.down) {
+                    llama::weight_gemv_residual(gpu, &ffn.down, &scratch.ffn_hidden, stream)?;
+                } else {
+                    weight_gemv(gpu, &ffn.down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+                    gpu.add_inplace_f32(stream, &scratch.ffn_out)?;
+                }
+            } else {
+                weight_gemv(gpu, &ffn.down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+                gpu.add_inplace_f32(&scratch.ffn_out, &scratch.o)?;
+            }
         }
         Qwen35MtpFfnWeights::Moe(ffn) => {
             gpu.memcpy_dtod_at_auto(&scratch.ffn_out.buf, 0, &scratch.o.buf, 0, dim_bytes)?;
             mtp_moe_ffn_decode(gpu, ffn, &scratch.tmp, &scratch.ffn_out, cfg, scratch)?;
         }
+    }
+    if cleanup {
+        // The post-FFN hidden is already in `stream` (= `out` or t_mtp_out).
+        return Ok(out.is_some());
     }
     // scratch.ffn_out now holds the post-FFN, pre-LM-head-norm hidden.
 
@@ -1834,7 +2057,103 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         dim_bytes,
     )?;
 
-    Ok(())
+    Ok(false)
+}
+
+/// claude C3 / C4a: whether `weight_gemv(w, x)` takes its generic FWHT arm
+/// (`ensure_mq_signs` + non-AWQ `rotate_x_mq_for` -> `mq_rotate_x` into the
+/// shared `mq_x_rot` scratch + `GemvVariant::Prerotated`) on gfx1100, so the
+/// rotate can be produced by an equivalent kernel (or once for several
+/// weights) and the GEMV issued through `weight_gemv_prerotated`.
+fn claude_draft_rotate_fusable(gpu: &Gpu, w: &WeightTensor) -> bool {
+    gpu.arch_caps.is_gfx1100()
+        && w.awq_scale.is_none()
+        && w.k % 256 == 0
+        && w.k <= 32768
+        && hipfire_dispatch::types::dtype_needs_rotation(w.gpu_dtype)
+        && !matches!(
+            w.gpu_dtype,
+            DType::MQ8G256 | DType::MQ4G128 | DType::ParoQ4G128
+        )
+}
+
+/// claude C4a: `y += W·x` through [`llama::weight_gemv_residual`] is
+/// bit-identical to `t = W·x` ([`weight_gemv`]) followed by an
+/// `add_inplace_f32` of `t` and `y` (either order): on gfx1100 MQ4G256 the
+/// plain prerotated GEMV (`gemv_hfq4g256.gfx1100.hip`) and the residual one
+/// (`gemv_hfq4g256_residual.gfx1100.hip`, with or without the stage-x32
+/// loads) evaluate the same 4-accumulator FMA expression per group, the same
+/// `(acc0 + acc1) + (acc2 + acc3)` combine and `__shfl_down` tree, and end
+/// with `y = acc` vs `y = y + acc` (IEEE addition commutes). Admitted only
+/// for the single-row default kernels (no `HIPFIRE_GEMV_ROWS` multirow, no
+/// `HIPFIRE_RESIDUAL_CPOL` probe, not the K=2048 specializations); the
+/// equivalence is checked by `test_claude_draft_residual_gemv`.
+fn claude_residual_gemv_exact(gpu: &Gpu, w: &WeightTensor) -> bool {
+    static CPOL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cpol = *CPOL.get_or_init(|| hipfire_config::developer_var("HIPFIRE_RESIDUAL_CPOL").is_ok());
+    w.gpu_dtype == DType::MQ4G256
+        && gpu.arch_caps.is_gfx1100()
+        && gpu.flags.gemv_rows.unwrap_or(1) == 1
+        && w.awq_scale.is_none()
+        && w.k % 256 == 0
+        && w.k != 2048
+        && !cpol
+}
+
+/// claude C4a: [`llama::weight_gemv_residual`] for an input the caller has
+/// already rotated into `x_rot` (the `claude_sigmoid_rotate_x` output): the
+/// same `GemvVariant::WithResidual` dispatch without the internal rotate.
+/// `x` only feeds the calibration tap, as in `weight_gemv_residual`.
+fn claude_gemv_residual_prerotated(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    y: &GpuTensor,
+) -> HipResult<()> {
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
+    use hipfire_dispatch::types::GemvVariant;
+    let gemv = llama::gemv_family();
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    let wr = WeightRef {
+        buf: &w.buf,
+        dtype: w.gpu_dtype,
+        m: w.m,
+        k: w.k,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
+    };
+    gemv.run(
+        &ctx,
+        gpu,
+        &GemvParams {
+            w: &wr,
+            x: x_rot,
+            y,
+            variant: GemvVariant::WithResidual,
+            residual: None,
+            gate: None,
+            up: None,
+        },
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+}
+
+/// claude: the shared `mq_x_rot` scratch as a tensor view (the `xr` of
+/// `weight_gemv`'s generic FWHT arm).
+fn claude_mq_x_rot(gpu: &mut Gpu) -> HipResult<GpuTensor> {
+    gpu.ensure_mq_signs()?;
+    let t = gpu.scratch.mq_x_rot.as_ref().unwrap();
+    Ok(GpuTensor {
+        buf: unsafe { t.buf.alias() },
+        shape: vec![t.buf.size() / 4],
+        dtype: DType::F32,
+    })
 }
 
 fn mtp_moe_ffn_decode(
@@ -3049,5 +3368,403 @@ mod claude_fill_dump_tests {
         }
         std::fs::write(&out, &dump).unwrap();
         eprintln!("[claude-fill-dump] wrote {} bytes to {out}", dump.len());
+    }
+}
+
+
+#[cfg(test)]
+mod claude_draft_ab_tests {
+    //! claude C1 / C3 / C4a: in-process A/B of the single-row MTP draft step.
+    //!
+    //! Builds a synthetic dense MTP head (random MQ4G256 weights; the
+    //! Qwen3.8-27B draft shapes, and a small shape with tail groups and a
+    //! K=2048 wo that takes the non-residual fallback) plus a Q8_0 embedding
+    //! table, and runs a 6-step draft chain the way
+    //! `spec_step_mtp_compressed_serial_with_k` does (step k > 0 feeds row k-1
+    //! of a t_outs buffer back as prev_hidden; with the cleanup the hidden of
+    //! step k lands in row k directly, otherwise t_mtp_out is copied there).
+    //! Every `ClaudeDraftOpts` combination is compared with `OFF` bit for bit:
+    //! per-step post-FFN hidden, q (post-RoPE) / k / v, and the whole K and V
+    //! cache buffers. A checksum of the OFF run is printed so a second process
+    //! with `CLAUDE_KV_PAIR=0` can confirm the pair KV write end to end.
+    //!
+    //! GPU, ~240 MB; run explicitly:
+    //!   cargo test --release -p hipfire-arch-qwen35 --lib claude_draft_ab -- --ignored --nocapture
+    use super::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as u32
+        }
+        fn unit(&mut self) -> f32 {
+            self.next() as f32 / 2_147_483_648.0
+        }
+        fn sym(&mut self, a: f32) -> f32 {
+            (self.unit() * 2.0 - 1.0) * a
+        }
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + self.unit() * (hi - lo)
+        }
+    }
+
+    fn up(gpu: &mut Gpu, v: &[f32]) -> GpuTensor {
+        gpu.upload_f32(v, &[v.len()]).expect("upload")
+    }
+
+    /// MQ4G256 (= HFQ4-G256 layout, FWHT-domain) rows: per 256-group
+    /// [f32 scale][f32 zero][128 B nibbles].
+    fn mq4(gpu: &mut Gpu, m: usize, k: usize, r: &mut Lcg) -> WeightTensor {
+        let gpr = k / 256;
+        let mut bytes = Vec::with_capacity(m * gpr * 136);
+        for _ in 0..m * gpr {
+            let sc = r.range(0.002, 0.02);
+            let zp = -7.5 * sc + r.sym(0.01);
+            bytes.extend_from_slice(&sc.to_le_bytes());
+            bytes.extend_from_slice(&zp.to_le_bytes());
+            for _ in 0..128 {
+                bytes.push(r.next() as u8);
+            }
+        }
+        let buf = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload weight");
+        WeightTensor {
+            buf,
+            gpu_dtype: DType::MQ4G256,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn norm_w(gpu: &mut Gpu, n: usize, r: &mut Lcg) -> GpuTensor {
+        let v: Vec<f32> = (0..n).map(|_| r.range(0.5, 1.5)).collect();
+        up(gpu, &v)
+    }
+
+    fn config(n_embd: usize, n_head: usize, n_head_kv: usize, n_ff: usize) -> Qwen35MtpHeadConfig {
+        Qwen35MtpHeadConfig {
+            n_embd,
+            n_head,
+            n_head_kv,
+            head_dim: 256,
+            n_ff,
+            ffn_kind: Qwen35MtpFfnKind::Dense,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            vocab_size: 64,
+            rope_theta: 10_000_000.0,
+            n_rot: 64,
+            rms_norm_eps: 1e-6,
+            max_seq: 64,
+            tie_word_embeddings: false,
+        }
+    }
+
+    fn synth_head(gpu: &mut Gpu, cfg: &Qwen35MtpHeadConfig, r: &mut Lcg) -> Qwen35MtpHead {
+        let d = cfg.n_embd;
+        let qd = cfg.head_dim * cfg.n_head;
+        let kvd = cfg.head_dim * cfg.n_head_kv;
+        let weights = Qwen35MtpHeadWeights {
+            shared_head_norm: norm_w(gpu, d, r),
+            enorm: norm_w(gpu, d, r),
+            hnorm: norm_w(gpu, d, r),
+            attn_norm: norm_w(gpu, d, r),
+            attn_post_norm: norm_w(gpu, d, r),
+            attn_q_norm: norm_w(gpu, cfg.head_dim, r),
+            attn_k_norm: norm_w(gpu, cfg.head_dim, r),
+            eh_proj: mq4(gpu, d, 2 * d, r),
+            wq: mq4(gpu, 2 * qd, d, r),
+            wk: mq4(gpu, kvd, d, r),
+            wv: mq4(gpu, kvd, d, r),
+            wo: mq4(gpu, d, qd, r),
+            ffn: Qwen35MtpFfnWeights::Dense(Qwen35MtpDenseFfnWeights {
+                gate: mq4(gpu, cfg.n_ff, d, r),
+                up: mq4(gpu, cfg.n_ff, d, r),
+                down: mq4(gpu, d, cfg.n_ff, r),
+            }),
+            lm_head_draft: None,
+            lm_head_draft_vocab_map: None,
+            lm_head_draft_vocab_map_gpu: None,
+            compressed_vocab_size: None,
+        };
+        Qwen35MtpHead { config: cfg.clone(), weights }
+    }
+
+    /// Trunk stand-in: only `token_embd` (Q8_0) is read by the draft block.
+    fn synth_trunk(gpu: &mut Gpu, vocab: usize, dim: usize, r: &mut Lcg) -> Qwen35Weights {
+        let mut bytes = Vec::with_capacity(vocab * dim / 32 * 34);
+        for _ in 0..vocab * dim / 32 {
+            let s = hipfire_runtime::llama::f32_to_f16(r.range(0.005, 0.03));
+            bytes.extend_from_slice(&s.to_le_bytes());
+            for _ in 0..32 {
+                bytes.push(r.next() as u8);
+            }
+        }
+        let token_embd = gpu.upload_raw(&bytes, &[bytes.len()]).expect("embd");
+        let output_norm = up(gpu, &vec![1.0f32; dim]);
+        let output = mq4(gpu, 256, dim, r);
+        Qwen35Weights {
+            token_embd,
+            embd_format: EmbeddingFormat::Q8_0,
+            output_norm,
+            output,
+            layers: Vec::new(),
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            ep_shard: None,
+        }
+    }
+
+    fn f32_bits(gpu: &Gpu, t: &GpuTensor) -> Vec<u32> {
+        gpu.download_f32(t).expect("dl").iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// The tensor's logical bytes (`numel * 4`): the pool may round the
+    /// allocation up, and that tail is not part of the cache.
+    fn raw(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
+        let mut v = vec![0u8; t.buf.size()];
+        gpu.hip.memcpy_dtoh(&mut v, &t.buf).expect("dtoh");
+        v.truncate(t.numel() * 4);
+        v
+    }
+
+    struct ChainOut {
+        hidden: Vec<Vec<u32>>,
+        qkv: Vec<Vec<u32>>,
+        kcache: Vec<u8>,
+        vcache: Vec<u8>,
+        in_row: usize,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_chain(
+        gpu: &mut Gpu,
+        head: &Qwen35MtpHead,
+        trunk: &Qwen35Weights,
+        opts: ClaudeDraftOpts,
+        tokens: &[u32],
+        prev0: &GpuTensor,
+        pos0: usize,
+    ) -> ChainOut {
+        let cfg = &head.config;
+        let d = cfg.n_embd;
+        let steps = tokens.len();
+        let scratch = Qwen35MtpHeadScratch::new(gpu, cfg).expect("scratch");
+        let mut kv = Qwen35MtpHeadKvCache::new(gpu, cfg).expect("kv");
+        kv.reset(gpu).expect("kv reset");
+        let t_outs = gpu.zeros(&[steps * d], DType::F32).expect("t_outs");
+        let mut out = ChainOut { hidden: vec![], qkv: vec![], kcache: vec![], vcache: vec![], in_row: 0 };
+        for k in 0..steps {
+            let pos = pos0 + k;
+            gpu.hip
+                .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())
+                .expect("pos");
+            let prev_row = (k > 0).then(|| t_outs.sub_offset((k - 1) * d, d));
+            let prev: &GpuTensor = prev_row.as_ref().unwrap_or(prev0);
+            let out_row = (opts.cleanup && k + 1 < steps).then(|| t_outs.sub_offset(k * d, d));
+            let in_row = claude_mtp_block_forward(
+                gpu,
+                head,
+                &scratch,
+                &mut kv,
+                tokens[k],
+                prev,
+                None,
+                &scratch.pos_buf,
+                pos,
+                pos + 1,
+                trunk,
+                out_row.as_ref(),
+                opts,
+            )
+            .expect("draft block");
+            if k + 1 < steps && !in_row {
+                gpu.memcpy_dtod_at_auto(&t_outs.buf, k * d * 4, &scratch.t_mtp_out.buf, 0, d * 4)
+                    .expect("t_outs copy");
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            let h: &GpuTensor = match out_row.as_ref() {
+                Some(row) if in_row => row,
+                _ => &scratch.t_mtp_out,
+            };
+            out.in_row += in_row as usize;
+            out.hidden.push(f32_bits(gpu, h));
+            let mut qkv = f32_bits(gpu, &scratch.q);
+            qkv.extend(f32_bits(gpu, &scratch.k));
+            qkv.extend(f32_bits(gpu, &scratch.v));
+            qkv.extend(f32_bits(gpu, &scratch.attn_out));
+            out.qkv.push(qkv);
+        }
+        out.kcache = raw(gpu, &kv.inner.k_gpu[0]);
+        out.vcache = raw(gpu, &kv.inner.v_gpu[0]);
+        if opts == ClaudeDraftOpts::OFF {
+            println!(
+                "[claude-draft-ab] K cache: {} logical bytes ({} allocated), {} per position",
+                out.kcache.len(),
+                kv.inner.k_gpu[0].buf.size(),
+                cfg.n_head_kv * (cfg.head_dim / 32) * 34
+            );
+        }
+        gpu.free_tensor(t_outs).expect("free");
+        kv.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        out
+    }
+
+    const SPIN_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void claude_bench_spin(unsigned long long ticks) {
+    const unsigned long long t0 = wall_clock64();
+    while (wall_clock64() - t0 < ticks) { __builtin_amdgcn_s_sleep(2); }
+}
+"#;
+
+    /// GPU time per draft step (us): `reps` back-to-back steps at a fixed
+    /// position, queued behind a ~4 ms spin kernel and bracketed by events on
+    /// the active stream (launch gaps included, host enqueue time excluded).
+    fn time_steps(
+        gpu: &mut Gpu,
+        head: &Qwen35MtpHead,
+        trunk: &Qwen35Weights,
+        opts: ClaudeDraftOpts,
+        prev0: &GpuTensor,
+        reps: usize,
+    ) -> f64 {
+        let cfg = &head.config;
+        let scratch = Qwen35MtpHeadScratch::new(gpu, cfg).expect("scratch");
+        let mut kv = Qwen35MtpHeadKvCache::new(gpu, cfg).expect("kv");
+        kv.reset(gpu).expect("kv reset");
+        let pos = 20usize;
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes()).expect("pos");
+        gpu.ensure_kernel_public("claude_bench_spin", SPIN_SRC, "claude_bench_spin").expect("spin");
+        let mut step = |gpu: &mut Gpu| {
+            claude_mtp_block_forward(
+                gpu, head, &scratch, &mut kv, 7, prev0, None, &scratch.pos_buf, pos, pos + 1, trunk,
+                None, opts,
+            )
+            .expect("draft step");
+        };
+        for _ in 0..3 {
+            step(gpu);
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let e0 = gpu.hip.event_create().unwrap();
+        let e1 = gpu.hip.event_create().unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_u64(4000 * 100);
+            gpu.launch_kernel_blob("claude_bench_spin", [1, 1, 1], [32, 1, 1], 0, b.as_mut_slice())
+                .unwrap();
+            gpu.hip.event_record(&e0, gpu.active_stream.as_ref()).unwrap();
+            for _ in 0..reps {
+                step(gpu);
+            }
+            gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+            gpu.hip.event_synchronize(&e1).unwrap();
+            let ms = gpu.hip.event_elapsed_ms(&e0, &e1).unwrap() as f64;
+            best = best.min(ms * 1000.0 / reps as f64);
+        }
+        gpu.hip.event_destroy(e0).unwrap();
+        gpu.hip.event_destroy(e1).unwrap();
+        kv.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        best
+    }
+
+    fn fnv(h: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+    }
+
+    #[test]
+    #[ignore = "GPU (~240 MB); run with --ignored"]
+    fn claude_draft_ab_bit_identical() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1100() {
+            eprintln!("skip: the claude draft switches are gfx1100-only");
+            return;
+        }
+        // (n_embd, n_head, n_head_kv, n_ff): Qwen3.8-27B draft head, then a
+        // small head (K=2048 wo -> non-residual fallback, 11-group down tail).
+        for &(d, nh, nkv, nff) in &[(5120usize, 24usize, 4usize, 17408usize), (1024, 8, 2, 2816)] {
+            let mut r = Lcg(0xD4A ^ ((d as u64) << 16) ^ nff as u64);
+            let cfg = config(d, nh, nkv, nff);
+            let head = synth_head(&mut gpu, &cfg, &mut r);
+            let trunk = synth_trunk(&mut gpu, cfg.vocab_size, d, &mut r);
+            let prev0_h: Vec<f32> = (0..d).map(|_| r.sym(3.0)).collect();
+            let prev0 = up(&mut gpu, &prev0_h);
+            let tokens: Vec<u32> = (0..6).map(|_| r.next() % cfg.vocab_size as u32).collect();
+            let pos0 = 3;
+
+            let base = run_chain(&mut gpu, &head, &trunk, ClaudeDraftOpts::OFF, &tokens, &prev0, pos0);
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for v in &base.hidden {
+                h = fnv(h, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+            }
+            h = fnv(fnv(h, &base.kcache), &base.vcache);
+            println!(
+                "[claude-draft-ab] d={d} nff={nff} OFF checksum {h:016x} (CLAUDE_KV_PAIR={})",
+                std::env::var("CLAUDE_KV_PAIR").unwrap_or_else(|_| "default".into())
+            );
+            let mut failed = false;
+            for opts in [
+                ClaudeDraftOpts { gate_rotate: true, cleanup: false },
+                ClaudeDraftOpts { gate_rotate: false, cleanup: true },
+                ClaudeDraftOpts { gate_rotate: true, cleanup: true },
+            ] {
+                let got = run_chain(&mut gpu, &head, &trunk, opts, &tokens, &prev0, pos0);
+                let hid_mm: usize = base
+                    .hidden
+                    .iter()
+                    .zip(&got.hidden)
+                    .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count())
+                    .sum();
+                let qkv_mm: usize = base
+                    .qkv
+                    .iter()
+                    .zip(&got.qkv)
+                    .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count())
+                    .sum();
+                let k_mm = base.kcache.iter().zip(&got.kcache).filter(|(x, y)| x != y).count();
+                let v_mm = base.vcache.iter().zip(&got.vcache).filter(|(x, y)| x != y).count();
+                let ok = hid_mm == 0 && qkv_mm == 0 && k_mm == 0 && v_mm == 0;
+                failed |= !ok;
+                println!(
+                    "[claude-draft-ab] {} d={d} nff={nff} {opts:?}: hidden_mm={hid_mm} q/k/v/attn_mm={qkv_mm} kcache_mm={k_mm} vcache_mm={v_mm} (steps written in-row: {})",
+                    if ok { "PASS" } else { "FAIL" },
+                    got.in_row
+                );
+            }
+            assert!(!failed, "claude draft A/B mismatch (d={d})");
+            if d == 5120 {
+                let reps = 20;
+                let t_off = time_steps(&mut gpu, &head, &trunk, ClaudeDraftOpts::OFF, &prev0, reps);
+                let all = ClaudeDraftOpts { gate_rotate: true, cleanup: true };
+                let t_on = time_steps(&mut gpu, &head, &trunk, all, &prev0, reps);
+                println!(
+                    "[claude-draft-ab] draft step GPU time (d={d} nff={nff}, {reps} steps queued, events): OFF {t_off:.2} us, gate_rotate+cleanup {t_on:.2} us (CLAUDE_KV_PAIR={})",
+                    std::env::var("CLAUDE_KV_PAIR").unwrap_or_else(|_| "default".into())
+                );
+            }
+            gpu.free_tensor(prev0).unwrap();
+            head.free_gpu(&mut gpu);
+            trunk.free_gpu(&mut gpu);
+        }
     }
 }
