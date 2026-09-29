@@ -20348,55 +20348,7 @@ impl Gpu {
             && k % 512 == 0
             && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
         {
-            let kname = "gemm_hfq4g256_residual_wmma_ldsstage";
-            let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC;
-            self.ensure_kernel(kname, ksrc, kname)?;
-            let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-
-            let mut a_ptr = a_raw.buf.as_ptr();
-            let mut x_ptr = x_f16_ptr;
-            let mut y_ptr = y.buf.as_ptr();
-            let mut m_val = m as i32;
-            let mut k_val = k as i32;
-            let mut bs_val = batch_size as i32;
-
-            let mut params: Vec<*mut c_void> = vec![
-                &mut a_ptr as *mut _ as *mut c_void,
-                &mut x_ptr as *mut _ as *mut c_void,
-                &mut y_ptr as *mut _ as *mut c_void,
-                &mut m_val as *mut _ as *mut c_void,
-                &mut k_val as *mut _ as *mut c_void,
-                &mut bs_val as *mut _ as *mut c_void,
-            ];
-
-            let row_tiles = (m + 15) / 16;
-            let batch_tiles = (batch_size + 15) / 16;
-
-            let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
-                + batch_size * k * 2
-                + batch_size * m * 4 * 2;
-            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
-            let result = self.launch_maybe_blob(
-                kname,
-                [row_tiles as u32, batch_tiles as u32, 1],
-                [256, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr);
-                    b.push_ptr(x_ptr);
-                    b.push_ptr(y_ptr);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b.push_i32(bs_val);
-                    b
-                },
-            );
-            if let Some(t) = timer {
-                t.finish(&self.hip);
-            }
-            return result;
+            return self.gemm_hfq4g256_residual_wmma_ldsstage(a_raw, x, y, m, k, batch_size);
         }
 
         // Shape-aware default: ksplit only pays for itself when the un-split
@@ -20471,6 +20423,27 @@ impl Gpu {
         if variant == "ksplit_det" {
             return self.gemm_hfq4g256_residual_wmma_ksplit_det(a_raw, x, y, m, k, batch_size);
         }
+        self.gemm_hfq4g256_residual_wmma_variant(variant, a_raw, x, y, m, k, batch_size)
+    }
+
+    /// Launch one named `gemm_hfq4g256_residual_wmma` K-loop variant (`k2`,
+    /// `k2x32`, `k4`, `wmma`, `wmma2`, anything else = `ksplit`) with the
+    /// `Y += W@X` contract. Body split out of
+    /// [`Self::gemm_hfq4g256_residual_wmma`] unchanged so claude's
+    /// [`Self::claude_gemm_hfq4g256_multi`] can pick a variant without
+    /// touching the shared selector or feature flags.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_residual_wmma_variant(
+        &mut self,
+        variant: &str,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
         let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant {
             "k2" => (
                 "gemm_hfq4g256_residual_wmma_k2",
@@ -20588,6 +20561,75 @@ impl Gpu {
                 us,
                 gbs
             );
+        }
+        result
+    }
+
+    /// gfx11 LDS-staged multi-wave residual WMMA (`Y += W@X`): body of the
+    /// `HIPFIRE_HFQ4G256_LDSSTAGE=1` arm of
+    /// [`Self::gemm_hfq4g256_residual_wmma`], split out unchanged. Reorders the
+    /// FP32 K accumulation; K must be a multiple of 512.
+    pub fn gemm_hfq4g256_residual_wmma_ldsstage(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % 512,
+            0,
+            "gemm_hfq4g256_residual_wmma_ldsstage: k {k} % 512"
+        );
+        let kname = "gemm_hfq4g256_residual_wmma_ldsstage";
+        let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC;
+        self.ensure_kernel(kname, ksrc, kname)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
         result
     }
@@ -21160,6 +21202,96 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        result
+    }
+
+    /// claude `CLAUDE_MTP_HEAD_GEMM`: plain `y_i = A_i · x` batched HFQ4-G256
+    /// GEMMs for weights that share one activation `x` `[batch_size x k]`
+    /// (`y_i` is `[batch_size x m_i]`), for callers that do not need the
+    /// scalar [`Self::gemm_hfq4g256`]'s byte-exact AR baseline (the MTP head's
+    /// batched MQ4 projections). The scalar kernel re-reads the activations
+    /// once per output row (~5 TFLOPS at 1024 rows); this routes to the gfx11
+    /// kernels the trunk uses for the same byte layout, paying the activation
+    /// prep (f16 convert / Q8_1 quantize) once per call:
+    ///
+    /// * `batch_size <= 2`: `gemv_hfq4g256` per row (f32 math; weight-read
+    ///   bound, beats every batched kernel on cold weights at 1-2 rows).
+    /// * `3..=16` rows, `k % 512 == 0`: LDS-staged multi-wave residual WMMA
+    ///   on a zeroed `y` (f16 activations).
+    /// * larger: residual WMMA on a zeroed `y` — `k2`, or `ksplit_det` when
+    ///   `m < 8192` (CU-starved grid) and its partials scratch stays
+    ///   <= 16 MiB (so a 1024-row prompt fill does not pin an 84 MB scratch).
+    /// * `CLAUDE_MTP_HEAD_GEMM=mmq` instead sends `batch_size >= 128` to the
+    ///   i8-WMMA MMQ set kernel (one Q8_1 quantize, ~1.7x faster than f16
+    ///   WMMA at 1024 rows, ~1e-2 relative error vs ~6e-4).
+    ///
+    /// `CLAUDE_MTP_HEAD_GEMM=0`, non-RDNA3 archs, replay recording and graph
+    /// capture keep the scalar kernel.
+    pub fn claude_gemm_hfq4g256_multi(
+        &mut self,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let mode = claude_mtp_head_gemm_mode();
+        let fast = mode != ClaudeMtpHeadGemm::Scalar
+            && batch_size >= 1
+            && k % 256 == 0
+            && self.arch_caps.has_wmma_w32()
+            && !self.graphs.capture_mode
+            && !self.replay.is_recording();
+        if !fast {
+            for &(a, y, m) in outs {
+                self.gemm_hfq4g256(a, x, y, m, k, batch_size)?;
+            }
+            return Ok(());
+        }
+        if batch_size <= 2 {
+            for &(a, y, m) in outs {
+                for b in 0..batch_size {
+                    let xr = x.sub_offset(b * k, k);
+                    let yr = y.sub_offset(b * m, m);
+                    self.gemv_hfq4g256(a, &xr, &yr, m, k)?;
+                }
+            }
+            return Ok(());
+        }
+        let rdna3_mmq = matches!(
+            self.arch.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151"
+        );
+        if mode == ClaudeMtpHeadGemm::Mmq && rdna3_mmq && batch_size >= 128 {
+            let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+            for &(a, y, m) in outs {
+                self.gemm_hfq4g256_mmq_set_prequant(a, xq, y, m, k, batch_size)?;
+            }
+            return Ok(());
+        }
+        // f16 WMMA residual kernels on a zeroed y. `x` may be a pool-recycled
+        // buffer at an address the f16 scratch still claims to hold, so force
+        // one fresh conversion (reused by every weight below) and drop the
+        // claim afterwards: the caller may free `x` and the pool hand its
+        // address to a buffer nobody converted.
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        let result = (|| -> HipResult<()> {
+            for &(a, y, m) in outs {
+                let bytes = batch_size * m * 4;
+                match self.active_stream.as_ref() {
+                    Some(stream) => self.hip.memset_async(&y.buf, 0, bytes, stream)?,
+                    None => self.hip.memset(&y.buf, 0, bytes)?,
+                }
+                if batch_size <= 16 && k % 512 == 0 {
+                    self.gemm_hfq4g256_residual_wmma_ldsstage(a, x, y, m, k, batch_size)?;
+                } else if m < 8192 && 4 * batch_size * m * 4 <= 16 << 20 {
+                    self.gemm_hfq4g256_residual_wmma_ksplit_det(a, x, y, m, k, batch_size)?;
+                } else {
+                    self.gemm_hfq4g256_residual_wmma_variant("k2", a, x, y, m, k, batch_size)?;
+                }
+            }
+            Ok(())
+        })();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         result
     }
 
@@ -42289,6 +42421,28 @@ mod lds_epi_tests {
             );
         }
     }
+}
+
+/// claude: route of [`Gpu::claude_gemm_hfq4g256_multi`] (`CLAUDE_MTP_HEAD_GEMM`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaudeMtpHeadGemm {
+    /// `=0`: the portable scalar `gemm_hfq4g256` for every batch size.
+    Scalar,
+    /// default: gemv (<= 2 rows) / f16 WMMA.
+    Wmma,
+    /// `=mmq`: as `Wmma`, but >= 128 rows take the i8-WMMA MMQ set kernel.
+    Mmq,
+}
+
+/// claude: `CLAUDE_MTP_HEAD_GEMM` (`0` scalar, `mmq`, anything else / unset =
+/// f16 WMMA), read once.
+pub fn claude_mtp_head_gemm_mode() -> ClaudeMtpHeadGemm {
+    static V: std::sync::OnceLock<ClaudeMtpHeadGemm> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("CLAUDE_MTP_HEAD_GEMM").as_deref() {
+        Ok("0") | Ok("scalar") => ClaudeMtpHeadGemm::Scalar,
+        Ok("mmq") => ClaudeMtpHeadGemm::Mmq,
+        _ => ClaudeMtpHeadGemm::Wmma,
+    })
 }
 
 /// claude: MMQ admission threshold for batched MQ4v2 projections (default 64).

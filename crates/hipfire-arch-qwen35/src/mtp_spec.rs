@@ -119,6 +119,31 @@ fn mtp_q8_verify_wmma_enabled_from_env_value(value: Option<&str>) -> bool {
     }
 }
 
+/// claude `CLAUDE_LMHEAD_Q8X`: largest MTP verify row count whose MQ4G256V2
+/// lm_head goes to `claude_q8x_project` (int8-activation GEMV, weights read
+/// once for all rows) instead of memset + the gfx1100 ldsstage residual WMMA.
+/// Unset / `1` / `on` = 4 (measured crossover: q8x 1.8x / 1.6x / 1.4x faster
+/// at 2 / 3 / 4 rows, even at 5, slower at 6..8); `2`..`8` = that cap;
+/// `0` / `off` = never (the WMMA path). 0 means disabled. Read once.
+fn claude_lmhead_q8x_max_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        claude_lmhead_q8x_max_rows_from(std::env::var("CLAUDE_LMHEAD_Q8X").ok().as_deref())
+    })
+}
+
+fn claude_lmhead_q8x_max_rows_from(value: Option<&str>) -> usize {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("1") | Some("on") | Some("true") | Some("yes") => 4,
+        Some("0") | Some("off") | Some("false") | Some("no") => 0,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (2..=8).contains(n))
+            .unwrap_or(4),
+    }
+}
+
 fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     // Default on for MTP q8 verify: the chunked dispatch only routes to gfx12
     // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
@@ -1345,14 +1370,36 @@ fn mtp_trunk_verify_lm_head(
         DType::MQ4G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, verify_hidden, &rot, w_out.k, n_verify)?;
-            gpu.gemm_mq4g256v2_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
+            // claude CLAUDE_LMHEAD_Q8X: 2..=4 verify rows (cap via the env) are
+            // weight-read bound, so the int8-activation GEMV that already serves
+            // every other small-batch verify projection streams the 675 MB
+            // lm_head once at ~720-860 GB/s instead of memset + ldsstage WMMA
+            // (~470-510 GB/s). Same `[n_verify x vocab]` row-major output
+            // (y[b * M + row]) and no memset needed (the kernel stores, not
+            // accumulates). `claude_xbatch_eligible` keeps it off under replay
+            // recording / graph capture, off gfx1100 and with CLAUDE_XBATCH=0.
+            if n_verify <= claude_lmhead_q8x_max_rows()
+                && gpu.claude_xbatch_eligible(n_verify)
+                && w_out.k % 256 == 0
+                && w_out.k <= 32768
+            {
+                gpu.claude_q8x_project(
+                    &[(&w_out.buf, logits_view, w_out.m)],
+                    &rot,
+                    w_out.k,
+                    n_verify,
+                    false,
+                )?;
+            } else {
+                gpu.gemm_mq4g256v2_batched_lmhead(
+                    &w_out.buf,
+                    &rot,
+                    logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
         }
         DType::MQ6G256V2 => {
             let rot = verify_rot.sub_offset(0, n_verify * w_out.k);
@@ -1971,7 +2018,10 @@ where
 
             gpu.hip.device_synchronize()?;
             let t_trunk = Instant::now();
-            qwen35::forward_prefill_batch(
+            // claude: only the final chunk's last-token logits are read (the
+            // caller seeds the first token from scratch.logits); earlier chunks
+            // skip that lm_head GEMV. Hidden rows are unchanged.
+            qwen35::forward_prefill_batch_last_logits(
                 gpu,
                 &target.weights,
                 &target.config,
@@ -1984,6 +2034,7 @@ where
                 Some(&chunk_hidden),
                 None,
                 None,
+                end == prompt_tokens.len(),
             )?;
             gpu.hip.device_synchronize()?;
             trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
@@ -3955,6 +4006,24 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     result.drafts_generated = drafts_generated;
     result.chain_truncated = false;
     Ok(result)
+}
+
+#[cfg(test)]
+mod claude_lmhead_q8x_tests {
+    use super::claude_lmhead_q8x_max_rows_from as f;
+
+    #[test]
+    fn lmhead_q8x_env_parses_default_off_and_caps() {
+        assert_eq!(f(None), 4);
+        assert_eq!(f(Some("1")), 4);
+        assert_eq!(f(Some("on")), 4);
+        assert_eq!(f(Some("0")), 0);
+        assert_eq!(f(Some("off")), 0);
+        assert_eq!(f(Some("2")), 2);
+        assert_eq!(f(Some("8")), 8);
+        assert_eq!(f(Some("9")), 4);
+        assert_eq!(f(Some("junk")), 4);
+    }
 }
 
 #[cfg(test)]

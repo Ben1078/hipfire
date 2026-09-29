@@ -46,7 +46,7 @@ pub use load::{
     EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };
 pub use prefill::{
-    forward_prefill_batch, forward_prefill_batch_capped,
+    forward_prefill_batch, forward_prefill_batch_capped, forward_prefill_batch_last_logits,
     forward_prefill_batch_single_chunk_captured, forward_prefill_batch_single_chunk_captured_opts,
     forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts,
     prefill_batch_pbs_eligible, prefill_max_batch, prefill_max_batch_ep, prefill_max_batch_tp,

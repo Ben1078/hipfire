@@ -2067,6 +2067,46 @@ pub fn forward_prefill_batch(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
+    forward_prefill_batch_last_logits(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        true, // legacy post-condition: scratch.logits is last-token logits
+    )
+}
+
+/// claude: [`forward_prefill_batch`] with an explicit `needs_last_token_logits`
+/// (see [`forward_prefill_batch_with_pbs_opts`]). With `per_token_hidden_out`
+/// supplied, `false` skips only the last-token lm_head (rotate + the 675 MB
+/// GEMV, ~0.75 ms); the per-token hidden rows are written exactly as before.
+/// Used by the chunked MTP prompt fill for every chunk but the last, whose
+/// `scratch.logits` the caller seeds from. `true` is byte-for-byte
+/// [`forward_prefill_batch`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_last_logits(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
     // Widened ordinary route: omit the implicit ≤512 legacy cache so a fully
     // admitted request allocates one larger owned PBS in the inner entry.
     // Explicit small ceilings keep the cache; capped/explicit-PBS callers
@@ -2077,7 +2117,7 @@ pub fn forward_prefill_batch(
         Some(_) if widen => None,
         other => other,
     };
-    forward_prefill_batch_with_pbs(
+    forward_prefill_batch_with_pbs_opts(
         gpu,
         weights,
         config,
@@ -2093,6 +2133,8 @@ pub fn forward_prefill_batch(
         pbs_for_call,
         None, // mask_override: MTP probe is the only consumer; default callers don't override
         None, // max_layer: pflash uses this; non-pflash default is full stack
+        needs_last_token_logits,
+        DflashFusionCtx::Off,
     )
 }
 

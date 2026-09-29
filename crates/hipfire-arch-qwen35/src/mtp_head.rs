@@ -93,6 +93,24 @@ pub(crate) fn claude_mtp_async() -> bool {
     })
 }
 
+/// claude `CLAUDE_MTP_FILL_SKIP_Q` (default on; `=0` restores the previous
+/// calls): a KV-only batched head forward (`kv_only = true`: the prompt fill
+/// and the accepted-row refresh) never reads Q, so it skips the wq projection
+/// (the head's largest attention GEMM, 12288 x 5120), the Q/gate deinterleave
+/// and q_norm, and RoPE rotates K alone. The K/V written to the cache are
+/// bit-identical (RoPE's K lanes do not depend on Q). Read once per process.
+pub(crate) fn claude_mtp_fill_skip_q() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        !matches!(
+            std::env::var("CLAUDE_MTP_FILL_SKIP_Q")
+                .as_deref()
+                .map(str::trim),
+            Ok("0" | "false" | "off" | "no")
+        )
+    })
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2285,12 +2303,17 @@ fn weight_gemm_batched(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::Q8_0 => gpu.gemm_q8_0_batched(&w.buf, x_batched, y_batched, w.m, w.k, n),
-        DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x_batched, y_batched, w.m, w.k, n),
+        // claude CLAUDE_MTP_HEAD_GEMM: the HFQ4-G256-byte formats go through the
+        // routed GEMM (gemv / f16 WMMA, `=mmq` i8-WMMA MMQ, `=0` the scalar
+        // `gemm_hfq4g256` they used before) instead of always the scalar kernel.
+        DType::HFQ4G256 => {
+            gpu.claude_gemm_hfq4g256_multi(&[(&w.buf, y_batched, w.m)], x_batched, w.k, n)
+        }
         DType::MQ4G256 => {
             // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
             let rot = rotated_x_scratch.expect("MQ4 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
+            gpu.claude_gemm_hfq4g256_multi(&[(&w.buf, y_batched, w.m)], rot, w.k, n)
         }
         DType::MQ4G256V2 => {
             let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
@@ -2344,6 +2367,41 @@ fn weight_gemm_batched(
         }
         other => panic!("weight_gemm_batched: unsupported dtype {:?}", other),
     }
+}
+
+/// claude: [`weight_gemm_batched`] for several weights that read the same
+/// `x_batched`. When all of them are MQ4G256 (no AWQ scale) or all HFQ4G256
+/// with one K, the FWHT rotation runs once and the routed GEMM prepares the
+/// activations once for all of them; any other mix calls
+/// [`weight_gemm_batched`] per weight exactly as before.
+fn weight_gemm_batched_shared(
+    gpu: &mut Gpu,
+    outs: &[(&WeightTensor, &GpuTensor)],
+    x_batched: &GpuTensor,
+    n: usize,
+    rotated_x_scratch: Option<&GpuTensor>,
+) -> HipResult<()> {
+    let first = outs[0].0;
+    let shared = matches!(first.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+        && outs.iter().all(|(w, _)| {
+            w.gpu_dtype == first.gpu_dtype && w.k == first.k && w.awq_scale.is_none()
+        });
+    if !shared {
+        for (w, y) in outs {
+            weight_gemm_batched(gpu, w, x_batched, y, n, rotated_x_scratch)?;
+        }
+        return Ok(());
+    }
+    let x_in = if first.gpu_dtype == DType::MQ4G256 {
+        let rot = rotated_x_scratch.expect("MQ4 batched gemm requires rotated_x_scratch");
+        llama::rotate_x_mq_batched_for(gpu, first, x_batched, rot, first.k, n)?;
+        rot
+    } else {
+        x_batched
+    };
+    let list: Vec<(&GpuTensor, &GpuTensor, usize)> =
+        outs.iter().map(|(w, y)| (&w.buf, *y, w.m)).collect();
+    gpu.claude_gemm_hfq4g256_multi(&list, x_in, first.k, n)
 }
 
 /// True when [`weight_gemm_batched`] has a non-panicking arm for `dtype`.
@@ -2622,29 +2680,14 @@ pub fn mtp_head_forward_block_batched_xfer(
 
     // ── 3. Build concat = [e_norm | h_norm] per slot ─────────────────────
     // Layout: concat[i] = [e_norm[i, 0..dim], h_norm[i, 0..dim]] (length 2*dim).
-    for i in 0..n {
-        claude_dtod(
-            gpu,
-            xfer.ordered,
-            &scratch.concat.buf,
-            i * 2 * dim_bytes,
-            &scratch.e_norm.buf,
-            i * dim_bytes,
-            dim_bytes,
-        )?;
-        claude_dtod(
-            gpu,
-            xfer.ordered,
-            &scratch.concat.buf,
-            i * 2 * dim_bytes + dim_bytes,
-            &scratch.h_norm.buf,
-            i * dim_bytes,
-            dim_bytes,
-        )?;
-    }
+    // claude: two stream-ordered strided row copies (one launch per half)
+    // instead of 2n per-row D2D copies (blocking hipMemcpy under LEGACY
+    // transport: 2046 per 1024-row prompt-fill chunk, ~57 ms). Same bytes.
+    let concat_view = scratch.concat.sub_offset(0, n * 2 * dim);
+    gpu.copy_rows_strided_f32(&e_norm_view, &concat_view, n, dim, dim, 2 * dim, 0)?;
+    gpu.copy_rows_strided_f32(&h_norm_view, &concat_view, n, dim, dim, 2 * dim, dim)?;
 
     // cur = eh_proj @ concat (per-slot). w.eh_proj has m=n_embd, k=2*n_embd.
-    let concat_view = scratch.concat.sub_offset(0, n * 2 * dim);
     let cur_view = scratch.cur.sub_offset(0, n * dim);
     weight_gemm_batched(
         gpu,
@@ -2655,10 +2698,11 @@ pub fn mtp_head_forward_block_batched_xfer(
         rotated_x_scratch,
     )?;
 
-    // Save residual (inpSA) for the post-attn add.
+    // Save residual (inpSA) for the post-attn add. claude: always the
+    // stream-ordered copy (was blocking under LEGACY transport); same bytes.
     claude_dtod(
         gpu,
-        xfer.ordered,
+        true,
         &scratch.residual.buf,
         0,
         &scratch.cur.buf,
@@ -2672,40 +2716,56 @@ pub fn mtp_head_forward_block_batched_xfer(
 
     // wq emits 2 * q_dim per slot.
     let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
-    weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch)?;
-
-    // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
     let q_view = scratch.q.sub_offset(0, n * q_dim);
     let gate_view = scratch.gate.sub_offset(0, n * q_dim);
-    gpu.deinterleave_f32_batched(
-        &q_full_view,
-        &q_view,
-        &gate_view,
-        cfg.n_head,
-        cfg.head_dim,
-        n,
-    )?;
-
-    // attn_q_norm: per-head normalization of Q.
-    // rmsnorm_batched treats `batch` as "rows of length n", and gates the
-    // single norm-weight broadcast across all rows. For per-head norm here,
-    // each Q row is `n_head` heads of length `head_dim`, so we want
-    // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
-    // per-head q_norm at qwen35.rs.
-    gpu.rmsnorm_batched(
-        &q_view,
-        &w.attn_q_norm,
-        &q_view,
-        n * cfg.n_head,
-        cfg.head_dim,
-        cfg.rms_norm_eps,
-    )?;
-
-    // K, V projections.
     let k_view = scratch.k.sub_offset(0, n * kv_dim);
     let v_view = scratch.v.sub_offset(0, n * kv_dim);
-    weight_gemm_batched(gpu, &w.wk, &tmp_view, &k_view, n, rotated_x_scratch)?;
-    weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch)?;
+    // claude CLAUDE_MTP_FILL_SKIP_Q: a KV-only forward never reads Q.
+    let skip_q = kv_only && claude_mtp_fill_skip_q();
+    if skip_q {
+        weight_gemm_batched_shared(
+            gpu,
+            &[(&w.wk, &k_view), (&w.wv, &v_view)],
+            &tmp_view,
+            n,
+            rotated_x_scratch,
+        )?;
+    } else {
+        // Q/K/V read the same normed activations: one rotation / prep.
+        weight_gemm_batched_shared(
+            gpu,
+            &[(&w.wq, &q_full_view), (&w.wk, &k_view), (&w.wv, &v_view)],
+            &tmp_view,
+            n,
+            rotated_x_scratch,
+        )?;
+
+        // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
+        gpu.deinterleave_f32_batched(
+            &q_full_view,
+            &q_view,
+            &gate_view,
+            cfg.n_head,
+            cfg.head_dim,
+            n,
+        )?;
+
+        // attn_q_norm: per-head normalization of Q.
+        // rmsnorm_batched treats `batch` as "rows of length n", and gates the
+        // single norm-weight broadcast across all rows. For per-head norm here,
+        // each Q row is `n_head` heads of length `head_dim`, so we want
+        // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
+        // per-head q_norm at qwen35.rs.
+        gpu.rmsnorm_batched(
+            &q_view,
+            &w.attn_q_norm,
+            &q_view,
+            n * cfg.n_head,
+            cfg.head_dim,
+            cfg.rms_norm_eps,
+        )?;
+    }
+
     gpu.rmsnorm_batched(
         &k_view,
         &w.attn_k_norm,
@@ -2716,11 +2776,13 @@ pub fn mtp_head_forward_block_batched_xfer(
     )?;
 
     // ── 5. Batched RoPE on Q + K ─────────────────────────────────────────
+    // claude CLAUDE_MTP_FILL_SKIP_Q: n_heads_q = 0 rotates K alone (both RoPE
+    // kernels loop Q and K heads independently, so K is bit-identical).
     gpu.rope_partial_interleaved_f32_batched(
         &q_view,
         &k_view,
         positions_dev,
-        cfg.n_head,
+        if skip_q { 0 } else { cfg.n_head },
         cfg.n_head_kv,
         cfg.head_dim,
         cfg.n_rot,
@@ -2826,15 +2888,13 @@ pub fn mtp_head_forward_block_batched_xfer(
     let ffn_out_view = scratch.ffn_out.sub_offset(0, n * dim);
     match &w.ffn {
         Qwen35MtpFfnWeights::Dense(ffn) => {
-            weight_gemm_batched(
+            weight_gemm_batched_shared(
                 gpu,
-                &ffn.gate,
+                &[(&ffn.gate, &gate_ffn_view), (&ffn.up, &up_view)],
                 &tmp_view,
-                &gate_ffn_view,
                 n,
                 rotated_x_scratch,
             )?;
-            weight_gemm_batched(gpu, &ffn.up, &tmp_view, &up_view, n, rotated_x_scratch)?;
             gpu.silu_mul_f32(&gate_ffn_view, &up_view, &ffn_hidden_view)?;
             weight_gemm_batched(
                 gpu,
@@ -2863,4 +2923,131 @@ pub fn mtp_head_forward_block_batched_xfer(
     )?;
 
     Ok(())
+}
+
+/// claude: end-to-end dump of the batched MTP head forward on the REAL
+/// Qwen3.8 `.mtp` sidecar (MQ4G256 weights), for comparing the routed GEMM /
+/// skip-Q path against the scalar path in two processes:
+///
+/// ```text
+/// CLAUDE_MTP_HEAD_GEMM=0 CLAUDE_MTP_FILL_SKIP_Q=0 CLAUDE_FILL_DUMP_OUT=/tmp/a.bin \
+///   flock /tmp/hipfire-gpu.lock <test bin> --ignored claude_mtp_fill_dump
+/// CLAUDE_FILL_DUMP_OUT=/tmp/b.bin flock /tmp/hipfire-gpu.lock <test bin> --ignored claude_mtp_fill_dump
+/// ```
+///
+/// Runs `n` in {1, 2, 3, 16, 64} rows, kv_only (prompt fill / refresh) and full
+/// (compose) forwards, and appends `cur`, `k`, `v` (+ `t_mtp_outs` for full) as
+/// little-endian f32 to the dump. Needs ~290 MB VRAM (head weights 225 MB, a
+/// 4096-row Q8 embedding stand-in, 64-row scratch); GPU, so `#[ignore]`.
+#[cfg(test)]
+mod claude_fill_dump_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn claude_mtp_fill_dump() {
+        let path = std::env::var("CLAUDE_FILL_DUMP_MTP")
+            .expect("CLAUDE_FILL_DUMP_MTP=<path to the Qwen3.8 .mtp sidecar>");
+        let out = std::env::var("CLAUDE_FILL_DUMP_OUT").expect("CLAUDE_FILL_DUMP_OUT");
+        let mut gpu = Gpu::init().expect("GPU init");
+        let head = load_mtp_head(Path::new(&path), &mut gpu, 256).expect("load .mtp");
+        let cfg = head.config.clone();
+        let dim = cfg.n_embd;
+        let kv_dim = cfg.n_head_kv * cfg.head_dim;
+        let max_n = 64usize;
+
+        // Deterministic pseudo-random helpers.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        // Minimal trunk: a 4096-row Q8_0 embedding table (34 B per 32 dims).
+        let n_tok = 4096usize;
+        let mut table = vec![0u8; n_tok * (dim / 32) * 34];
+        for blk in table.chunks_exact_mut(34) {
+            // f16 scale in [0.02, 0.04): exponent 2^-6 / 2^-5 range, 10-bit mantissa.
+            let d = 0.02f32 + 0.02 * (next() % 1000) as f32 / 1000.0;
+            let bits = d.to_bits();
+            let h = ((((bits >> 23) & 0xff) as i32 - 127 + 15) as u16) << 10
+                | ((bits >> 13) & 0x3ff) as u16;
+            blk[0..2].copy_from_slice(&h.to_le_bytes());
+            for b in &mut blk[2..] {
+                *b = (next() % 255) as u8;
+            }
+        }
+        let token_embd = gpu.upload_raw(&table, &[table.len()]).unwrap();
+        let output_norm = gpu.zeros(&[dim], DType::F32).unwrap();
+        let output = WeightTensor {
+            buf: gpu.zeros(&[dim], DType::F32).unwrap(),
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: dim,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        };
+        let trunk = Qwen35Weights {
+            token_embd,
+            embd_format: EmbeddingFormat::Q8_0,
+            output_norm,
+            output,
+            layers: Vec::new(),
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            ep_shard: None,
+        };
+
+        let mut scratch = Qwen35MtpHeadBatchedScratch::new(&mut gpu, &cfg, max_n).unwrap();
+        let mut kv = Qwen35MtpHeadKvCache::new(&mut gpu, &cfg).unwrap();
+        let widest_k = (2 * dim).max(cfg.n_ff).max(cfg.n_head * cfg.head_dim);
+        let rot = gpu.alloc_tensor(&[max_n * widest_k], DType::F32).unwrap();
+        let prev_host: Vec<f32> = (0..max_n * dim)
+            .map(|_| ((next() % 20001) as f32 / 10000.0 - 1.0) * 1.7)
+            .collect();
+        let prev = gpu.upload_f32(&prev_host, &[max_n * dim]).unwrap();
+
+        let mut dump: Vec<u8> = Vec::new();
+        let mut push = |gpu: &mut Gpu, t: &GpuTensor, len: usize| {
+            gpu.hip.device_synchronize().unwrap();
+            let v = gpu.download_f32(&t.sub_offset(0, len)).unwrap();
+            for x in v {
+                dump.extend_from_slice(&x.to_le_bytes());
+            }
+        };
+        for kv_only in [true, false] {
+            for n in [1usize, 2, 3, 16, 64] {
+                let tokens: Vec<u32> = (0..n).map(|i| ((i * 37 + 11) % n_tok) as u32).collect();
+                let positions: Vec<i32> = (0..n as i32).map(|p| p + 5).collect();
+                mtp_head_forward_block_batched(
+                    &mut gpu,
+                    &head,
+                    &mut scratch,
+                    &mut kv,
+                    &tokens,
+                    &prev,
+                    &positions,
+                    n,
+                    &trunk,
+                    Some(&rot),
+                    kv_only,
+                )
+                .unwrap();
+                push(&mut gpu, &scratch.cur, n * dim);
+                push(&mut gpu, &scratch.k, n * kv_dim);
+                push(&mut gpu, &scratch.v, n * kv_dim);
+                if !kv_only {
+                    push(&mut gpu, &scratch.t_mtp_outs, n * dim);
+                }
+            }
+        }
+        std::fs::write(&out, &dump).unwrap();
+        eprintln!("[claude-fill-dump] wrote {} bytes to {out}", dump.len());
+    }
 }
