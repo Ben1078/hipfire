@@ -21,7 +21,7 @@ pub use error::{
 };
 pub use ffi::launch_counters;
 pub use ffi::{
-    Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
+    Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp, HostMappedBuffer,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
     HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,

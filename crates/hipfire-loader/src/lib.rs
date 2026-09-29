@@ -2116,6 +2116,43 @@ fn finish_qwen35_load(
         let trunk_path = Path::new(ctx.path);
         let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
         let mut load_err: Option<String> = None;
+        // claude r2: CLAUDE_MTP_SIDECAR=<file.mtp> loads that head instead of the
+        // bundled trailer / sibling `<trunk>.mtp` (e.g. a compressed draft-vocab
+        // head from `claude_mtp_draft_vocab build`). The model path itself is
+        // canonicalized upstream, so a symlinked model dir cannot select a
+        // different sibling sidecar; this is the explicit way. Unset or empty =
+        // the unchanged resolution below.
+        let claude_sidecar = std::env::var("CLAUDE_MTP_SIDECAR")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let claude_override = if let Some(p) = claude_sidecar.as_deref() {
+            match hipfire_arch_qwen35::mtp_head::load_mtp_head(
+                Path::new(p),
+                ctx.gpu,
+                physical_cap,
+            ) {
+                Ok(h) => {
+                    eprintln!(
+                        "  MTP head loaded (CLAUDE_MTP_SIDECAR {}): n_embd={} vocab={} draft_vocab={}",
+                        p,
+                        h.config.n_embd,
+                        h.config.vocab_size,
+                        h.weights
+                            .compressed_vocab_size
+                            .map(|c| format!("compressed {c}"))
+                            .unwrap_or_else(|| "full (trunk lm_head)".to_string())
+                    );
+                    head_opt = Some(h);
+                }
+                Err(e) => {
+                    load_err = Some(format!("CLAUDE_MTP_SIDECAR {p} load failed: {e}"));
+                }
+            }
+            true
+        } else {
+            false
+        };
+        if !claude_override {
         match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
             trunk_path,
             ctx.gpu,
@@ -2178,6 +2215,7 @@ fn finish_qwen35_load(
                     }
                 }
             }
+        }
         }
         if head_opt.is_none() {
             if ctx.spec.mtp == Some(true) {

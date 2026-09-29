@@ -89,3 +89,12 @@ required-features = ["deltanet"]
 name = "qwen35_sealed_moe_oracle"
 path = "examples/qwen35_sealed_moe_oracle.rs"
 required-features = ["deltanet", "moe-oracle"]
+
+[[example]]
+name = "bench_claude_cvs_lmhead"
+path = "examples/bench_claude_cvs_lmhead.rs"
+
+[[example]]
+name = "test_claude_mtp_e2e"
+path = "examples/test_claude_mtp_e2e.rs"
+required-features = ["deltanet"]

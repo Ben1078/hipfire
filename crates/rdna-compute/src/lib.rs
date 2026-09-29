@@ -7,6 +7,9 @@
 pub mod arch_caps;
 pub mod attention;
 pub mod cdna;
+pub mod claude_doorbell;
+pub mod claude_misc;
+pub mod claude_sample;
 pub mod claude_draft_attn;
 mod compiler;
 pub mod dflash_draft_fusion;

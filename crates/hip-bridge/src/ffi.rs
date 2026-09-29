@@ -330,6 +330,37 @@ pub struct HipRuntime {
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
+    // claude r2: pinned, device-mapped host memory (doorbell readbacks).
+    fn_host_malloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_host_free: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    fn_host_get_device_pointer:
+        Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32>,
+    fn_stream_query: Option<unsafe extern "C" fn(HipStream) -> u32>,
+}
+
+/// claude r2: pinned host memory mapped into the device address space
+/// (`hipHostMalloc(Mapped | Coherent)`): kernels store to `dev_ptr`, the host
+/// reads the same bytes at `host_ptr` without a copy or a HIP call. Freed with
+/// [`HipRuntime::host_free_mapped`]; not freed on drop (the owner decides).
+pub struct HostMappedBuffer {
+    host: *mut c_void,
+    dev: *mut c_void,
+    size: usize,
+}
+
+// The allocation is plain pinned host memory; ownership moves with the value.
+unsafe impl Send for HostMappedBuffer {}
+
+impl HostMappedBuffer {
+    pub fn host_ptr(&self) -> *mut u8 {
+        self.host as *mut u8
+    }
+    pub fn dev_ptr(&self) -> *mut c_void {
+        self.dev
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -715,6 +746,26 @@ impl HipRuntime {
                     lib,
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
+                ),
+                fn_host_malloc: load_optional_fn!(
+                    lib,
+                    "hipHostMalloc",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
+                fn_host_free: load_optional_fn!(
+                    lib,
+                    "hipHostFree",
+                    unsafe extern "C" fn(*mut c_void) -> u32
+                ),
+                fn_host_get_device_pointer: load_optional_fn!(
+                    lib,
+                    "hipHostGetDevicePointer",
+                    unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32
+                ),
+                fn_stream_query: load_optional_fn!(
+                    lib,
+                    "hipStreamQuery",
+                    unsafe extern "C" fn(HipStream) -> u32
                 ),
                 _lib: lib,
             }
@@ -1727,6 +1778,60 @@ impl HipRuntime {
         };
         let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
         self.check(code, "hipStreamWaitValue32")
+    }
+
+    /// claude r2: allocate `size` bytes of pinned host memory mapped into the
+    /// device address space. `coherent` selects fine-grained memory
+    /// (`hipHostMallocCoherent`): device stores followed by
+    /// `__threadfence_system()` become visible to host loads in order, which
+    /// is what a doorbell needs. Zero-filled.
+    pub fn host_malloc_mapped(&self, size: usize, coherent: bool) -> HipResult<HostMappedBuffer> {
+        const MAPPED: c_uint = 0x2;
+        const COHERENT: c_uint = 0x4000_0000;
+        let (Some(hm), Some(gdp)) = (self.fn_host_malloc, self.fn_host_get_device_pointer) else {
+            return Err(HipError::new(
+                0,
+                "hipHostMalloc / hipHostGetDevicePointer unavailable in this HIP runtime",
+            ));
+        };
+        let mut host: *mut c_void = ptr::null_mut();
+        let flags = MAPPED | if coherent { COHERENT } else { 0 };
+        let code = unsafe { hm(&mut host, size, flags) };
+        self.check(code, "hipHostMalloc")?;
+        let mut dev: *mut c_void = ptr::null_mut();
+        let code = unsafe { gdp(&mut dev, host, 0) };
+        if let Err(e) = self.check(code, "hipHostGetDevicePointer") {
+            if let Some(hf) = self.fn_host_free {
+                unsafe { hf(host) };
+            }
+            return Err(e);
+        }
+        unsafe { ptr::write_bytes(host as *mut u8, 0, size) };
+        Ok(HostMappedBuffer { host, dev, size })
+    }
+
+    /// claude r2: non-blocking `hipStreamQuery`: `Ok(true)` when all work on
+    /// `stream` has completed, `Ok(false)` while some is outstanding. Lets the
+    /// runtime retire completed commands without a blocking call.
+    pub fn stream_query(&self, stream: &Stream) -> HipResult<bool> {
+        let Some(q) = self.fn_stream_query else {
+            return Err(HipError::new(0, "hipStreamQuery unavailable"));
+        };
+        let code = unsafe { q(stream.0) };
+        if code == HIP_ERROR_NOT_READY {
+            return Ok(false);
+        }
+        self.check(code, "hipStreamQuery").map(|_| true)
+    }
+
+    /// claude r2: free a [`HostMappedBuffer`]. The caller must ensure no
+    /// queued kernel still writes to it.
+    pub fn host_free_mapped(&self, buf: HostMappedBuffer) -> HipResult<()> {
+        let Some(hf) = self.fn_host_free else {
+            return Err(HipError::new(0, "hipHostFree unavailable"));
+        };
+        let code = unsafe { hf(buf.host) };
+        self.check(code, "hipHostFree")
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {

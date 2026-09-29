@@ -1787,12 +1787,78 @@ impl Gpu {
     fn claude_fast_reduce_ok(&self, n: usize, rows: usize) -> bool {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let off = *OFF.get_or_init(|| std::env::var("CLAUDE_FAST_REDUCE").as_deref() == Ok("0"));
+        // claude r2: CLAUDE_FAST_REDUCE_MIN_N lowers the row-length gate (default
+        // 65536 = unchanged) so the compressed draft vocab (32K/48K) can take
+        // the two-stage kernels; see claude_fast_reduce_min_n.
         !off
-            && n >= 65_536
+            && n >= Self::claude_fast_reduce_min_n()
             && (1..=16).contains(&rows)
             && self.arch.as_str() == "gfx1100"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
+    }
+
+    /// claude r2: minimum row length for the two-stage argmax / top-2 kernels
+    /// (`CLAUDE_FAST_REDUCE_MIN_N`, default 65536 = the original gate).
+    pub fn claude_fast_reduce_min_n() -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("CLAUDE_FAST_REDUCE_MIN_N")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n >= 1024)
+                .unwrap_or(65_536)
+        })
+    }
+
+    /// claude r2: [`Self::claude_fast_reduce_ok`] without the row-length gate
+    /// (row length >= 4096 still required). For callers that know their rows
+    /// are short on purpose, e.g. the compressed MTP draft vocab (32K/48K),
+    /// where the stock single-workgroup kernels cost ~90-230 us per row
+    /// against ~30 us for the two-stage pair.
+    fn claude_fast_reduce_ok_any_n(&self, n: usize, rows: usize) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("CLAUDE_FAST_REDUCE").as_deref() == Ok("0"));
+        !off
+            && n >= 4096
+            && (1..=16).contains(&rows)
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// claude r2: top-2 + log-sum-exp (as `topk_logsumexp_batched_f32` with
+    /// k = 2) through the two-stage kernels for any row length the two-stage
+    /// path supports; otherwise exactly `topk_logsumexp_batched_f32`.
+    pub fn claude_top2lse_any_n(
+        &mut self,
+        logits: &GpuTensor,
+        top_idx: &GpuTensor,
+        top_logp: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.claude_fast_reduce_ok_any_n(vocab, rows) {
+            return self.claude_top2lse_two_stage(logits, top_idx, top_logp, vocab, rows);
+        }
+        self.topk_logsumexp_batched_f32(logits, top_idx, top_logp, vocab, 2, rows)
+    }
+
+    /// claude r2: `argmax_f32_batched` through the two-stage kernels for any
+    /// row length the two-stage path supports (see `claude_top2lse_any_n`).
+    pub fn claude_argmax_any_n(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.claude_fast_reduce_ok_any_n(n, rows) {
+            return self.claude_argmax_two_stage(data, result, n, rows);
+        }
+        self.argmax_f32_batched(data, result, n, rows)
     }
 
     fn claude_reduce_scratch(&mut self) -> HipResult<(*mut c_void, *mut c_void)> {

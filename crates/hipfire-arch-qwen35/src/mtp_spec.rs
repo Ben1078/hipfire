@@ -155,6 +155,14 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     )
 }
 
+/// claude r2 `CLAUDE_CVS_FAST` (default on; only matters when the loaded MTP
+/// head carries a compressed `lm_head_draft`): run host-mediated compressed
+/// draft steps through the same block path as full-vocab drafts.
+fn claude_cvs_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_CVS_FAST").as_deref() != Ok("0"))
+}
+
 /// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
 /// the low-confidence tail of the K-chain — a win measured on the gfx1100 dGPU
 /// (2026-06-16 sweep: lifts every domain, even high-τ code +11%; 0.6 is the
@@ -584,6 +592,15 @@ pub struct MtpSpecState {
     /// claude item 6: `prefill_batch_pbs_eligible(.., n, ..)` per verify row
     /// count `n` (weights, config and arch are fixed for this state).
     claude_eligible_cache: Vec<Option<bool>>,
+    /// claude r2 `CLAUDE_MTP_DOORBELL`: pinned host slots for the per-step
+    /// top-2 / verify argmax readbacks (lazily allocated on first use).
+    claude_doorbell: Option<rdna_compute::claude_doorbell::ClaudeDoorbell>,
+    /// claude r2 `CLAUDE_MTP_GPU_SAMPLE`: device buffers of the on-device
+    /// sampled draft / accept (lazily allocated on the first sampled cycle).
+    claude_gs: Option<ClaudeGpuSample>,
+    /// claude r2: this cycle's drafts were sampled on the device (their rows
+    /// and picks live in `claude_gs`), so the verify accepts on the device.
+    claude_gs_cycle: bool,
 
     /// Optional draft-confidence cutoff for [`spec_step_mtp_compressed_serial`].
     /// When `p_min > 0`, the K-chain truncates early at step k if the draft's
@@ -749,6 +766,9 @@ impl MtpSpecState {
             claude_verify_pbs: None,
             claude_prestage: None,
             claude_eligible_cache: Vec::new(),
+            claude_doorbell: None,
+            claude_gs: None,
+            claude_gs_cycle: false,
             mtp_proposal_graph: None,
             mtp_proposal_graph_exec: None,
             mtp_proposal_graph_blobs: Vec::new(),
@@ -935,6 +955,14 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_topk_logp);
         if let Some(pack) = self.claude_topk_pack {
             let _ = gpu.free_tensor(pack);
+        }
+        if let Some(db) = self.claude_doorbell {
+            // the slots may be the target of queued publishes: drain first
+            let _ = gpu.hip.device_synchronize();
+            db.free(gpu);
+        }
+        if let Some(gs) = self.claude_gs {
+            gs.free_gpu(gpu);
         }
         let _ = gpu.free_tensor(self.mtp_sample_result);
         let _ = gpu.free_tensor(self.mtp_sample_repeat_buf);
@@ -1631,7 +1659,21 @@ fn mtp_shared_verify_accept_rollback(
 
     let effective_use_sampling = if is_external { false } else { use_sampling };
 
-    if effective_use_sampling {
+    let claude_gs_accept = effective_use_sampling && state.claude_gs_cycle;
+    state.claude_gs_cycle = false;
+    if claude_gs_accept {
+        hit_eos = claude_gpu_sampled_accept(
+            gpu,
+            state,
+            &logits_view,
+            drafts_generated,
+            vocab,
+            sampling,
+            eos_token_id,
+            &mut committed,
+            &mut accept_count,
+        )?;
+    } else if effective_use_sampling {
         hit_eos = mtp_sampled_accept(
             gpu,
             state,
@@ -1680,7 +1722,14 @@ fn mtp_shared_verify_accept_rollback(
             )
         } else {
             let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
-            {
+            if !is_external && n_verify < 60 && claude_doorbell_ready(gpu, state) {
+                // claude r2 CLAUDE_MTP_DOORBELL: the verify argmax through a slot.
+                let mut w = vec![0u32; n_verify];
+                claude_doorbell_read(gpu, state, &argmax_v, &mut w, None, None)?;
+                for (d, v) in argmax_v_host.iter_mut().zip(w) {
+                    *d = v as i32;
+                }
+            } else {
                 let bytes: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
                         argmax_v_host.as_mut_ptr() as *mut u8,
@@ -1702,7 +1751,7 @@ fn mtp_shared_verify_accept_rollback(
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
-    if mtp_head::claude_mtp_async() && !effective_use_sampling {
+    if mtp_head::claude_mtp_async() && (!effective_use_sampling || claude_gs_accept) {
         // claude CLAUDE_MTP_ASYNC: stream-ordered instead of a blocking hipMemcpy.
         state.capture_prev_hidden_from_verify_row_ordered(gpu, prev_hidden_row, dim)?;
     } else {
@@ -3126,17 +3175,293 @@ struct ClaudePrestage {
     positions: usize,
     /// host copy of `trunk_pbs.tokens[..tokens.len()]` as staged
     tokens: Vec<u32>,
+    /// claude r2: the candidates are stored on the device by the draft
+    /// steps' doorbell publishes (no host-issued writes).
+    db_tokens: bool,
 }
 
-/// claude item 6 `CLAUDE_VERIFY_PRESTAGE` (default OFF; `=1` stages the
-/// verify tokens / positions stream-ordered and memoizes the per-cycle
-/// admissibility scan). Opt-in until the full-model check: measured on
-/// gfx1100 / ROCm 7.2, each hipStreamWriteValue32 costs ~6.6 us of GPU time
+/// claude r2 `CLAUDE_MTP_DOORBELL` (default on, needs `CLAUDE_MTP_ASYNC` and an
+/// active stream): readbacks through pinned host slots rung by a one-thread
+/// publish kernel instead of blocking `hipMemcpy`, and the draft positions
+/// (plus, with `CLAUDE_VERIFY_PRESTAGE=1`, the verify tokens/positions)
+/// written by kernels from arguments instead of `hipStreamWriteValue32`.
+/// Returns false (and the caller keeps the blocking path) when switched off,
+/// when the pinned allocation failed, or after a doorbell ever failed to ring.
+fn claude_doorbell_ready(gpu: &mut Gpu, state: &mut MtpSpecState) -> bool {
+    if !rdna_compute::claude_doorbell::claude_mtp_doorbell_enabled()
+        || !mtp_head::claude_mtp_async()
+        || gpu.active_stream.is_none()
+    {
+        return false;
+    }
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if state.claude_doorbell.is_none() {
+        match rdna_compute::claude_doorbell::ClaudeDoorbell::new(gpu) {
+            Ok(db) => state.claude_doorbell = Some(db),
+            Err(e) => {
+                FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[claude] MTP doorbell unavailable ({e}); blocking readbacks");
+                return false;
+            }
+        }
+    }
+    !state.claude_doorbell.as_ref().unwrap().disabled
+}
+
+/// claude r2: publish `n_words` of `src` through the doorbell and wait for them
+/// (optional device-side position / token stores ride along, see
+/// `Gpu::claude_mtp_publish`).
+fn claude_doorbell_read(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    src: &GpuTensor,
+    out: &mut [u32],
+    pos: Option<(*mut std::ffi::c_void, i32)>,
+    tok: Option<(*const std::ffi::c_void, usize, *mut std::ffi::c_void)>,
+) -> HipResult<()> {
+    let db = state.claude_doorbell.as_mut().expect("doorbell allocated");
+    let t = gpu.claude_mtp_publish(db, src, out.len(), pos, tok)?;
+    gpu.claude_doorbell_wait(db, &t, out)
+}
+
+/// claude r2 `CLAUDE_MTP_GPU_SAMPLE`: device state of the on-device sampled
+/// draft + accept (see rdna_compute::claude_sample).
+struct ClaudeGpuSample {
+    scratch: rdna_compute::claude_sample::ClaudeSampleScratch,
+    smx: rdna_compute::claude_sample::ClaudeSoftmaxScratch,
+    /// draft softmax rows `[max_n x vd]` + their nucleus tau / Z
+    dprobs: GpuTensor,
+    dtau: GpuTensor,
+    dz: GpuTensor,
+    /// per draft step `[idx, q(idx), max p, token]`
+    dout: GpuTensor,
+    /// verify target softmax rows `[rows x vocab]` + tau / Z
+    tprobs: GpuTensor,
+    ttau: GpuTensor,
+    tz: GpuTensor,
+    aout: GpuTensor,
+    /// compressed draft vocab: full id -> draft idx (or -1)
+    inv_map: Option<GpuTensor>,
+    vd: usize,
+    vocab: usize,
+    max_n: usize,
+    rows: usize,
+}
+
+impl ClaudeGpuSample {
+    fn free_gpu(self, gpu: &mut Gpu) {
+        self.scratch.free_gpu(gpu);
+        self.smx.free_gpu(gpu);
+        for t in [self.dprobs, self.dtau, self.dz, self.dout, self.tprobs, self.ttau, self.tz, self.aout] {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.inv_map {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// claude r2: allocate (or reuse) the on-device sampling buffers for this
+/// head's draft vocab `vd` (`vocab_map` = the compressed map, if any).
+fn claude_gs_ensure(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    vocab: usize,
+    vd: usize,
+    vocab_map: Option<&Vec<u32>>,
+) -> HipResult<()> {
+    let max_n = state.max_n;
+    let rows = state.verify_capacity + 1;
+    if let Some(gs) = state.claude_gs.as_ref() {
+        if gs.vd == vd && gs.vocab == vocab && gs.max_n >= max_n && gs.rows >= rows {
+            return Ok(());
+        }
+    }
+    if let Some(old) = state.claude_gs.take() {
+        let _ = gpu.hip.device_synchronize();
+        old.free_gpu(gpu);
+    }
+    let scratch = rdna_compute::claude_sample::ClaudeSampleScratch::new(gpu)?;
+    let inv_map = match vocab_map {
+        Some(vm) => {
+            let mut inv = vec![-1i32; vocab];
+            for (j, &id) in vm.iter().enumerate() {
+                if (id as usize) < vocab {
+                    inv[id as usize] = j as i32;
+                }
+            }
+            let bytes: Vec<u8> = inv.iter().flat_map(|x| x.to_ne_bytes()).collect();
+            Some(gpu.upload_raw(&bytes, &[bytes.len()])?)
+        }
+        None => None,
+    };
+    let smx = rdna_compute::claude_sample::ClaudeSoftmaxScratch::new(gpu, rows)?;
+    state.claude_gs = Some(ClaudeGpuSample {
+        scratch,
+        smx,
+        dprobs: gpu.alloc_tensor(&[max_n * vd], DType::F32)?,
+        dtau: gpu.alloc_tensor(&[max_n], DType::F32)?,
+        dz: gpu.alloc_tensor(&[max_n], DType::F32)?,
+        dout: gpu.alloc_tensor(&[max_n * 4], DType::F32)?,
+        tprobs: gpu.alloc_tensor(&[rows * vocab], DType::F32)?,
+        ttau: gpu.alloc_tensor(&[rows], DType::F32)?,
+        tz: gpu.alloc_tensor(&[rows], DType::F32)?,
+        aout: gpu.alloc_tensor(&[4 + rows + 4], DType::F32)?,
+        inv_map,
+        vd,
+        vocab,
+        max_n,
+        rows,
+    });
+    Ok(())
+}
+
+/// claude r2: the softmax + nucleus rows of the GPU-sampled path. Rows of
+/// >= 65536 go through the multi-block kernels (`CLAUDE_SOFTMAX_MB`, same
+/// definitions; 246 -> 49 us for one 248320-wide row, 265 -> 67 us for four);
+/// shorter rows (the compressed draft vocab) keep the one-workgroup kernel,
+/// which is as fast there.
+#[allow(clippy::too_many_arguments)]
+fn claude_gs_softmax(
+    gpu: &mut Gpu,
+    smx: &rdna_compute::claude_sample::ClaudeSoftmaxScratch,
+    logits: &GpuTensor,
+    probs: &GpuTensor,
+    tau: &GpuTensor,
+    z: &GpuTensor,
+    n: usize,
+    rows: usize,
+    sampling: MtpSamplingConfig,
+) -> HipResult<()> {
+    if n >= 65_536 && rdna_compute::claude_sample::claude_softmax_mb_enabled() {
+        gpu.claude_softmax_topp_mb(
+            smx,
+            logits,
+            probs,
+            tau,
+            z,
+            n,
+            rows,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        )
+    } else {
+        gpu.softmax_temp_topp_batched_into_f32(
+            logits,
+            probs,
+            tau,
+            z,
+            n,
+            rows,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+        )
+    }
+}
+
+/// claude r2 `CLAUDE_MTP_GPU_SAMPLE`: `mtp_sampled_accept` on the device for
+/// a cycle whose drafts were sampled by `claude_mtp_sample_row`. Same softmax
+/// + nucleus rows (`softmax_temp_topp_batched_into_f32`), same accept rule
+/// (`u * p_draft <= p_target`, EOS stop, residual / target bonus) and the same
+/// uniforms in the same order: U[0..=d] are drawn from a copy of the RNG, and
+/// the real RNG is advanced by exactly the number the device consumed.
+fn claude_gpu_sampled_accept(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    logits_view: &GpuTensor,
+    drafts_generated: usize,
+    vocab: usize,
+    sampling: MtpSamplingConfig,
+    eos_token_id: u32,
+    committed: &mut Vec<u32>,
+    accept_count: &mut usize,
+) -> HipResult<bool> {
+    let d = drafts_generated;
+    let n_verify = d + 1;
+    let base = state.rng;
+    let mut r2 = base;
+    let us: Vec<f32> = (0..=d).map(|_| r2.next_uniform_f32()).collect();
+    let gs = state.claude_gs.as_ref().expect("claude_gs allocated for a GPU-sampled cycle");
+    claude_gs_softmax(
+        gpu,
+        &gs.smx,
+        logits_view,
+        &gs.tprobs.sub_offset(0, n_verify * vocab),
+        &gs.ttau.sub_offset(0, n_verify),
+        &gs.tz.sub_offset(0, n_verify),
+        vocab,
+        n_verify,
+        sampling,
+    )?;
+    let inv = gs
+        .inv_map
+        .as_ref()
+        .map(|t| t.buf.as_ptr() as *const std::ffi::c_void)
+        .unwrap_or(std::ptr::null());
+    let db = state.claude_doorbell.as_mut().expect("doorbell for a GPU-sampled cycle");
+    let ticket = gpu
+        .claude_mtp_sample_accept(
+            &gs.scratch,
+            Some(db),
+            &gs.tprobs,
+            vocab,
+            &gs.ttau,
+            &gs.tz,
+            &gs.dprobs,
+            gs.vd,
+            &gs.dtau,
+            &gs.dz,
+            &gs.dout,
+            inv,
+            d,
+            eos_token_id,
+            &us,
+            &gs.aout,
+        )?
+        .expect("doorbell ticket");
+    let mut w = vec![0u32; 4 + n_verify];
+    gpu.claude_doorbell_wait(db, &ticket, &mut w)?;
+    let res = rdna_compute::claude_sample::claude_decode_accept(&w);
+    state.rng = base;
+    for _ in 0..res.n_consumed {
+        let _ = state.rng.next_u64();
+    }
+    committed.extend_from_slice(&res.committed);
+    *accept_count = res.accept_count;
+    Ok(res.hit_eos)
+}
+
+/// claude item 6 `CLAUDE_VERIFY_PRESTAGE` (`=1` stages the verify tokens /
+/// positions stream-ordered and memoizes the per-cycle admissibility scan;
+/// unset: only on doorbell draft cycles, see [`claude_verify_prestage_mode`];
+/// `=0`: never). The stream-write variant is not worth it on its own: on
+/// gfx1100 / ROCm 7.2 each hipStreamWriteValue32 costs ~6.6 us of GPU time
 /// (a one-wave kernel ~2.8 us), so the 5 + d writes per cycle cost ~45 us of
-/// GPU time against the two blocking H2D round trips they remove.
+/// GPU time against the two blocking H2D round trips they remove; the
+/// doorbell path stages with one launch plus the publishes' token stores.
 fn claude_verify_prestage_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CLAUDE_VERIFY_PRESTAGE").as_deref() == Ok("1"))
+    claude_verify_prestage_mode() == Some(true)
+}
+
+/// claude r2: `CLAUDE_VERIFY_PRESTAGE` as a tri-state. `=1` always stages
+/// (stream writes when the doorbell path is off), `=0` never, unset stages
+/// only on cycles that run the doorbell draft path, where staging costs one
+/// argument-staged launch (tiny-model e2e: -56 us per window, tokens and all
+/// trunk / DN / MTP state identical).
+fn claude_verify_prestage_mode() -> Option<bool> {
+    static M: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CLAUDE_VERIFY_PRESTAGE").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
 }
 
 /// claude item 6: `t[idx] = value` as a stream-ordered 32-bit write on the
@@ -3200,14 +3525,49 @@ fn claude_prestage_begin(
     cur_pos: usize,
     last_committed: u32,
     max_n: usize,
-) {
+    db_draft: bool,
+) -> HipResult<()> {
     state.claude_prestage = None;
-    if !claude_verify_prestage_enabled()
-        || gpu.active_stream.is_none()
-        || max_n + 1 > state.trunk_pbs.max_batch
-    {
-        return;
+    let staged = claude_verify_prestage_mode().unwrap_or(db_draft)
+        && gpu.active_stream.is_some()
+        && max_n + 1 <= state.trunk_pbs.max_batch;
+    if db_draft {
+        // claude r2 (CLAUDE_MTP_DOORBELL draft path): ONE argument-staged launch
+        // stores the draft step-0 position into the MTP pos_buf and, when
+        // prestaging, the verify positions ramp + tokens[0] (instead of up to
+        // 3 + max_n hipStreamWriteValue32 at ~6.2 us GPU each). The candidates
+        // follow from the draft steps' doorbell publishes.
+        let pos = Some((state.mtp_scratch.pos_buf.as_ptr(), cur_pos as i32));
+        if staged && max_n + 1 <= 64 {
+            let ramp = (state.trunk_pbs.positions.buf.as_ptr(), cur_pos as i32, max_n + 1);
+            let tok = (state.trunk_pbs.tokens.buf.as_ptr(), last_committed as i32);
+            gpu.claude_mtp_stage(Some(ramp), Some(tok), pos)?;
+            state.claude_prestage = Some(ClaudePrestage {
+                cur_pos,
+                positions: max_n + 1,
+                tokens: vec![last_committed],
+                db_tokens: true,
+            });
+        } else {
+            gpu.claude_mtp_stage(None, None, pos)?;
+        }
+        return Ok(());
     }
+    if !staged {
+        return Ok(());
+    }
+    claude_prestage_begin_stream_writes(gpu, state, cur_pos, last_committed, max_n);
+    Ok(())
+}
+
+/// claude item 6: the original hipStreamWriteValue32 staging.
+fn claude_prestage_begin_stream_writes(
+    gpu: &mut Gpu,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    max_n: usize,
+) {
     for i in 0..=max_n {
         if !claude_stream_write_i32(gpu, &state.trunk_pbs.positions, i, (cur_pos + i) as i32) {
             return;
@@ -3220,6 +3580,7 @@ fn claude_prestage_begin(
         cur_pos,
         positions: max_n + 1,
         tokens: vec![last_committed],
+        db_tokens: false,
     });
 }
 
@@ -3230,6 +3591,19 @@ fn claude_prestage_candidates(gpu: &mut Gpu, state: &mut MtpSpecState, candidate
     let Some(mut p) = state.claude_prestage.take() else {
         return;
     };
+    if p.db_tokens {
+        // claude r2: each doorbell publish already stored its candidate into
+        // trunk_pbs.tokens[1 + k] on the device (same id through the same
+        // vocab map); only the host record is updated here.
+        while p.tokens.len() < candidates.len() + 1 && p.tokens.len() < p.positions {
+            p.tokens.push(candidates[p.tokens.len() - 1]);
+        }
+        if p.tokens.len() < candidates.len() + 1 {
+            return; // more candidates than staged rows: the verify uploads
+        }
+        state.claude_prestage = Some(p);
+        return;
+    }
     while p.tokens.len() < candidates.len() + 1 {
         let i = p.tokens.len();
         if i >= p.positions
@@ -3254,7 +3628,11 @@ fn claude_pbs_eligible_cached(
     n: usize,
     arch: &str,
 ) -> bool {
-    if !claude_verify_prestage_enabled() {
+    if claude_verify_prestage_mode() == Some(false)
+        || (!claude_verify_prestage_enabled()
+            && !(rdna_compute::claude_doorbell::claude_mtp_doorbell_enabled()
+                && mtp_head::claude_mtp_async()))
+    {
         return qwen35::prefill_batch_pbs_eligible(weights, config, dn_state, n, arch, true);
     }
     if state.claude_eligible_cache.len() <= n {
@@ -3456,6 +3834,10 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             "compressed MTP device-token chain requires GPU vocab_map"
         );
     }
+    // claude r2: host-mediated compressed draft steps run the full-vocab block
+    // path (async position write + C4a) with the head's slice as lm_head;
+    // CLAUDE_CVS_FAST=0 restores mtp_head_forward_compressed.
+    let claude_fast_lm = use_full_vocab || (!use_device_token_chain && claude_cvs_fast_enabled());
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
     let use_proposal_graph = max_n > 0
         && !state.mtp_proposal_graph_disabled
@@ -3538,13 +3920,48 @@ pub fn spec_step_mtp_compressed_serial_with_k(
         }
     }
 
+    // claude r2 CLAUDE_MTP_DOORBELL: host-mediated greedy / p_min drafts read
+    // each step's pick through a doorbell slot; the step's position is stored
+    // by a kernel (step 0: claude_prestage_begin's stage launch; step k > 0:
+    // step k-1's publish).
+    // claude r2 CLAUDE_MTP_GPU_SAMPLE: sampled drafts pick on the device and
+    // the verify accepts on the device (no 1 MB row downloads, no host scans).
+    let claude_gs_cycle = use_sampling
+        && rdna_compute::claude_sample::claude_mtp_gpu_sample_enabled()
+        && !proposal_graph_ran
+        && !use_device_token_chain
+        && claude_fast_lm
+        && max_n > 0
+        && max_n <= rdna_compute::claude_sample::CLAUDE_ACCEPT_MAX_D
+        && mtp_head::claude_mtp_async()
+        && claude_doorbell_ready(gpu, state);
+    if claude_gs_cycle {
+        claude_gs_ensure(gpu, state, vocab, cvs, vocab_map_opt)?;
+    }
+    state.claude_gs_cycle = claude_gs_cycle;
+    let claude_db_draft = !proposal_graph_ran
+        && !use_device_token_chain
+        && ((!use_sampling && claude_async_draft) || claude_gs_cycle)
+        && claude_fast_lm
+        && max_n > 0
+        && claude_doorbell_ready(gpu, state);
     // claude item 6 (CLAUDE_VERIFY_PRESTAGE): stage the verify's positions and
     // first token now, stream-ordered behind the previous cycle's work.
     if !proposal_graph_ran && !use_device_token_chain {
-        claude_prestage_begin(gpu, state, cur_pos, last_committed, max_n);
+        claude_prestage_begin(gpu, state, cur_pos, last_committed, max_n, claude_db_draft)?;
     } else {
         state.claude_prestage = None;
     }
+    // Device-side token staging for the prestaged verify (tokens[1 + k]).
+    let claude_db_tok_map: *const std::ffi::c_void = if use_full_vocab {
+        std::ptr::null()
+    } else {
+        head.weights
+            .lm_head_draft_vocab_map_gpu
+            .as_ref()
+            .map(|t| t.buf.as_ptr() as *const std::ffi::c_void)
+            .unwrap_or(std::ptr::null())
+    };
     if !proposal_graph_ran {
         for k in 0..max_n {
             // claude item 6: the candidate read back by step k-1.
@@ -3580,7 +3997,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             // step k+1 as prev_hidden, and always rewritten by step k before
             // that read), dropping the t_mtp_out -> row copy below.
             // `claude_in_row` says where the hidden actually is.
-            let claude_out_row = if use_full_vocab
+            let claude_out_row = if claude_fast_lm
                 && k + 1 < max_n
                 && mtp_head::claude_draft_cleanup_enabled()
             {
@@ -3589,8 +4006,31 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 None
             };
             let mut claude_in_row = false;
-            if use_full_vocab {
-                if k == 0 {
+            if claude_fast_lm {
+                if claude_db_draft {
+                    // claude r2: position already in pos_buf (stage / previous publish)
+                    let prev_row_db = if k == 0 {
+                        None
+                    } else {
+                        Some(state.mtp_t_outs.sub_offset((k - 1) * dim, dim))
+                    };
+                    let prev: &GpuTensor = match prev_row_db.as_ref() {
+                        Some(r) => r,
+                        None => &state.prev_hidden,
+                    };
+                    claude_in_row = mtp_head::mtp_head_forward_block_only_prestaged_out(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        prev,
+                        next_token_embed,
+                        cur_pos + k,
+                        trunk_weights,
+                        claude_out_row.as_ref(),
+                    )?;
+                } else if k == 0 {
                     claude_in_row = mtp_head::mtp_head_forward_block_only_xfer_out(
                         gpu,
                         head,
@@ -3628,18 +4068,33 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
                 // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
                 // trunk's output dtype.
+                //
+                // claude r2 (CLAUDE_CVS_FAST): a compressed head takes this same
+                // block path (stream-ordered position write, C4a row output) and
+                // swaps only the lm_head: its `lm_head_draft` slice into
+                // `logits_compressed` (the exact ops of
+                // mtp_head_apply_lm_head_draft).
                 gpu.rmsnorm_f32(
                     claude_hidden,
                     &head.weights.shared_head_norm,
                     &state.mtp_scratch.tmp,
                     head.config.rms_norm_eps,
                 )?;
-                llama::weight_gemv(
-                    gpu,
-                    &trunk_weights.output,
-                    &state.mtp_scratch.tmp,
-                    &full_vocab_logits_view,
-                )?;
+                if use_full_vocab {
+                    llama::weight_gemv(
+                        gpu,
+                        &trunk_weights.output,
+                        &state.mtp_scratch.tmp,
+                        &full_vocab_logits_view,
+                    )?;
+                } else {
+                    llama::weight_gemv(
+                        gpu,
+                        head.weights.lm_head_draft.as_ref().unwrap(),
+                        &state.mtp_scratch.tmp,
+                        state.mtp_scratch.logits_compressed.as_ref().unwrap(),
+                    )?;
+                }
             } else if use_device_token_chain {
                 if k == 0 {
                     mtp_head::mtp_head_forward_block_only_xfer(
@@ -3706,7 +4161,71 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             let argmax_vocab = cvs; // = full vocab in full-vocab mode, = compressed vocab in compressed mode
 
             let draft_idx: usize;
-            if use_sampling {
+            if claude_gs_cycle {
+                // claude r2 CLAUDE_MTP_GPU_SAMPLE: same softmax + nucleus rows as
+                // the host path, kept on the device (row k of claude_gs); the
+                // same host uniform picks the index on the device, which rings
+                // [idx, q(idx), max p, token] through the doorbell and stores the
+                // next step's position (+ the prestaged verify token).
+                let u = state.rng.next_uniform_f32();
+                let next_pos = if k + 1 < max_n {
+                    Some((state.mtp_scratch.pos_buf.as_ptr(), (cur_pos + k + 1) as i32))
+                } else {
+                    None
+                };
+                let tok_dst = match state.claude_prestage.as_ref() {
+                    Some(p) if p.db_tokens && k + 1 < p.positions => unsafe {
+                        (state.trunk_pbs.tokens.buf.as_ptr() as *mut u32).add(k + 1)
+                            as *mut std::ffi::c_void
+                    },
+                    _ => std::ptr::null_mut(),
+                };
+                let gs = state.claude_gs.as_ref().unwrap();
+                let row = gs.dprobs.sub_offset(k * gs.vd, argmax_vocab);
+                let tau_k = gs.dtau.sub_offset(k, 1);
+                let z_k = gs.dz.sub_offset(k, 1);
+                claude_gs_softmax(
+                    gpu,
+                    &gs.smx,
+                    logits_for_argmax,
+                    &row,
+                    &tau_k,
+                    &z_k,
+                    argmax_vocab,
+                    /* rows */ 1,
+                    sampling,
+                )?;
+                let db = state.claude_doorbell.as_mut().unwrap();
+                let ticket = gpu
+                    .claude_mtp_sample_row(
+                        &gs.scratch,
+                        Some(db),
+                        &row,
+                        argmax_vocab,
+                        &tau_k,
+                        &z_k,
+                        u,
+                        &gs.dout.sub_offset(4 * k, 4),
+                        claude_db_tok_map,
+                        next_pos,
+                        tok_dst,
+                    )?
+                    .expect("doorbell ticket");
+                let mut w = [0u32; 4];
+                gpu.claude_doorbell_wait(db, &ticket, &mut w)?;
+                draft_idx = w[0] as usize;
+                assert!(
+                    draft_idx < argmax_vocab,
+                    "draft sample {draft_idx} out of draft vocab {argmax_vocab}"
+                );
+                draft_probs.push(f32::from_bits(w[1]));
+                candidates.push(w[3]);
+                let top_prob = f32::from_bits(w[2]);
+                if use_sampled_pmin && top_prob < p_min {
+                    chain_truncated = true;
+                    break;
+                }
+            } else if use_sampling {
                 // ── F5b: DFlash-convention sampled DRAFT (full-vocab only) ──
                 //
                 // Distribution-preserving spec-decode requires the draft to be
@@ -3836,14 +4355,53 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                     // the two 8-byte reads. idx is needed after every step (it
                     // is the draft token the host feeds forward and verifies),
                     // so the last step's read stays; logp rides along for free.
-                    gpu.topk_logsumexp_batched_f32(
-                        logits_for_argmax,
-                        &pack.sub_offset(0, 2),
-                        &pack.sub_offset(2, 2),
-                        argmax_vocab,
-                        /* k */ 2,
-                        /* b */ 1,
-                    )?;
+                    if use_full_vocab {
+                        gpu.topk_logsumexp_batched_f32(
+                            logits_for_argmax,
+                            &pack.sub_offset(0, 2),
+                            &pack.sub_offset(2, 2),
+                            argmax_vocab,
+                            /* k */ 2,
+                            /* b */ 1,
+                        )?;
+                    } else {
+                        // claude r2: the 32K/48K compressed row is below the
+                        // 65536 gate of the two-stage kernels (stock: ~90-230 us).
+                        gpu.claude_top2lse_any_n(
+                            logits_for_argmax,
+                            &pack.sub_offset(0, 2),
+                            &pack.sub_offset(2, 2),
+                            argmax_vocab,
+                            1,
+                        )?;
+                    }
+                    if claude_db_draft {
+                        // claude r2: doorbell readback; the same launch stores the
+                        // next step's position and (prestage) the verify token.
+                        let pack_view = pack.sub_offset(0, 4);
+                        let next_pos = if k + 1 < max_n {
+                            Some((state.mtp_scratch.pos_buf.as_ptr(), (cur_pos + k + 1) as i32))
+                        } else {
+                            None
+                        };
+                        let tok = match state.claude_prestage.as_ref() {
+                            Some(p) if p.db_tokens && k + 1 < p.positions => Some((
+                                claude_db_tok_map,
+                                0usize,
+                                unsafe {
+                                    (state.trunk_pbs.tokens.buf.as_ptr() as *mut u32).add(k + 1)
+                                        as *mut std::ffi::c_void
+                                },
+                            )),
+                            _ => None,
+                        };
+                        let mut w = [0u32; 4];
+                        claude_doorbell_read(gpu, state, &pack_view, &mut w, next_pos, tok)?;
+                        (
+                            [w[0] as i32, w[1] as i32],
+                            [f32::from_bits(w[2]), f32::from_bits(w[3])],
+                        )
+                    } else {
                     let mut raw = [0u8; 16];
                     gpu.hip.memcpy_dtoh(&mut raw, &pack.buf)?;
                     let w = |i: usize| [raw[4 * i], raw[4 * i + 1], raw[4 * i + 2], raw[4 * i + 3]];
@@ -3851,6 +4409,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                         [i32::from_ne_bytes(w(0)), i32::from_ne_bytes(w(1))],
                         [f32::from_ne_bytes(w(2)), f32::from_ne_bytes(w(3))],
                     )
+                    }
                 } else {
                     gpu.topk_logsumexp_batched_f32(
                         logits_for_argmax,
@@ -3907,9 +4466,34 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                     k + 1,
                 )?;
             } else {
-                gpu.argmax_f32_batched(logits_for_argmax, &argmax_view, argmax_vocab, 1)?;
+                if use_full_vocab {
+                    gpu.argmax_f32_batched(logits_for_argmax, &argmax_view, argmax_vocab, 1)?;
+                } else {
+                    gpu.claude_argmax_any_n(logits_for_argmax, &argmax_view, argmax_vocab, 1)?;
+                }
                 let mut argmax_host: [i32; 1] = [0];
-                {
+                if claude_db_draft {
+                    let next_pos = if k + 1 < max_n {
+                        Some((state.mtp_scratch.pos_buf.as_ptr(), (cur_pos + k + 1) as i32))
+                    } else {
+                        None
+                    };
+                    let tok = match state.claude_prestage.as_ref() {
+                        Some(p) if p.db_tokens && k + 1 < p.positions => Some((
+                            claude_db_tok_map,
+                            0usize,
+                            unsafe {
+                                (state.trunk_pbs.tokens.buf.as_ptr() as *mut u32).add(k + 1)
+                                    as *mut std::ffi::c_void
+                            },
+                        )),
+                        _ => None,
+                    };
+                    let mut w = [0u32; 1];
+                    let av = argmax_view.sub_offset(0, 1);
+                    claude_doorbell_read(gpu, state, &av, &mut w, next_pos, tok)?;
+                    argmax_host[0] = w[0] as i32;
+                } else {
                     let bytes: &mut [u8] = unsafe {
                         std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, 4)
                     };
@@ -4012,7 +4596,9 @@ pub fn spec_step_mtp_compressed_serial_with_k(
             // EOS-stop token is always last, never inside it -- so slots 1..=n
             // are exactly the refresh's tokens and positions cur_pos+1..=cur_pos+n.
             // Both facts are re-checked here; otherwise upload as before.
-            let claude_async = mtp_head::claude_mtp_async() && !use_sampling;
+            // claude r2: a GPU-sampled cycle (CLAUDE_MTP_GPU_SAMPLE) has the same
+            // device-resident verify inputs; its refresh is stream-ordered too.
+            let claude_async = mtp_head::claude_mtp_async() && (!use_sampling || claude_gs_cycle);
             let n_verify = result.drafts_generated + 1;
             let pbs_views = if claude_async
                 && state.claude_verify_pbs == Some((cur_pos, n_verify))

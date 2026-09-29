@@ -1641,6 +1641,44 @@ pub fn mtp_head_forward_block_only_xfer_out(
     )
 }
 
+/// claude r2 (`CLAUDE_MTP_DOORBELL`): [`mtp_head_forward_block_only_xfer_out`]
+/// for a step whose position the caller already stored into
+/// `scratch.pos_buf`, stream-ordered on the active stream (the cycle's
+/// `claude_mtp_stage` launch for step 0, the previous step's doorbell publish
+/// for step k > 0). No position upload is issued here.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_block_only_prestaged_out(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    next_token_embed: Option<&GpuTensor>,
+    pos: usize,
+    trunk_weights: &Qwen35Weights,
+    out: Option<&GpuTensor>,
+) -> HipResult<bool> {
+    assert_eq!(prev_hidden.numel(), head.config.n_embd);
+    assert!(pos < kv.max_seq, "mtp prestaged: pos={pos} >= kv.max_seq={}", kv.max_seq);
+    let opts = ClaudeDraftOpts::from_env(gpu);
+    claude_mtp_block_forward(
+        gpu,
+        head,
+        scratch,
+        kv,
+        next_token,
+        prev_hidden,
+        next_token_embed,
+        &scratch.pos_buf,
+        pos,
+        pos + 1,
+        trunk_weights,
+        out,
+        opts,
+    )
+}
+
 /// Graph-capturable variant of [`mtp_head_forward_block_only`].
 ///
 /// `pos_buf` must point at an i32 device slot containing `pos`. Captured
@@ -2896,6 +2934,51 @@ pub fn mtp_head_forward_block_batched_xfer(
     kv_only: bool,
     xfer: MtpBatchedXfer<'_>,
 ) -> HipResult<()> {
+    let c5 = kv_only && claude_refresh_c5_enabled();
+    claude_mtp_block_batched_impl(
+        gpu,
+        head,
+        scratch,
+        kv,
+        next_tokens,
+        prev_hiddens_stacked,
+        positions,
+        n,
+        trunk_weights,
+        rotated_x_scratch,
+        kv_only,
+        xfer,
+        c5,
+    )
+}
+
+/// claude r2 C5 `CLAUDE_REFRESH_C5` (default on): the KV-only batched MTP
+/// forward (accepted-row refresh, prompt fill) builds the `[e_norm | h_norm]`
+/// concat in one launch, skips the inpSA residual copy nothing reads, and
+/// writes K and V with the pair kernel (C1, same quantizer and addressing).
+/// K/V bytes are unchanged; `=0` restores the previous launches.
+pub fn claude_refresh_c5_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_REFRESH_C5").as_deref() != Ok("0"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn claude_mtp_block_batched_impl(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &mut Qwen35MtpHeadBatchedScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_tokens: &[u32],
+    prev_hiddens_stacked: &GpuTensor,
+    positions: &[i32],
+    n: usize,
+    trunk_weights: &Qwen35Weights,
+    rotated_x_scratch: Option<&GpuTensor>,
+    kv_only: bool,
+    xfer: MtpBatchedXfer<'_>,
+    c5: bool,
+) -> HipResult<()> {
+    let c5 = c5 && kv_only;
     let cfg = &head.config;
     let w = &head.weights;
     let dim = cfg.n_embd;
@@ -3003,8 +3086,13 @@ pub fn mtp_head_forward_block_batched_xfer(
     // instead of 2n per-row D2D copies (blocking hipMemcpy under LEGACY
     // transport: 2046 per 1024-row prompt-fill chunk, ~57 ms). Same bytes.
     let concat_view = scratch.concat.sub_offset(0, n * 2 * dim);
-    gpu.copy_rows_strided_f32(&e_norm_view, &concat_view, n, dim, dim, 2 * dim, 0)?;
-    gpu.copy_rows_strided_f32(&h_norm_view, &concat_view, n, dim, dim, 2 * dim, dim)?;
+    if c5 {
+        // claude r2 C5: both halves in one launch (same bytes).
+        gpu.claude_concat2_rows_f32(&e_norm_view, &h_norm_view, &concat_view, n, dim)?;
+    } else {
+        gpu.copy_rows_strided_f32(&e_norm_view, &concat_view, n, dim, dim, 2 * dim, 0)?;
+        gpu.copy_rows_strided_f32(&h_norm_view, &concat_view, n, dim, dim, 2 * dim, dim)?;
+    }
 
     // cur = eh_proj @ concat (per-slot). w.eh_proj has m=n_embd, k=2*n_embd.
     let cur_view = scratch.cur.sub_offset(0, n * dim);
@@ -3019,15 +3107,18 @@ pub fn mtp_head_forward_block_batched_xfer(
 
     // Save residual (inpSA) for the post-attn add. claude: always the
     // stream-ordered copy (was blocking under LEGACY transport); same bytes.
-    claude_dtod(
-        gpu,
-        true,
-        &scratch.residual.buf,
-        0,
-        &scratch.cur.buf,
-        0,
-        n * dim_bytes,
-    )?;
+    // claude r2 C5: a KV-only forward returns before the add; no copy.
+    if !c5 {
+        claude_dtod(
+            gpu,
+            true,
+            &scratch.residual.buf,
+            0,
+            &scratch.cur.buf,
+            0,
+            n * dim_bytes,
+        )?;
+    }
 
     // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
     let tmp_view = scratch.tmp.sub_offset(0, n * dim);
@@ -3118,22 +3209,36 @@ pub fn mtp_head_forward_block_batched_xfer(
     // (single-token softmax = 1). We still write K/V to make the KV cache
     // available for future cycles that wire historical reads.
     //
-    gpu.kv_cache_write_q8_0_batched(
-        &kv.inner.k_gpu[0],
-        &k_view,
-        positions_dev,
-        cfg.n_head_kv,
-        cfg.head_dim,
-        n,
-    )?;
-    gpu.kv_cache_write_q8_0_batched(
-        &kv.inner.v_gpu[0],
-        &v_view,
-        positions_dev,
-        cfg.n_head_kv,
-        cfg.head_dim,
-        n,
-    )?;
+    if c5 && gpu.claude_kv_pair_enabled() {
+        // claude r2 C5: K and V in one launch (C1 pair kernel).
+        gpu.kv_cache_write_q8_0_pair_batched(
+            &kv.inner.k_gpu[0],
+            &kv.inner.v_gpu[0],
+            &k_view,
+            &v_view,
+            positions_dev,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+        )?;
+    } else {
+        gpu.kv_cache_write_q8_0_batched(
+            &kv.inner.k_gpu[0],
+            &k_view,
+            positions_dev,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+        )?;
+        gpu.kv_cache_write_q8_0_batched(
+            &kv.inner.v_gpu[0],
+            &v_view,
+            positions_dev,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+        )?;
+    }
     if kv_only {
         return Ok(());
     }
@@ -3766,5 +3871,244 @@ extern "C" __global__ void claude_bench_spin(unsigned long long ticks) {
             head.free_gpu(&mut gpu);
             trunk.free_gpu(&mut gpu);
         }
+    }
+}
+
+#[cfg(test)]
+mod claude_refresh_c5_tests {
+    //! claude r2 C5: the KV-only batched MTP forward (accepted-row refresh /
+    //! prompt fill) with and without the C5 launch cleanups must leave
+    //! byte-identical K and V caches. Synthetic dense head at the Qwen3.8-27B
+    //! draft shapes (random MQ4G256 weights), Q8_0 embedding stand-in, random
+    //! prev hiddens, tokens and scattered positions; n = 1..4 (refresh) and
+    //! 37 / 64 (fill-like). GPU time per call is printed for n = 3.
+    //!   cargo test --release -p hipfire-arch-qwen35 --lib claude_refresh_c5 -- --ignored --nocapture
+    use super::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as u32
+        }
+        fn unit(&mut self) -> f32 {
+            self.next() as f32 / 2_147_483_648.0
+        }
+        fn sym(&mut self, a: f32) -> f32 {
+            (self.unit() * 2.0 - 1.0) * a
+        }
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + self.unit() * (hi - lo)
+        }
+    }
+
+    fn up(gpu: &mut Gpu, v: &[f32]) -> GpuTensor {
+        gpu.upload_f32(v, &[v.len()]).expect("upload")
+    }
+
+    fn mq4(gpu: &mut Gpu, m: usize, k: usize, r: &mut Lcg) -> WeightTensor {
+        let gpr = k / 256;
+        let mut bytes = Vec::with_capacity(m * gpr * 136);
+        for _ in 0..m * gpr {
+            let sc = r.range(0.002, 0.02);
+            let zp = -7.5 * sc + r.sym(0.01);
+            bytes.extend_from_slice(&sc.to_le_bytes());
+            bytes.extend_from_slice(&zp.to_le_bytes());
+            for _ in 0..128 {
+                bytes.push(r.next() as u8);
+            }
+        }
+        let buf = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload weight");
+        WeightTensor {
+            buf,
+            gpu_dtype: DType::MQ4G256,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn norm_w(gpu: &mut Gpu, n: usize, r: &mut Lcg) -> GpuTensor {
+        let v: Vec<f32> = (0..n).map(|_| r.range(0.5, 1.5)).collect();
+        up(gpu, &v)
+    }
+
+    fn head(gpu: &mut Gpu, d: usize, nh: usize, nkv: usize, nff: usize, r: &mut Lcg) -> Qwen35MtpHead {
+        let cfg = Qwen35MtpHeadConfig {
+            n_embd: d,
+            n_head: nh,
+            n_head_kv: nkv,
+            head_dim: 256,
+            n_ff: nff,
+            ffn_kind: Qwen35MtpFfnKind::Dense,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            vocab_size: 64,
+            rope_theta: 10_000_000.0,
+            n_rot: 64,
+            rms_norm_eps: 1e-6,
+            max_seq: 128,
+            tie_word_embeddings: false,
+        };
+        let qd = 256 * nh;
+        let kvd = 256 * nkv;
+        let weights = Qwen35MtpHeadWeights {
+            shared_head_norm: norm_w(gpu, d, r),
+            enorm: norm_w(gpu, d, r),
+            hnorm: norm_w(gpu, d, r),
+            attn_norm: norm_w(gpu, d, r),
+            attn_post_norm: norm_w(gpu, d, r),
+            attn_q_norm: norm_w(gpu, 256, r),
+            attn_k_norm: norm_w(gpu, 256, r),
+            eh_proj: mq4(gpu, d, 2 * d, r),
+            wq: mq4(gpu, 2 * qd, d, r),
+            wk: mq4(gpu, kvd, d, r),
+            wv: mq4(gpu, kvd, d, r),
+            // never read by a KV-only forward: minimal stand-ins
+            wo: mq4(gpu, 256, qd, r),
+            ffn: Qwen35MtpFfnWeights::Dense(Qwen35MtpDenseFfnWeights {
+                gate: mq4(gpu, 256, d, r),
+                up: mq4(gpu, 256, d, r),
+                down: mq4(gpu, 256, 256, r),
+            }),
+            lm_head_draft: None,
+            lm_head_draft_vocab_map: None,
+            lm_head_draft_vocab_map_gpu: None,
+            compressed_vocab_size: None,
+        };
+        Qwen35MtpHead { config: cfg, weights }
+    }
+
+    fn trunk(gpu: &mut Gpu, vocab: usize, dim: usize, r: &mut Lcg) -> Qwen35Weights {
+        let mut bytes = Vec::with_capacity(vocab * dim / 32 * 34);
+        for _ in 0..vocab * dim / 32 {
+            let s = hipfire_runtime::llama::f32_to_f16(r.range(0.005, 0.03));
+            bytes.extend_from_slice(&s.to_le_bytes());
+            for _ in 0..32 {
+                bytes.push(r.next() as u8);
+            }
+        }
+        let token_embd = gpu.upload_raw(&bytes, &[bytes.len()]).expect("embd");
+        let output_norm = up(gpu, &vec![1.0f32; dim]);
+        let output = mq4(gpu, 256, dim, r);
+        Qwen35Weights {
+            token_embd,
+            embd_format: EmbeddingFormat::Q8_0,
+            output_norm,
+            output,
+            layers: Vec::new(),
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            ep_shard: None,
+        }
+    }
+
+    fn raw(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
+        let mut v = vec![0u8; t.buf.size()];
+        gpu.hip.memcpy_dtoh(&mut v, &t.buf).expect("dtoh");
+        v.truncate(t.numel() * 4);
+        v
+    }
+
+    #[test]
+    #[ignore = "GPU (~150 MB); run with --ignored"]
+    fn claude_refresh_c5_bit_identical() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1100() {
+            eprintln!("skip: gfx1100 only (pair KV kernel)");
+            return;
+        }
+        gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+        let (d, nh, nkv) = (5120usize, 24usize, 4usize);
+        let mut r = Lcg(0xC5C5_0001);
+        let h = head(&mut gpu, d, nh, nkv, 256, &mut r);
+        let tw = trunk(&mut gpu, 64, d, &mut r);
+        let rows = 64usize;
+        let widest_k = (2 * d).max(d).max(nh * 256);
+        let rot = gpu.alloc_tensor(&[rows * widest_k], DType::F32).expect("rot");
+        let prev_host: Vec<f32> = (0..rows * d).map(|_| r.sym(3.0)).collect();
+        let prev = up(&mut gpu, &prev_host);
+        let mut all_ok = true;
+        for &n in &[1usize, 2, 3, 4, 37, 64] {
+            let tokens: Vec<u32> = (0..n).map(|_| r.next() % 64).collect();
+            let mut positions: Vec<i32> = Vec::new();
+            while positions.len() < n {
+                let p = (r.next() % 128) as i32;
+                if !positions.contains(&p) {
+                    positions.push(p);
+                }
+            }
+            let mut outs = Vec::new();
+            for c5 in [false, true] {
+                let mut scratch = Qwen35MtpHeadBatchedScratch::new(&mut gpu, &h.config, rows).expect("scratch");
+                let mut kv = Qwen35MtpHeadKvCache::new(&mut gpu, &h.config).expect("kv");
+                kv.reset(&mut gpu).expect("reset");
+                let xfer = MtpBatchedXfer { tokens: None, positions: None, ordered: true };
+                claude_mtp_block_batched_impl(
+                    &mut gpu, &h, &mut scratch, &mut kv, &tokens, &prev, &positions, n, &tw, Some(&rot), true, xfer, c5,
+                )
+                .expect("forward");
+                gpu.hip.device_synchronize().expect("sync");
+                outs.push((raw(&gpu, &kv.inner.k_gpu[0]), raw(&gpu, &kv.inner.v_gpu[0])));
+                kv.free_gpu(&mut gpu);
+                scratch.free_gpu(&mut gpu);
+            }
+            let ok = outs[0] == outs[1];
+            all_ok &= ok;
+            println!(
+                "[claude-c5] n={n}: K cache {} B, V cache {} B: {}",
+                outs[0].0.len(),
+                outs[0].1.len(),
+                if ok { "bit-identical" } else { "MISMATCH" }
+            );
+        }
+        // GPU time per KV-only forward at refresh size n = 3.
+        let n = 3usize;
+        let tokens = vec![5u32, 9, 17];
+        let positions = vec![40i32, 41, 42];
+        for c5 in [false, true] {
+            let mut scratch = Qwen35MtpHeadBatchedScratch::new(&mut gpu, &h.config, rows).expect("scratch");
+            let mut kv = Qwen35MtpHeadKvCache::new(&mut gpu, &h.config).expect("kv");
+            kv.reset(&mut gpu).expect("reset");
+            let mut once = |gpu: &mut Gpu| {
+                let xfer = MtpBatchedXfer { tokens: None, positions: None, ordered: true };
+                claude_mtp_block_batched_impl(
+                    gpu, &h, &mut scratch, &mut kv, &tokens, &prev, &positions, n, &tw, Some(&rot), true, xfer, c5,
+                )
+                .expect("forward");
+            };
+            for _ in 0..3 {
+                once(&mut gpu);
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let e0 = gpu.hip.event_create().unwrap();
+            let e1 = gpu.hip.event_create().unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                gpu.hip.event_record(&e0, gpu.active_stream.as_ref()).unwrap();
+                for _ in 0..20 {
+                    once(&mut gpu);
+                }
+                gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+                gpu.hip.event_synchronize(&e1).unwrap();
+                best = best.min(gpu.hip.event_elapsed_ms(&e0, &e1).unwrap() as f64 * 1000.0 / 20.0);
+            }
+            println!("[claude-c5] KV-only forward n=3, CLAUDE_REFRESH_C5={}: {best:.1} us GPU per call (includes the 2 blocking H2D uploads of this test)", c5 as u8);
+            kv.free_gpu(&mut gpu);
+            scratch.free_gpu(&mut gpu);
+        }
+        assert!(all_ok, "C5 changed the K/V cache bytes");
     }
 }
