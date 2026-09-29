@@ -1049,7 +1049,8 @@ pub fn execute_gated_attention(
 // ── Dense SwiGLU FFN ──────────────────────────────────────────────────────
 
 /// Dense FFN sublayer: norm → gate/up projection → SwiGLU down projection
-/// added into `x`.
+/// added into `x`. With `rows > 1` the tensors are `[rows, …]` batches and
+/// `batch` carries the batched-only operands.
 pub struct SwigluFfnOp<'a> {
     pub rows: usize,
     pub eps: f32,
@@ -1063,6 +1064,7 @@ pub struct SwigluFfnOp<'a> {
     pub gate: &'a GpuTensor,
     pub up: &'a GpuTensor,
     pub hidden: &'a GpuTensor,
+    pub batch: Option<crate::pipeline::batched::SwigluFfnBatch<'a>>,
 }
 
 impl SwigluFfnOp<'_> {
@@ -1095,6 +1097,9 @@ pub fn execute_swiglu_ffn(
     ctx: &DispatchCtx,
     op: &SwigluFfnOp<'_>,
 ) -> Result<(), DispatchError> {
+    if let Some(batch) = &op.batch {
+        return crate::pipeline::batched::execute_swiglu_ffn_batched(gpu, op, batch).map_err(hip);
+    }
     op.project(gpu, ctx)?;
     op.down(gpu, ctx)
 }

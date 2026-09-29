@@ -197,6 +197,7 @@ impl<'a> DecodeBinding<'a> {
             gate: &s.gate_ffn,
             up: &s.up,
             hidden: &s.ffn_hidden,
+            batch: None,
         }))
     }
 }
