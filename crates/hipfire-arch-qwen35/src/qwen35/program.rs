@@ -14,8 +14,7 @@ use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::weights::{DeltaNetState, LayerWeights, StateQuant};
 use hipfire_dispatch::pipeline::hybrid::{
-    AttentionKv, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState, HybridDims,
-    SwigluFfnOp,
+    AttentionKv, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState, HybridDims, SwigluFfnOp,
 };
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::{self, KvCacheExt};
@@ -82,12 +81,28 @@ impl<'a> DecodeBinding<'a> {
                 let (attn_norm, wqkv, wz, w_beta, w_alpha, dt_bias, a_log, conv, norm, wo) =
                     match layer {
                         LayerWeights::DeltaNet(l) => (
-                            &l.attn_norm, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.dt_bias,
-                            &l.a_log, &l.conv_weight, &l.norm_weight, &l.wo,
+                            &l.attn_norm,
+                            &l.wqkv,
+                            &l.wz,
+                            &l.w_beta,
+                            &l.w_alpha,
+                            &l.dt_bias,
+                            &l.a_log,
+                            &l.conv_weight,
+                            &l.norm_weight,
+                            &l.wo,
                         ),
                         LayerWeights::DeltaNetMoe(l) => (
-                            &l.attn_norm, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.dt_bias,
-                            &l.a_log, &l.conv_weight, &l.norm_weight, &l.wo,
+                            &l.attn_norm,
+                            &l.wqkv,
+                            &l.wz,
+                            &l.w_beta,
+                            &l.w_alpha,
+                            &l.dt_bias,
+                            &l.a_log,
+                            &l.conv_weight,
+                            &l.norm_weight,
+                            &l.wo,
                         ),
                         _ => unreachable!(),
                     };
@@ -125,12 +140,24 @@ impl<'a> DecodeBinding<'a> {
             }
             LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
                 let (attn_norm, wq, wk, wv, q_norm, k_norm, wo) = match layer {
-                    LayerWeights::FullAttn(l) => {
-                        (&l.attn_norm, &l.wq, &l.wk, &l.wv, &l.q_norm, &l.k_norm, &l.wo)
-                    }
-                    LayerWeights::FullAttnMoe(l) => {
-                        (&l.attn_norm, &l.wq, &l.wk, &l.wv, &l.q_norm, &l.k_norm, &l.wo)
-                    }
+                    LayerWeights::FullAttn(l) => (
+                        &l.attn_norm,
+                        &l.wq,
+                        &l.wk,
+                        &l.wv,
+                        &l.q_norm,
+                        &l.k_norm,
+                        &l.wo,
+                    ),
+                    LayerWeights::FullAttnMoe(l) => (
+                        &l.attn_norm,
+                        &l.wq,
+                        &l.wk,
+                        &l.wv,
+                        &l.q_norm,
+                        &l.k_norm,
+                        &l.wo,
+                    ),
                     _ => unreachable!(),
                 };
                 let kv = self.kv_cache;

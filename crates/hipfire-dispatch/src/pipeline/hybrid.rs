@@ -19,7 +19,9 @@ use crate::families::attention::AttnParams;
 use crate::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
 use crate::pipeline::steps::{execute_steps, GemvInput, Step};
-use crate::types::{dtype_needs_rotation, dtype_rotation_plan, DispatchError, GemvVariant, KernelKey, RotationPlan};
+use crate::types::{
+    dtype_needs_rotation, dtype_rotation_plan, DispatchError, GemvVariant, KernelKey, RotationPlan,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
 
@@ -130,12 +132,11 @@ fn is_mq4(dtype: DType) -> bool {
 pub fn gdn_compact_qk_div(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> Option<usize> {
     static COMPACT3: LazyLock<bool> =
         LazyLock::new(|| developer_var("HIPFIRE_GDN_COMPACT3").as_deref() != Some("0"));
-    let compact2 = (gpu.arch_caps.is_gfx1201()
-        || gpu.arch_caps.arch() == "gfx1100"
-        || gfx1151_radiowave(gpu))
-        && developer_var("HIPFIRE_GDN_COMPACT2").as_deref() != Some("0")
-        && q8_state
-        && dims.linear_key_heads * 2 == dims.linear_value_heads;
+    let compact2 =
+        (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100" || gfx1151_radiowave(gpu))
+            && developer_var("HIPFIRE_GDN_COMPACT2").as_deref() != Some("0")
+            && q8_state
+            && dims.linear_key_heads * 2 == dims.linear_value_heads;
     if compact2 {
         return Some(2);
     }
@@ -256,10 +257,9 @@ pub fn qkvza_scalar_prep(
 
 pub fn conv_qknorm(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
     let mode = developer_var("HIPFIRE_CONV_QKNORM");
-    let arch_enabled = (gpu.arch_caps.is_gfx1201()
-        || gpu.arch_caps.arch() == "gfx1100"
-        || gfx1151_radiowave(gpu))
-        && mode.as_deref() != Some("0");
+    let arch_enabled =
+        (gpu.arch_caps.is_gfx1201() || gpu.arch_caps.arch() == "gfx1100" || gfx1151_radiowave(gpu))
+            && mode.as_deref() != Some("0");
     arch_enabled && q8_state && dims.linear_key_dim == 128
 }
 
@@ -549,8 +549,22 @@ impl DeltaNetMixerOp<'_> {
             };
             return gpu
                 .fused_qkvza_hfq4g256_scalar_prep_gfx1100(
-                    wqkv.buf, wz.buf, wb.buf, wa.buf, input, self.qkv, self.z, self.beta,
-                    self.alpha, self.dt_bias, self.a_log, wqkv.m, wz.m, wb.m, wa.m, wqkv.k,
+                    wqkv.buf,
+                    wz.buf,
+                    wb.buf,
+                    wa.buf,
+                    input,
+                    self.qkv,
+                    self.z,
+                    self.beta,
+                    self.alpha,
+                    self.dt_bias,
+                    self.a_log,
+                    wqkv.m,
+                    wz.m,
+                    wb.m,
+                    wa.m,
+                    wqkv.k,
                 )
                 .map_err(hip);
         }
@@ -814,7 +828,9 @@ pub fn execute_deltanet_mixer(
 // ── Gated full-attention mixer ────────────────────────────────────────────
 
 /// Observer of the pre-RoPE Q/K of one attention layer (diagnostic tap).
-pub type AttentionTap<'a> = &'a dyn Fn(&mut Gpu, &GpuTensor, &GpuTensor) -> Result<(), DispatchError>;
+/// Arguments: pre-RoPE Q rows, K rows, row count.
+pub type AttentionTap<'a> =
+    &'a dyn Fn(&mut Gpu, &GpuTensor, &GpuTensor, usize) -> hip_bridge::HipResult<()>;
 
 /// KV storage one attention layer writes and reads.
 pub struct AttentionKv<'a> {
@@ -877,8 +893,17 @@ impl GatedAttentionOp<'_> {
         if self.prerotated_input {
             return gpu
                 .fused_qkv_hfq4g256(
-                    wq.buf, wk.buf, wv.buf, self.x_rot, self.q_gate, self.k, self.v, wq.m, wk.m,
-                    wv.m, wq.k,
+                    wq.buf,
+                    wk.buf,
+                    wv.buf,
+                    self.x_rot,
+                    self.q_gate,
+                    self.k,
+                    self.v,
+                    wq.m,
+                    wk.m,
+                    wv.m,
+                    wq.k,
                 )
                 .map_err(hip);
         }
@@ -923,7 +948,7 @@ impl GatedAttentionOp<'_> {
             .map_err(hip)?;
         }
         if let Some(tap) = self.tap {
-            tap(gpu, self.q, self.k)?;
+            tap(gpu, self.q, self.k, 1).map_err(hip)?;
         }
         // RoPE uses the logical position; the KV slot stays physical.
         let compacted = self.kv.compact_offset > 0;
@@ -1002,7 +1027,11 @@ impl GatedAttentionOp<'_> {
             block_start: 0,
             block_cols: 0,
             output_gate: fused_epilogue.then_some(self.gate),
-            output_awq_scale: if fused_epilogue { self.wo.awq_scale } else { None },
+            output_awq_scale: if fused_epilogue {
+                self.wo.awq_scale
+            } else {
+                None
+            },
             output: self.attn_out,
         };
         execute_steps(gpu, ctx, &[Step::Attend { plan, io }])?;
@@ -1088,7 +1117,15 @@ impl SwigluFfnOp<'_> {
     }
 
     pub fn down(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> Result<(), DispatchError> {
-        swiglu_down_residual(gpu, ctx, &self.w_down, self.gate, self.up, self.hidden, self.x)
+        swiglu_down_residual(
+            gpu,
+            ctx,
+            &self.w_down,
+            self.gate,
+            self.up,
+            self.hidden,
+            self.x,
+        )
     }
 }
 

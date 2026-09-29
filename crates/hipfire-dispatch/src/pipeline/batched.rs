@@ -170,6 +170,21 @@ pub enum DenseBatchMath {
     SingletonWmma,
 }
 
+/// Dense-batch arithmetic of a target-verify forward: [`DenseBatchMath::SingletonWmma`]
+/// at every row count while the PM FP8 verify scope is open
+/// (`HIPFIRE_CB_VERIFY_FP8`, see `Gpu::fp8_verify_enter`) so every dense stage
+/// is an F32 producer + `*VerifyExact` key, which rdna routes to the FP8 verify
+/// GEMMs (batched == singleton by construction, no F16 fusion fast route);
+/// [`DenseBatchMath::Product`] (byte-identical to the pre-FP8 route) otherwise.
+#[inline]
+pub fn verify_dense_math(gpu: &Gpu) -> DenseBatchMath {
+    if gpu.fp8_verify_scope {
+        DenseBatchMath::SingletonWmma
+    } else {
+        DenseBatchMath::Product
+    }
+}
+
 pub fn require_singleton_wmma_mq4v2(site: &str, dtypes: &[DType]) -> HipResult<()> {
     if dtypes.iter().all(|d| *d == DType::MQ4G256V2) {
         Ok(())
@@ -464,10 +479,7 @@ pub fn try_a8_rmsnorm_prepared(
     eps: f32,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod
-        || !gpu.a8_prefill_active(n, k)
-        || next.dtype != DType::MQ4G256V2
-    {
+    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || next.dtype != DType::MQ4G256V2 {
         return Ok(None);
     }
     let reservation = gpu.reserve_int8_mmq(k, n)?;
@@ -491,10 +503,7 @@ pub fn try_a8_hin_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
-    if !gpu.flags.a8_fused_prod
-        || !gpu.a8_prefill_active(n, k)
-        || down.dtype != DType::MQ4G256V2
-    {
+    if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || down.dtype != DType::MQ4G256V2 {
         return Ok(None);
     }
     let Some(awq) = down.awq_scale else {
@@ -769,14 +778,7 @@ pub fn try_gfx12_fp8_stream_silu_prepared(
     let prep = if h_ready {
         gpu.fused_silu_hin_rotate_mq_fp8_gfx12_batched(gate, w_down.awq_scale, k, n)?
     } else {
-        gpu.fused_silu_mul_rotate_mq_fp8_gfx12_batched(
-            gate,
-            up,
-            w_down.awq_scale,
-            x_rot,
-            k,
-            n,
-        )?
+        gpu.fused_silu_mul_rotate_mq_fp8_gfx12_batched(gate, up, w_down.awq_scale, x_rot, k, n)?
     };
     Ok(Some(prep))
 }
@@ -955,26 +957,12 @@ pub fn dispatch_batched_gemm_epilogue(
                 // fail-closed inside the FP8 launcher (never uniform).
                 if lloyd_mmq_lut_route(gpu) {
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
-                    return gpu.gemm_hfq4g256_residual_mmq_lloyd(
-                        w.buf,
-                        input,
-                        x_batch,
-                        m,
-                        k,
-                        n,
-                        c16,
-                    );
+                    return gpu
+                        .gemm_hfq4g256_residual_mmq_lloyd(w.buf, input, x_batch, m, k, n, c16);
                 }
                 let lut = lloyd_e4m3_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                 return gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
-                    w.buf,
-                    input,
-                    x_batch,
-                    m,
-                    k,
-                    n,
-                    1,
-                    lut,
+                    w.buf, input, x_batch, m, k, n, 1, lut,
                 );
             } else {
                 return run_residual_gemm_key(
@@ -1373,47 +1361,22 @@ fn swiglu_ffn_gate_up_batched(
     let ffn_is_lowbit = matches!(op.w_gate.dtype, DType::TQ2G128 | DType::BQ1G128);
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[op.w_gate.dtype, op.w_up.dtype]);
-    let a8_prep =
-        if op.w_gate.dtype == DType::MQ4G256V2 && op.w_up.dtype == DType::MQ4G256V2 {
-            try_a8_rmsnorm_prepared(
-                gpu,
-                op.x,
-                &op.norm,
-                &op.w_gate,
-                dim,
-                op.eps,
-                n,
-            )?
-        } else {
-            None
-        };
+    let a8_prep = if op.w_gate.dtype == DType::MQ4G256V2 && op.w_up.dtype == DType::MQ4G256V2 {
+        try_a8_rmsnorm_prepared(gpu, op.x, &op.norm, &op.w_gate, dim, op.eps, n)?
+    } else {
+        None
+    };
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if ffn_is_mq && a8_prep.is_none() {
         // C2: MQ4V2 IU4 producer (emit_f32=false — gate_up has no f32 small tails).
         iu4_prep = try_iu4_rmsnorm_prepared(
-            gpu,
-            op.x,
-            &op.norm,
-            &op.w_gate,
-            op.x_rot,
-            dim,
-            op.eps,
-            n,
-            false,
+            gpu, op.x, &op.norm, &op.w_gate, op.x_rot, dim, op.eps, n, false,
         )?;
         if iu4_prep.is_none() {
             // gfx1201 slices-2: fused rmsnorm+quant producer (bit-identical).
             iu4_prep = try_gfx12_rmsnorm_quant_fused_prepared(
-                gpu,
-                op.x,
-                &op.norm,
-                &op.w_gate,
-                op.x_rot,
-                dim,
-                op.eps,
-                n,
-                false,
+                gpu, op.x, &op.norm, &op.w_gate, op.x_rot, dim, op.eps, n, false,
             )?;
         }
         if iu4_prep.is_none() {
@@ -1436,25 +1399,11 @@ fn swiglu_ffn_gate_up_batched(
         if iu4_prep.is_none() && fp8_prep.is_none() {
             // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
             fused_rmsnorm_rotate_mq_batched_for(
-                gpu,
-                op.x,
-                &op.norm,
-                &op.w_gate,
-                op.x_rot,
-                dim,
-                op.eps,
-                n,
+                gpu, op.x, &op.norm, &op.w_gate, op.x_rot, dim, op.eps, n,
             )?;
         }
     } else if !ffn_is_mq {
-        gpu.rmsnorm_batched(
-            op.x,
-            &op.norm,
-            op.x_rot,
-            n,
-            dim,
-            op.eps,
-        )?;
+        gpu.rmsnorm_batched(op.x, &op.norm, op.x_rot, n, dim, op.eps)?;
     }
 
     // Batched gate+up projection.
@@ -1486,14 +1435,7 @@ fn swiglu_ffn_gate_up_batched(
             op.w_gate.k,
             n,
         )?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            op.w_up.buf,
-            xq,
-            op.up,
-            op.w_up.m,
-            op.w_up.k,
-            n,
-        )?;
+        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(op.w_up.buf, xq, op.up, op.w_up.m, op.w_up.k, n)?;
     } else if f1lite && gpu.a8_prefill_active(n, op.w_gate.k) {
         let xq = gpu.ensure_int8_mmq_x(op.x_rot, n, op.w_gate.k)?;
         gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
@@ -1832,14 +1774,7 @@ fn swiglu_ffn_down_batched(
                 n,
             )?;
             let x_f16 = b.hidden_f16.sub_offset(0, n * hidden_dim);
-            gpu.gemm_mq4g256v2_residual_wmma_f16(
-                op.w_down.buf,
-                &x_f16,
-                op.x,
-                m,
-                hidden_dim,
-                n,
-            )?;
+            gpu.gemm_mq4g256v2_residual_wmma_f16(op.w_down.buf, &x_f16, op.x, m, hidden_dim, n)?;
             return Ok(());
         }
     }
@@ -1870,19 +1805,10 @@ fn swiglu_ffn_down_batched(
         && op.w_down.dtype == DType::MQ4G256V2
         && matches!(&b.epilogue, BatchEpilogue::Residual)
     {
-        let xq = if let Some(prep) =
-            try_a8_hin_prepared(gpu, &op.w_down, op.gate, hidden_dim, n)?
-        {
+        let xq = if let Some(prep) = try_a8_hin_prepared(gpu, &op.w_down, op.gate, hidden_dim, n)? {
             gpu.int8_mmq_prepared_ptr(&prep, hidden_dim, n)?
         } else {
-            rotate_x_mq_batched_for(
-                gpu,
-                &op.w_down,
-                op.gate,
-                op.hidden,
-                hidden_dim,
-                n,
-            )?;
+            rotate_x_mq_batched_for(gpu, &op.w_down, op.gate, op.hidden, hidden_dim, n)?;
             gpu.ensure_int8_mmq_x(op.hidden, n, hidden_dim)?
         };
         return gpu.gemm_mq4g256v2_mmq_add_prequant_i8(
@@ -1912,36 +1838,16 @@ fn swiglu_ffn_down_batched(
         // Partial TP epilogue still needs the f32 rotated buffer.
         if matches!(&b.epilogue, BatchEpilogue::Residual) && h_source != FfnGateOutput::Fp8H {
             iu4_prep = if h_source == FfnGateOutput::Iu4H {
-                Some(iu4_hin_prepared(
-                    gpu,
-                    &op.w_down,
-                    op.gate,
-                    hidden_dim,
-                    n,
-                )?)
+                Some(iu4_hin_prepared(gpu, &op.w_down, op.gate, hidden_dim, n)?)
             } else {
                 try_iu4_silu_prepared(
-                    gpu,
-                    &op.w_down,
-                    op.gate,
-                    op.up,
-                    op.hidden,
-                    hidden_dim,
-                    n,
-                    false,
+                    gpu, &op.w_down, op.gate, op.up, op.hidden, hidden_dim, n, false,
                 )?
             };
             if iu4_prep.is_none() {
                 // gfx1201 slice-1: fused silu+quant producer (bit-identical).
                 iu4_prep = try_gfx12_silu_quant_fused_prepared(
-                    gpu,
-                    &op.w_down,
-                    op.gate,
-                    op.up,
-                    op.hidden,
-                    hidden_dim,
-                    n,
-                    false,
+                    gpu, &op.w_down, op.gate, op.up, op.hidden, hidden_dim, n, false,
                 )?;
             }
         }
@@ -1960,13 +1866,7 @@ fn swiglu_ffn_down_batched(
         if iu4_prep.is_none() && fp8_prep.is_none() {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
             fused_silu_mul_rotate_mq_batched_for(
-                gpu,
-                &op.w_down,
-                op.gate,
-                op.up,
-                op.hidden,
-                hidden_dim,
-                n,
+                gpu, &op.w_down, op.gate, op.up, op.hidden, hidden_dim, n,
             )?;
         }
     } else {

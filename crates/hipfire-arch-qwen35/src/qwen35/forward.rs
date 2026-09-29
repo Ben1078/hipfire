@@ -6162,8 +6162,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         let (s, config, layer_idx) = (self.s, self.config, self.layer_idx);
-        let tap_fn = |gpu: &mut Gpu, _q: &GpuTensor, _k: &GpuTensor| {
-            triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
+        let tap_fn = |gpu: &mut Gpu, q: &GpuTensor, k: &GpuTensor, rows: usize| {
+            super::prefill::triattn_tap_rows(gpu, layer_idx, q, k, rows, config)
         };
         let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
         match (op_code(op), self.mixer(tap)) {
@@ -6642,8 +6642,8 @@ fn forward_scratch_layers_lowered(
             )?;
             dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx - 1, "pertoken");
         }
-        let tap_fn = |gpu: &mut Gpu, _q: &GpuTensor, _k: &GpuTensor| {
-            triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
+        let tap_fn = |gpu: &mut Gpu, q: &GpuTensor, k: &GpuTensor, rows: usize| {
+            super::prefill::triattn_tap_rows(gpu, layer_idx, q, k, rows, config)
         };
         let tap = tap_enabled.then_some(&tap_fn as AttentionTap<'_>);
         let mixer = binding.mixer(

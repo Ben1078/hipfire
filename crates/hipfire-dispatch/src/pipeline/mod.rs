@@ -29,6 +29,8 @@ pub use moe_program::{MoeStage, SealedMoeOp};
 pub mod moe_dump;
 pub mod batched;
 #[cfg(feature = "deltanet")]
+pub mod batched_attention;
+#[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod draft_head;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};

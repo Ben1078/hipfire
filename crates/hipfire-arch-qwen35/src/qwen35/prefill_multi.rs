@@ -39,6 +39,8 @@
 //! view instead.
 
 use super::*;
+use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
+use hipfire_dispatch::pipeline::batched_attention::gfx12_fa_prep_admitted;
 
 /// One request's rows of a multi-request chunk.
 ///
@@ -662,25 +664,43 @@ pub fn forward_prefill_batch_multi(
                 delta_layer_idx += 1;
             }
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                // batch_chunk_full_attn_attn with the per-request flags each
-                // request's own singleton chunk computes (all n < 64).
+                // execute_gated_attention_batched with the per-request flags
+                // each request's own singleton chunk computes (all n < 64).
+                let (attn_w, dims) = (fa_attention_weights(layer), crate::qwen35::program::hybrid_dims(config));
                 if split_proj {
                     for (r, view) in reqs.iter().zip(&views) {
-                        batch_chunk_full_attn_input_projection(
-                            gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion,
+                        attention_input_projection_batched(
+                            gpu,
+                            &attn_w,
+                            &dims,
+                            &attention_scratch(view),
+                            r.tokens.len(),
+                            dim,
+                            q8_wmma_arch,
+                            r.fusion == DflashFusionCtx::ChainVerify,
                             DenseBatchMath::Product,
                         )?;
                     }
                 } else {
-                    batch_chunk_full_attn_input_projection(
-                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, math,
+                    attention_input_projection_batched(
+                        gpu,
+                        &attn_w,
+                        &dims,
+                        &attention_scratch(pbs),
+                        total,
+                        dim,
+                        q8_wmma_arch,
+                        shared_fusion == DflashFusionCtx::ChainVerify,
+                        math,
                     )?;
                 }
                 for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                     let n = r.tokens.len();
                     let max_ctx_len = r.start_pos + n;
-                    let rctx = if r.fusion == DflashFusionCtx::ChainVerify { &chain_ctx } else { &ctx };
-                    let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
+                    let chain_verify = r.fusion == DflashFusionCtx::ChainVerify;
+                    let rctx = if chain_verify { &chain_ctx } else { &ctx };
+                    let gfx12_fa_prep =
+                        gfx12_fa_prep_admitted(gpu, &dims, chain_verify, hipfire_runtime::triattn::tap_enabled(), n);
                     let multirow = q8_multirow_attn_admitted(
                         gpu.arch_caps.arch(),
                         r.kv_cache.quant_q8,
@@ -693,9 +713,27 @@ pub fn forward_prefill_batch_multi(
                         false,
                         false,
                     );
-                    batch_chunk_full_attn_prepare(
-                        gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None,
-                        kv_layer_idx, layer_idx, r.fusion, gfx12_fa_prep, false, false,
+                    attention_prepare_batched(
+                        gpu,
+                        multirow,
+                        &attn_w,
+                        &dims,
+                        &attention_scratch(view),
+                        &flash_scratch(s),
+                        &kv_view(r.kv_cache),
+                        n,
+                        r.start_pos,
+                        max_ctx_len,
+                        rctx,
+                        sem,
+                        None,
+                        kv_layer_idx,
+                        layer_idx,
+                        chain_verify,
+                        gfx12_fa_prep,
+                        false,
+                        false,
+                        attention_tap(layer_idx, config).as_deref(),
                     )?;
                     if twin {
                         // The singleton attend's paired write; the attention
@@ -713,9 +751,22 @@ pub fn forward_prefill_batch_multi(
                             )?;
                         }
                     } else {
-                        batch_chunk_fa_attend(
-                            gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None, layer_idx,
-                            multirow, None, false,
+                        attention_attend_batched(
+                            gpu,
+                            &dims,
+                            &attention_scratch(view),
+                            &flash_scratch(s),
+                            &kv_view(r.kv_cache),
+                            n,
+                            r.start_pos,
+                            max_ctx_len,
+                            rctx,
+                            sem,
+                            None,
+                            layer_idx,
+                            multirow,
+                            None,
+                            false,
                         )?;
                     }
                 }
@@ -738,15 +789,15 @@ pub fn forward_prefill_batch_multi(
                 {
                     for (r, view) in reqs.iter().zip(&views) {
                         let n = r.tokens.len();
-                        batch_chunk_full_attn_output_projection(
+                        attention_output_projection_batched(
                             gpu,
-                            layer,
-                            view,
+                            &attn_w,
+                            &attention_scratch(view),
                             n,
                             q8_wmma_arch,
                             arch_has_wmma,
                             BatchEpilogue::Residual,
-                            r.fusion,
+                            r.fusion == DflashFusionCtx::ChainVerify,
                             false,
                             None,
                             DenseBatchMath::Product,
@@ -757,15 +808,15 @@ pub fn forward_prefill_batch_multi(
                         )?;
                     }
                 } else {
-                    batch_chunk_full_attn_output_projection(
+                    attention_output_projection_batched(
                         gpu,
-                        layer,
-                        pbs,
+                        &attn_w,
+                        &attention_scratch(pbs),
                         total,
                         q8_wmma_arch,
                         arch_has_wmma,
                         BatchEpilogue::Residual,
-                        shared_fusion,
+                        shared_fusion == DflashFusionCtx::ChainVerify,
                         false,
                         None,
                         math,
