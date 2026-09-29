@@ -2039,6 +2039,15 @@ pub fn forward_scratch_mrope(
             gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
         );
     };
+    // claude VL: grow the VMM KV mapping before the write, like the 1D twin.
+    // This arm used to skip it, so any VL prompt longer than the initially
+    // mapped prefix (1927 tokens for q8 KV on the 27B) wrote into unmapped VA
+    // under `--kv-backend vmm` -> "Memory access fault ... Page not present".
+    // No-op on the fully allocated legacy backend. CLAUDE_VL_VMM_GROW=0 restores.
+    if super::vl_prefill::claude_vl_vmm_grow() {
+        let required_tokens = checked_kv_end(pos, 1, "forward_scratch_mrope")?;
+        kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    }
     mark_mrope_forward_ineligible(gpu);
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by
     // the KV write and flash attention, which want the PHYSICAL slot).
@@ -2083,6 +2092,11 @@ pub fn forward_scratch_embed_mrope(
             scratch,
         );
     };
+    // claude VL: same missing VMM growth as `forward_scratch_mrope` (see there).
+    if super::vl_prefill::claude_vl_vmm_grow() {
+        let required_tokens = checked_kv_end(pos, 1, "forward_scratch_embed_mrope")?;
+        kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    }
     mark_mrope_forward_ineligible(gpu);
     let pos_i32 = pos as i32;
     gpu.hip

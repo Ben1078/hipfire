@@ -3078,6 +3078,103 @@ pub fn generate_dflash(
         None => (prompt_tokens.clone(), 0, false, 0),
     };
 
+    generate_dflash_rendered(
+        m,
+        gpu,
+        stdout,
+        id,
+        DflashRenderedTurn {
+            prompt_tokens,
+            prefill_tokens,
+            prefill_start,
+            cache_hit,
+            resume_from,
+            cached_tokens_dflash,
+            started_in_think,
+            im_end_token,
+            max_tokens,
+            max_think_tokens,
+            pflash_bypass_reason,
+            pflash_alpha,
+            tools,
+            stop,
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            cactus_delta,
+            request_seed,
+            emit_gen_start: true,
+        },
+    )
+}
+
+/// claude: an already-rendered qwen35/llama spec turn for
+/// [`generate_dflash_rendered`] — everything [`generate_dflash`] has decided
+/// once the prompt is tokenized and the prompt-cache plan is made.
+pub struct DflashRenderedTurn<'a> {
+    pub prompt_tokens: Vec<u32>,
+    pub prefill_tokens: Vec<u32>,
+    pub prefill_start: usize,
+    pub cache_hit: bool,
+    pub resume_from: Option<usize>,
+    pub cached_tokens_dflash: usize,
+    pub started_in_think: bool,
+    pub im_end_token: Option<u32>,
+    pub max_tokens: usize,
+    pub max_think_tokens: usize,
+    pub pflash_bypass_reason: Option<&'a str>,
+    pub pflash_alpha: Option<f32>,
+    pub tools: Option<&'a [serde_json::Value]>,
+    pub stop: &'a [String],
+    pub temp: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub min_p: f32,
+    pub cactus_delta: f32,
+    pub request_seed: u64,
+    /// `false` when the caller already opened the stream (the VL body emits
+    /// `gen_start` before its vision encoder).
+    pub emit_gen_start: bool,
+}
+
+/// claude: the render-independent half of [`generate_dflash`] (speculator
+/// request config, `gen_start`, [`generate_spec`], `done`/cache epilogue),
+/// split out verbatim so the Qwen3.5-VL body can run an image prompt through
+/// the same MTP/DFlash spec path. [`generate_dflash`] calls it with
+/// `emit_gen_start = true`; behaviour is unchanged for text requests.
+pub fn generate_dflash_rendered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    turn: DflashRenderedTurn<'_>,
+) -> bool {
+    let DflashRenderedTurn {
+        prompt_tokens,
+        prefill_tokens,
+        prefill_start,
+        cache_hit,
+        resume_from,
+        cached_tokens_dflash,
+        started_in_think,
+        im_end_token,
+        max_tokens,
+        max_think_tokens,
+        pflash_bypass_reason,
+        pflash_alpha,
+        tools,
+        stop,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        cactus_delta,
+        request_seed,
+        emit_gen_start,
+    } = turn;
+    let spec_name = m.speculator.as_ref().map(|s| s.name()).unwrap_or("");
+
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
     // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
@@ -3129,12 +3226,14 @@ pub fn generate_dflash(
     // Advertise semantic-v2 only when this turn's arch has a correlated
     // router-backed DFlash producer (qwen35 / qwen35-vl). Other arches still
     // use whole-output tool extraction and stay on legacy contract.
-    crate::ar::emit_generation_start(
-        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenDflash),
-        stdout,
-        id,
-        started_in_think,
-    );
+    if emit_gen_start {
+        crate::ar::emit_generation_start(
+            crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::QwenDflash),
+            stdout,
+            id,
+            started_in_think,
+        );
+    }
     let run = match generate_spec(
         m,
         gpu,

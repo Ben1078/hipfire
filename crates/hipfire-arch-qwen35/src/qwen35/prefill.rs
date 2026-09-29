@@ -1905,6 +1905,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         n,
         pbs.max_batch
     );
+    // claude VL: a captured replay would bake the VL splice into the graph.
+    super::vl_prefill::refuse_overlap(start_pos, n, "captured prefill")?;
     let required_tokens = checked_kv_end(start_pos, n, "captured prefill")?;
     // This entry may already be inside graph capture, so it must only validate
     // capacity preflighted by its caller.
@@ -2505,6 +2507,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
              model fell through to the per-token fallback (likely non-MQ4 \
              weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
         );
+        // claude VL: the per-token loop cannot splice image embeddings.
+        super::vl_prefill::refuse_overlap(start_pos, n, "per-token prefill fallback")?;
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
         // buffer still gets populated correctly (each call advances head by 1).
@@ -8383,10 +8387,10 @@ fn batch_chunk_full_attn_prepare(
     _s: &Qwen35Scratch,
     kv_cache: &llama::KvCache,
     n: usize,
-    _start_pos: usize,
+    start_pos: usize,
     _max_ctx_len: usize,
     _ctx: &DispatchCtx,
-    _batch_semantics: BatchSemantics<'_>,
+    batch_semantics: BatchSemantics<'_>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     _kv_layer_idx: usize,
     layer_idx: usize,
@@ -8394,6 +8398,52 @@ fn batch_chunk_full_attn_prepare(
     gfx12_fa_prep: bool,
     gfx12_fa_prep_fp8q: bool,
 ) -> HipResult<()> {
+    // claude VL: chunks that start inside the image / explicit-phase region
+    // rotate with the batched mrope kernel at their (t, h, w) phases (see
+    // `vl_prefill`); the fused preps only carry 1D phases, so take the unfused
+    // deinterleave+Q-norm / K-norm chain here. KV write + attend are unchanged
+    // (physical slots in `pbs.positions`).
+    if let Some((pos3, section)) = super::vl_prefill::rope_rows(start_pos, n)? {
+        if tree_verify.is_some() || batch_semantics.is_independent() {
+            return Err(HipError::new(
+                0,
+                "VL mrope rows cannot run under tree verify or independent batches",
+            ));
+        }
+        gpu.deinterleave_q_rmsnorm_f32_batched(
+            &pbs.fa_q_full_batch,
+            &pbs.fa_q_batch,
+            &pbs.fa_gate_batch,
+            &layer.q_norm,
+            config.n_heads,
+            config.head_dim,
+            n,
+            config.norm_eps,
+        )?;
+        gpu.rmsnorm_batched(
+            &pbs.fa_k_batch,
+            &layer.k_norm,
+            &pbs.fa_k_batch,
+            n * config.n_kv_heads,
+            config.head_dim,
+            config.norm_eps,
+        )?;
+        let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            kv_cache.compact_offset as i32,
+            section,
+        )?;
+        return Ok(());
+    }
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
@@ -9247,6 +9297,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     let q_dim = config.n_heads * config.head_dim;
     let gfx12_fa_prep = gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
+        && !super::vl_prefill::overlaps(start_pos, n)
         && fusion != DflashFusionCtx::ChainVerify
         && !gpu.flags.rope_interleaved_legacy
         && !hipfire_runtime::triattn::tap_enabled()
@@ -9920,6 +9971,8 @@ fn batch_chunk_full_attn_fallback(
     s: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
 ) -> HipResult<()> {
+    // claude VL: this per-token body rotates at 1D slot phases.
+    super::vl_prefill::refuse_overlap(start_pos, n, "per-token FA fallback")?;
     // Per-token gather/scatter fallback for FA layers that don't
     // qualify for batched FA (non-MQ4 weights, non-Q8_0 KV, etc).
     for i in 0..n {
@@ -11908,6 +11961,17 @@ fn forward_prefill_chunk_pair(
         None,
         false,
     )?;
+    // claude VL: image rows of either half (see forward_batch_chunk_impl).
+    super::vl_prefill::overwrite_image_rows(gpu, &pbs_c.x_batch, start_c, n)?;
+    super::vl_prefill::overwrite_image_rows(gpu, &pbs_n.x_batch, start_n, n)?;
+    if super::vl_prefill::is_active()
+        && weights
+            .layers
+            .iter()
+            .any(|lw| matches!(lw, LayerWeights::FullAttnMoe(_)))
+    {
+        super::vl_prefill::refuse_overlap(start_c, 2 * n, "MoE full-attention")?;
+    }
 
     #[cfg(feature = "moe-oracle")]
     crate::qwen35::oracle::set_prefill_start(start_c)
@@ -12572,6 +12636,16 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify,
         pre_uploaded,
     )?;
+    // claude VL: splice the vision tower's embeddings over the image rows of
+    // this chunk (no-op unless a VL prefill context overlaps it; see
+    // `vl_prefill`). Bands past the first carry the already-spliced activation.
+    if matches!(batch_semantics, BatchSemantics::Sequential) {
+        if do_embed && !pre_embedded {
+            super::vl_prefill::overwrite_image_rows(gpu, &pbs.x_batch, start_pos, n)?;
+        } else if pre_embedded {
+            super::vl_prefill::refuse_overlap(start_pos, n, "pre-embedded batch")?;
+        }
+    }
 
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
@@ -12585,6 +12659,18 @@ pub(crate) fn forward_batch_chunk_impl(
                 }
                 _ => true,
             });
+    // claude VL: explicit mrope phases are only wired into the dense batched
+    // FA prep; the per-token FA fallback and the MoE FA prep would silently
+    // rotate VL rows at 1D slot phases.
+    if super::vl_prefill::is_active()
+        && (!fa_batched_ok
+            || weights
+                .layers
+                .iter()
+                .any(|lw| matches!(lw, LayerWeights::FullAttnMoe(_))))
+    {
+        super::vl_prefill::refuse_overlap(start_pos, n, "unbatched/MoE full-attention")?;
+    }
     // Attention only: the batched masked FA kernel grids [n_heads, tiles, ROW]
     // and re-scans the whole KV once per row, so a small verify block over a
     // long context pays the scan n times (202 vs 103 ms at 33k). The layer's

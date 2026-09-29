@@ -919,6 +919,19 @@ pub fn generate_vl(
         raw: false,
     }
     .build_with_user_tokens(&user_body);
+    // claude CLAUDE_VL_AB (validation only; see `vl_ab_mode`): 't'/'T' drop the
+    // image tokens so the same prompt calibrates per-token vs batched numerics
+    // on plain text.
+    let ab = vl_ab_mode();
+    let ab_text_only = matches!(ab, Some('t' | 'T'));
+    let prompt_tokens: Vec<u32> = if ab_text_only {
+        prompt_tokens
+            .into_iter()
+            .filter(|&t| t != image_pad_id && t != vision_start_id && t != vision_end_id)
+            .collect()
+    } else {
+        prompt_tokens
+    };
 
     // KV-budget guard — tier-aware without eviction, absolute window with.
     // Adaptive admits against max_seq (floor-tier guarantee); non-adaptive keeps
@@ -972,6 +985,21 @@ pub fn generate_vl(
             m.seq_pos,
             config,
         )
+    };
+    // CLAUDE_VL_AB 'S' (validation only): the per-token path with every phase
+    // shifted by -rope_delta and decode at slot phases — the layout the fast
+    // path uses — to check the shift is numerically neutral on identical kernels.
+    let mrope_ctx = match (ab, mrope_ctx) {
+        (Some('S'), Some(mc)) => {
+            let shift = -mc.rope_delta;
+            let positions = mc
+                .positions
+                .iter()
+                .map(|p| [p[0] + shift, p[1] + shift, p[2] + shift])
+                .collect();
+            Some(qwen35::MropeCtx::new(config, mc.base, positions, 0))
+        }
+        (_, mc) => mc,
     };
     let mrope = mrope_ctx.as_ref();
 
@@ -1217,6 +1245,137 @@ pub fn generate_vl(
     } else {
         None
     };
+    let mut visual_tokens = visual_tokens;
+
+    // ── claude: VL fast paths ───────────────────────────────────────────
+    // (a) CLAUDE_VL_FAST_PREFILL (default on): the prompt runs through the
+    //     chunked batched text prefill with the image embeddings spliced over
+    //     the `<|image_pad|>` rows and (t, h, w) phases for the image region
+    //     (`qwen35::vl_prefill`), instead of one per-token forward per row.
+    // (b) CLAUDE_VL_MTP (default on, needs (a) and a loaded MTP head): the
+    //     whole turn — MTP prompt fill, speculative decode, emission, done —
+    //     runs through the shared text spec path (`generate_dflash_rendered`)
+    //     instead of the per-token CPU-sampled VL decode loop below.
+    // Each `=0` restores the per-token path for its stage.
+    // CLAUDE_VL_AB (validation only) overrides both per request.
+    if let Some(mode) = ab {
+        eprintln!("[daemon/vl] CLAUDE_VL_AB mode {mode}");
+    }
+    let vl_fast = ab.map_or_else(vl_fast_prefill_enabled, |mode| matches!(mode, 'f' | 'm' | 'T'))
+        && m.seq_pos == 0
+        && m.eviction.is_none()
+        && m.kv_adaptive.is_none()
+        && m.ep.is_none()
+        && m.pp <= 1
+        && match qwen35::vl_prefill::batched_supported(
+            gpu,
+            weights,
+            config,
+            dn,
+            kv,
+            prompt_tokens.len(),
+        ) {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("[daemon/vl] fast prefill unavailable ({why}) — per-token VL path");
+                false
+            }
+        };
+    let image_start = prompt_tokens
+        .iter()
+        .position(|&t| t == image_pad_id)
+        .unwrap_or(0);
+    let vl_spec = vl_fast
+        && ab.map_or_else(vl_mtp_enabled, |mode| mode == 'm')
+        && hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0")
+        && match m.speculator.as_ref() {
+            // Same admission as the text route selector for MTP: greedy, or
+            // sampled when the verify supports it. Non-neutral repeat penalty
+            // stays on the per-token decode loop, which applies it.
+            Some(s) => {
+                s.name() == "mtp"
+                    && (temp <= 1e-6 || s.supports_temp_verify())
+                    && repeat_penalty == 1.0
+                    && crate::common::spec_ctx_request_fits(
+                        prompt_tokens.len(),
+                        max_tokens,
+                        s.block_size(),
+                        s.ctx_capacity(),
+                    )
+            }
+            None => false,
+        };
+    if vl_spec {
+        let inputs = qwen35::vl_prefill::VlPrefillInputs::new(
+            image_start,
+            visual_tokens,
+            config.dim,
+            mrope_ctx.as_ref(),
+            config.mrope_section,
+        );
+        eprintln!(
+            "[daemon/vl] fast path: batched prefill + MTP spec decode (prompt={} image rows {}..{} rope_end={})",
+            prompt_tokens.len(),
+            image_start,
+            image_start + inputs.n_visual(),
+            inputs.rope_end(),
+        );
+        if let Err(e) = qwen35::vl_prefill::install(gpu, inputs) {
+            vl_forward_fail(
+                stdout,
+                id,
+                "vl_prefill install",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
+        // gen_start went out at the top of this body (before the encoder).
+        let _ = crate::qwen::generate_dflash_rendered(
+            m,
+            gpu,
+            stdout,
+            id,
+            crate::qwen::DflashRenderedTurn {
+                prompt_tokens: prompt_tokens.clone(),
+                prefill_tokens: prompt_tokens,
+                prefill_start: 0,
+                cache_hit: false,
+                resume_from: None,
+                cached_tokens_dflash: 0,
+                started_in_think,
+                im_end_token,
+                max_tokens,
+                max_think_tokens,
+                pflash_bypass_reason: None,
+                pflash_alpha: None,
+                tools: None,
+                stop: &[],
+                temp,
+                top_p,
+                top_k: 0,
+                min_p: 0.0,
+                cactus_delta: 0.0,
+                request_seed: seed as u64,
+                emit_gen_start: false,
+            },
+        );
+        if let Err(e) = qwen35::vl_prefill::uninstall(gpu) {
+            eprintln!("[daemon/vl] vl_prefill uninstall: {e}");
+        }
+        vl_invalidate_turn_reuse(m, gpu);
+        return;
+    }
+
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
     // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
@@ -1238,13 +1397,90 @@ pub fn generate_vl(
         _ => None,
     };
 
+    // claude: fast prefill without the MTP route (no MTP head, sampled request
+    // with a repeat penalty, CLAUDE_VL_MTP=0): one chunked batched prefill,
+    // then the per-token decode loop below at slot phases — the shifted phase
+    // layout (see `qwen35::vl_prefill`) makes every post-image row rotate at
+    // its KV slot, so decode needs no mrope context.
+    let mrope = if vl_fast { None } else { mrope };
+    if vl_fast {
+        if check_abort(id) {
+            vl_cancel_after_rollback(
+                stdout,
+                id,
+                0,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            return;
+        }
+        let embeds = std::mem::take(&mut visual_tokens);
+        let inputs = qwen35::vl_prefill::VlPrefillInputs::new(
+            image_start,
+            if ab_text_only { Vec::new() } else { embeds },
+            config.dim,
+            mrope_ctx.as_ref(),
+            config.mrope_section,
+        );
+        eprintln!(
+            "[daemon/vl] fast path: batched prefill + per-token decode (prompt={} image rows {}..{} rope_end={})",
+            prompt_tokens.len(),
+            image_start,
+            image_start + inputs.n_visual(),
+            inputs.rope_end(),
+        );
+        let prefill = qwen35::vl_prefill::install(gpu, inputs).and_then(|()| {
+            qwen35::forward_prefill_batch(
+                gpu,
+                weights,
+                config,
+                &prompt_tokens,
+                m.seq_pos,
+                kv,
+                dn,
+                scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+        });
+        let uninstall = qwen35::vl_prefill::uninstall(gpu);
+        if let Err(e) = prefill.and(uninstall) {
+            vl_forward_fail(
+                stdout,
+                id,
+                "forward_prefill_batch (vl)",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
+        m.seq_pos += prompt_tokens.len();
+    }
     // Prefill with vision token embedding for image_pad positions. VL
     // prefill is per-token (forward_scratch_embed isn't batched), so we
     // advance m.seq_pos in-loop and call maybe_evict / maybe_downshift after
     // every committed write. Lazy VMM map/growth failures and adaptive
     // transition errors are request-scoped (no panic, no later token emit).
+    // (claude: empty when the fast path above already prefilled.)
+    let per_token_prompt: &[u32] = if vl_fast { &[] } else { &prompt_tokens };
     let mut visual_idx = 0usize;
-    for &token in prompt_tokens.iter() {
+    for &token in per_token_prompt.iter() {
         // Client-cancel poll. The encoder phase before this loop cannot be
         // interrupted mid-kernel, so prefill's first iteration is where an
         // abort signalled during vision_forward takes effect. The terminal
@@ -1435,6 +1671,17 @@ pub fn generate_vl(
             return;
         }
     };
+    if ab.is_some() {
+        let mut top: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        top.truncate(5);
+        eprintln!(
+            "[daemon/vl] post-prefill top5 (fast={vl_fast}): {:?}",
+            top.iter()
+                .map(|(t, v)| format!("{t}:{v:.4}"))
+                .collect::<Vec<_>>()
+        );
+    }
     if let Some((open, close)) = think_pair {
         block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
     }
@@ -1959,6 +2206,65 @@ pub fn generate_vl(
         ClientTerminalDecision::Abort => {
             crate::ar::emit_active_route_cancel(stdout, id, generated);
         }
+    }
+    if vl_fast {
+        vl_invalidate_turn_reuse(m, gpu);
+    }
+}
+
+/// `CLAUDE_VL_FAST_PREFILL` (default on): VL prompts use the batched prefill.
+fn vl_fast_prefill_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_VL_FAST_PREFILL").as_deref() != Ok("0"))
+}
+
+/// `CLAUDE_VL_AB=<modes>` (validation only): successive VL requests rotate
+/// through the listed modes — `s` per-token (the historical path), `S`
+/// per-token at the fast path's shifted phases, `f` fast prefill + per-token
+/// decode, `m` fast prefill + MTP, `t`/`T` per-token/fast on the same prompt
+/// with the image tokens dropped (text-only numerics calibration). `1` = `sfm`.
+fn vl_ab_mode() -> Option<char> {
+    static MODES: std::sync::OnceLock<Vec<char>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let modes = MODES.get_or_init(|| match std::env::var("CLAUDE_VL_AB") {
+        Ok(v) if v == "1" => vec!['s', 'f', 'm'],
+        Ok(v) => v.chars().filter(|c| "sSfmtT".contains(*c)).collect(),
+        Err(_) => Vec::new(),
+    });
+    if modes.is_empty() {
+        return None;
+    }
+    Some(modes[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % modes.len()])
+}
+
+/// `CLAUDE_VL_MTP` (default on): VL turns decode through the shared MTP spec path.
+fn vl_mtp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_VL_MTP").as_deref() != Ok("0"))
+}
+
+/// After a fast-path VL turn: the prompt was rotated at phases shifted by
+/// `-rope_delta` (see `qwen35::vl_prefill`), so neither its KV prefix nor the
+/// recurrent checkpoints taken during its prefill may be reused by a later
+/// (text) turn's prompt cache. Drop the conversation so the next request
+/// prefills cold. VL is single-turn anyway: the next image request resets.
+fn vl_invalidate_turn_reuse(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    free_checkpoints(&mut m.prefill_checkpoints, gpu);
+    free_checkpoints(&mut m.dflash_checkpoints, gpu);
+    if let Some(s) = m.speculator.as_mut() {
+        if let Err(e) = s.reset(gpu) {
+            eprintln!("[daemon/vl] speculator reset after VL turn: {e}");
+        }
+    }
+    if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+        eprintln!("[daemon/vl] recurrent reset after VL turn: {e}");
+    }
+    if let Some(b) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) {
+        b.kv_cache.compact_offset = 0;
     }
 }
 
