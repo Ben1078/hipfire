@@ -45,6 +45,23 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 /// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
 /// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
 /// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
+/// `CLAUDE_CONV_TPAR` (default on; `0` = incumbent): token-parallel
+/// conv1d+SiLU+split for prefill batches of at least
+/// [`CONV_TPAR_MIN_TOKENS`] rows.
+fn claude_conv_tpar() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_CONV_TPAR").as_deref() != Ok("0"))
+}
+const CONV_TPAR_MIN_TOKENS: usize = 8;
+
+/// `CLAUDE_GDN_QUADROW` (default on; `0` = incumbent per-segment launches):
+/// quad-per-row prefill GDN, see [`Gpu::gated_delta_net_q8_quadrow_segments`].
+#[cfg(feature = "deltanet")]
+fn claude_gdn_quadrow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_GDN_QUADROW").as_deref() != Ok("0"))
+}
+
 fn dn_requant_per_token() -> bool {
     // Truthy (non-empty, non-"0") predicate preserved verbatim from the
     // cached form; only the process-global cache is gone (the snapshot is
@@ -3035,6 +3052,122 @@ impl Gpu {
         result
     }
 
+    /// Quad-per-row prefill GDN (`gated_delta_net_q8_quadrow`): runs every
+    /// `seg`-row commit segment of an `n_tokens` chunk in ONE launch and is
+    /// bit-identical (outputs, Q8 state, scales, EF residual) to launching
+    /// [`Self::gated_delta_net_q8_batch_seq`] once per segment with the fast
+    /// kernel. `seg == 0` means one segment. Returns `Ok(false)` without
+    /// launching when not eligible: `CLAUDE_GDN_QUADROW=0`, no EF residual,
+    /// head_dim != 128, fewer than 64 rows (decode/verify keep the incumbent),
+    /// per-token requant mode, replay recording or graph capture.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_quadrow_segments(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        seg: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<bool> {
+        let Some(ef) = ef_residual else {
+            return Ok(false);
+        };
+        if !claude_gdn_quadrow()
+            || head_dim != 128
+            || n_tokens < 64
+            || n_heads == 0
+            || dn_requant_per_token()
+            || self.replay.is_recording()
+            || self.graphs.capture_mode
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_q8_quadrow",
+            kernels::GATED_DELTA_NET_Q8_QUADROW_SRC,
+            "gated_delta_net_q8_quadrow",
+        )?;
+        // The incumbent reserves n frames per segment launch; the EF path
+        // never reads them, but keep the global frame counter identical.
+        let seg_rows = if seg == 0 { n_tokens } else { seg };
+        let mut off = 0;
+        while off < n_tokens {
+            let sn = (n_tokens - off).min(seg_rows);
+            let _ = reserve_gdn_requant_frames(sn as u32);
+            off += sn;
+        }
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut sg = seg as i32;
+        let mut efp = ef.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut sg as *mut _ as *mut c_void,
+            &mut efp as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_quadrow",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_quadrow",
+            [n_heads as u32, (head_dim / 8) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(scp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(sg);
+                b.push_ptr(efp);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
     /// Batched sequential `gated_delta_net_q8` for prefill.
     ///
     /// Launches the single-token kernel N times with offset pointers into
@@ -4590,6 +4723,83 @@ impl Gpu {
         result
     }
 
+    /// Launch `conv1d_silu_split_f32_tpar`: grid (ceil(C/256), ceil(n/16)),
+    /// block 256; token slice 0 owns each channel's conv-state update.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_silu_split_f32_tpar(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        const TT: usize = 16; // CONV_TPAR_TT in the kernel source
+        self.ensure_kernel(
+            "conv1d_silu_split_tpar",
+            kernels::CONV1D_SILU_SPLIT_TPAR_SRC,
+            "conv1d_silu_split_f32_tpar",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let grid = [n_channels.div_ceil(256) as u32, n_tokens.div_ceil(TT) as u32, 1];
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "conv1d_silu_split_f32_tpar",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32_tpar",
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched conv1d + silu + Q/K/V split. Processes `n_tokens` tokens in
     /// order through the conv, advancing the ring-buffer state N times
     /// (identical state trajectory to calling the single-token variant N
@@ -4609,6 +4819,19 @@ impl Gpu {
         n_tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Token-parallel sibling (bit-identical outputs and state; see
+        // kernels/src/conv1d_silu_split_tpar.hip). Prefill-sized batches only,
+        // outside replay recording / graph capture; `CLAUDE_CONV_TPAR=0`
+        // restores the incumbent single-pass launch.
+        if n_tokens >= CONV_TPAR_MIN_TOKENS
+            && claude_conv_tpar()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+        {
+            return self.conv1d_silu_split_f32_tpar(
+                q_out, k_out, v_out, input, weight, state, k_dim, v_dim, n_tokens,
+            );
+        }
         self.ensure_kernel(
             "conv1d_silu_split",
             kernels::CONV1D_SILU_SPLIT_SRC,

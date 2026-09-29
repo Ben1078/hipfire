@@ -806,3 +806,11 @@ required-features = ["lab"]
 [[example]]
 name = "tmp_scratch_leak_probe"
 required-features = ["lab"]
+
+[[example]]
+name = "claude_prefill_parity"
+required-features = ["deltanet"]
+
+[[example]]
+name = "claude_gdn_paths"
+required-features = ["deltanet"]

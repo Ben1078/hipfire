@@ -7208,6 +7208,24 @@ pub(crate) fn batch_chunk_delta_net_attn(
                             active_mask,
                         )?
                     }
+                } else if gpu.gated_delta_net_q8_quadrow_segments(
+                    &pbs.dn_q_batch,
+                    &pbs.dn_k_batch,
+                    &pbs.dn_v_batch,
+                    &pbs.dn_alpha_batch,
+                    &pbs.dn_beta_batch,
+                    &dn_state.s_matrices[delta_layer_idx],
+                    &dn_state.s_scales[delta_layer_idx],
+                    &pbs.dn_attn_out_batch,
+                    n,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    commit_stride.unwrap_or(0),
+                    dn_state.ef_residual(delta_layer_idx),
+                )? {
+                    // Every commit segment ran in one quad-per-row launch
+                    // (bit-identical to the per-segment fast launches below;
+                    // `CLAUDE_GDN_QUADROW=0` restores them).
                 } else if let Some(stride) = commit_stride {
                     // Widened ordinary chunk: commit every full 512-row seam,
                     // then commit the final valid partial segment. Projection
@@ -12532,44 +12550,78 @@ pub(crate) fn forward_batch_chunk_impl(
 
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
-    let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
-        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
-        && config.num_experts == 0
-        && config.linear_num_key_heads == 16
-        && config.linear_num_value_heads == 48
-        && config.linear_key_head_dim == 128
-        && config.linear_value_head_dim == 128
-        && config.conv_kernel_dim == 4
-        && dense_layers_are_all_mq4v2(weights)
+    // `CLAUDE_GDN_CHUNK_ADMIT=1` (opt-in, NOT bit-identical to the Q8
+    // recurrence: rel. RMS ~5e-4 on the GDN output in claude_gdn_paths) also
+    // admits the WMMA chunk scan when the MTP prompt fill captures hidden
+    // states (`hidden_rb` / `per_token_hidden_out`) and while a replay backend
+    // is merely enabled (it still refuses replay *recording* and graph
+    // capture). `CLAUDE_GDN_CHUNK_WHY=1` prints the conditions that keep a
+    // chunk off the scan (first 4 chunks).
+    let chunk_admit_mtp = claude_gdn_chunk_admit();
+    let chunk_scan_conds: [(&str, bool); 30] = [
+        ("flag gfx12_gdn_chunk_scan", gpu.flags.gfx12_gdn_chunk_scan),
+        ("arch", matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")),
+        ("dense (num_experts == 0)", config.num_experts == 0),
+        ("16 key heads", config.linear_num_key_heads == 16),
+        ("48 value heads", config.linear_num_value_heads == 48),
+        ("key head dim 128", config.linear_key_head_dim == 128),
+        ("value head dim 128", config.linear_value_head_dim == 128),
+        ("conv kernel 4", config.conv_kernel_dim == 4),
+        ("dense layers all MQ4V2", dense_layers_are_all_mq4v2(weights)),
         // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
         // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
         // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
         // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
-        && (gpu.flags.iu4_prefill_enabled()
-            || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
+        (
+            "iu4 prefill route",
+            gpu.flags.iu4_prefill_enabled()
+                || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza),
+        ),
         // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its supported Q8 KV tier.
-        && (kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8))
-        && dn_state.quant == StateQuant::Q8
-        && !dn_state.s_matrices.is_empty()
-        && dn_state.s_matrices.len() == dn_state.s_scales.len()
-        && dn_state.s_matrices.len() == dn_state.conv_states.len()
-        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
-        && matches!(batch_semantics, BatchSemantics::Sequential)
-        && tree_verify.is_none()
-        && gdn_tape.is_none()
-        && fusion == DflashFusionCtx::Off
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_enabled()
-        && hidden_rb.is_none()
-        && per_token_hidden_out.is_none()
-        && band.is_none()
-        && max_layer.is_none()
-        && routed_out.is_none()
-        && mask_override.is_none()
-        && n >= 64
-        && (n <= 512
-            || (commit_stride == Some(512)
-                && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
+        (
+            "KV tier",
+            kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8),
+        ),
+        ("Q8 DeltaNet state", dn_state.quant == StateQuant::Q8),
+        ("state present", !dn_state.s_matrices.is_empty()),
+        ("scales per layer", dn_state.s_matrices.len() == dn_state.s_scales.len()),
+        ("conv state per layer", dn_state.s_matrices.len() == dn_state.conv_states.len()),
+        ("EF per layer", dn_state.s_matrices.len() == dn_state.s_ef_residual.len()),
+        ("sequential batch", matches!(batch_semantics, BatchSemantics::Sequential)),
+        ("no tree verify", tree_verify.is_none()),
+        ("no GDN tape", gdn_tape.is_none()),
+        ("no DFlash/MTP fusion", fusion == DflashFusionCtx::Off),
+        ("no graph capture", !gpu.graphs.capture_mode),
+        (
+            "replay not enabled",
+            if chunk_admit_mtp { !gpu.replay.is_recording() } else { !gpu.replay.is_enabled() },
+        ),
+        ("no hidden ring buffer", chunk_admit_mtp || hidden_rb.is_none()),
+        ("no per-token hidden out", chunk_admit_mtp || per_token_hidden_out.is_none()),
+        ("no band", band.is_none()),
+        ("no max_layer", max_layer.is_none()),
+        ("no routed_out", routed_out.is_none()),
+        ("no mask override", mask_override.is_none()),
+        ("n >= 64", n >= 64),
+        (
+            "segment geometry",
+            n <= 512
+                || (commit_stride == Some(512)
+                    && (n % 512 == 0 || (64..512).contains(&(n % 512)))),
+        ),
+    ];
+    let gdn_chunk_scan_common_admitted = chunk_scan_conds.iter().all(|&(_, ok)| ok);
+    if !gdn_chunk_scan_common_admitted && claude_gdn_chunk_why() {
+        static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            let failed: Vec<&str> = chunk_scan_conds
+                .iter()
+                .filter(|&&(_, ok)| !ok)
+                .map(|&(name, _)| name)
+                .collect();
+            eprintln!("claude: GDN chunk scan not admitted for n={n}: {}", failed.join(", "));
+        }
+    }
     let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
     for layer_idx in layer_start..layer_end {
@@ -16372,4 +16424,18 @@ mod tests {
             f32_unfused.len(),
         );
     }
+}
+
+
+/// `CLAUDE_GDN_CHUNK_ADMIT=1` (default off): see the chunk-scan admission in
+/// the prefill chunk forward.
+fn claude_gdn_chunk_admit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_GDN_CHUNK_ADMIT").as_deref() == Ok("1"))
+}
+
+/// `CLAUDE_GDN_CHUNK_WHY=1`: log why a prefill chunk misses the GDN chunk scan.
+fn claude_gdn_chunk_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_GDN_CHUNK_WHY").as_deref() == Ok("1"))
 }

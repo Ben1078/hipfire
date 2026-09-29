@@ -311,6 +311,21 @@ enum Mq4v2QkvVariant {
     K2048XBufferGfx1100,
 }
 
+/// `CLAUDE_IU4_V2D` (default on; `0` = V2C): route the gfx1100 GEMM v2 V2C
+/// tile through the bit-identical s-major V2D module.
+fn claude_iu4_v2d() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_IU4_V2D").as_deref() != Ok("0"))
+}
+
+/// `CLAUDE_IU4_GROUP` (default on; `0` = one launch per matrix): run the
+/// attention q/k/v SETs and the GDN qkv + folded-z SETs as one grouped V2D
+/// launch (bit-identical; needs the V2D module).
+fn claude_iu4_group() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_IU4_GROUP").as_deref() != Ok("0"))
+}
+
 /// GEMM v2 tile of an exact-gfx11 symmetric IU4 full-tile prefill GEMM
 /// (`Gpu::iu4_v2_tile`). Both read the unchanged MQ4V2 / `block_i4_128`
 /// layouts and are bit-identical to X5.
@@ -19922,19 +19937,33 @@ impl Gpu {
             // ADD epilogue (`HIPFIRE_V2C_ADDEPI=0` restores the plain ADD):
             // `_add_touch` touches the residual tile ahead of the epilogue,
             // byte-identical to `_add`.
+            // `CLAUDE_IU4_V2D=0` restores the V2C module; V2D is the same
+            // tile with s-major steps (bit-identical outputs).
+            let v2d = claude_iu4_v2d();
             let kernel_name = match (
+                v2d,
                 add,
                 hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"),
             ) {
-                (false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
-                (true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
+                (false, false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
+                (false, true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
+                (false, true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
+                (true, false, _) => "gemm_mq4g256v2_residual_iu4_v2d_set_gfx11",
+                (true, true, true) => "gemm_mq4g256v2_residual_iu4_v2d_add_touch_gfx11",
+                (true, true, false) => "gemm_mq4g256v2_residual_iu4_v2d_add_gfx11",
             };
-            self.ensure_kernel(
-                "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
-                kernel_name,
-            )?;
+            let (module, source) = if v2d {
+                (
+                    "gemm_mq4g256v2_residual_iu4_v2d_gfx11",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC,
+                )
+            } else {
+                (
+                    "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
+                )
+            };
+            self.ensure_kernel(module, source, kernel_name)?;
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
             let mut y_ptr = y.buf.as_ptr();
@@ -20258,6 +20287,101 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Grouped V2D SET (`gemm_mq4g256v2_residual_iu4_v2d_set_group3_gfx11`):
+    /// 2-3 MQ4V2 matrices that share K and the prepared int4 activation run
+    /// as ONE launch over their concatenated row tiles; every output is
+    /// bit-identical to [`Self::gemm_mq4g256v2_mmq_set_prequant_iu4`] per
+    /// matrix. Returns `Ok(false)` (nothing launched) unless every matrix
+    /// takes the gfx1100 V2C tile and `CLAUDE_IU4_V2D`/`CLAUDE_IU4_GROUP`
+    /// are on.
+    fn gemm_mq4g256v2_iu4_v2d_set_group(
+        &mut self,
+        mats: &[(&GpuTensor, &GpuTensor, usize)],
+        x_i4_ptr: *mut c_void,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !(2..=3).contains(&mats.len())
+            || !claude_iu4_v2d()
+            || !claude_iu4_group()
+            || mats
+                .iter()
+                .any(|&(_, _, m)| self.iu4_v2_tile(m, k, batch_size) != Some(Iu4V2Tile::V2c))
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        const NAME: &str = "gemm_mq4g256v2_residual_iu4_v2d_set_group3_gfx11";
+        self.ensure_kernel(
+            "gemm_mq4g256v2_residual_iu4_v2d_gfx11",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC,
+            NAME,
+        )?;
+        let (a0, y0, m0) = mats[0];
+        let (a1, y1, m1) = mats[1];
+        // An absent third matrix is M2 = 0 (no row tiles; pointers unused).
+        let (a2, y2, m2) = if mats.len() == 3 { mats[2] } else { (a0, y0, 0) };
+        let mut a0p = a0.buf.as_ptr();
+        let mut a1p = a1.buf.as_ptr();
+        let mut a2p = a2.buf.as_ptr();
+        let mut xq_ptr = x_i4_ptr;
+        let mut y0p = y0.buf.as_ptr();
+        let mut y1p = y1.buf.as_ptr();
+        let mut y2p = y2.buf.as_ptr();
+        let mut m0v = m0 as i32;
+        let mut m1v = m1 as i32;
+        let mut m2v = m2 as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a0p as *mut _ as *mut c_void,
+            &mut a1p as *mut _ as *mut c_void,
+            &mut a2p as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y0p as *mut _ as *mut c_void,
+            &mut y1p as *mut _ as *mut c_void,
+            &mut y2p as *mut _ as *mut c_void,
+            &mut m0v as *mut _ as *mut c_void,
+            &mut m1v as *mut _ as *mut c_void,
+            &mut m2v as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let m_total = m0 + m1 + m2;
+        let bytes =
+            m_total * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m_total * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", NAME, bytes);
+        const V2C_LDS_BYTES: u32 = Iu4V2Tile::V2c.lds_bytes();
+        let result = self.launch_maybe_blob(
+            NAME,
+            [(batch_size / 128) as u32, (m_total / 128) as u32, 1],
+            [32, 8, 1],
+            V2C_LDS_BYTES,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a0p);
+                b.push_ptr(a1p);
+                b.push_ptr(a2p);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y0p);
+                b.push_ptr(y1p);
+                b.push_ptr(y2p);
+                b.push_i32(m0v);
+                b.push_i32(m1v);
+                b.push_i32(m2v);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
     }
 
     pub fn gemm_mq4g256v2_mmq_set_prequant_iu4(
@@ -30076,10 +30200,17 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(1, "invalid MQ4V2 Z beta/alpha fold layout"));
         }
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
-            a_z_fold, xq, y_z_fold, folded_m, k, n,
-        )?;
+        if !self.gemm_mq4g256v2_iu4_v2d_set_group(
+            &[(a_qkv, y_qkv, qkv_m), (a_z_fold, y_z_fold, folded_m)],
+            xq,
+            k,
+            n,
+        )? {
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                a_z_fold, xq, y_z_fold, folded_m, k, n,
+            )?;
+        }
         self.ensure_kernel(
             "split_mq4v2_z_betaalpha",
             kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
@@ -30655,6 +30786,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        if self.gemm_mq4g256v2_iu4_v2d_set_group(
+            &[(a_q, y_q, q_m), (a_k, y_k, k_m), (a_v, y_v, v_m)],
+            xq,
+            k,
+            batch_size,
+        )? {
+            return Ok(());
+        }
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_v, xq, y_v, v_m, k, batch_size)?;
@@ -31927,6 +32066,11 @@ impl Gpu {
         self.flush_residual_fold()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
         let (module, source, kernel_name) = match tile {
+            Iu4V2Tile::V2c if claude_iu4_v2d() => (
+                "gemm_mq4g256v2_residual_iu4_v2d_gfx11",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC,
+                "gemm_mq4g256v2_gate_up_silu_iu4_v2d_gfx11",
+            ),
             Iu4V2Tile::V2c => (
                 "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,

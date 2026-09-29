@@ -3881,6 +3881,13 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 /// h = silu(gate)*up.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
+/// gfx1100 GEMM v2 "V2D": V2C's tile, layouts, fold DAG and epilogues
+/// (bit-identical outputs) with s-major K16 steps (6 instead of 10 LDS
+/// operand reads per 8 WMMAs), half-packet staging and buffer-load
+/// addressing. Same symbols as V2C with `_v2d_`; `CLAUDE_IU4_V2D=0` restores
+/// the V2C module.
+pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2d.gfx11.hip");
 /// gfx11 GEMM v2 "V2B" symmetric IU4 prefill tile (M256xN256, 16 waves, two
 /// 32 KiB K128 LDS slots, 1 CTA/WGP), dispatched on gfx1151. Same production
 /// operand layouts, staging permutation, fold numerics and 6-argument
@@ -7219,6 +7226,13 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
+/// Quad-per-row prefill sibling of `GATED_DELTA_NET_Q8_FAST_SRC` (four lanes
+/// per state row: the incumbent's reduction tree in-lane plus two DPP steps,
+/// all commit segments in one launch). Bit-identical outputs and Q8/scale/EF
+/// state to the per-segment fast launches. `CLAUDE_GDN_QUADROW=0` disables.
+pub const GATED_DELTA_NET_Q8_QUADROW_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_q8_quadrow.hip");
+
 /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
 #[cfg(feature = "deltanet")]
 pub const GDN_CHUNK_PREP_SRC: &str =
@@ -7362,6 +7376,13 @@ pub const CONV1D_SILU_SRC: &str = include_str!("../../../kernels/src/conv1d_silu
 /// linear-attention layer.
 #[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SPLIT_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split.hip");
+/// Token-parallel prefill sibling of `conv1d_silu_split_f32` (one thread per
+/// channel x 16-token slice instead of one thread walking every token);
+/// bit-identical outputs and conv state. `CLAUDE_CONV_TPAR=0` restores the
+/// incumbent launch.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_TPAR_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_silu_split_tpar.hip");
 
 pub const CONV1D_SILU_SPLIT_QKNORM_B32_SRC: &str = concat!(
     "#define HIPFIRE_CQN_BLOCK 32\n#define HIPFIRE_CQN_KERNEL conv1d_silu_split_qknorm_b32\n",
