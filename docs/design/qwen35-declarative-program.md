@@ -65,7 +65,14 @@ parity must hold. The tape hash may change only if the launch sequence changes.
 |---|---|---|
 | Decode mixers + dense FFN as Steps (`program.rs`, `hybrid.rs`) | landed, bit-exact, tape hash unchanged | `ff892ed98` |
 | Batched dense FFN (`rows > 1`) + `pipeline::batched` library | landed, bit-exact | `505277d01` |
-| Batched full attention | next | |
-| Batched DeltaNet, MoE layers | pending | |
+| Batched full attention (`pipeline::batched_attention`) | landed, bit-exact | `9ec50733b` |
+| Batched DeltaNet (`pipeline::batched_deltanet`) | landed, bit-exact | `5466e9e8c` |
+| MoE layers (DN-MoE LA body, FA-MoE prep/finish) | pending: the MoE LA copy carries a PARO (Givens) route the dense executor lacks; folding needs a PARO fixture to prove parity | |
 | Decode hand arms (DFlash hidden capture, VL mrope), `lower_variant` removal | pending | |
 | MTP head | pending | |
+
+Verification per landed slice (gfx1151): greedy serve battery/chain and a
+1131-token prompt on `qwen35-4b.mq4`, greedy battery on
+`ornith-1.5-35b-a3b.mq4r`, byte-identical to the pre-port daemon; emulated
+EP2/EP4 route oracles exact; TP2 oracle unchanged (2.968e-1). Decode slices
+also keep the Redline tape hash.
