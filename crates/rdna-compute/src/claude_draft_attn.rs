@@ -34,6 +34,13 @@
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use hip_bridge::{DeviceBuffer, HipResult};
 
+/// `CLAUDE_DRAFT_ATTN5` != "0" (default on), read once: route the draft head
+/// through `claude_attn5` before `claude_attn4`.
+pub fn claude_draft_attn5_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_DRAFT_ATTN5").as_deref() != Ok("0"))
+}
+
 /// `CLAUDE_DRAFT_ATTN4` != "0" (default on), read once.
 pub fn claude_draft_attn4_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -81,6 +88,26 @@ impl Gpu {
             shape: vec![1],
             dtype: DType::F32,
         };
+        // claude v4: prefer claude_attn5 (QT=1 variant, ~1.6x attn4 at 40K;
+        // CLAUDE_ATTN5=0 or CLAUDE_DRAFT_ATTN5=0 keeps attn4). Its fixed grid
+        // ignores seq_len_hint; it needs n_heads * nblk * 260 partial floats.
+        if claude_draft_attn5_enabled()
+            && self.claude_attn5(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                &positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len_hint,
+                1,
+                partials,
+            )?
+        {
+            return Ok(true);
+        }
         self.claude_attn4(
             q,
             k_cache,

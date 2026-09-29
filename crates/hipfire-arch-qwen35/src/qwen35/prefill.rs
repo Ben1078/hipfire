@@ -9067,7 +9067,14 @@ fn batch_chunk_fa_attend(
         && tree_verify.is_none()
         && !batch_semantics.is_independent()
         && gpu.claude_attn4_ok(n, config.head_dim, config.n_heads, config.n_kv_heads);
-    if multirow || claude_gqa || claude_a3 || claude_a4 {
+    // claude v4: WMMA split-K verify attention for 1..=8 rows (preferred;
+    // CLAUDE_ATTN5=0 falls back to attn4 / the rows kernel).
+    let claude_a5 = kv_cache.quant_q8
+        && !kv_cache.quant_fp8
+        && tree_verify.is_none()
+        && !batch_semantics.is_independent()
+        && gpu.claude_attn5_ok(n, config.head_dim, config.n_heads, config.n_kv_heads);
+    if multirow || claude_gqa || claude_a3 || claude_a4 || claude_a5 {
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
@@ -9101,6 +9108,23 @@ fn batch_chunk_fa_attend(
                 config.head_dim,
                 n,
             )?;
+        }
+        if claude_a5
+            && gpu.claude_attn5(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                max_ctx_len,
+                n,
+                &s.flash_partials,
+            )?
+        {
+            return Ok(());
         }
         if claude_a4
             && gpu.claude_attn4(

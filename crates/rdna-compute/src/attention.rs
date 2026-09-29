@@ -214,6 +214,35 @@ fn flash_rows_per_block(batch_size: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// claude v4: floats per `claude_attn5` partial (m, l, 2 pad, 256 O values).
+pub const CLAUDE_ATTN5_PSTRIDE: usize = 260;
+
+/// claude v4: `CLAUDE_ATTN5=0` disables `claude_attn5` (read once).
+pub fn claude_attn5_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("CLAUDE_ATTN5").as_deref() == Ok("0"))
+}
+
+/// claude v4: 16-query WMMA tiles for `rows` verify rows (6 q heads per kv head).
+pub fn claude_attn5_qt(rows: usize) -> usize {
+    (6 * rows).div_ceil(16).max(1)
+}
+
+/// claude v4: `claude_attn5` blocks per kv head. One resident round on the
+/// 7900 XTX: 3 blocks per WGP (<= 41.7 KB LDS) for 1..=5 rows, 2 per WGP
+/// (45.8 KB) for 6..=8 rows, x 48 WGPs / 4 kv heads; below 24K context 24
+/// per kv head measured ~6% faster at 9K (fewer partials, longer blocks).
+/// `CLAUDE_ATTN5_NBLK` overrides (1..=256).
+pub fn claude_attn5_nblk(qt: usize, max_ctx_len: usize) -> usize {
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(n) = *ENV.get_or_init(|| {
+        std::env::var("CLAUDE_ATTN5_NBLK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| (1..=256).contains(n))
+    }) {
+        return n;
+    }
+    if qt >= 3 || max_ctx_len < 24 * 1024 { 24 } else { 36 }
+}
+
 /// claude v3: context ceiling for the gfx11 GQA-fused Q8 FA2 prefill route.
 /// Upstream admits it only for `max_ctx_len <= 32768` (the range its oracle
 /// covered); the kernel itself has no context-sized state (64-bit K/V offsets,
@@ -20275,6 +20304,139 @@ impl Gpu {
             },
         )?;
         self.claude_attn_reduce_launch(p_ptr, o_ptr, pos_ptr, nh, head_dim as i32, sp, mt, 0, rows)?;
+        Ok(true)
+    }
+
+    /// claude v4: can `claude_attn5` (WMMA split-K, interleaved key tiles,
+    /// 1..=8 verify rows) serve this block? `CLAUDE_ATTN5=0` disables it
+    /// (callers then fall back to `claude_attn4` for 1..=4 rows).
+    pub fn claude_attn5_ok(&self, rows: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize) -> bool {
+        !claude_attn5_disabled()
+            && (1..=8).contains(&rows)
+            && head_dim == 256
+            && n_kv_heads == 4
+            && n_heads == 24
+            && self.arch.as_str() == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// claude v4: WMMA split-K verify attention (`kernels/src/claude_attn5.hip`)
+    /// + its split-K reduce. Same numerics class as `claude_attn4` (Q/K/V/P in
+    /// f16, f32 accumulation). Grid [n_kv_heads, blocks per kv head]; each
+    /// block owns 32-key tiles `b, b + nblk, ...` and all key bounds come from
+    /// `positions` on the device (`max_ctx_len` only picks the block count).
+    /// `partials` needs `rows * n_heads * nblk * 260` floats. `Ok(false)` = not
+    /// applicable (caller falls back).
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_attn5(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        rows: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<bool> {
+        if !self.claude_attn5_ok(rows, head_dim, n_heads, n_kv_heads) {
+            return Ok(false);
+        }
+        let qt = claude_attn5_qt(rows);
+        let nblk = claude_attn5_nblk(qt, max_ctx_len);
+        if partials.numel() < rows * n_heads * nblk * CLAUDE_ATTN5_PSTRIDE {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        const MODULE: &str = "claude_attn5";
+        let name: &'static str = match qt {
+            1 => "claude_attn5_q1",
+            2 => "claude_attn5_q2",
+            _ => "claude_attn5_q3",
+        };
+        if !self.functions.contains_key(name) {
+            self.ensure_kernel(MODULE, kernels::CLAUDE_ATTN5_SRC, name)?;
+        }
+        const RED: &str = "claude_attn5_reduce";
+        if !self.functions.contains_key(RED) {
+            self.ensure_kernel(MODULE, kernels::CLAUDE_ATTN5_SRC, RED)?;
+        }
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let sc = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
+        let nb = nblk as i32;
+        let ms = nblk as i32;
+        let bo = 0i32;
+        let rv = rows as i32;
+        self.launch_maybe_blob(
+            name,
+            [n_kv_heads as u32, nblk as u32, 1],
+            [128 * qt as u32, 1, 1],
+            0,
+            &mut vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &nb as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &bo as *const _ as *mut c_void,
+                &rv as *const _ as *mut c_void,
+            ],
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_f32(sc);
+                b.push_i32(nb);
+                b.push_i32(ms);
+                b.push_i32(bo);
+                b.push_i32(rv);
+                b
+            },
+        )?;
+        self.launch_maybe_blob(
+            RED,
+            [n_heads as u32, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut vec![
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nb as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &bo as *const _ as *mut c_void,
+            ],
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nb);
+                b.push_i32(ms);
+                b.push_i32(bo);
+                b
+            },
+        )?;
         Ok(true)
     }
 

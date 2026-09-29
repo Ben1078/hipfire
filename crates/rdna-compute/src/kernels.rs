@@ -2002,6 +2002,9 @@ pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4
 pub const CLAUDE_ATTN_GQA_SRC: &str = include_str!("../../../kernels/src/claude_attn_gqa.hip");
 /// claude v3: WMMA split-K verify attention (q8_0 KV, 24/4 heads, head_dim 256).
 pub const CLAUDE_ATTN4_SRC: &str = include_str!("../../../kernels/src/claude_attn4.hip");
+/// claude v4: WMMA split-K verify attention for 1..=8 rows (q8_0 KV, 24/4 heads,
+/// head_dim 256): `claude_attn5_q{1,2,3}` + `claude_attn5_reduce`.
+pub const CLAUDE_ATTN5_SRC: &str = include_str!("../../../kernels/src/claude_attn5.hip");
 /// claude v3: LDS-staged GQA-shared verify attention (q8_0 KV, head_dim 256).
 pub const CLAUDE_ATTN3_SRC: &str = include_str!("../../../kernels/src/claude_attn3.hip");
 /// claude: 8-warp split-K attention reduce (head_dim 256).
