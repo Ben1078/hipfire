@@ -230,6 +230,87 @@ pub fn claude_fa2_max_ctx() -> usize {
     })
 }
 
+/// claude fa2: body variant for the gfx1100/gfx1151 GQA FA2 prefill route.
+/// 0 = upstream kernel (`attention_q8_0_fa2_gqa.gfx11.hip`, byte-identical
+/// module), N > 0 = claude variants built from
+/// `attention_q8_0_fa2_gqa_claude.gfx11.hip` (see
+/// [`claude_fa2_variant_defines`]). Env `CLAUDE_FA2_VARIANT`: unset = auto
+/// ([`CLAUDE_FA2_DEFAULT_VARIANT`] on gfx1100, upstream elsewhere), `0`
+/// restores the upstream kernel, `N` forces variant N on gfx1100/gfx1151.
+/// Variants apply only to the Q16 warp-specialized-fill recipe;
+/// `HIPFIRE_FA2_FILL=0` keeps the upstream all-wave fill kernel.
+pub fn claude_fa2_variant(arch: &str) -> u32 {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let forced = *V.get_or_init(|| {
+        std::env::var("CLAUDE_FA2_VARIANT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v == 0 || claude_fa2_variant_defines(v).is_some())
+    });
+    match forced {
+        Some(v) => v,
+        None if arch == "gfx1100" => CLAUDE_FA2_DEFAULT_VARIANT,
+        None => 0,
+    }
+}
+
+/// Default claude FA2 body on gfx1100: v6 = v3 (pipelined operand fetch,
+/// permlanex16 exchanges, exact lazy rescale, conflict-free fill v2, b128
+/// fragments, upstream zero-fill past the causal end) with 32 query positions
+/// per workgroup (12 compute + 2 fill waves). Bit-identical output to the
+/// upstream kernel; 1.49-1.58x faster per 1024-row chunk at 32K-100K context
+/// (bench_fa2_longctx). `CLAUDE_FA2_VARIANT=0` restores the upstream kernel.
+pub const CLAUDE_FA2_DEFAULT_VARIANT: u32 = 6;
+
+/// Feature defines for claude FA2 variant `v` (None = unknown variant) and
+/// the dynamic LDS bytes that recipe needs. Each variant is a fixed recipe so
+/// its JIT cache key and entry symbol are stable. 99 = developer hook: defines
+/// from `CLAUDE_FA2_XDEF` (`;`-separated `NAME=VALUE` pairs), sweeps only.
+pub fn claude_fa2_variant_defines(v: u32) -> Option<(String, u32, u32)> {
+    let body = match v {
+        // Pipelined Q/K/V operand fetch + permlanex16 pair exchange + exact
+        // lazy rescale; arithmetic identical to upstream (bit-exact).
+        1 => "CL_PIPE=1;CL_QD=2;CL_XLANE=1;CL_LAZY=1;CL_SM32=0;CL_KPAD=1;CL_FILL2=0;CL_B128=0".to_string(),
+        // v1 + 32-key online softmax in the log2 domain (not bit-exact).
+        2 => "CL_PIPE=1;CL_QD=2;CL_XLANE=1;CL_LAZY=1;CL_SM32=1;CL_KPAD=1;CL_FILL2=0;CL_B128=0".to_string(),
+        // v1 + conflict-free fill v2 + b128 fragment layout; keys past the
+        // causal end are zero-filled like upstream (bit-exact).
+        3 => "CL_PIPE=1;CL_QD=2;CL_XLANE=1;CL_LAZY=1;CL_SM32=0;CL_KPAD=1;CL_FILL2=1;CL_B128=1;CL_ZERO_OOB=1".to_string(),
+        // v3 + 32-key log2-domain softmax (not bit-exact).
+        4 => "CL_PIPE=1;CL_QD=2;CL_XLANE=1;CL_LAZY=1;CL_SM32=1;CL_KPAD=1;CL_FILL2=1;CL_B128=1;CL_ZERO_OOB=1".to_string(),
+        // v3 + first 9 Q dim chunks staged in LDS (64 KiB, 2 WGs/WGP; bit-exact).
+        5 => "CL_PIPE=1;CL_QD=2;CL_XLANE=1;CL_LAZY=1;CL_SM32=0;CL_KPAD=1;CL_FILL2=1;CL_B128=1;CL_ZERO_OOB=1;CL_QLDS=9".to_string(),
+        // v3 with 32 query positions per workgroup (12 compute + 2 fill waves,
+        // 448 threads; bit-exact).
+        6 => "CL_PIPE=1;CL_QD=2;CL_XLANE=1;CL_LAZY=1;CL_SM32=0;CL_KPAD=1;CL_FILL2=1;CL_B128=1;CL_ZERO_OOB=1;CL_Q32=1".to_string(),
+        99 => std::env::var("CLAUDE_FA2_XDEF").ok()?,
+        _ => return None,
+    };
+    let mut s = String::new();
+    let flag = |name: &str, default: u32| -> u32 {
+        body.split(';')
+            .filter_map(|kv| kv.trim().split_once('='))
+            .find(|(k, _)| k.trim() == name)
+            .and_then(|(_, val)| val.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    let (kpad, fill2, b128) = (flag("CL_KPAD", 1), flag("CL_FILL2", 1), flag("CL_B128", 1));
+    let qlds = flag("CL_QLDS", 0);
+    let qpos = if flag("CL_Q32", 0) != 0 { 32 } else { 16 };
+    for kv in body.split(';').map(str::trim).filter(|kv| !kv.is_empty()) {
+        let (k, val) = kv.split_once('=').unwrap_or((kv, "1"));
+        s.push_str(&format!("#define {} {}\n", k.trim(), val.trim()));
+    }
+    s.push_str(&format!(
+        "#define CLAUDE_FA2_ENTRY attention_q8_0_fa2_gqa_claude_v{v}_gfx11\n"
+    ));
+    // Must match CL_LDS_DWORDS in attention_q8_0_fa2_gqa_claude.gfx11.hip.
+    let krow = if kpad == 0 { 128 } else if b128 != 0 { 132 } else { 130 };
+    let vplane = if fill2 != 0 { 256 * if b128 != 0 { 20 } else { 18 } + 16 * 7 } else { 32 * 128 };
+    let lds = 4 * (32 * krow + vplane + qlds * 6 * 128);
+    Some((s, lds, qpos))
+}
+
 pub fn claude_rows_small() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CLAUDE_ROWS_SMALL").as_deref() != Ok("0"))
@@ -5676,6 +5757,41 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.attention_q8_0_fa2_gqa_gfx11_variant(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            claude_fa2_variant(&self.arch),
+        )
+    }
+
+    /// [`Self::attention_q8_0_fa2_gqa_gfx11`] with an explicit claude body
+    /// variant (0 = upstream kernel; see [`claude_fa2_variant`]). Variants
+    /// other than 0 run only on the Q16 warp-specialized-fill recipe
+    /// (gfx1100/gfx1151, `HIPFIRE_FA2_FILL` not disabled); otherwise the
+    /// upstream body runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_gfx11_variant(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        variant: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if !matches!(
             self.arch.as_str(),
@@ -5778,11 +5894,11 @@ impl Gpu {
         // the same stream just below); the entry symbol and the pre-convert
         // symbol both resolve out of this module's source.
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx11";
+        // Warp-specialized K/V fill: bit-exact, screened +30% FA2 on
+        // gfx1100 and gfx1151 (the Q16 cards). `HIPFIRE_FA2_FILL=0`
+        // restores the all-wave fill.
+        let fill = q16_tile && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
         if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
-            // Warp-specialized K/V fill: bit-exact, screened +30% FA2 on
-            // gfx1100 and gfx1151 (the Q16 cards). `HIPFIRE_FA2_FILL=0`
-            // restores the all-wave fill.
-            let fill = q16_tile && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
             let src = format!(
                 "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}",
                 u8::from(q16_tile),
@@ -5792,6 +5908,23 @@ impl Gpu {
             self.ensure_kernel(module, &src, module)?;
             self.ensure_kernel(module, &src, PRECONVERT)?;
         }
+        // claude fa2 body variant (same kernarg ABI, grid, block and LDS as
+        // the upstream Q16/fill body; the upstream pre-convert is reused).
+        let claude_defs = if variant != 0 && q16_tile && fill {
+            claude_fa2_variant_defines(variant)
+        } else {
+            None
+        };
+        let claude_sym = format!("attention_q8_0_fa2_gqa_claude_v{variant}_gfx11");
+        let body_sym: &str = if let Some((defs, _, _)) = claude_defs.as_ref() {
+            if !self.functions.contains_key(&claude_sym) {
+                let src = format!("{defs}{}", kernels::ATTENTION_Q8_0_FA2_GQA_CLAUDE_GFX11_SRC);
+                self.ensure_kernel(&claude_sym, &src, &claude_sym)?;
+            }
+            &claude_sym
+        } else {
+            module
+        };
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
@@ -5820,7 +5953,19 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(if q16_tile { 16 } else { 8 }) as u32;
+        // Query positions per workgroup: 16 (upstream Q16), 8 (other gfx11),
+        // or the claude recipe's 32 (448-thread blocks).
+        let wg_pos: usize = match claude_defs.as_ref() {
+            Some((_, _, qpos)) => *qpos as usize,
+            None if q16_tile => 16,
+            None => 8,
+        };
+        let grid_x = batch_size.div_ceil(wg_pos) as u32;
+        let block_x: u32 = match wg_pos {
+            32 => 448,
+            16 => 256,
+            _ => 128,
+        };
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -5869,11 +6014,13 @@ impl Gpu {
             batch_size,
             0,
         )?;
+        // claude bodies use padded K/V planes (size per recipe).
+        let lds_bytes: u32 = claude_defs.as_ref().map_or(32768, |(_, lds, _)| *lds);
         let result = self.launch_maybe_blob(
-            module,
+            body_sym,
             [grid_x, 4, 1],
-            [if q16_tile { 256 } else { 128 }, 1, 1],
-            32768,
+            [block_x, 1, 1],
+            lds_bytes,
             &mut params,
             || {
                 pack_attention_q8_0_fa2_gqa_gfx11_kernarg(

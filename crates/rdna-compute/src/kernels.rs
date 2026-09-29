@@ -6552,6 +6552,13 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC: &str = concat!
 pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
 
+/// claude fa2: latency-optimized compute waves for the gfx1100/gfx1151 Q16/KT32
+/// warp-specialized-fill FA2 body (same fill, planes, barriers and kernarg ABI
+/// as [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`]). Feature defines and the entry
+/// symbol are prepended per variant by `claude_fa2_variant_defines`.
+pub const ATTENTION_Q8_0_FA2_GQA_CLAUDE_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa_claude.gfx11.hip");
+
 /// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
 /// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
