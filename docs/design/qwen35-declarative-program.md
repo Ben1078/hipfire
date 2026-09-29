@@ -1,0 +1,60 @@
+# Qwen3.5 declarative layer program
+
+Status: in progress on `feat/qwen35-declarative` (cut from #774).
+
+## Goal
+
+Qwen3.5 declares each decoder layer as one typed `Step` list, as Qwen4 does
+(`hipfire-arch-qwen4/src/gpu_forward.rs`). The dispatch crate owns every
+executor body and every arch- or dtype-gated route choice. The same program
+serves decode (`rows == 1`), batched prefill and speculative verify
+(`rows > 1`). Each op picks GEMV or GEMM from `rows`.
+
+The architecture crate keeps:
+
+- weight and state ownership;
+- the per-layer program shape (which ops, in which order, bound to which
+  tensors);
+- the surrounding lifecycle: hipGraph, Redline, DFlash capture and the chunk loop.
+
+## Vocabulary
+
+This port uses typed `Step` only. The #397 super-op path (`lower_variant` plus
+`Qwen35Bindings`) is removed for single-GPU decode once the Step program is
+bit-exact. The EP decode hooks (`ep_*`) keep their current binding until the EP
+schedule consumes the same program.
+
+New ops are model-neutral. They live in `hipfire-dispatch/src/pipeline/hybrid_ops.rs`:
+
+| Step | Replaces (qwen35 today) | Route choice owned by dispatch |
+|---|---|---|
+| `GdnPrep` | `ATTEND_DN_PREP` | conv+qk-norm fusion, gfx1100 scalar prep, compact QK |
+| `GdnRecurrence` | `RECUR_GDN` | FP32 / Q8 / Q8-compact / Q4 state |
+| `GatedNorm` | `NORM_GATED` | fused gated-norm + MQ rotate |
+| `GatedAttention` | `ATTEND_FULL` | fused FA prep, TriAttention tap, compaction offset, fused epilogue |
+| `SwigluResidual` | `RESID_DOWN_SWIGLU` | GEMV family SwiGLU-residual variant |
+
+Projections keep the existing `RmsnormAutomatic`, `Gemv` and `GemvResidual`
+steps, which the fusion table already rewrites into qkv, qkvza or gate/up
+kernels. MoE keeps `Step::Moe`.
+
+## Slices
+
+Each slice keeps greedy token ids and prefill logits byte-identical to the
+pre-port build, on dense 4B and on the Ornith MoE fixture. Redline PM4 shadow
+parity must hold. The tape hash may change only if the launch sequence changes.
+
+1. **Decode.** The ops above with `rows == 1` executors; the arch crate builds
+   the program in `qwen35/program.rs`; delete `lower_variant` and the
+   single-GPU `Qwen35Bindings` bodies.
+2. **Prefill.** Add `rows > 1` executors by moving the `batch_chunk_*` layer
+   bodies. `forward_batch_chunk_impl` runs the slice-1 program.
+3. **MTP head.** `mtp_head_forward_block_only_with_pos_buf` becomes the same
+   ops over the MTP layer.
+
+## Gates per slice
+
+- Greedy decode ids identical (serve battery and chain) on
+  `qwen35-4b.mq4` and `ornith-1.5-35b-a3b.mq4r`.
+- `redline_daemon_harness.py --pm4` shadow parity exact.
+- EP route oracles unchanged (EP uses the shared MoE step).
