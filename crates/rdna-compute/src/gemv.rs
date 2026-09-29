@@ -138,6 +138,295 @@ fn claude_q8_fuse_check_enabled() -> bool {
     *CHECK.get_or_init(|| std::env::var("CLAUDE_Q8_FUSE_CHECK").as_deref() == Ok("1"))
 }
 
+/// claude: one compiled variant of the `claude_q8x` small-batch GEMV
+/// (`kernels/src/claude_q8x.hip`, int8 activations from `claude_q8x_quant`).
+/// The JIT function name encodes every compile-time parameter (it is the
+/// kernel cache key together with the source hash), so each variant, batch
+/// bucket and residual flavour gets its own unique name.
+///
+/// Spellings accepted by [`Self::parse`] (and printed by [`Self::spec`]); they
+/// are used by `CLAUDE_Q8X_VARIANT` and `bench_claude_q8x --variants`:
+/// * `v1:u4:o8`   legacy one-warp-per-row kernel: dword loads, U groups per
+///   iteration, `__launch_bounds__(32, OCC)`, runtime batch (BMAX 4 or 8).
+///   `v1e:...` is the same code with the batch compiled in (bench only).
+/// * `lds:w8:kc16` legacy LDS-staged activations, W rows per block.
+/// * `v2:s1:r2:w2:p2:x1:nt0` wide kernel: dwordx4 weight loads (a warp covers
+///   four 256-groups per load, each lane one 32-element activation block),
+///   exact batch, W rows per warp sharing each activation fetch, S warps per
+///   row set (split-K with a deterministic LDS reduction), R row sets per
+///   workgroup, P 4-group steps in the weight register ring, X = 1 prefetches
+///   the next step's activations, NT = 1 nontemporal weight loads.
+/// * `v3:r8:w2:p2:nt1:kb32` the v2 mapping with the activations (and each
+///   32-block's d * sum(x)) staged in LDS per workgroup, K in chunks of at
+///   most KB KiB; R warps x W rows per workgroup.
+/// * `v4:r8:p3:nt1:kb64:x0` persistent v3 (the default where it fits): one
+///   resident wave of workgroups (occupancy API, or G per multiprocessor with
+///   `:gG`), activations staged once, each warp streams an equal contiguous
+///   range of (row, step) pairs with the weight ring running across rows;
+///   rows split between two warps are finished in fixed order (deterministic).
+///   X = 1 prefetches the next step's LDS reads. Needs all of K in LDS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClaudeQ8xVariant {
+    V1 { u: u32, occ: u32, exact: bool },
+    Lds { w: u32, kc: u32 },
+    V2 { s: u32, r: u32, w: u32, p: u32, x: u32, nt: u32 },
+    V3 { r: u32, w: u32, p: u32, nt: u32, kb: u32 },
+    V4 { r: u32, p: u32, nt: u32, kb: u32, g: u32, x: u32 },
+}
+
+impl ClaudeQ8xVariant {
+    /// The kernel `claude_q8x_project` used before the V2 kernels (default knobs).
+    pub const LEGACY: Self = Self::V1 { u: 4, occ: 8, exact: false };
+
+    /// Parse a spelling such as `v1:u4:o8`, `lds:w8:kc16` or `v2:s2:r1:p2`.
+    /// Omitted fields take their defaults; invalid values yield `None`.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut it = spec.trim().split(':');
+        let kind = it.next()?.to_ascii_lowercase();
+        let mut fields: Vec<(String, u32)> = Vec::new();
+        for tok in it {
+            let split = tok.find(|c: char| c.is_ascii_digit())?;
+            let (key, val) = tok.split_at(split);
+            fields.push((key.to_ascii_lowercase(), val.parse().ok()?));
+        }
+        let get = |key: &str, default: u32| -> u32 {
+            fields.iter().rev().find(|(k, _)| k == key).map(|&(_, v)| v).unwrap_or(default)
+        };
+        let known = |keys: &[&str]| fields.iter().all(|(k, _)| keys.contains(&k.as_str()));
+        let v = match kind.as_str() {
+            "v1" | "v1e" if known(&["u", "o"]) => Self::V1 { u: get("u", 4), occ: get("o", 8), exact: kind == "v1e" },
+            "lds" if known(&["w", "kc"]) => Self::Lds { w: get("w", 8), kc: get("kc", 16) },
+            "v2" if known(&["s", "r", "w", "p", "x", "nt"]) => Self::V2 {
+                s: get("s", 1),
+                r: get("r", 1),
+                w: get("w", 1),
+                p: get("p", 2),
+                x: get("x", 0),
+                nt: get("nt", 0),
+            },
+            "v3" if known(&["r", "w", "p", "nt", "kb"]) => Self::V3 {
+                r: get("r", 8),
+                w: get("w", 1),
+                p: get("p", 3),
+                nt: get("nt", 1),
+                kb: get("kb", 32),
+            },
+            "v4" if known(&["r", "p", "nt", "kb", "g", "x"]) => Self::V4 {
+                r: get("r", 8),
+                p: get("p", 3),
+                nt: get("nt", 1),
+                kb: get("kb", 64),
+                g: get("g", 0),
+                x: get("x", 0),
+            },
+            _ => return None,
+        };
+        v.valid().then_some(v)
+    }
+
+    fn valid(&self) -> bool {
+        match *self {
+            Self::V1 { u, occ, .. } => [2, 4, 8].contains(&u) && [4, 8, 12, 16].contains(&occ),
+            Self::Lds { w, kc } => [1, 2, 4, 8, 16].contains(&w) && [4, 8, 16, 24, 32].contains(&kc),
+            Self::V2 { s, r, w, p, x, nt } => {
+                [1, 2, 4].contains(&s) && [1, 2, 4, 8].contains(&r) && s * r <= 16
+                    && [1, 2, 4, 8].contains(&w) && (1..=4).contains(&p) && x <= 1 && nt <= 1
+            }
+            Self::V3 { r, w, p, nt, kb } => {
+                [1, 2, 4, 8, 16].contains(&r) && [1, 2, 4].contains(&w) && (1..=4).contains(&p) && nt <= 1
+                    && [16, 24, 32, 40, 48, 64].contains(&kb)
+            }
+            Self::V4 { r, p, nt, kb, g, x } => {
+                [2, 4, 8, 16].contains(&r) && (1..=6).contains(&p) && nt <= 1
+                    && [16, 24, 32, 40, 48, 64].contains(&kb) && g <= 16 && x <= 1
+            }
+        }
+    }
+
+    /// Canonical spelling (round-trips through [`Self::parse`]).
+    pub fn spec(&self) -> String {
+        match *self {
+            Self::V1 { u, occ, exact } => format!("{}:u{u}:o{occ}", if exact { "v1e" } else { "v1" }),
+            Self::Lds { w, kc } => format!("lds:w{w}:kc{kc}"),
+            Self::V2 { s, r, w, p, x, nt } => format!("v2:s{s}:r{r}:w{w}:p{p}:x{x}:nt{nt}"),
+            Self::V3 { r, w, p, nt, kb } => format!("v3:r{r}:w{w}:p{p}:nt{nt}:kb{kb}"),
+            Self::V4 { r, p, nt, kb, g, x } => format!("v4:r{r}:p{p}:nt{nt}:kb{kb}:x{x}{}", if g > 0 { format!(":g{g}") } else { String::new() }),
+        }
+    }
+
+    /// Batch the kernel is compiled for: the BMAX bucket (4 or 8) of the
+    /// legacy kernels, the exact batch otherwise.
+    fn compiled_batch(&self, batch: usize) -> usize {
+        match *self {
+            Self::V1 { exact: false, .. } | Self::Lds { .. } => if batch <= 4 { 4 } else { 8 },
+            _ => batch,
+        }
+    }
+
+    /// Whether the variant has a `_multi` twin (up to four weights sharing one
+    /// activation in a single launch).
+    pub fn has_multi(&self) -> bool {
+        !matches!(self, Self::Lds { .. })
+    }
+
+    /// JIT function name (unique per variant, compiled batch and residual).
+    pub fn kernel_name(&self, batch: usize, residual: bool) -> String {
+        let nb = self.compiled_batch(batch);
+        let res = if residual { "_res" } else { "" };
+        match *self {
+            // Legacy names unchanged (`CLAUDE_Q8X_V2=0` keeps today's names).
+            Self::V1 { u, occ, exact: false } => format!("claude_q8x_gemv_u{u}_o{occ}_b{nb}{res}"),
+            Self::V1 { u, occ, exact: true } => format!("claude_q8x_gemv_u{u}_o{occ}_nb{nb}{res}"),
+            Self::Lds { w, kc } => format!("claude_q8x_gemv_lds_w{w}_kc{kc}_b{nb}{res}"),
+            Self::V2 { s, r, w, p, x, nt } => format!("claude_q8x_v2_s{s}_r{r}_w{w}_p{p}_x{x}_nt{nt}_nb{nb}{res}"),
+            Self::V3 { r, w, p, nt, kb } => format!("claude_q8x_v3_r{r}_w{w}_p{p}_nt{nt}_kb{kb}_nb{nb}{res}"),
+            Self::V4 { r, p, nt, kb, x, .. } => format!("claude_q8x_v4_r{r}_p{p}_nt{nt}_kb{kb}_x{x}_nb{nb}{res}"),
+        }
+    }
+
+    /// Full JIT source for [`Self::kernel_name`] (and its `_multi` twin).
+    pub fn source(&self, batch: usize, residual: bool) -> String {
+        let nb = self.compiled_batch(batch);
+        let name = self.kernel_name(batch, residual);
+        let variant = match *self {
+            Self::V1 { u, occ, exact } => format!(
+                "#define CLAUDE_Q8X_GEMV 1\n#define CLAUDE_Q8X_U {u}\n#define CLAUDE_Q8X_OCC {occ}\n{}",
+                if exact { format!("#define CLAUDE_Q8X_NB {nb}\n") } else { String::new() }
+            ),
+            Self::Lds { w, kc } => {
+                format!("#define CLAUDE_Q8X_GEMV_LDS 1\n#define CLAUDE_Q8X_W {w}\n#define CLAUDE_Q8X_KC {kc}\n")
+            }
+            Self::V2 { s, r, w, p, x, nt } => format!(
+                "#define CLAUDE_Q8X_GEMV2 1\n#define Q8X2_S {s}\n#define Q8X2_R {r}\n#define Q8X2_W {w}\n#define Q8X2_P {p}\n#define Q8X2_X {x}\n#define Q8X2_NT {nt}\n"
+            ),
+            Self::V3 { r, w, p, nt, kb } => format!(
+                "#define CLAUDE_Q8X_GEMV3 1\n#define Q8X3_R {r}\n#define Q8X3_W {w}\n#define Q8X3_P {p}\n#define Q8X3_NT {nt}\n#define Q8X3_LDSKB {kb}\n"
+            ),
+            Self::V4 { r, p, nt, kb, x, .. } => format!(
+                "#define CLAUDE_Q8X_GEMV4 1\n#define Q8X3_R {r}\n#define Q8X3_P {p}\n#define Q8X3_NT {nt}\n#define Q8X3_LDSKB {kb}\n#define Q8X4_XP {x}\n"
+            ),
+        };
+        format!(
+            "{variant}#define CLAUDE_Q8X_BMAX {nb}\n{}#define CLAUDE_Q8X_KERNEL {name}\n#define CLAUDE_Q8X_MULTI_KERNEL {name}_multi\n{}",
+            if residual { "#define CLAUDE_Q8X_RESIDUAL 1\n" } else { "" },
+            kernels::CLAUDE_Q8X_SRC
+        )
+    }
+
+    /// `(workgroups, threads per workgroup)` for one weight of `m` rows.
+    pub fn geometry(&self, m: usize) -> (usize, usize) {
+        match *self {
+            Self::V1 { .. } => (m, 32),
+            Self::Lds { w, .. } => (m.div_ceil(w as usize), 32 * w as usize),
+            Self::V2 { s, r, w, .. } => (m.div_ceil((r * w) as usize), 32 * (s * r) as usize),
+            Self::V3 { r, w, .. } => (m.div_ceil((r * w) as usize), 32 * r as usize),
+            // Persistent: the launcher sizes the grid (`claude_q8x_gemv_launch`).
+            Self::V4 { r, .. } => (m.div_ceil(r as usize), 32 * r as usize),
+        }
+    }
+
+    /// Whether the variant can run `[batch x k]` (V4 stages all of K in LDS).
+    pub fn supports(&self, k: usize, batch: usize) -> bool {
+        match *self {
+            Self::V2 { w, .. } | Self::V3 { w, .. } => w as usize * batch <= 32,
+            Self::V4 { kb, .. } => batch <= 8 && self.lds_bytes(k, batch) <= (kb as usize * 1024).min(65536),
+            _ => true,
+        }
+    }
+
+    /// Dynamic LDS bytes per workgroup: the staged activation chunk of V3/V4
+    /// (`q8x3_chunk_steps` steps of 4 groups x (PSX + PDD) bytes, see
+    /// `kernels/src/claude_q8x.hip`). V4 always stages all of K.
+    pub fn lds_bytes(&self, k: usize, batch: usize) -> usize {
+        let per_step = 4 * ((batch * 256 + 16) + ((batch * 64 + 191) / 256 * 256 + 64));
+        let nst = k.div_ceil(1024);
+        match *self {
+            Self::V3 { p, kb, .. } => {
+                let mut cs = (kb as usize * 1024) / per_step;
+                if nst <= cs {
+                    cs = nst;
+                } else {
+                    cs -= cs % p as usize;
+                    cs = cs.max(p as usize);
+                }
+                cs * per_step
+            }
+            Self::V4 { .. } => nst * per_step,
+            _ => 0,
+        }
+    }
+}
+
+/// claude: the variant the legacy env knobs select (`CLAUDE_Q8X_LDS=1` with
+/// `CLAUDE_Q8X_W`/`CLAUDE_Q8X_KC`, else `CLAUDE_Q8X_U`/`CLAUDE_Q8X_OCC`);
+/// `ClaudeQ8xVariant::LEGACY` when none is set.
+fn claude_q8x_legacy_variant() -> ClaudeQ8xVariant {
+    static V: std::sync::OnceLock<ClaudeQ8xVariant> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let num = |key: &str, ok: &[u32], default: u32| -> u32 {
+            std::env::var(key).ok().and_then(|v| v.parse().ok()).filter(|v| ok.contains(v)).unwrap_or(default)
+        };
+        if std::env::var("CLAUDE_Q8X_LDS").as_deref() == Ok("1") {
+            ClaudeQ8xVariant::Lds { w: num("CLAUDE_Q8X_W", &[1, 2, 4, 8, 16], 8), kc: num("CLAUDE_Q8X_KC", &[4, 8, 16, 24, 32], 16) }
+        } else {
+            ClaudeQ8xVariant::V1 { u: num("CLAUDE_Q8X_U", &[2, 4, 8], 4), occ: num("CLAUDE_Q8X_OCC", &[4, 8, 12, 16], 8), exact: false }
+        }
+    })
+}
+
+/// claude: default at batch <= 2, and batch <= 4 for K <= 5120, when all of
+/// K's staged activations fit in LDS (`v4:r8:p3:nt1:kb64`, persistent).
+pub const CLAUDE_Q8X_V4_DEFAULT: ClaudeQ8xVariant = ClaudeQ8xVariant::V4 { r: 8, p: 3, nt: 1, kb: 64, g: 0, x: 0 };
+/// claude: default for the other shapes up to batch 5 (e.g. out_proj K = 6144
+/// and MLP down K = 17408 at batch 3-5): `v3:r8:w2:p2:nt1:kb32`.
+pub const CLAUDE_Q8X_V3_DEFAULT: ClaudeQ8xVariant = ClaudeQ8xVariant::V3 { r: 8, w: 2, p: 2, nt: 1, kb: 32 };
+/// claude: default for batch >= 6: `v2:s1:r8:w2:p2:x1:nt1`.
+pub const CLAUDE_Q8X_V2_DEFAULT: ClaudeQ8xVariant = ClaudeQ8xVariant::V2 { s: 1, r: 8, w: 2, p: 2, x: 1, nt: 1 };
+
+/// claude: GEMV variant for one `claude_q8x_project` call: `k`, `total_m`
+/// (sum of the fused weights' rows), batch and residual flavour.
+/// Default (measured on gfx1100 over the Qwen 3.8 27B verify shapes, see
+/// `bench_claude_q8x`): v4 (persistent, LDS-staged activations) at batch <= 2
+/// and at batch <= 4 for K <= 5120, where all of K fits in LDS; else v3
+/// (LDS-staged, two rows per warp) up to batch 5; v2 (register activations,
+/// two rows per warp) at batch >= 6.
+/// All of them compile the exact batch, so batch 5 and 6 get their own kernels
+/// instead of the legacy BMAX = 8 bucket.
+/// `CLAUDE_Q8X_V2=0` restores the legacy kernel (and its env knobs);
+/// `CLAUDE_Q8X_VARIANT=<spec>` forces one variant for every shape it supports.
+pub fn claude_q8x_pick(k: usize, total_m: usize, batch: usize, residual: bool) -> ClaudeQ8xVariant {
+    static V2_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FORCE: std::sync::OnceLock<Option<ClaudeQ8xVariant>> = std::sync::OnceLock::new();
+    if *V2_OFF.get_or_init(|| std::env::var("CLAUDE_Q8X_V2").as_deref() == Ok("0")) {
+        return claude_q8x_legacy_variant();
+    }
+    let force = FORCE.get_or_init(|| {
+        let spec = std::env::var("CLAUDE_Q8X_VARIANT").ok()?;
+        let v = ClaudeQ8xVariant::parse(&spec);
+        if v.is_none() {
+            eprintln!("[claude-q8x] ignoring invalid CLAUDE_Q8X_VARIANT={spec:?}");
+        }
+        v
+    });
+    if let Some(v) = *force {
+        if v.supports(k, batch) {
+            return v;
+        }
+    }
+    let _ = (total_m, residual);
+    // v4 at batch <= 2, and up to batch 4 for K <= 5120 (at K = 6144, batch 4,
+    // v3 measured 25.5 us vs 29.0 us for the 5120-row out_proj).
+    if (batch <= 2 || (batch <= 4 && k <= 5120)) && CLAUDE_Q8X_V4_DEFAULT.supports(k, batch) {
+        CLAUDE_Q8X_V4_DEFAULT
+    } else if batch <= 5 && CLAUDE_Q8X_V3_DEFAULT.supports(k, batch) {
+        CLAUDE_Q8X_V3_DEFAULT
+    } else if CLAUDE_Q8X_V2_DEFAULT.supports(k, batch) {
+        CLAUDE_Q8X_V2_DEFAULT
+    } else {
+        claude_q8x_legacy_variant()
+    }
+}
+
 /// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
 /// GEMVs to the 4-way-unroll gfx11_dgpu twin rather than the gfx1151 kernel.
 ///
@@ -9673,113 +9962,11 @@ impl Gpu {
         if claude_q8_fuse_check_enabled() {
             self.claude_q8_fuse_check(x, k, batch, fused)?;
         }
-        struct Cfg {
-            lds: bool,
-            w: usize,
-            kc: usize,
-            u: usize,
-            occ: usize,
-            names: [String; 4],
-        }
-        static CFG: std::sync::OnceLock<Cfg> = std::sync::OnceLock::new();
-        let cfg = CFG.get_or_init(|| {
-            let lds = std::env::var("CLAUDE_Q8X_LDS").as_deref() == Ok("1");
-            let w = std::env::var("CLAUDE_Q8X_W").ok().and_then(|v| v.parse().ok()).filter(|w| [1, 2, 4, 8, 16].contains(w)).unwrap_or(8);
-            let kc = std::env::var("CLAUDE_Q8X_KC").ok().and_then(|v| v.parse().ok()).filter(|k| [4, 8, 16, 24, 32].contains(k)).unwrap_or(16);
-            let u = std::env::var("CLAUDE_Q8X_U").ok().and_then(|v| v.parse::<usize>().ok()).filter(|u| [2, 4, 8].contains(u)).unwrap_or(4);
-            let occ = std::env::var("CLAUDE_Q8X_OCC").ok().and_then(|v| v.parse::<usize>().ok()).filter(|o| [4, 8, 12, 16].contains(o)).unwrap_or(8);
-            let tag = if lds { format!("lds_w{w}_kc{kc}_") } else { format!("u{u}_o{occ}_") };
-            let names = [
-                format!("claude_q8x_gemv_{tag}b4"),
-                format!("claude_q8x_gemv_{tag}b4_res"),
-                format!("claude_q8x_gemv_{tag}b8"),
-                format!("claude_q8x_gemv_{tag}b8_res"),
-            ];
-            Cfg { lds, w, kc, u, occ, names }
-        });
-        let bmax = if batch <= 4 { 4 } else { 8 };
-        let name: &str = &cfg.names[if bmax == 4 { 0 } else { 2 } + if residual { 1 } else { 0 }];
-        if !self.functions.contains_key(name) {
-            let variant = if cfg.lds {
-                format!("#define CLAUDE_Q8X_GEMV_LDS 1\n#define CLAUDE_Q8X_W {}\n#define CLAUDE_Q8X_KC {}\n", cfg.w, cfg.kc)
-            } else {
-                format!("#define CLAUDE_Q8X_GEMV 1\n#define CLAUDE_Q8X_U {}\n#define CLAUDE_Q8X_OCC {}\n", cfg.u, cfg.occ)
-            };
-            let src = format!(
-                "{}#define CLAUDE_Q8X_BMAX {}\n{}#define CLAUDE_Q8X_KERNEL {}\n#define CLAUDE_Q8X_MULTI_KERNEL {}_multi\n{}",
-                variant,
-                bmax,
-                if residual { "#define CLAUDE_Q8X_RESIDUAL 1\n" } else { "" },
-                name,
-                name,
-                kernels::CLAUDE_Q8X_SRC
-            );
-            self.ensure_kernel(name, &src, name)?;
-            if !cfg.lds {
-                let multi = format!("{name}_multi");
-                self.ensure_kernel(name, &src, &multi)?;
-            }
-        }
+        let total_m: usize = outs.iter().map(|o| o.2).sum();
+        let variant = claude_q8x_pick(k, total_m, batch, residual);
         static MULTI_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let multi_off = *MULTI_OFF.get_or_init(|| std::env::var("CLAUDE_Q8X_MULTI").as_deref() == Ok("0"));
-        if !cfg.lds && !multi_off && outs.len() > 1 && outs.len() <= 4 {
-            let multi = format!("{name}_multi");
-            let func = &self.functions[multi.as_str()];
-            let mut a_ptrs = [std::ptr::null_mut::<c_void>(); 4];
-            let mut y_ptrs = [std::ptr::null_mut::<c_void>(); 4];
-            let mut ms = [0i32; 4];
-            let mut total = 0usize;
-            for (i, &(a, y, m)) in outs.iter().enumerate() {
-                a_ptrs[i] = a.buf.as_ptr();
-                y_ptrs[i] = y.buf.as_ptr();
-                ms[i] = m as i32;
-                total += m;
-            }
-            let k_val = k as i32;
-            let b_val = batch as i32;
-            let mut params: Vec<*mut c_void> = Vec::with_capacity(16);
-            for i in 0..4 {
-                params.push(&a_ptrs[i] as *const _ as *mut c_void);
-                params.push(&y_ptrs[i] as *const _ as *mut c_void);
-                params.push(&ms[i] as *const _ as *mut c_void);
-            }
-            params.push(&xq_ptr as *const _ as *mut c_void);
-            params.push(&dx_ptr as *const _ as *mut c_void);
-            params.push(&k_val as *const _ as *mut c_void);
-            params.push(&b_val as *const _ as *mut c_void);
-            unsafe {
-                self.hip.launch_kernel(func, [total as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?;
-            }
-            return Ok(());
-        }
-        let (grid_div, block) = if cfg.lds { (cfg.w, 32 * cfg.w) } else { (1, 32) };
-        for &(a, y, m) in outs {
-            let func = &self.functions[name];
-            let a_ptr = a.buf.as_ptr();
-            let y_ptr = y.buf.as_ptr();
-            let m_val = m as i32;
-            let k_val = k as i32;
-            let b_val = batch as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &a_ptr as *const _ as *mut c_void,
-                &xq_ptr as *const _ as *mut c_void,
-                &dx_ptr as *const _ as *mut c_void,
-                &y_ptr as *const _ as *mut c_void,
-                &m_val as *const _ as *mut c_void,
-                &k_val as *const _ as *mut c_void,
-                &b_val as *const _ as *mut c_void,
-            ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [m.div_ceil(grid_div) as u32, 1, 1],
-                    [block as u32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
-        }
+        let multi = !*MULTI_OFF.get_or_init(|| std::env::var("CLAUDE_Q8X_MULTI").as_deref() == Ok("0"));
+        self.claude_q8x_gemv_launch(variant, outs, xq_ptr, dx_ptr, k, batch, residual, multi)?;
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !residual && *CHECK.get_or_init(|| std::env::var("CLAUDE_XBATCH_CHECK").as_deref() == Ok("1")) {
             static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -9804,10 +9991,165 @@ impl Gpu {
                     sq_r += (w as f64).powi(2);
                 }
                 eprintln!(
-                    "[claude-q8x-check] m={m} k={k} b={batch} max_abs_diff={max_diff:.3e} max_abs_ref={max_ref:.3e} rel_l2={:.3e}",
+                    "[claude-q8x-check] {} m={m} k={k} b={batch} max_abs_diff={max_diff:.3e} max_abs_ref={max_ref:.3e} rel_l2={:.3e}",
+                    variant.spec(),
                     (sq_d / sq_r.max(1e-30)).sqrt()
                 );
                 self.free_tensor(tmp)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// claude: resident workgroups per multiprocessor (a WGP on RDNA) for a
+    /// loaded function, cached per (function, dynamic LDS). The HIP occupancy
+    /// API counts LDS per CU (64 KiB) on gfx1100, while a WGP-mode workgroup
+    /// allocates from the WGP's 128 KiB, so two workgroups of <= 64 KiB and
+    /// <= 512 threads always fit: floor at 2 (measured: at 42.6 KB of LDS the
+    /// API says 1, and 2 is 9% faster).
+    fn claude_q8x_occupancy(&self, func_name: &str, threads: u32, lds: u32) -> usize {
+        thread_local! {
+            static OCC: std::cell::RefCell<std::collections::HashMap<(String, u32), usize>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        if let Some(v) = OCC.with(|m| m.borrow().get(&(func_name.to_string(), lds)).copied()) {
+            return v;
+        }
+        let v = self
+            .occupancy_max_active_blocks(func_name, [threads, 1, 1], lds)
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| v as usize)
+            .unwrap_or(1)
+            .max(if threads <= 512 && lds <= 65536 { 2 } else { 1 });
+        OCC.with(|m| m.borrow_mut().insert((func_name.to_string(), lds), v));
+        if std::env::var("CLAUDE_Q8X_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "[claude-q8x] {func_name}: {v} resident workgroups x {} multiprocessors ({threads} threads, {lds} B LDS)",
+                self.claude_q8x_mp_count()
+            );
+        }
+        v
+    }
+
+    /// claude: HIP multiprocessor count (WGPs on RDNA), cached.
+    fn claude_q8x_mp_count(&self) -> usize {
+        static MP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MP.get_or_init(|| {
+            self.hip
+                .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, self.device_id)
+                .ok()
+                .filter(|&v| v > 0)
+                .map(|v| v as usize)
+                .unwrap_or(48)
+        })
+    }
+
+    /// claude: launch GEMV variant `v` for up to four weights `(a, y, m)` that
+    /// share the int8 activations `(xq, dx)` written by `claude_q8x_quant_into`
+    /// (or a fused q8 producer) for `[batch x k]`. `multi` fuses 2..=4 weights
+    /// into one launch when the variant has a `_multi` twin. Compiles the
+    /// variant on first use through the regular JIT cache. Used by
+    /// `claude_q8x_project` and by `bench_claude_q8x`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_q8x_gemv_launch(
+        &mut self,
+        v: ClaudeQ8xVariant,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        xq: *mut c_void,
+        dx: *mut c_void,
+        k: usize,
+        batch: usize,
+        residual: bool,
+        multi: bool,
+    ) -> HipResult<()> {
+        assert!((1..=8).contains(&batch), "claude_q8x_gemv_launch: batch {batch}");
+        assert!(k % 256 == 0 && k <= 32768, "claude_q8x_gemv_launch: k {k}");
+        assert!(!outs.is_empty() && outs.len() <= 4, "claude_q8x_gemv_launch: {} outs", outs.len());
+        assert!(v.supports(k, batch), "claude_q8x_gemv_launch: {} cannot run k {k} batch {batch}", v.spec());
+        let lds = v.lds_bytes(k, batch) as u32;
+        self.bind_thread()?;
+        let name = v.kernel_name(batch, residual);
+        let use_multi = multi && v.has_multi() && outs.len() > 1;
+        let multi_name = format!("{name}_multi");
+        let func_name: &str = if use_multi { &multi_name } else { &name };
+        if !self.functions.contains_key(func_name) {
+            let src = v.source(batch, residual);
+            self.ensure_kernel(&name, &src, func_name)?;
+        }
+        // V4 is persistent: one wave of workgroups sized to the resident
+        // capacity (occupancy API x multiprocessors), never more workgroups
+        // than rows / R (so every warp range covers at least one row).
+        let persist = match v {
+            ClaudeQ8xVariant::V4 { r, g, .. } => {
+                let total: usize = if use_multi { outs.iter().map(|o| o.2).sum() } else { outs[0].2 };
+                let per_mp = if g > 0 { g as usize } else { self.claude_q8x_occupancy(func_name, 32 * r, lds) };
+                Some(((per_mp * self.claude_q8x_mp_count()).min(total / r as usize)).max(1))
+            }
+            _ => None,
+        };
+        let func = &self.functions[func_name];
+        let k_val = k as i32;
+        let b_val = batch as i32;
+        if use_multi {
+            let mut a_ptrs = [std::ptr::null_mut::<c_void>(); 4];
+            let mut y_ptrs = [std::ptr::null_mut::<c_void>(); 4];
+            let mut ms = [0i32; 4];
+            let mut blocks = 0usize;
+            let mut threads = 32usize;
+            for (i, &(a, y, m)) in outs.iter().enumerate() {
+                a_ptrs[i] = a.buf.as_ptr();
+                y_ptrs[i] = y.buf.as_ptr();
+                ms[i] = m as i32;
+                let (g, t) = v.geometry(m);
+                blocks += g;
+                threads = t;
+            }
+            if let Some(g) = persist {
+                blocks = g;
+            }
+            let mut params: Vec<*mut c_void> = Vec::with_capacity(16);
+            for i in 0..4 {
+                params.push(&a_ptrs[i] as *const _ as *mut c_void);
+                params.push(&y_ptrs[i] as *const _ as *mut c_void);
+                params.push(&ms[i] as *const _ as *mut c_void);
+            }
+            params.push(&xq as *const _ as *mut c_void);
+            params.push(&dx as *const _ as *mut c_void);
+            params.push(&k_val as *const _ as *mut c_void);
+            params.push(&b_val as *const _ as *mut c_void);
+            unsafe {
+                self.hip.launch_kernel(func, [blocks as u32, 1, 1], [threads as u32, 1, 1], lds, self.stream_ref(), &mut params)?;
+            }
+            return Ok(());
+        }
+        for &(a, y, m) in outs {
+            let a_ptr = a.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let (mut blocks, threads) = v.geometry(m);
+            if persist.is_some() {
+                // one persistent grid per weight (single-weight launches)
+                let per = match v {
+                    ClaudeQ8xVariant::V4 { r, g, .. } => {
+                        let per_mp = if g > 0 { g as usize } else { self.claude_q8x_occupancy(func_name, 32 * r, lds) };
+                        ((per_mp * self.claude_q8x_mp_count()).min(m / r as usize)).max(1)
+                    }
+                    _ => blocks,
+                };
+                blocks = per;
+            }
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &xq as *const _ as *mut c_void,
+                &dx as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &b_val as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(func, [blocks as u32, 1, 1], [threads as u32, 1, 1], lds, self.stream_ref(), &mut params)?;
             }
         }
         Ok(())
