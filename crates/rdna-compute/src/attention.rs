@@ -245,7 +245,7 @@ pub fn claude_fa2_variant(arch: &str) -> u32 {
         std::env::var("CLAUDE_FA2_VARIANT")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&v| v == 0 || claude_fa2_variant_defines(v).is_some())
+            .filter(|&v| v == 0 || v == CLAUDE_FA2_UPSTREAM_R3 || claude_fa2_variant_defines(v).is_some())
     });
     match forced {
         Some(v) => v,
@@ -254,13 +254,17 @@ pub fn claude_fa2_variant(arch: &str) -> u32 {
     }
 }
 
-/// Default claude FA2 body on gfx1100: v6 = v3 (pipelined operand fetch,
+/// Default claude FA2 body on gfx1100: v3 (pipelined operand fetch,
 /// permlanex16 exchanges, exact lazy rescale, conflict-free fill v2, b128
-/// fragments, upstream zero-fill past the causal end) with 32 query positions
-/// per workgroup (12 compute + 2 fill waves). Bit-identical output to the
-/// upstream kernel; 1.49-1.58x faster per 1024-row chunk at 32K-100K context
-/// (bench_fa2_longctx). `CLAUDE_FA2_VARIANT=0` restores the upstream kernel.
-pub const CLAUDE_FA2_DEFAULT_VARIANT: u32 = 6;
+/// fragments, upstream zero-fill past the causal end). Bit-identical output to
+/// today's production kernel; 1.36-1.43x faster per 1024-row chunk at
+/// 32K-100K context (bench_fa2_longctx). `CLAUDE_FA2_VARIANT=0` restores
+/// today's production kernel.
+pub const CLAUDE_FA2_DEFAULT_VARIANT: u32 = 3;
+/// `CLAUDE_FA2_VARIANT` value selecting upstream HipFire's exact-gfx1100 FA2
+/// variant (cherry-picked 1faea2968, "R3"); also reachable with
+/// `CLAUDE_FA2_VARIANT=0 HIPFIRE_GFX1100_FA2_R3=1`.
+pub const CLAUDE_FA2_UPSTREAM_R3: u32 = 101;
 
 /// Feature defines for claude FA2 variant `v` (None = unknown variant) and
 /// the dynamic LDS bytes that recipe needs. Each variant is a fixed recipe so
@@ -5896,9 +5900,13 @@ impl Gpu {
         // tiles dispatched first; its own entry symbols. Kernel -24.7% at
         // N4096@4096 and -28.5% at N4096@0 on a real H2 layer.
         // `HIPFIRE_GFX1100_FA2_R3=0` restores the shared gfx11 body.
+        // claude: today's production kernel is the shared gfx11 body, so R3
+        // is opt-in here (`CLAUDE_FA2_VARIANT=101`, or `CLAUDE_FA2_VARIANT=0`
+        // with `HIPFIRE_GFX1100_FA2_R3=1`); claude variants ignore it.
         let r3 = fill
             && self.arch == "gfx1100"
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", true);
+            && (variant == CLAUDE_FA2_UPSTREAM_R3
+                || (variant == 0 && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", false)));
         let (module, preconvert) = if r3 {
             ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
         } else {

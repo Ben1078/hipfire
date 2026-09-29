@@ -547,16 +547,28 @@ __device__ __forceinline__ half16_t cl_prow(const float* e, uint32_t sel_lo, uin
 
 // PV for one 16-key subtile: Ofr[dc] += V^T(dc) * P, V fragments prefetched one
 // chunk ahead. `v0` is chunk 0, already issued by the caller.
+#if CL_Q32
+// Wave-uniform V^T key mask (lower position half's last tile only): keys past
+// that half's causal end are zeroed in the fragment registers (upstream's
+// 16-row workgroup zero-fills them in its plane; here they hold the upper
+// half's valid keys). P is already 0 for them, but the WMMA sum is not
+// bit-invariant to finite operands under zero P, so the operand must match.
+#define CL_PV_MASK_ARGS , bool msk, uint8v_t vm
+#define CL_VMASK(x) (msk ? __builtin_bit_cast(half16_t, __builtin_bit_cast(uint8v_t, (x)) & vm) : (x))
+#else
+#define CL_PV_MASK_ARGS
+#define CL_VMASK(x) (x)
+#endif
 __device__ __forceinline__ void cl_pv(const uint32_t* Vdw, const int* vl, half16_t v0,
-                                      half16_t prow, float8_t* Ofr)
+                                      half16_t prow, float8_t* Ofr CL_PV_MASK_ARGS)
 {
 #if CL_PIPE
     half16_t vb[2];
-    vb[0] = v0;
+    vb[0] = CL_VMASK(v0);
 #pragma unroll
     for (int dc = 0; dc < 16; ++dc) {
         if (dc + 1 < 16)
-            vb[(dc + 1) & 1] = cl_vfrag(Vdw, vl, dc + 1);
+            vb[(dc + 1) & 1] = CL_VMASK(cl_vfrag(Vdw, vl, dc + 1));
 #if CL_KO_PV
         asm volatile("" :: "v"(vb[dc & 1]), "v"(prow));
 #else
@@ -577,26 +589,6 @@ __device__ __forceinline__ void cl_pv(const uint32_t* Vdw, const int* vl, half16
 }
 
 #if CL_Q32
-// PV for the lower position half's last tile: keys past that half's causal
-// end are zeroed in the V^T fragment registers (upstream's 16-row workgroup
-// zero-fills them in its plane; here they hold the upper half's valid keys).
-// P is already 0 for them, but the WMMA sum is not bit-invariant to finite
-// operands under zero P, so the operand must match upstream exactly.
-__device__ __forceinline__ void cl_pv_masked(const uint32_t* Vdw, const int* vl, half16_t v0,
-                                             half16_t prow, float8_t* Ofr, uint8v_t vm)
-{
-    half16_t vb[2];
-    vb[0] = __builtin_bit_cast(half16_t, __builtin_bit_cast(uint8v_t, v0) & vm);
-#pragma unroll
-    for (int dc = 0; dc < 16; ++dc) {
-        if (dc + 1 < 16)
-            vb[(dc + 1) & 1] = __builtin_bit_cast(
-                half16_t, __builtin_bit_cast(uint8v_t, cl_vfrag(Vdw, vl, dc + 1)) & vm);
-        Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vb[dc & 1], prow, Ofr[dc]);
-        CL_FENCE();
-    }
-}
-
 // Dword mask for keys kbase+0..15 of a subtile: half h of dword j is kept iff
 // key kbase+2j+h < lim.
 __device__ __forceinline__ uint8v_t cl_keymask(int kbase, int lim)
@@ -784,13 +776,12 @@ __device__ __forceinline__ void cl_fa2_body(
             const bool active = ktile <= my_gmax;
             const bool do1 = ktile + 16 <= my_gmax;
 #if CL_Q32
-            if (!active) {
-                CL_TILE_BARRIER();
-                CL_TILE_BARRIER();
-                continue;
-            }
             // Lower group's last tile when the workgroup extends past it.
+#ifndef CL_Q32_NOMASK
             const bool vmask_on = my_gmax < gmax && ktile + 32 > my_gmax + 1;
+#else
+            const bool vmask_on = false;
+#endif
 #else
             (void)active;
 #endif
@@ -804,7 +795,7 @@ __device__ __forceinline__ void cl_fa2_body(
             float8_t s0 = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             float8_t s1 = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #if CL_PIPE
-            {
+            if (!CL_Q32 || active) {
                 half16_t ka[2], kb[2];
                 ka[0] = cl_kfrag(Kdw, kb0, rot, 0);
                 kb[0] = cl_kfrag(Kdw, kb1, rot, 0);
@@ -859,6 +850,7 @@ __device__ __forceinline__ void cl_fa2_body(
             CL_TILE_BARRIER();  // B1: V(t) in plane; K(t) consumed
 
             // ---- Phase B: online softmax + PV ----
+            if (!CL_Q32 || active) {
 #if CL_SM32
             {
                 // One online-softmax step over all 32 keys, log2 domain.
@@ -912,18 +904,15 @@ __device__ __forceinline__ void cl_fa2_body(
                         Ofr[dc] *= alpha;
                 }
 #if CL_Q32
-                if (vmask_on) {
-                    cl_pv_masked(Vdw, vl0, v00, p0, Ofr, cl_keymask(ktile, my_gmax + 1));
-                    if (do1)
-                        cl_pv_masked(Vdw, vl1, cl_vfrag(Vdw, vl1, 0), p1, Ofr,
-                                     cl_keymask(ktile + 16, my_gmax + 1));
-                } else
-#endif
-                {
+                cl_pv(Vdw, vl0, v00, p0, Ofr, vmask_on, cl_keymask(ktile, my_gmax + 1));
+                if (do1)
+                    cl_pv(Vdw, vl1, cl_vfrag(Vdw, vl1, 0), p1, Ofr, vmask_on,
+                          cl_keymask(ktile + 16, my_gmax + 1));
+#else
                 cl_pv(Vdw, vl0, v00, p0, Ofr);
                 if (do1)
                     cl_pv(Vdw, vl1, cl_vfrag(Vdw, vl1, 0), p1, Ofr);
-                }
+#endif
             }
 #else
 #pragma unroll
@@ -990,11 +979,10 @@ __device__ __forceinline__ void cl_fa2_body(
                         Ofr[dc] *= alpha;
                 }
 #if CL_Q32
-                if (vmask_on)
-                    cl_pv_masked(Vdw, vl, v00, prow, Ofr, cl_keymask(kt_sub, my_gmax + 1));
-                else
-#endif
+                cl_pv(Vdw, vl, v00, prow, Ofr, vmask_on, cl_keymask(kt_sub, my_gmax + 1));
+#else
                 cl_pv(Vdw, vl, v00, prow, Ofr);
+#endif
             }
 #endif
 #if CL_PIPE
@@ -1005,6 +993,7 @@ __device__ __forceinline__ void cl_fa2_body(
                 if (p >= CL_QLDS)
                     qbuf[p] = cl_q(q16, qq, p);
 #endif
+            }  // active (phase B)
             CL_TILE_BARRIER();  // B2: K(t+1) in plane; V(t) consumed
         }
 
