@@ -5367,6 +5367,26 @@ pub fn generate_multi(
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     let trailer = nl.len();
+    // claude-v3: clamp max_tokens to the remaining KV budget (llama.cpp
+    // semantics) instead of aborting the stream. Agent harnesses send a fixed
+    // large max_tokens regardless of prompt size; the honest outcome is
+    // finish_reason=length, not a dropped connection. Disable with
+    // CLAUDE_MAX_TOKENS_CLAMP=0. Requests with fewer than 16 tokens of room
+    // still fail with the original context_length error.
+    let max_tokens = {
+        let clamp_on = std::env::var("CLAUDE_MAX_TOKENS_CLAMP").map(|v| v != "0").unwrap_or(true);
+        let used = m.seq_pos.saturating_add(new_tokens.len()).saturating_add(trailer);
+        let room = m.physical_cap.saturating_sub(used);
+        if clamp_on && room >= 16 && max_tokens > room {
+            eprintln!(
+                "[daemon] max_tokens {} clamped to {} (seq_pos={} prefill={} trailer={} physical_cap={})",
+                max_tokens, room, m.seq_pos, new_tokens.len(), trailer, m.physical_cap
+            );
+            room
+        } else {
+            max_tokens
+        }
+    };
     if m.seq_pos
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)
