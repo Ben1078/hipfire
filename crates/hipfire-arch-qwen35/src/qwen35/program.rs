@@ -33,6 +33,7 @@ pub(crate) fn hybrid_dims(config: &Qwen35Config) -> HybridDims {
         linear_value_heads: config.linear_num_value_heads,
         linear_key_dim: config.linear_key_head_dim,
         linear_value_dim: config.linear_value_head_dim,
+        conv_kernel: config.conv_kernel_dim,
         num_experts: config.num_experts,
     }
 }

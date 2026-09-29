@@ -40,7 +40,11 @@
 
 use super::*;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
+use hipfire_dispatch::pipeline::batched::{mq_f16_projection_fast_route, s4_residual_fast};
 use hipfire_dispatch::pipeline::batched_attention::gfx12_fa_prep_admitted;
+use hipfire_dispatch::pipeline::batched_deltanet::{
+    deltanet_input_projection_batched, deltanet_output_projection_batched, deltanet_prepare_batched,
+};
 
 /// One request's rows of a multi-request chunk.
 ///
@@ -577,24 +581,57 @@ pub fn forward_prefill_batch_multi(
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                // batch_chunk_delta_net_attn, non chunk-scan arm (n < 64).
+                // execute_deltanet_batched, non chunk-scan arm (n < 64).
+                let (dn_w, dims) = (deltanet_layer_view(layer), crate::qwen35::program::hybrid_dims(config));
                 if split_proj {
                     for (r, view) in reqs.iter().zip(&views) {
-                        batch_chunk_delta_net_input_projection(
-                            gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion, None,
+                        deltanet_input_projection_batched(
+                            gpu,
+                            &dn_w,
+                            &dims,
+                            &deltanet_scratch(view),
+                            r.tokens.len(),
+                            dim,
+                            q8_wmma_arch,
+                            r.fusion == DflashFusionCtx::ChainVerify,
+                            None,
                             DenseBatchMath::Product,
                         )?;
                     }
                 } else {
-                    batch_chunk_delta_net_input_projection(
-                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, None, math,
+                    deltanet_input_projection_batched(
+                        gpu,
+                        &dn_w,
+                        &dims,
+                        &deltanet_scratch(pbs),
+                        total,
+                        dim,
+                        q8_wmma_arch,
+                        shared_fusion == DflashFusionCtx::ChainVerify,
+                        None,
+                        math,
                     )?;
                 }
                 for (r, view) in reqs.iter_mut().zip(&views) {
                     let n = r.tokens.len();
-                    let parents = batch_chunk_delta_net_pre_gdn(
-                        gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape, 0,
-                        delta_layer_idx, r.fusion,
+                    let tape = r.gdn_tape.map(gdn_tape_view);
+                    let parents = deltanet_prepare_batched(
+                        gpu,
+                        &dn_w,
+                        &dims,
+                        &deltanet_scratch(view),
+                        &deltanet_state_view(r.dn_state),
+                        n,
+                        k_dim,
+                        v_dim,
+                        n_v_heads,
+                        hd,
+                        sem,
+                        None,
+                        tape.as_ref(),
+                        0,
+                        delta_layer_idx,
+                        r.fusion == DflashFusionCtx::ChainVerify,
                     )?;
                     if parents.is_some() {
                         return refuse("tree recurrence in a linear verify");
@@ -621,17 +658,17 @@ pub fn forward_prefill_batch_multi(
                 {
                     for (r, view) in reqs.iter().zip(&views) {
                         let n = r.tokens.len();
-                        batch_chunk_delta_net_output_projection(
+                        deltanet_output_projection_batched(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            &dn_w,
+                            &dims,
+                            &deltanet_scratch(view),
                             n,
                             n_v_heads,
                             q8_wmma_arch,
                             arch_has_wmma,
                             BatchEpilogue::Residual,
-                            r.fusion,
+                            r.fusion == DflashFusionCtx::ChainVerify,
                             GdnScanOut::F32,
                             DenseBatchMath::Product,
                         )?;
@@ -641,17 +678,17 @@ pub fn forward_prefill_batch_multi(
                         )?;
                     }
                 } else {
-                    batch_chunk_delta_net_output_projection(
+                    deltanet_output_projection_batched(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        &dn_w,
+                        &dims,
+                        &deltanet_scratch(pbs),
                         total,
                         n_v_heads,
                         q8_wmma_arch,
                         arch_has_wmma,
                         BatchEpilogue::Residual,
-                        shared_fusion,
+                        shared_fusion == DflashFusionCtx::ChainVerify,
                         GdnScanOut::F32,
                         math,
                     )?;

@@ -50,6 +50,8 @@ pub struct HybridDims {
     pub linear_value_heads: usize,
     pub linear_key_dim: usize,
     pub linear_value_dim: usize,
+    /// DeltaNet causal-conv kernel width.
+    pub conv_kernel: usize,
     pub num_experts: usize,
 }
 
