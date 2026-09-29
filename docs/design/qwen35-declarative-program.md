@@ -58,3 +58,14 @@ parity must hold. The tape hash may change only if the launch sequence changes.
   `qwen35-4b.mq4` and `ornith-1.5-35b-a3b.mq4r`.
 - `redline_daemon_harness.py --pm4` shadow parity exact.
 - EP route oracles unchanged (EP uses the shared MoE step).
+
+## Progress
+
+| Piece | State | Commit |
+|---|---|---|
+| Decode mixers + dense FFN as Steps (`program.rs`, `hybrid.rs`) | landed, bit-exact, tape hash unchanged | `ff892ed98` |
+| Batched dense FFN (`rows > 1`) + `pipeline::batched` library | landed, bit-exact | `505277d01` |
+| Batched full attention | next | |
+| Batched DeltaNet, MoE layers | pending | |
+| Decode hand arms (DFlash hidden capture, VL mrope), `lower_variant` removal | pending | |
+| MTP head | pending | |
