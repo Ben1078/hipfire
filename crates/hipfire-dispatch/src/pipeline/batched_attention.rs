@@ -86,9 +86,10 @@ pub struct AttentionLayerWeights<'a> {
     pub q_norm: &'a GpuTensor,
     pub k_norm: &'a GpuTensor,
     pub wo: WeightRef<'a>,
-    /// Gate projection of the FFN that follows; decides whether the output
-    /// projection may fold its residual into that FFN's norm producer.
-    pub w_gate: WeightRef<'a>,
+    /// Gate projection of the dense FFN that follows, if any; decides whether
+    /// the output projection may fold its residual into that FFN's norm
+    /// producer. A routed MoE FFN never consumes the fold.
+    pub w_gate: Option<WeightRef<'a>>,
 }
 
 /// Batched attention scratch rows, `[rows, …]` per tensor.
@@ -105,6 +106,8 @@ pub struct AttentionBatchScratch<'a> {
     pub fa_attn_out_batch: &'a GpuTensor,
     pub fa_attn_out_rot_batch: &'a GpuTensor,
     pub fa_attn_out_rot_f16_batch: &'a GpuTensor,
+    /// PARO projection-input / output-projection scratch.
+    pub x_norm_batch: &'a GpuTensor,
     /// Residual-fold delta (the following FFN's gate buffer, dead here).
     pub gate_ffn_batch: &'a GpuTensor,
     pub positions: &'a GpuTensor,
@@ -179,12 +182,12 @@ pub fn gfx12_sigmoid_rotate_quant_admitted(
 /// out-projection until the gate/up GEMM, which runs after the norm.
 pub fn residual_fold_consumer_ready(
     gpu: &Gpu,
-    w_gate: &WeightRef<'_>,
+    w_gate: Option<&WeightRef<'_>>,
     chain_verify: bool,
     n: usize,
     dim: usize,
 ) -> bool {
-    w_gate.dtype == DType::MQ4G256V2
+    w_gate.is_some_and(|w| w.dtype == DType::MQ4G256V2)
         && gpu.iu4_producer_sidecar_active(n, dim)
         && !mq_f16_projection_fast_route(gpu, chain_verify, n, dim)
 }
@@ -197,7 +200,7 @@ pub fn out_proj_residual_iu4_prepared(
     x_batch: &GpuTensor,
     fold_delta: &GpuTensor,
     wo: &WeightRef<'_>,
-    w_gate: &WeightRef<'_>,
+    w_gate: Option<&WeightRef<'_>>,
     prep: &rdna_compute::Int4MmqPrepared,
     chain_verify: bool,
     n: usize,
@@ -219,7 +222,7 @@ pub fn out_proj_residual_i8_prepared(
     x_batch: &GpuTensor,
     fold_delta: &GpuTensor,
     wo: &WeightRef<'_>,
-    w_gate: &WeightRef<'_>,
+    w_gate: Option<&WeightRef<'_>>,
     prep: &rdna_compute::Int8MmqPrepared,
     chain_verify: bool,
     n: usize,
@@ -2015,7 +2018,7 @@ pub fn attention_output_projection_batched(
             &pbs.x_batch,
             &pbs.gate_ffn_batch,
             &layer.wo,
-            &layer.w_gate,
+            layer.w_gate.as_ref(),
             prep,
             chain_verify,
             n,
@@ -2193,7 +2196,7 @@ pub fn attention_output_projection_batched(
             &pbs.x_batch,
             &pbs.gate_ffn_batch,
             &layer.wo,
-            &layer.w_gate,
+            layer.w_gate.as_ref(),
             prep,
             chain_verify,
             n,
@@ -2204,7 +2207,7 @@ pub fn attention_output_projection_batched(
             &pbs.x_batch,
             &pbs.gate_ffn_batch,
             &layer.wo,
-            &layer.w_gate,
+            layer.w_gate.as_ref(),
             prep,
             chain_verify,
             n,
@@ -2418,5 +2421,487 @@ pub fn execute_gated_attention_batched(
         math,
     )?;
 
+    Ok(())
+}
+
+/// QKV projection (all dtype arms, including PARO's per-weight Givens
+/// rotation) + deinterleave/Q-norm/K-norm + TriAttention tap + RoPE of a
+/// full-attention layer whose FFN is a routed MoE. The paired-chunk path runs
+/// this per half, one merged attend step, then
+/// [`attention_moe_output_projection_batched`] per half.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_moe_prepare_batched(
+    gpu: &mut Gpu,
+    layer: &AttentionLayerWeights<'_>,
+    config: &HybridDims,
+    pbs: &AttentionBatchScratch<'_>,
+    n: usize,
+    dim: usize,
+    compact_offset: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    layer_idx: usize,
+    tap: Option<AttentionTap<'_>>,
+) -> HipResult<()> {
+    // Batched MoE FA layer. FA body is the same as FullAttn
+    // (rmsnorm + qkv + deinterleave + q/k norm + RoPE +
+    // kv_write + attention + sigmoid_mul + wo+residual);
+    // only the FFN differs. Duplicated inline — will be
+    // consolidated with the dense FA batched body once the
+    // MoE path is proven byte-exact.
+    // This body is unreachable for MQ3 / MQ3-Lloyd weights —
+    // the upstream `mq3_in_moe` guard at the top of
+    // `forward_prefill_batch_with_pbs` rejects any MoE layer
+    // with MQ3/Lloyd-MQ3 weights anywhere (attention OR FFN),
+    // mirroring the captured-path guard at line 3367+. So
+    // `layer.wq.dtype` is restricted to MQ4G256 / HFQ4G256
+    // / MQ6G256 / HFQ6G256 here. Adding MQ3 to the matcher AND
+    // the QKV dispatch is insufficient — the wo path below
+    // (line 5320) is hardcoded MQ4 too — so the all-or-nothing
+    // wiring lives in a separate PR (see followup issue).
+    let qkv_is_mq = matches!(
+        layer.wq.dtype,
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    );
+    let qkv_is_6bit = matches!(layer.wq.dtype, DType::MQ6G256 | DType::HFQ6G256);
+    let qkv_is_q8 = matches!(layer.wq.dtype, DType::Q8_0);
+    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+    // to the HFQ4 arm, which would read these packed blocks at the wrong
+    // stride and produce fluent-but-wrong tokens.
+    let qkv_is_lowbit = matches!(layer.wq.dtype, DType::TQ2G128 | DType::BQ1G128);
+    // qt=52 has no MoE-batched kernels (grouped/indexed LUT variants don't
+    // exist): refuse loudly here rather than falling through to a uniform
+    // fused key. Per-token decode serves Lloyd-MoE via generic dispatch paths.
+    if matches!(layer.wq.dtype, DType::MQ4G256V2Lloyd) {
+        return Err(HipError::new(
+            0,
+            "batch_chunk_full_attn_moe: MQ4G256V2Lloyd attention weights have no MoE-batched prefill kernel — refusing (per-token fallback serves this layer)",
+        ));
+    }
+    // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
+    // (each with its own Givens rotation tables). The fused-QKV
+    // kernels can't handle this — they assume one shared
+    // rotation. Unfused 3-way dispatch (rotate + gemm_hfq4g128
+    // per projection) matches the LA QKVZA Phase 1.5 pattern.
+    let qkv_is_paro = matches!(layer.wq.dtype, DType::ParoQ4G128);
+    // Fused QKV requires uniform dtype — see issue #249 for
+    // the dense FA variant. Gate the same way here.
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    let qkv_same_dtype = layer.wk.dtype == layer.wq.dtype && layer.wv.dtype == layer.wq.dtype;
+
+    if qkv_is_mq {
+        // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wq,
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+    } else if qkv_is_paro {
+        // PARO: rmsnorm into x_norm_batch (un-rotated). x_rot_batch
+        // is reused as the per-weight rotation scratch.
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_norm_batch,
+            n,
+            dim,
+            config.norm_eps,
+        )?;
+    } else {
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_rot_batch,
+            n,
+            dim,
+            config.norm_eps,
+        )?;
+    }
+    if qkv_is_paro {
+        // PARO 3-way unfused dispatch (wq, wk, wv each with own
+        // Givens rotation). Same shape outputs as the fused
+        // paths: fa_q_full_batch, fa_k_batch, fa_v_batch.
+        let paro_wq = layer.wq.rotation.as_ref().unwrap_or_else(|| {
+            panic!("ParoQ4G128 wq missing paro metadata at FA layer {layer_idx}")
+        });
+        let paro_wk = layer.wk.rotation.as_ref().unwrap_or_else(|| {
+            panic!("ParoQ4G128 wk missing paro metadata at FA layer {layer_idx}")
+        });
+        let paro_wv = layer.wv.rotation.as_ref().unwrap_or_else(|| {
+            panic!("ParoQ4G128 wv missing paro metadata at FA layer {layer_idx}")
+        });
+        // wq
+        gpu.givens_rotate_to(
+            &pbs.x_norm_batch,
+            &pbs.x_rot_batch,
+            &paro_wq.pairs,
+            &paro_wq.theta,
+            &paro_wq.scales,
+            n,
+            dim,
+            paro_wq.krot,
+        )?;
+        run_plain_gemm_key(
+            gpu,
+            crate::types::KernelKey::GemmHfq4G128,
+            &layer.wq.buf,
+            layer.wq.dtype,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            layer.wq.m,
+            layer.wq.k,
+            n,
+        )?;
+        // wk
+        gpu.givens_rotate_to(
+            &pbs.x_norm_batch,
+            &pbs.x_rot_batch,
+            &paro_wk.pairs,
+            &paro_wk.theta,
+            &paro_wk.scales,
+            n,
+            dim,
+            paro_wk.krot,
+        )?;
+        run_plain_gemm_key(
+            gpu,
+            crate::types::KernelKey::GemmHfq4G128,
+            &layer.wk.buf,
+            layer.wk.dtype,
+            &pbs.x_rot_batch,
+            &pbs.fa_k_batch,
+            layer.wk.m,
+            layer.wk.k,
+            n,
+        )?;
+        // wv
+        gpu.givens_rotate_to(
+            &pbs.x_norm_batch,
+            &pbs.x_rot_batch,
+            &paro_wv.pairs,
+            &paro_wv.theta,
+            &paro_wv.scales,
+            n,
+            dim,
+            paro_wv.krot,
+        )?;
+        run_plain_gemm_key(
+            gpu,
+            crate::types::KernelKey::GemmHfq4G128,
+            &layer.wv.buf,
+            layer.wv.dtype,
+            &pbs.x_rot_batch,
+            &pbs.fa_v_batch,
+            layer.wv.m,
+            layer.wv.k,
+            n,
+        )?;
+    } else if qkv_is_6bit && qkv_same_dtype {
+        run_fused_qkv_key(
+            gpu,
+            crate::types::KernelKey::FusedQkvHfq6G256,
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        )?;
+    } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
+        debug_assert!(
+            matches!(layer.wk.dtype, DType::Q8_0) && matches!(layer.wv.dtype, DType::Q8_0),
+            "FAMoe qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
+        );
+        run_fused_qkv_key(
+            gpu,
+            crate::types::KernelKey::FusedQkvQ8_0,
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        )?;
+    } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
+        run_plain_gemm_key(
+            gpu,
+            plain_gemm_key_for(layer.wq.dtype),
+            &layer.wq.buf,
+            layer.wq.dtype,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            layer.wq.m,
+            layer.wq.k,
+            n,
+        )?;
+        run_plain_gemm_key(
+            gpu,
+            plain_gemm_key_for(layer.wk.dtype),
+            &layer.wk.buf,
+            layer.wk.dtype,
+            &pbs.x_rot_batch,
+            &pbs.fa_k_batch,
+            layer.wk.m,
+            layer.wk.k,
+            n,
+        )?;
+        run_plain_gemm_key(
+            gpu,
+            plain_gemm_key_for(layer.wv.dtype),
+            &layer.wv.buf,
+            layer.wv.dtype,
+            &pbs.x_rot_batch,
+            &pbs.fa_v_batch,
+            layer.wv.m,
+            layer.wv.k,
+            n,
+        )?;
+    } else if qkv_same_dtype {
+        run_fused_qkv_key(
+            gpu,
+            crate::families::fused_qkv::fused_qkv_key_for(layer.wq.dtype),
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        )?;
+    } else {
+        // Mixed-format fallback (issue #249). batched_gemm_single_weight
+        // covers MQ4/HFQ4 + MQ6/HFQ6 + Q8_0; mixed-Q8/MQ4 within FAMoe
+        // routes here.
+        batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
+        batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+        batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+    }
+    // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
+    // global-memory round trip. K-norm, triattn tap, and RoPE below are
+    // unchanged.
+    gpu.deinterleave_q_rmsnorm_f32_batched(
+        &pbs.fa_q_full_batch,
+        &pbs.fa_q_batch,
+        &pbs.fa_gate_batch,
+        &layer.q_norm,
+        config.n_heads,
+        config.head_dim,
+        n,
+        config.norm_eps,
+    )?;
+    gpu.rmsnorm_batched(
+        &pbs.fa_k_batch,
+        &layer.k_norm,
+        &pbs.fa_k_batch,
+        n * config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    if let Some(tap) = tap {
+        tap(gpu, &pbs.fa_q_batch, &pbs.fa_k_batch, n)?;
+    }
+    let n_rot = config.n_rot;
+    // pos_offset = compact_offset (absolute RoPE phase post-eviction);
+    // pbs.positions stays physical for the KV-write. 0 when no compaction.
+    // 39aa358: in DDTree verify, rotate at DEPTH positions instead
+    // (correct sibling phases); KV write below stays physical.
+    let rope_pos_buf = if tree_verify.is_some() {
+        &pbs.rope_positions
+    } else {
+        &pbs.positions
+    };
+    gpu.rope_partial_interleaved_f32_batched(
+        &pbs.fa_q_batch,
+        &pbs.fa_k_batch,
+        rope_pos_buf,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+        n,
+        compact_offset as i32,
+    )?;
+    Ok(())
+}
+
+/// Gate sigmoid + output projection + residual of a full-attention layer
+/// whose FFN is a routed MoE (always the residual epilogue, no fold).
+pub fn attention_moe_output_projection_batched(
+    gpu: &mut Gpu,
+    layer: &AttentionLayerWeights<'_>,
+    pbs: &AttentionBatchScratch<'_>,
+    n: usize,
+    q8_wmma_arch: bool,
+    layer_idx: usize,
+) -> HipResult<()> {
+    gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+    // wo + residual. Mirrors the dense FA wo dispatch at
+    // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
+    // input expected); MQ4/MQ6 wo apply FWHT(awq_scale-adjusted).
+    // MQ6 branch added alongside MQ6_ADMIT (without it, MQ6 wo
+    // bytes get fed to gemm_hfq4g256_residual which reads them
+    // as 136 B/group HFQ4 layout vs the actual 200 B/group MQ6
+    // — catastrophic stride mismatch produces a single-token
+    // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
+    let fa_wo_is_q8 = matches!(layer.wo.dtype, DType::Q8_0);
+    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+    // to the HFQ4 arm, which would read these packed blocks at the wrong
+    // stride and produce fluent-but-wrong tokens.
+    let fa_wo_is_lowbit = matches!(layer.wo.dtype, DType::TQ2G128 | DType::BQ1G128);
+    let fa_wo_is_6bit = matches!(layer.wo.dtype, DType::MQ6G256 | DType::HFQ6G256);
+    // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
+    // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
+    // paro into fa_attn_out_rot_batch, then HFQ4G128 GEMM into a
+    // scratch, then add into x_batch.
+    let fa_wo_is_paro = matches!(layer.wo.dtype, DType::ParoQ4G128);
+    // T-B: fused rotate+quantize (always-Residual here — no epilogue param).
+    let iu4_wo_prep =
+        try_iu4_rotate_prepared_no_epilogue(gpu, &layer.wo, &pbs.fa_attn_out_batch, layer.wo.k, n)?;
+    let fa_wo_input = if iu4_wo_prep.is_some() {
+        &pbs.fa_attn_out_rot_batch
+    } else if fa_wo_is_q8 {
+        &pbs.fa_attn_out_batch
+    } else if fa_wo_is_paro {
+        let paro_wo = layer.wo.rotation.as_ref().unwrap_or_else(|| {
+            panic!("ParoQ4G128 wo missing paro metadata at FA layer {layer_idx}")
+        });
+        gpu.givens_rotate_to(
+            &pbs.fa_attn_out_batch,
+            &pbs.fa_attn_out_rot_batch,
+            &paro_wo.pairs,
+            &paro_wo.theta,
+            &paro_wo.scales,
+            n,
+            layer.wo.k,
+            paro_wo.krot,
+        )?;
+        &pbs.fa_attn_out_rot_batch
+    } else {
+        // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.fa_attn_out_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+        &pbs.fa_attn_out_rot_batch
+    };
+    if fa_wo_is_6bit {
+        run_residual_gemm_key(
+            gpu,
+            crate::types::KernelKey::GemmHfq6G256Residual,
+            &layer.wo.buf,
+            layer.wo.dtype,
+            fa_wo_input,
+            &pbs.x_batch,
+            layer.wo.m,
+            layer.wo.k,
+            n,
+        )?;
+    } else if fa_wo_is_q8 && q8_wmma_arch {
+        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+        run_residual_gemm_key(
+            gpu,
+            crate::types::KernelKey::GemmQ8_0ResidualWmma,
+            &layer.wo.buf,
+            layer.wo.dtype,
+            fa_wo_input,
+            &x_n,
+            layer.wo.m,
+            layer.wo.k,
+            n,
+        )?;
+    } else if fa_wo_is_q8 || fa_wo_is_lowbit {
+        // Non-WMMA Q8: GEMM into a scratch then add into x_batch.
+        // Reuse `fa_attn_out_rot_batch` (free since MQ4 rotate
+        // didn't run here) as scratch.
+        let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
+        run_plain_gemm_key(
+            gpu,
+            plain_gemm_key_for(layer.wo.dtype),
+            &layer.wo.buf,
+            layer.wo.dtype,
+            fa_wo_input,
+            &scratch,
+            layer.wo.m,
+            layer.wo.k,
+            n,
+        )?;
+        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+        gpu.add_inplace_f32(&x_n, &scratch)?;
+    } else if fa_wo_is_paro {
+        // PARO wo residual: HFQ4G128 batched GEMM into scratch,
+        // then add into x_batch. Reuse x_norm_batch (free since
+        // QKVZA is done — the MoE FFN body below rewrites it
+        // as its first action) as the gemm output scratch.
+        let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
+        run_plain_gemm_key(
+            gpu,
+            crate::types::KernelKey::GemmHfq4G128,
+            &layer.wo.buf,
+            layer.wo.dtype,
+            fa_wo_input,
+            &scratch,
+            layer.wo.m,
+            layer.wo.k,
+            n,
+        )?;
+        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+        gpu.add_inplace_f32(&x_n, &scratch)?;
+    } else if let Some(prep) = &iu4_wo_prep {
+        gpu.gemm_mq4g256v2_residual_wmma_iu4_prepared(
+            &layer.wo.buf,
+            prep,
+            &pbs.x_batch,
+            layer.wo.m,
+            layer.wo.k,
+            n,
+        )?;
+    } else {
+        run_residual_gemm_key(
+            gpu,
+            crate::families::gemm::residual_gemm_key_for(layer.wo.dtype),
+            &layer.wo.buf,
+            layer.wo.dtype,
+            fa_wo_input,
+            &pbs.x_batch,
+            layer.wo.m,
+            layer.wo.k,
+            n,
+        )?;
+    }
     Ok(())
 }

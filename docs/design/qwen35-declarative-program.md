@@ -67,7 +67,7 @@ parity must hold. The tape hash may change only if the launch sequence changes.
 | Batched dense FFN (`rows > 1`) + `pipeline::batched` library | landed, bit-exact | `505277d01` |
 | Batched full attention (`pipeline::batched_attention`) | landed, bit-exact | `9ec50733b` |
 | Batched DeltaNet (`pipeline::batched_deltanet`) | landed, bit-exact | `5466e9e8c` |
-| MoE layers (DN-MoE LA body, FA-MoE prep/finish) | pending: the MoE LA copy carries a PARO (Givens) route the dense executor lacks; folding needs a PARO fixture to prove parity | |
+| MoE layers (DN-MoE LA body, FA-MoE prep and output projection) | landed, bit-exact incl. PARO (`HIPFIRE_PARO_BATCHED=1`); separate executors because the MoE route differs in its input producers, PARO Givens arms and always-residual output projection, so merging with the dense executors would change numerics | |
 | Decode hand arms (DFlash hidden capture, VL mrope), `lower_variant` removal | pending | |
 | MTP head | pending | |
 

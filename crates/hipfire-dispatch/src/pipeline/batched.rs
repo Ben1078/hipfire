@@ -1924,6 +1924,46 @@ pub fn execute_swiglu_ffn_batched(
     swiglu_ffn_down_batched(gpu, op, b, n, h_source)
 }
 
+pub fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, _arch: &str, has_wmma: bool) -> bool {
+    if !has_wmma {
+        return false;
+    }
+    match value {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => true,
+    }
+}
+
+pub fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
+    q8_prefill_wmma_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
+            .ok()
+            .as_deref(),
+        gpu.arch.as_str(),
+        gpu.arch_caps.has_wmma(),
+    )
+}
+
+/// T-B: epilogue-free twin of [`try_iu4_rotate_prepared`] for the MoE wo
+/// sites, which have no `epilogue` param and always accumulate residual
+/// into x_batch. Same gate minus the Residual check. The f32 `x_rot` store
+/// is always skipped for the same reason as the Residual twin.
+pub fn try_iu4_rotate_prepared_no_epilogue(
+    gpu: &mut Gpu,
+    wo: &WeightRef<'_>,
+    x: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
+    if wo.dtype != DType::MQ4G256V2 || !gpu.iu4_producer_sidecar_active(n, k) {
+        return Ok(None);
+    }
+    let res = gpu.reserve_int4_mmq(k, n)?;
+    let prep = gpu.rotate_x_mq_i4_batched(x, wo.awq_scale, None, res, k, n)?;
+    Ok(Some(prep))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

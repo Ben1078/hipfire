@@ -45,6 +45,7 @@ use hipfire_dispatch::pipeline::batched_attention::gfx12_fa_prep_admitted;
 use hipfire_dispatch::pipeline::batched_deltanet::{
     deltanet_input_projection_batched, deltanet_output_projection_batched, deltanet_prepare_batched,
 };
+use rdna_compute::norm::GdnScanOut;
 
 /// One request's rows of a multi-request chunk.
 ///
