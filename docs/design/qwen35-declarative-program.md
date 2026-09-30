@@ -49,8 +49,11 @@ parity must hold. The tape hash may change only if the launch sequence changes.
    single-GPU `Qwen35Bindings` bodies.
 2. **Prefill.** Add `rows > 1` executors by moving the `batch_chunk_*` layer
    bodies. `forward_batch_chunk_impl` runs the slice-1 program.
-3. **MTP head.** `mtp_head_forward_block_only_with_pos_buf` becomes the same
-   ops over the MTP layer.
+3. **MTP head.** `mtp_head_forward_block_only_with_pos_buf` runs the MTP layer
+   as `[GatedAttention, SwigluFfn | Moe]`, the trunk's decode steps. The MoE
+   MTP experts load through the trunk MoE loader as a sealed
+   `MoeFfnWeights`. The MTP head and the decode hand arms use a different
+   gate (below).
 
 ## Gates per slice
 
@@ -58,6 +61,11 @@ parity must hold. The tape hash may change only if the launch sequence changes.
   `qwen35-4b.mq4` and `ornith-1.5-35b-a3b.mq4r`.
 - `redline_daemon_harness.py --pm4` shadow parity exact.
 - EP route oracles unchanged (EP uses the shared MoE step).
+- MTP head and decode hand arms: tau parity and coherent decoded text. The
+  shared steps take the trunk's certified MQ4 fusions, which the hand paths
+  never used. That moves draft logits in their last bits, and speculative
+  decode on the A3B MoE is not AR-invariant, so the greedy text can differ
+  where the verify window hits a near-tie.
 
 ## Progress
 
@@ -69,7 +77,7 @@ parity must hold. The tape hash may change only if the launch sequence changes.
 | Batched DeltaNet (`pipeline::batched_deltanet`) | landed, bit-exact | `5466e9e8c` |
 | MoE layers (DN-MoE LA body, FA-MoE prep and output projection) | landed, bit-exact incl. PARO (`HIPFIRE_PARO_BATCHED=1`); separate executors because the MoE route differs in its input producers, PARO Givens arms and always-residual output projection, so merging with the dense executors would change numerics | `1f3265f3d` |
 | Decode hand arms (DFlash hidden capture, VL mrope), `lower_variant` removal | pending | |
-| MTP head | pending | |
+| MTP head (`[GatedAttention, SwigluFfn \| Moe]`, sealed MoE experts) | landed; Ornith MTP battery tau per turn 1.46/1.36/1.21/0.89/1.13 vs 1.46/1.36/1.20/0.89/1.13 before; 1 of 5 turns diverges at token 3, all coherent; the sealed MoE step matches the old hand MoE decode byte for byte | |
 
 Verification per landed slice (gfx1151): greedy serve battery/chain and a
 1131-token prompt on `qwen35-4b.mq4`, greedy battery on

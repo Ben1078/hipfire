@@ -92,20 +92,20 @@ use rdna_compute::GpuTensor;
 /// Non-owning borrow of the scratch buffers `moe_ffn_decode_impl` needs.
 /// Callers construct one of these from either a `Qwen35Scratch` (preallocated,
 /// hipGraph-capturable) or from tensors they own locally (heap path).
-struct MoeScratchRef<'a> {
-    router_logits: &'a GpuTensor,
-    scalar_buf: &'a GpuTensor,
-    x_rot_local: &'a GpuTensor,
-    gate_up_buf: &'a GpuTensor,
-    gate_buf: &'a GpuTensor,
-    up_buf: &'a GpuTensor,
-    ffn_hidden: &'a GpuTensor,
-    ffn_out: &'a GpuTensor,
-    gate_batch: &'a GpuTensor,
-    up_batch: &'a GpuTensor,
-    rot_batch: &'a GpuTensor,
-    topk_indices: &'a GpuTensor,
-    topk_weights: &'a GpuTensor,
+pub(crate) struct MoeScratchRef<'a> {
+    pub(crate) router_logits: &'a GpuTensor,
+    pub(crate) scalar_buf: &'a GpuTensor,
+    pub(crate) x_rot_local: &'a GpuTensor,
+    pub(crate) gate_up_buf: &'a GpuTensor,
+    pub(crate) gate_buf: &'a GpuTensor,
+    pub(crate) up_buf: &'a GpuTensor,
+    pub(crate) ffn_hidden: &'a GpuTensor,
+    pub(crate) ffn_out: &'a GpuTensor,
+    pub(crate) gate_batch: &'a GpuTensor,
+    pub(crate) up_batch: &'a GpuTensor,
+    pub(crate) rot_batch: &'a GpuTensor,
+    pub(crate) topk_indices: &'a GpuTensor,
+    pub(crate) topk_weights: &'a GpuTensor,
     // [k_top × dim + ceil(dim/4)] f32 — per-(expert-rank) MoE down output
     // plus a zero-initialised u32 counter tail used only by the optional
     // expert-wave-preserving last-arriver combine experiment. The production
@@ -113,7 +113,7 @@ struct MoeScratchRef<'a> {
     // `pbs.moe_down_expanded_batch` layout with batch=1. Required so
     // the MoE FFN is byte-deterministic under hipGraph replay; see
     // task #100 root-cause notes in `forward_scratch`.
-    down_expanded: &'a GpuTensor,
+    pub(crate) down_expanded: &'a GpuTensor,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -651,6 +651,35 @@ fn moe_params_for_decode<'a>(
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
     }
+}
+
+/// Single-device decode recipe with the FFN norm folded in: `x` is normed
+/// into `x_norm` and receives the FFN output as its residual.
+pub(crate) fn moe_decode_params<'a>(
+    ffn: &'a MoeFfnWeights,
+    x: &'a GpuTensor,
+    ffn_norm: &'a GpuTensor,
+    x_norm: &'a GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'a>,
+) -> hipfire_dispatch::families::moe::MoeParams<'a> {
+    moe_params_for_decode(
+        ffn,
+        x_norm,
+        x,
+        config,
+        s,
+        false,
+        None,
+        false,
+        false,
+        MoeEpMode::None,
+        hipfire_dispatch::families::moe::MoeNormalization::RmsNorm {
+            weight: ffn_norm,
+            plain_out: x_norm,
+            eps: config.norm_eps,
+        },
+    )
 }
 
 /// Execute an already-built decode recipe and retain the existing observation
@@ -6089,7 +6118,9 @@ impl Qwen35Bindings<'_> {
         )
     }
 
-    fn dense_ffn(&self) -> Result<hipfire_dispatch::pipeline::hybrid::SwigluFfnOp<'_>, DispatchError> {
+    fn dense_ffn(
+        &self,
+    ) -> Result<hipfire_dispatch::pipeline::hybrid::SwigluFfnOp<'_>, DispatchError> {
         let program = super::program::DecodeBinding {
             dims: super::program::hybrid_dims(self.config),
             s: self.s,
