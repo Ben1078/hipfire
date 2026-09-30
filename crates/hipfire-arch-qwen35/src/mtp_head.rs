@@ -1748,6 +1748,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         flash_partials: &scratch.flash_partials,
         attn_out: &scratch.attn_out,
         tap: None,
+        mrope: None,
     };
     // ── 10. POST-attn norm + FFN (dense SwiGLU or routed MoE), residual in
     // place on `cur`. `attn_post_norm` is the pre-FFN norm.

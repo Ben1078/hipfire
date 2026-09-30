@@ -4,8 +4,10 @@
 // Exact VMM batched step: byte-identical, per request, to the default
 // singleton route.
 //
-// Decode rows run the singleton's own lowered layer program
-// (`qwen35::forward::{lower_variant, variant_of}` + `Qwen35Bindings`). The
+// Decode rows run the qwen35 super-op layer program
+// (`qwen35::forward::{lower_variant, variant_of}` + `Qwen35Bindings`), whose
+// bindings call the same `hipfire_dispatch::pipeline::hybrid` op stages as the
+// singleton's decode Steps. The
 // projection super-ops are batched across requests, each column
 // byte-identical to the singleton's kernel:
 // - plain (QKVZA / QKV / gate+up): the exact batched RMSNorm+FWHT rotate,
@@ -41,15 +43,10 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// The exact route reproduces the default singleton route only where its
 /// batched projection super-ops are the singleton's norm+GEMV: dense
-/// DeltaNet/FullAttention layers, uniform MQ4G256V2 projections, gfx1201,
-/// and the lowered decode program (the default; `HIPFIRE_FORWARD_LOWERED=0`
-/// selects the hand path, which this route does not mirror).
+/// DeltaNet/FullAttention layers, uniform MQ4G256V2 projections, gfx1201.
 pub(super) fn supports(gpu: &Gpu, weights: &Qwen35Weights) -> Result<(), String> {
     if !gpu.arch_caps.is_gfx1201() {
         return Err(format!("exact VMM route: arch {} not admitted (gfx1201 only)", gpu.arch));
-    }
-    if hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("0") {
-        return Err("exact VMM route: singleton is on the hand decode path (HIPFIRE_FORWARD_LOWERED=0)".into());
     }
     let v2 = |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256V2;
     for (i, layer) in weights.layers.iter().enumerate() {

@@ -876,6 +876,17 @@ pub struct GatedAttentionOp<'a> {
     pub flash_partials: &'a GpuTensor,
     pub attn_out: &'a GpuTensor,
     pub tap: Option<AttentionTap<'a>>,
+    /// Multimodal (t, h, w) RoPE; `None` rotates at `pos_buf`.
+    pub mrope: Option<MropeRope<'a>>,
+}
+
+/// Three-section RoPE positions of one token (vision-language prompts).
+#[derive(Clone, Copy)]
+pub struct MropeRope<'a> {
+    /// `[3]` i32 (t, h, w) rotary phases, already offset by KV compaction.
+    pub positions: &'a hip_bridge::DeviceBuffer,
+    /// Frequency counts of the t, h and w sections.
+    pub section: [usize; 3],
 }
 
 impl GatedAttentionOp<'_> {
@@ -926,7 +937,8 @@ impl GatedAttentionOp<'_> {
     pub fn attend(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> Result<bool, DispatchError> {
         self.require_decode()?;
         let dims = &self.dims;
-        let fused_prep = fused_attention_prep(gpu, dims) && self.tap.is_none();
+        let fused_prep =
+            fused_attention_prep(gpu, dims) && self.tap.is_none() && self.mrope.is_none();
         if !fused_prep {
             gpu.deinterleave_f32(self.q_gate, self.q, self.gate, dims.n_heads, dims.head_dim)
                 .map_err(hip)?;
@@ -959,7 +971,19 @@ impl GatedAttentionOp<'_> {
             gpu.memcpy_htod_auto(self.pos_buf, &logical.to_ne_bytes())
                 .map_err(hip)?;
         }
-        if fused_prep {
+        if let Some(mrope) = self.mrope {
+            gpu.rope_mrope_halfsplit_f32(
+                self.q,
+                self.k,
+                mrope.positions,
+                dims.n_heads,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.n_rot,
+                dims.rope_theta,
+                mrope.section,
+            )
+        } else if fused_prep {
             gpu.qwen35_fa_prep_gfx1100(
                 self.q_gate,
                 self.q,
