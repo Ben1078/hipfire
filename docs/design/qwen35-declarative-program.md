@@ -77,7 +77,7 @@ parity must hold. The tape hash may change only if the launch sequence changes.
 | Batched DeltaNet (`pipeline::batched_deltanet`) | landed, bit-exact | `5466e9e8c` |
 | MoE layers (DN-MoE LA body, FA-MoE prep and output projection) | landed, bit-exact incl. PARO (`HIPFIRE_PARO_BATCHED=1`); separate executors because the MoE route differs in its input producers, PARO Givens arms and always-residual output projection, so merging with the dense executors would change numerics | `1f3265f3d` |
 | Decode hand arms (DFlash hidden capture, VL mrope), `lower_variant` removal | pending | |
-| MTP head (`[GatedAttention, SwigluFfn \| Moe]`, sealed MoE experts) | landed; Ornith MTP battery tau per turn 1.46/1.36/1.21/0.89/1.13 vs 1.46/1.36/1.20/0.89/1.13 before; 1 of 5 turns diverges at token 3, all coherent; the sealed MoE step matches the old hand MoE decode byte for byte | |
+| MTP head (`[GatedAttention, SwigluFfn \| Moe]`, sealed MoE experts) | landed; Ornith MTP battery tau per turn 1.46/1.36/1.21/0.89/1.13 vs 1.46/1.36/1.20/0.89/1.13 before; 1 of 5 turns diverges at token 3, all coherent; the sealed MoE step matches the old hand MoE decode byte for byte | `fb16c0344` |
 
 Verification per landed slice (gfx1151): greedy serve battery/chain and a
 1131-token prompt on `qwen35-4b.mq4`, greedy battery on
