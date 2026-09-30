@@ -1705,6 +1705,9 @@ pub fn generate(
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
 ) {
+    // claude VL v2 (H0): a text turn after an image turn must not reuse KV
+    // rotated at the image turn's shifted phases (see `vl_turn`).
+    crate::vl_turn::text_turn_guard(m, gpu);
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
     // every stateful branch. Non-empty tools are denied for unsafe routes

@@ -3049,6 +3049,15 @@ fn main() {
                     _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                 };
 
+                // claude VL v2: the serve layer sends every image of the
+                // conversation, in message order, as `images_base64` (and the
+                // single-image `image_base64` for older consumers).
+                let images_base64: Vec<&str> = msg
+                    .get("images_base64")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let image_base64 = image_base64.or_else(|| images_base64.first().copied());
                 let has_image = image_base64.is_some() || image.is_some();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
                 // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
@@ -3071,6 +3080,83 @@ fn main() {
                         ),
                         None => write_error(&mut stdout, id, "model has no vision encoder"),
                     }
+                } else if has_image
+                    && has_vl
+                    && matches!(vision_route, hipfire_loader::VisionRoute::QwenVl)
+                    && match hipfire_generate::vl_turn::v2_eligible(m, &gpu, temp) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            eprintln!("[daemon/vl] VL v2 unavailable ({why}) — historical VL body");
+                            false
+                        }
+                    }
+                {
+                    // claude VL v2: the image turn runs through the text/MTP
+                    // path (full chat template with system prompt, tools and
+                    // history, every image at its message position, prompt
+                    // cache) — see `hipfire_generate::vl_turn`. No forced
+                    // conversation reset: the prompt-cache plan decides, gated
+                    // on the resident KV's phase layout.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
+                    let mut images: Vec<ImageSource> = Vec::new();
+                    let payloads: Vec<&str> = if images_base64.is_empty() {
+                        image_base64.into_iter().collect()
+                    } else {
+                        images_base64.clone()
+                    };
+                    if let Some(big) = payloads.iter().find(|b| b.len() > MAX_BASE64_ENCODED_LEN) {
+                        write_error(
+                            &mut stdout,
+                            id,
+                            &format!(
+                                "image payload exceeds maximum encoded size ({} bytes, got {})",
+                                MAX_BASE64_ENCODED_LEN,
+                                big.len(),
+                            ),
+                        );
+                        continue;
+                    }
+                    images.extend(payloads.iter().map(|b| ImageSource::Base64(b)));
+                    if images.is_empty() {
+                        if let Some(path) = image {
+                            images.push(ImageSource::Path(path));
+                        }
+                    }
+                    let params = hipfire_generate::vl_turn::VlTurnParams {
+                        id,
+                        prompt,
+                        system_prompt: system,
+                        images,
+                        max_tokens,
+                        max_think_tokens,
+                        assistant_prefix,
+                        tools: tools_json.as_deref(),
+                        messages_history: messages_history.as_deref(),
+                        stop: &stop_seqs,
+                        temp,
+                        top_p,
+                        top_k,
+                        min_p,
+                        cactus_delta,
+                        request_seed,
+                        reasoning_effort: reasoning_effort_jinja.as_deref(),
+                        enable_thinking: enable_thinking_jinja,
+                    };
+                    hipfire_generate::vl_turn::generate_vl_v2(m, &mut gpu, &mut stdout, &params);
+                } else if has_image && has_vl && images_base64.len() > 1 {
+                    write_error(
+                        &mut stdout,
+                        id,
+                        "several images need the VL v2 path (qwen35-vl with an MTP speculator); this load serves one image per request",
+                    );
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
                     // CLI rejects images in non-last turns, but a raw

@@ -602,7 +602,7 @@ pub(crate) fn build_vl_mrope_ctx(
 /// Strip an optional `data:...;base64,` prefix and base64-decode image bytes.
 /// Shared by the VCN pre-pass and the CPU fallback below so both see the
 /// same bytes (and the same errors).
-fn decode_image_bytes(b64: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_image_bytes(b64: &str) -> Result<Vec<u8>, String> {
     // A `data:` URL missing the comma separator is malformed — surface that
     // explicitly rather than letting it fall through to a misleading
     // "invalid byte 'd' at index 0" base64 error.
@@ -665,6 +665,15 @@ pub fn generate_vl(
         assistant_prefix,
         seed,
     } = *params;
+    // claude VL v2: the serve layer marks where images sat in the message text;
+    // this body places its single image itself, so drop the markers.
+    let prompt_unmarked;
+    let prompt = if prompt.contains(crate::vl_turn::IMAGE_MARKER) {
+        prompt_unmarked = prompt.replace(crate::vl_turn::IMAGE_MARKER, "");
+        prompt_unmarked.as_str()
+    } else {
+        prompt
+    };
     // hunt3 M-E: seed the process-global CPU sampler RNG per request. The VL
     // path samples exclusively via sampler::sample_cpu, which draws from this
     // global; without the per-request reset it carried RNG state across
@@ -672,6 +681,9 @@ pub fn generate_vl(
     // nondeterminism. Seeded by hipfire-engine::request_seed_for (wire `seed`
     // wins, else attempt key + counter), matching the sequential text path.
     hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
+    // claude: this body does not record the phase layout it leaves in the KV;
+    // the next text turn must not reuse it (see `vl_turn`).
+    crate::vl_turn::note_unrecorded_vl_turn();
     // Adaptive KV poison is sticky until unload/reload. Refuse VL generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
     // Mirror generate() — reset preserves poison, so VL must refuse independently.
@@ -1323,7 +1335,8 @@ pub fn generate_vl(
             image_start + inputs.n_visual(),
             inputs.rope_end(),
         );
-        if let Err(e) = qwen35::vl_prefill::install(gpu, inputs) {
+        let table_rows = kv.physical_cap;
+        if let Err(e) = qwen35::vl_prefill::install(gpu, inputs, table_rows) {
             vl_forward_fail(
                 stdout,
                 id,
@@ -1437,7 +1450,8 @@ pub fn generate_vl(
             image_start + inputs.n_visual(),
             inputs.rope_end(),
         );
-        let prefill = qwen35::vl_prefill::install(gpu, inputs).and_then(|()| {
+        let table_rows = kv.physical_cap;
+        let prefill = qwen35::vl_prefill::install(gpu, inputs, table_rows).and_then(|()| {
             qwen35::forward_prefill_batch(
                 gpu,
                 weights,

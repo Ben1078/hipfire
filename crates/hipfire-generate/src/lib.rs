@@ -54,6 +54,9 @@ pub mod img;
 /// dots.ocr path.
 pub mod vision;
 
+/// claude: Qwen3.5-VL image turns through the shared text/MTP path.
+pub mod vl_turn;
+
 /// Redline capture/replay fixtures lifted out of the daemon.
 pub mod redline;
 

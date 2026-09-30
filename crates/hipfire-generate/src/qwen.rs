@@ -3101,6 +3101,28 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
+    // claude VL v2 (H1): an image turn locates its image spans in the final
+    // prompt and clamps the cache plan to the prefix the resident KV's phase
+    // layout agrees on. No-op for text turns.
+    let resume_from_planned = resume_from;
+    let (prefill_tokens, prefill_start, cache_hit, resume_from, cached_tokens_dflash) =
+        match crate::vl_turn::turn_plan(
+            &prompt_tokens,
+            (
+                prefill_tokens,
+                prefill_start,
+                cache_hit,
+                resume_from_planned,
+                cached_tokens_dflash,
+            ),
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                emit_active_attempt_error(stdout, Some(id), &e, "validation", false, false);
+                let _ = stdout.flush();
+                return true;
+            }
+        };
 
     generate_dflash_rendered(
         m,
@@ -3257,6 +3279,21 @@ pub fn generate_dflash_rendered(
             id,
             started_in_think,
         );
+    }
+    // claude VL v2 (H2): encode the turn's images and install the VL prefill
+    // context for the whole spec turn (no-op for text turns). Nothing has
+    // touched GPU/host conversation state yet.
+    if let Err(e) = crate::vl_turn::turn_install(m, gpu) {
+        crate::ar::emit_active_route_error(
+            stdout,
+            Some(id),
+            &format!("image turn: {e}"),
+            "internal",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return true;
     }
     let run = match generate_spec(
         m,

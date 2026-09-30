@@ -1580,6 +1580,26 @@ pub(crate) fn project_request_contract(
     resolved: &hipfire_config::ResolvedConfig,
     include_reasoning: bool,
 ) -> Result<RequestContract> {
+    project_request_contract_opts(body, resolved, include_reasoning, false)
+}
+
+/// claude VL v2: Qwen3.5/3.6 arches take image content parts in place — the
+/// normalized text keeps [`QWEN_IMAGE_MARKER`] where each image sat, and the
+/// daemon expands it to the image's visual tokens (see
+/// `hipfire_generate::vl_turn`). Other arches keep the text-only projection.
+pub(crate) fn qwen_image_markers(arch: Option<&str>) -> bool {
+    arch != Some("muse_glimmer") && include_reasoning_content(arch)
+}
+
+/// What the Qwen chat template emits for one image content part.
+pub(crate) const QWEN_IMAGE_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+pub(crate) fn project_request_contract_opts(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    include_reasoning: bool,
+    image_markers: bool,
+) -> Result<RequestContract> {
     let max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
@@ -1588,7 +1608,8 @@ pub(crate) fn project_request_contract(
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
     }
-    let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
+    let mut messages =
+        normalize_openai_messages_opts(body.get("messages"), include_reasoning, image_markers);
     let default_system = request_string(resolved, "prompt.system", None)?;
     inject_default_system_message(&mut messages, default_system.as_deref());
     let conversation_messages = messages.clone();
@@ -1645,7 +1666,8 @@ pub(crate) fn complete_request_attempt(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
+    // claude VL v2: every image of the conversation, in message order.
+    let images_base64 = request_images_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -1676,10 +1698,11 @@ pub(crate) fn complete_request_attempt(
                 return Err(error.into());
             }
         }
-        let contract = project_request_contract(
+        let contract = project_request_contract_opts(
             body,
             &resolved,
             include_reasoning_content(runtime.current_arch.as_deref()),
+            !images_base64.is_empty() && qwen_image_markers(runtime.current_arch.as_deref()),
         )?;
         let max_tokens = contract.max_tokens;
         let required_max_seq = max_tokens.saturating_add(1024);
@@ -1698,8 +1721,16 @@ pub(crate) fn complete_request_attempt(
             "max_tokens": max_tokens,
             "attempt_id": attempt_id,
         });
-        if let Some(image) = image_base64 {
-            generate["image_base64"] = serde_json::Value::String(image);
+        if let Some(first) = images_base64.first() {
+            // `image_base64` keeps single-image daemons working; the daemon
+            // prefers `images_base64` (all images, message order).
+            generate["image_base64"] = serde_json::Value::String(first.clone());
+            generate["images_base64"] = serde_json::Value::Array(
+                images_base64
+                    .iter()
+                    .map(|b| serde_json::Value::String(b.clone()))
+                    .collect(),
+            );
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -2381,6 +2412,7 @@ pub(crate) fn openai_content_text(content: Option<&serde_json::Value>) -> String
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
         return Ok(None);
@@ -2417,6 +2449,76 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
         }
     }
     Ok(image)
+}
+
+/// Maximum images per request forwarded to the daemon.
+pub(crate) const MAX_REQUEST_IMAGES: usize = 8;
+
+/// claude VL v2: every `image_url` data URI of the conversation, in message
+/// order (the order the daemon expands [`QWEN_IMAGE_MARKER`]s in). Messages
+/// whose role the normalizer drops are skipped so markers and images agree.
+pub(crate) fn request_images_base64(messages: Option<&serde_json::Value>) -> Result<Vec<String>> {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut images = Vec::new();
+    for message in messages {
+        if !matches!(
+            message.get("role").and_then(serde_json::Value::as_str),
+            Some(
+                "developer" | "system" | "user" | "assistant" | "tool" | "toolResult"
+                    | "tool_result"
+            )
+        ) {
+            continue;
+        }
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(serde_json::Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let url = part
+                .pointer("/image_url/url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("image_url content part requires image_url.url"))?;
+            let payload = ["data:image/png;base64,", "data:image/jpeg;base64,"]
+                .into_iter()
+                .find_map(|prefix| url.strip_prefix(prefix))
+                .ok_or_else(|| {
+                    if url.starts_with("data:") {
+                        anyhow!("only base64 PNG and JPEG image_url data URIs are supported")
+                    } else {
+                        anyhow!("remote image_url values are unsupported; send a base64 data URI")
+                    }
+                })?;
+            if payload.is_empty() {
+                bail!("image_url data URI has an empty base64 payload");
+            }
+            images.push(payload.to_owned());
+            if images.len() > MAX_REQUEST_IMAGES {
+                bail!("at most {MAX_REQUEST_IMAGES} image_url parts are supported per request");
+            }
+        }
+    }
+    Ok(images)
+}
+
+/// Text of a content value with [`QWEN_IMAGE_MARKER`] where each image part
+/// sat (text-only projection otherwise identical to [`openai_content_text`]).
+pub(crate) fn openai_content_text_with_image_markers(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => part.get("text").and_then(serde_json::Value::as_str),
+                Some("image_url") => Some(QWEN_IMAGE_MARKER),
+                _ => None,
+            })
+            .collect(),
+        other => openai_content_text(other),
+    }
 }
 
 pub(crate) fn strip_inline_thinking(text: &str) -> String {
@@ -2494,6 +2596,14 @@ pub(crate) fn normalize_openai_messages(
     messages: Option<&serde_json::Value>,
     include_reasoning_content: bool,
 ) -> serde_json::Value {
+    normalize_openai_messages_opts(messages, include_reasoning_content, false)
+}
+
+pub(crate) fn normalize_openai_messages_opts(
+    messages: Option<&serde_json::Value>,
+    include_reasoning_content: bool,
+    image_markers: bool,
+) -> serde_json::Value {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
         return serde_json::json!([]);
     };
@@ -2506,7 +2616,11 @@ pub(crate) fn normalize_openai_messages(
                 role @ ("system" | "user" | "assistant" | "tool") => role,
                 _ => return None,
             };
-            let raw_content = openai_content_text(message.get("content"));
+            let raw_content = if image_markers {
+                openai_content_text_with_image_markers(message.get("content"))
+            } else {
+                openai_content_text(message.get("content"))
+            };
             let mut entry = serde_json::json!({
                 "role": role,
                 "content": if role == "assistant" {
@@ -3285,6 +3399,34 @@ mod tests {
         });
         let messages = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
+    }
+
+    #[test]
+    fn qwen_image_markers_keep_image_positions_and_order() {
+        let body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "sys" },
+            { "role": "user", "content": [
+                { "type": "text", "text": "a" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,QQ==" } },
+                { "type": "text", "text": "b" }
+            ] },
+            { "role": "assistant", "content": "ok" },
+            { "role": "user", "content": [
+                { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,Qg==" } },
+                { "type": "text", "text": "c" }
+            ] }
+        ] });
+        let images = request_images_base64(body.get("messages")).unwrap();
+        assert_eq!(images, vec!["QQ==".to_string(), "Qg==".to_string()]);
+        let marked = normalize_openai_messages_opts(body.get("messages"), false, true);
+        assert_eq!(marked[1]["content"], format!("a{QWEN_IMAGE_MARKER}b"));
+        assert_eq!(marked[3]["content"], format!("{QWEN_IMAGE_MARKER}c"));
+        let plain = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(plain[1]["content"], "ab");
+        assert!(qwen_image_markers(Some("qwen35")));
+        assert!(!qwen_image_markers(Some("muse_glimmer")));
+        assert!(!qwen_image_markers(Some("lfm2moe")));
+        assert!(!qwen_image_markers(None));
     }
 
     #[test]

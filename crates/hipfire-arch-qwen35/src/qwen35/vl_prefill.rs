@@ -31,12 +31,19 @@
 //! at `slot` with the prompt shifted by the same amount — identical attention
 //! scores up to fp32 rounding of the absolute angle.)
 //!
+//! Several images are several spans; the shift is the request's total
+//! `-rope_delta`, so rows after the LAST image sit at their slot.
+//!
 //! The context is a thread-local installed by the VL generate body around the
-//! prefill and removed afterwards. It is keyed by absolute KV slots, so chunks
-//! that do not overlap the prompt's image/rope region (every decode/verify
-//! forward) never see it. Paths that cannot honour it (per-token fallback,
-//! captured prefill, MoE FA prep, pre-embedded bands) refuse overlapping rows
-//! with an error instead of silently computing text semantics.
+//! whole spec turn and removed afterwards. It is keyed by absolute KV slots:
+//! the device phase table covers every slot up to the KV capacity (explicit
+//! phases for the prompt, slot phases after it), so any re-prefill of the
+//! conversation from slot 0 — spec prefix realign, terminal repair, checkpoint
+//! resume — gets the same embeddings and phases as the first prefill. Chunks
+//! that start past the last image (every decode/verify forward) never see it.
+//! Paths that cannot honour it (per-token fallback, captured prefill, MoE FA
+//! prep, pre-embedded bands) refuse overlapping rows with an error instead of
+//! silently computing text semantics.
 
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -99,25 +106,24 @@ pub fn batched_supported(
 
 /// Inputs for one image request's batched prefill.
 pub struct VlPrefillInputs {
-    /// Absolute KV slot of the first `<|image_pad|>` row.
-    pub image_start: usize,
-    /// Merged visual embeddings, `[n_visual][dim]` f32.
+    /// Image row runs `(first_slot, rows)`, ascending and disjoint. `embeds`
+    /// holds their rows back to back in the same order.
+    pub spans: Vec<(usize, usize)>,
+    /// Merged visual embeddings, `[sum(rows)][dim]` f32.
     pub embeds: Vec<f32>,
     /// Model width (`config.dim`).
     pub dim: usize,
-    /// Rotary phases `(t, h, w)` for rows `[0, positions.len())`; rows past the
-    /// end rotate at their slot. Empty = 1D slot phases everywhere.
+    /// Rotary phases `(t, h, w)` for rows `[0, positions.len())`, already
+    /// shifted; rows past the end rotate at their slot. Empty = slot phases.
     pub positions: Vec<[i32; 3]>,
     /// `config.mrope_section`.
     pub section: [usize; 3],
 }
 
 impl VlPrefillInputs {
-    /// Build the request's inputs from the per-request mrope context (the same
-    /// one the per-token path consumes), shifting every phase by `-rope_delta`
-    /// so rows after the image rotate at their slot (see the module docs).
-    /// `mrope == None` (1D fallback) keeps slot phases and only splices the
-    /// embeddings.
+    /// Single image from the per-request mrope context the per-token path
+    /// consumes. `mrope == None` (1D fallback) keeps slot phases and only
+    /// splices the embeddings.
     pub fn new(
         image_start: usize,
         embeds: Vec<f32>,
@@ -125,19 +131,16 @@ impl VlPrefillInputs {
         mrope: Option<&MropeCtx>,
         section: [usize; 3],
     ) -> Self {
+        let rows = if dim == 0 { 0 } else { embeds.len() / dim };
         let positions = match mrope {
             Some(mc) => {
                 debug_assert_eq!(mc.base, 0, "VL batched prefill models one turn from slot 0");
-                let shift = -mc.rope_delta;
-                mc.positions
-                    .iter()
-                    .map(|p| [p[0] + shift, p[1] + shift, p[2] + shift])
-                    .collect()
+                shift_positions(&mc.positions, mc.rope_delta)
             }
             None => Vec::new(),
         };
         Self {
-            image_start,
+            spans: if rows > 0 { vec![(image_start, rows)] } else { Vec::new() },
             embeds,
             dim,
             positions,
@@ -147,11 +150,7 @@ impl VlPrefillInputs {
 
     /// Number of spliced visual rows.
     pub fn n_visual(&self) -> usize {
-        if self.dim == 0 {
-            0
-        } else {
-            self.embeds.len() / self.dim
-        }
+        self.spans.iter().map(|&(_, rows)| rows).sum()
     }
 
     /// First slot from which every row rotates at its own slot (the shifted
@@ -170,32 +169,66 @@ impl VlPrefillInputs {
     }
 }
 
+/// HF `get_rope_index` phases shifted by `-rope_delta` (see the module docs).
+pub fn shift_positions(hf: &[[i32; 3]], rope_delta: i32) -> Vec<[i32; 3]> {
+    let shift = -rope_delta;
+    hf.iter()
+        .map(|p| [p[0] + shift, p[1] + shift, p[2] + shift])
+        .collect()
+}
+
 struct Active {
     inputs: VlPrefillInputs,
-    n_visual: usize,
+    /// First embedding row of each span in `inputs.embeds`.
+    span_row0: Vec<usize>,
     rope_end: usize,
-    /// Device copy of `inputs.positions` (`len * 3` i32, F32-sized elements).
+    /// Device phase table `[table_rows][3]` i32 (F32-sized elements): the
+    /// explicit phases, then slot phases up to `table_rows`.
     pos3: Option<GpuTensor>,
+    table_rows: usize,
 }
 
 thread_local! {
     static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
 }
 
-/// Install the request's VL prefill context (uploads the phase table once).
-/// Replaces (and frees) a stale context left by an aborted request.
-pub fn install(gpu: &mut Gpu, inputs: VlPrefillInputs) -> HipResult<()> {
+/// Install the request's VL prefill context. `table_rows` is the number of KV
+/// slots any prefill of this conversation may touch (the KV capacity): the
+/// device phase table covers all of them, so a replay of prompt + generated
+/// tokens from slot 0 always finds its phases. Replaces (and frees) a stale
+/// context left by an aborted request.
+pub fn install(gpu: &mut Gpu, inputs: VlPrefillInputs, table_rows: usize) -> HipResult<()> {
     uninstall(gpu)?;
-    if inputs.dim == 0 || inputs.embeds.len() % inputs.dim != 0 {
+    if inputs.dim == 0 || inputs.embeds.len() != inputs.n_visual() * inputs.dim {
         return Err(HipError::new(
             0,
-            "VL prefill: embedding buffer is not a whole number of rows",
+            "VL prefill: embedding rows do not match the image spans",
         ));
     }
-    let n_visual = inputs.n_visual();
+    if inputs
+        .spans
+        .windows(2)
+        .any(|w| w[0].0 + w[0].1 > w[1].0)
+    {
+        return Err(HipError::new(0, "VL prefill: image spans overlap or are unsorted"));
+    }
+    let mut span_row0 = Vec::with_capacity(inputs.spans.len());
+    let mut row = 0usize;
+    for &(_, rows) in &inputs.spans {
+        span_row0.push(row);
+        row += rows;
+    }
     let rope_end = inputs.rope_end();
+    let table_rows = table_rows.max(inputs.positions.len());
     let pos3 = if rope_end > 0 {
-        let flat: Vec<i32> = inputs.positions.iter().flat_map(|p| p.iter().copied()).collect();
+        let mut flat: Vec<i32> = Vec::with_capacity(table_rows * 3);
+        for p in &inputs.positions {
+            flat.extend_from_slice(p);
+        }
+        for slot in inputs.positions.len()..table_rows {
+            let s = slot as i32;
+            flat.extend_from_slice(&[s, s, s]);
+        }
         let t = gpu.alloc_tensor(&[flat.len()], DType::F32)?;
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4) };
@@ -210,9 +243,10 @@ pub fn install(gpu: &mut Gpu, inputs: VlPrefillInputs) -> HipResult<()> {
     ACTIVE.with(|a| {
         *a.borrow_mut() = Some(Active {
             inputs,
-            n_visual,
+            span_row0,
             rope_end,
             pos3,
+            table_rows,
         })
     });
     Ok(())
@@ -246,23 +280,27 @@ pub(crate) fn overwrite_image_rows(
         let Some(a) = a.as_ref() else {
             return Ok(());
         };
-        let img0 = a.inputs.image_start;
-        let lo = start.max(img0);
-        let hi = start.saturating_add(n).min(img0 + a.n_visual);
-        if lo >= hi {
-            return Ok(());
-        }
         let dim = a.inputs.dim;
-        let src = &a.inputs.embeds[(lo - img0) * dim..(hi - img0) * dim];
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, src.len() * 4) };
-        gpu.hip
-            .memcpy_htod_offset(&x_batch.buf, (lo - start) * dim * 4, bytes)
+        let end = start.saturating_add(n);
+        for (&(img0, rows), &row0) in a.inputs.spans.iter().zip(&a.span_row0) {
+            let lo = start.max(img0);
+            let hi = end.min(img0 + rows);
+            if lo >= hi {
+                continue;
+            }
+            let first = row0 + (lo - img0);
+            let src = &a.inputs.embeds[first * dim..(first + hi - lo) * dim];
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, src.len() * 4) };
+            gpu.hip
+                .memcpy_htod_offset(&x_batch.buf, (lo - start) * dim * 4, bytes)?;
+        }
+        Ok(())
     })
 }
 
 /// For a chunk `[start, start+n)` that starts below the end of the explicit
-/// phase table: a device view of its `[n][3]` phases plus the mrope section.
+/// phases: a device view of its `[n][3]` phases plus the mrope section.
 /// `None` → ordinary 1D slot phases.
 pub(crate) fn rope_rows(start: usize, n: usize) -> HipResult<Option<(GpuTensor, [usize; 3])>> {
     ACTIVE.with(|a| {
@@ -276,13 +314,13 @@ pub(crate) fn rope_rows(start: usize, n: usize) -> HipResult<Option<(GpuTensor, 
         let Some(t) = a.pos3.as_ref() else {
             return Ok(None);
         };
-        if start + n > a.inputs.positions.len() {
+        if start + n > a.table_rows {
             return Err(HipError::new(
                 0,
                 &format!(
                     "VL prefill: chunk [{start}, {}) runs past the {}-row mrope table",
                     start + n,
-                    a.inputs.positions.len()
+                    a.table_rows
                 ),
             ));
         }
@@ -299,8 +337,11 @@ pub(crate) fn overlaps(start: usize, n: usize) -> bool {
             return false;
         };
         let end = start.saturating_add(n);
-        let img0 = a.inputs.image_start;
-        let image_hit = start < img0 + a.n_visual && end > img0 && a.n_visual > 0;
+        let image_hit = a
+            .inputs
+            .spans
+            .iter()
+            .any(|&(img0, rows)| rows > 0 && start < img0 + rows && end > img0);
         image_hit || (start < a.rope_end && n > 0)
     })
 }
@@ -325,7 +366,7 @@ mod tests {
 
     fn inputs_for(positions: Vec<[i32; 3]>) -> VlPrefillInputs {
         VlPrefillInputs {
-            image_start: 2,
+            spans: vec![(2, 4)],
             embeds: vec![0.0; 4 * 8],
             dim: 8,
             positions,
@@ -349,10 +390,7 @@ mod tests {
             [6, 6, 6],
         ];
         let rope_delta = 7 - 9; // max+1 - n_tokens
-        let shifted: Vec<[i32; 3]> = hf
-            .iter()
-            .map(|p| [p[0] - rope_delta, p[1] - rope_delta, p[2] - rope_delta])
-            .collect();
+        let shifted = shift_positions(&hf, rope_delta);
         assert_eq!(shifted[6], [6, 6, 6]);
         assert_eq!(shifted[8], [8, 8, 8]);
         let inp = inputs_for(shifted);
@@ -387,5 +425,63 @@ mod tests {
         // The trailing text row (and every decode token) sits at its slot.
         assert_eq!(inp.rope_end(), 5);
         assert_eq!(inp.n_visual(), 4);
+        assert_eq!(inp.spans, vec![(1, 4)]);
+    }
+
+    #[test]
+    fn two_images_shift_by_the_total_delta() {
+        // [t, img 2x2, t, img 2x2, t]: each image spans 2 phases for 4 rows.
+        use hipfire_arch_qwen35_vl_free_mrope as m;
+        let (hf, delta) = m::positions(11, &[(1, 4, 4, 4), (6, 4, 4, 4)], 2);
+        assert_eq!(delta, -4);
+        let shifted = shift_positions(&hf, delta);
+        // Rows after the last image are the identity; rows between are not.
+        assert_eq!(shifted[10], [10, 10, 10]);
+        assert_ne!(shifted[5], [5, 5, 5]);
+        let inp = VlPrefillInputs {
+            spans: vec![(1, 4), (6, 4)],
+            embeds: vec![0.0; 8 * 8],
+            dim: 8,
+            positions: shifted,
+            section: [11, 11, 10],
+        };
+        assert_eq!(inp.n_visual(), 8);
+        assert_eq!(inp.rope_end(), 10);
+    }
+
+    /// Minimal copy of `hipfire_arch_qwen35_vl::mrope::build_mrope_positions`
+    /// (that crate depends on this one) for the multi-span test above.
+    mod hipfire_arch_qwen35_vl_free_mrope {
+        pub fn positions(
+            n: usize,
+            spans: &[(usize, usize, usize, usize)],
+            merge: usize,
+        ) -> (Vec<[i32; 3]>, i32) {
+            let mut out = Vec::new();
+            let mut cursor = 0i32;
+            let mut tok = 0usize;
+            for &(start, _len, gh, gw) in spans {
+                while tok < start {
+                    out.push([cursor; 3]);
+                    cursor += 1;
+                    tok += 1;
+                }
+                let (lh, lw) = (gh / merge, gw / merge);
+                for hh in 0..lh {
+                    for ww in 0..lw {
+                        out.push([cursor, cursor + hh as i32, cursor + ww as i32]);
+                    }
+                }
+                tok += lh * lw;
+                cursor += (gh.max(gw) / merge) as i32;
+            }
+            while tok < n {
+                out.push([cursor; 3]);
+                cursor += 1;
+                tok += 1;
+            }
+            let max = out.iter().flat_map(|p| p.iter().copied()).max().unwrap_or(0);
+            (out, max + 1 - n as i32)
+        }
     }
 }
