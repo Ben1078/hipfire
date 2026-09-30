@@ -2579,6 +2579,25 @@ pub fn generate(
             m.seq_pos
         );
     }
+    // claude v7.1: clients such as agent harnesses send a fixed large max_tokens
+    // (100k) on every turn. Reserving that much output space here dropped the
+    // cached conversation ("context full") as soon as the context passed
+    // max_seq - max_tokens (40k at 140k), forcing a full re-prefill every turn.
+    // Clamp the reservation to the room actually left in the window instead,
+    // and only reset when fewer than CLAUDE_CTX_CLAMP_MIN (default 1024) tokens
+    // of output would fit. CLAUDE_MAX_TOKENS_CLAMP=0 restores the old behaviour.
+    let max_tokens = {
+        let clamp_on = std::env::var("CLAUDE_MAX_TOKENS_CLAMP").map(|v| v != "0").unwrap_or(true);
+        let min_room: usize = std::env::var("CLAUDE_CTX_CLAMP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let margin: usize = std::env::var("CLAUDE_CLAMP_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let room = m.max_seq.saturating_sub(m.seq_pos.saturating_add(prompt_est)).saturating_sub(margin);
+        if clamp_on && max_tokens > room && room >= min_room {
+            eprintln!("[daemon] max_tokens {} clamped to {} to keep the cached conversation (seq_pos={} prompt_est={} max_seq={})", max_tokens, room, m.seq_pos, prompt_est, m.max_seq);
+            room
+        } else {
+            max_tokens
+        }
+    };
     if m.eviction.is_none()
         && m.seq_pos
             .saturating_add(prompt_est)
@@ -3565,7 +3584,8 @@ pub fn generate(
     let max_tokens = {
         let clamp_on = std::env::var("CLAUDE_MAX_TOKENS_CLAMP").map(|v| v != "0").unwrap_or(true);
         let used = m.seq_pos.saturating_add(new_tokens.len()).saturating_add(trailer);
-        let room = m.physical_cap.saturating_sub(used);
+        let margin: usize = std::env::var("CLAUDE_CLAMP_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let room = m.physical_cap.saturating_sub(used).saturating_sub(margin);
         if clamp_on && room >= 16 && max_tokens > room {
             eprintln!(
                 "[daemon] max_tokens {} clamped to {} (seq_pos={} prefill={} trailer={} physical_cap={})",
