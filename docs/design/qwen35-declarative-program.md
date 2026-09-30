@@ -84,3 +84,13 @@ Verification per landed slice (gfx1151): greedy serve battery/chain and a
 `ornith-1.5-35b-a3b.mq4r`, byte-identical to the pre-port daemon; emulated
 EP2/EP4 route oracles exact; TP2 oracle unchanged (2.968e-1). Decode slices
 also keep the Redline tape hash.
+
+Extra fixtures after the port:
+
+- `qwen3.6-35b-a3b.mq4r` + `qwen3.6-35b-a3b.mtp` (same architecture as Ornith).
+  The AR battery on the final build is byte-identical to the pre-port daemon.
+  The MTP battery is byte-identical to the build before the MTP slice, with
+  the same per-turn tau (2.44/2.07/0.92/1.00/1.25).
+- `qwen3.8-27b.mq4-xt` + `qwen3.8-27b.mtp` (dense MTP, `SwigluFfn` arm). The
+  MTP battery (`--thinking-effort none`) is byte-identical to the build before
+  the MTP slice, with tau 2.65/2.69/1.85/…. The daemon-protocol text equals AR.
