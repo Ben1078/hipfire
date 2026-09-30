@@ -3891,6 +3891,16 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
 /// the V2C module.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2d.gfx11.hip");
+/// claude: upstream HipFire beta's certified gfx1100 builder code object
+/// (`kernels/gemm_mq4g256v2_residual_iu4_pm_gfx1100.hxaco`, SHA-256
+/// cad59b8640fb9d1519af7c9f32b9011b5eda890a954ade81efd345daebc7f434, builder
+/// round 2 from upstream commit 7824b121: `hipfire-isa emit --kernel iu4_v2c
+/// --epi all`). The V2C algorithm's SET, ADD (residual touch) and F1-lite
+/// gate/up SiLU entries with VOPD-paired folds, ds_swizzle scale broadcasts
+/// and gate/up wave priority; V2C grid and kernarg ABI, 256-thread blocks.
+/// Outputs byte-identical to V2C/V2D. Selected by `CLAUDE_IU4_PM` (gemm.rs).
+pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_gfx1100.hxaco");
 /// gfx11 GEMM v2 "V2B" symmetric IU4 prefill tile (M256xN256, 16 waves, two
 /// 32 KiB K128 LDS slots, 1 CTA/WGP), dispatched on gfx1151. Same production
 /// operand layouts, staging permutation, fold numerics and 6-argument

@@ -2037,6 +2037,63 @@ pub fn prefill_trunk_and_mtp_cache(
 /// before the next chunk may write past the current-tier capacity. Failures
 /// propagate and abort the remaining prefill (caller must free MTP state).
 #[allow(clippy::too_many_arguments)]
+/// claude: `CLAUDE_DN_DUMP=<dir>` (debug, default off). After an MTP prompt
+/// prefill of >= 4096 tokens, write every DeltaNet layer's state (Q8 S bytes,
+/// per-row f32 scales, f16 EF residual, f32 conv state) and the final f32
+/// prompt hidden row to `<dir>/dn_<pid>_<n>_pos<P>.bin` (+ `.json` layout), for
+/// offline comparison of prefill routes (e.g. `CLAUDE_GDN_CHUNK_ADMIT`).
+fn claude_dn_dump(
+    gpu: &mut Gpu,
+    target: &ModelSlot,
+    state: &MtpSpecState,
+    end_pos: usize,
+) -> HipResult<()> {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Ok(dir) = std::env::var("CLAUDE_DN_DUMP") else { return Ok(()) };
+    if dir.is_empty() || end_pos < 4096 {
+        return Ok(());
+    }
+    gpu.hip.device_synchronize()?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = format!("{dir}/dn_{}_{seq}_pos{end_pos}", std::process::id());
+    let dn = &target.dn_state;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut layout: Vec<String> = Vec::new();
+    let mut put = |name: String, t: &GpuTensor, bytes: &mut Vec<u8>| -> HipResult<()> {
+        let mut v = vec![0u8; t.buf.size()];
+        gpu.hip.memcpy_dtoh(&mut v, &t.buf)?;
+        layout.push(format!("{{\"name\":\"{name}\",\"offset\":{},\"bytes\":{}}}", bytes.len(), v.len()));
+        bytes.extend_from_slice(&v);
+        Ok(())
+    };
+    for i in 0..dn.s_matrices.len() {
+        put(format!("s{i}"), &dn.s_matrices[i], &mut bytes)?;
+        if let Some(t) = dn.s_scales.get(i) {
+            put(format!("scale{i}"), t, &mut bytes)?;
+        }
+        if let Some(t) = dn.s_ef_residual.get(i) {
+            put(format!("ef{i}"), t, &mut bytes)?;
+        }
+        if let Some(t) = dn.conv_states.get(i) {
+            put(format!("conv{i}"), t, &mut bytes)?;
+        }
+    }
+    put("prev_hidden".to_string(), &state.prev_hidden, &mut bytes)?;
+    let json = format!("{{\"quant\":\"{:?}\",\"end_pos\":{end_pos},\"tensors\":[{}]}}", dn.quant, layout.join(","));
+    // File I/O on a detached thread so the dump adds only the device-to-host
+    // copy (~0.1% of a 39K prefill) to the measured prefill time.
+    let n_layers = dn.s_matrices.len();
+    std::thread::spawn(move || {
+        let r = std::fs::write(format!("{stem}.bin"), &bytes)
+            .and_then(|_| std::fs::write(format!("{stem}.json"), json));
+        match r {
+            Ok(()) => eprintln!("[claude-dn-dump] {stem}.bin ({} bytes, {n_layers} delta layers)", bytes.len()),
+            Err(e) => eprintln!("[claude-dn-dump] {stem}: write failed: {e}"),
+        }
+    });
+    Ok(())
+}
+
 pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -2207,6 +2264,7 @@ where
         }
 
         gpu.hip.memcpy_dtod_at(&state.prev_hidden.buf, 0, &prompt_hidden.buf, 0, dim_bytes)?;
+        claude_dn_dump(gpu, target, state, start_pos + prompt_tokens.len())?;
         eprintln!("[claude-instr] mtp_prefill tokens={} start_pos={} chunk_max={} batched_fill={} trunk_secs={:.3} mtp_fill_secs={:.3}", prompt_tokens.len(), start_pos, chunk_max, use_batched_mtp_fill, trunk_prefill_secs, mtp_prompt_fill_secs);
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,

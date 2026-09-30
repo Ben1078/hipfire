@@ -318,6 +318,45 @@ fn claude_iu4_v2d() -> bool {
     *ON.get_or_init(|| std::env::var("CLAUDE_IU4_V2D").as_deref() != Ok("0"))
 }
 
+/// `CLAUDE_IU4_PM` (default on; `0` = V2D/V2C JIT entries): run the gfx1100
+/// V2C-tile SET / ADD / F1-lite gate-up SiLU GEMMs from upstream beta's
+/// certified builder bundle (`kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100`,
+/// same algorithm, grid, ABI and output bytes as V2C, 256-thread blocks).
+/// `m < 2^22`: the builder's 24-bit lane-offset multiplies (upstream rule).
+/// `CLAUDE_IU4_PM_BUNDLE=<path>` loads another bundle file for A/B.
+fn claude_iu4_pm(m: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_IU4_PM").as_deref() != Ok("0"))
+        && m < (1 << 22)
+        && !CLAUDE_IU4_PM_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set when the builder bundle cannot be loaded (e.g. a runtime that rejects
+/// the code object): the process falls back to the V2D/V2C JIT entries.
+static CLAUDE_IU4_PM_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bundle image for [`claude_iu4_pm`]: the embedded certified object unless
+/// `CLAUDE_IU4_PM_BUNDLE=<path>` names another one (read once).
+fn claude_iu4_pm_image() -> HipResult<&'static [u8]> {
+    static IMG: std::sync::OnceLock<Result<&'static [u8], String>> = std::sync::OnceLock::new();
+    IMG.get_or_init(|| match std::env::var("CLAUDE_IU4_PM_BUNDLE") {
+        Ok(path) if !path.is_empty() => std::fs::read(&path)
+            .map(|v| &*Box::leak(v.into_boxed_slice()))
+            .map_err(|e| format!("CLAUDE_IU4_PM_BUNDLE={path}: {e}")),
+        _ => Ok(kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100),
+    })
+    .clone()
+    .map_err(|e| hip_bridge::HipError::new(1, &e))
+}
+
+/// `CLAUDE_IU4_PM_GDN_SPLIT` (default off): with the builder route on, run the
+/// GDN qkv + folded-z SETs as two builder launches instead of one grouped V2D
+/// launch (bit-identical either way; a speed choice).
+fn claude_iu4_pm_gdn_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CLAUDE_IU4_PM_GDN_SPLIT").as_deref() == Ok("1"))
+}
+
 /// `CLAUDE_IU4_GROUP` (default on; `0` = one launch per matrix): run the
 /// attention q/k/v SETs and the GDN qkv + folded-z SETs as one grouped V2D
 /// launch (bit-identical; needs the V2D module).
@@ -19940,11 +19979,22 @@ impl Gpu {
             // `CLAUDE_IU4_V2D=0` restores the V2C module; V2D is the same
             // tile with s-major steps (bit-identical outputs).
             let v2d = claude_iu4_v2d();
+            // claude: `CLAUDE_IU4_PM` runs the certified builder entries
+            // (byte-identical; its ADD always carries the residual touch,
+            // which is byte-identical to the plain ADD).
+            let pm = claude_iu4_pm(m)
+                && self.claude_iu4_pm_ready(if add {
+                    "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100"
+                } else {
+                    "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100"
+                });
             let kernel_name = match (
                 v2d,
                 add,
                 hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"),
             ) {
+                _ if pm && !add => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
+                _ if pm => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
                 (false, false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
                 (false, true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
                 (false, true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
@@ -19952,18 +20002,20 @@ impl Gpu {
                 (true, true, true) => "gemm_mq4g256v2_residual_iu4_v2d_add_touch_gfx11",
                 (true, true, false) => "gemm_mq4g256v2_residual_iu4_v2d_add_gfx11",
             };
-            let (module, source) = if v2d {
-                (
-                    "gemm_mq4g256v2_residual_iu4_v2d_gfx11",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC,
-                )
-            } else {
-                (
-                    "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
-                )
-            };
-            self.ensure_kernel(module, source, kernel_name)?;
+            if !pm {
+                let (module, source) = if v2d {
+                    (
+                        "gemm_mq4g256v2_residual_iu4_v2d_gfx11",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC,
+                    )
+                } else {
+                    (
+                        "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
+                    )
+                };
+                self.ensure_kernel(module, source, kernel_name)?;
+            }
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
             let mut y_ptr = y.buf.as_ptr();
@@ -19985,7 +20037,7 @@ impl Gpu {
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [(batch_size / 128) as u32, (m / 128) as u32, 1],
-                [32, 8, 1],
+                if pm { [256, 1, 1] } else { [32, 8, 1] },
                 V2C_LDS_BYTES,
                 &mut params,
                 || {
@@ -20289,6 +20341,23 @@ impl Gpu {
         result
     }
 
+    /// claude: make `name` from the builder bundle launchable. On a load
+    /// failure the builder route is disabled for the process (V2D fallback,
+    /// same output bytes) instead of failing the prefill.
+    fn claude_iu4_pm_ready(&mut self, name: &str) -> bool {
+        let r = claude_iu4_pm_image().and_then(|img| {
+            self.ensure_embedded_kernel("gemm_mq4g256v2_residual_iu4_pm_gfx1100", img, name)
+        });
+        match r {
+            Ok(()) => true,
+            Err(e) => {
+                CLAUDE_IU4_PM_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("claude: builder V2C bundle unavailable ({e}); using the V2D GEMM entries");
+                false
+            }
+        }
+    }
+
     /// Grouped V2D SET (`gemm_mq4g256v2_residual_iu4_v2d_set_group3_gfx11`):
     /// 2-3 MQ4V2 matrices that share K and the prepared int4 activation run
     /// as ONE launch over their concatenated row tiles; every output is
@@ -20306,6 +20375,7 @@ impl Gpu {
         if !(2..=3).contains(&mats.len())
             || !claude_iu4_v2d()
             || !claude_iu4_group()
+            || (mats.len() == 2 && claude_iu4_pm_gdn_split() && mats.iter().all(|&(_, _, m)| claude_iu4_pm(m)))
             || mats
                 .iter()
                 .any(|&(_, _, m)| self.iu4_v2_tile(m, k, batch_size) != Some(Iu4V2Tile::V2c))
@@ -32065,7 +32135,15 @@ impl Gpu {
         // residual add before overwriting it (see `arm_residual_fold`).
         self.flush_residual_fold()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        let pm = tile == Iu4V2Tile::V2c
+            && claude_iu4_pm(gate_m)
+            && self.claude_iu4_pm_ready("gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100");
         let (module, source, kernel_name) = match tile {
+            Iu4V2Tile::V2c if pm => (
+                "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+                "",
+                "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100",
+            ),
             Iu4V2Tile::V2c if claude_iu4_v2d() => (
                 "gemm_mq4g256v2_residual_iu4_v2d_gfx11",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2D_GFX11_SRC,
@@ -32082,7 +32160,9 @@ impl Gpu {
                 "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11",
             ),
         };
-        self.ensure_kernel(module, source, kernel_name)?;
+        if !pm {
+            self.ensure_kernel(module, source, kernel_name)?;
+        }
         let mut g_ptr = a_gate.buf.as_ptr();
         let mut u_ptr = a_up.buf.as_ptr();
         let mut xq_ptr = xq;
@@ -32107,7 +32187,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
-            [32, tile.waves(), 1],
+            if pm { [256, 1, 1] } else { [32, tile.waves(), 1] },
             tile.lds_bytes(),
             &mut params,
             || {

@@ -681,6 +681,9 @@ pub struct Gpu {
     orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// claude: private keepalive queue (`CLAUDE_PREFILL_KEEPALIVE`), see
+    /// [`Gpu::claude_keepalive_arm`].
+    pub(crate) claude_keepalive: Option<crate::claude_keepalive::Keepalive>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
     /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
     /// every successful launch so `sync_with_deadline` can name the suspect
@@ -1369,6 +1372,7 @@ impl Gpu {
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
             active_stream: None,
+            claude_keepalive: None,
             last_kernel: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
@@ -2716,6 +2720,29 @@ impl Gpu {
             source,
             func_name,
         )
+    }
+
+    /// claude: load a precompiled (embedded) code object into the same
+    /// module/function cache as JIT kernels (upstream beta's
+    /// `ensure_embedded_kernel`). No hipcc involved.
+    pub(crate) fn ensure_embedded_kernel(
+        &mut self,
+        module_name: &str,
+        image: &[u8],
+        func_name: &str,
+    ) -> HipResult<()> {
+        if self.functions.contains_key(func_name) {
+            return Ok(());
+        }
+        if !self.modules.contains_key(module_name) {
+            self.modules
+                .insert(module_name.to_owned(), self.hip.module_load_data(image)?);
+        }
+        let func = self
+            .hip
+            .module_get_function(&self.modules[module_name], func_name)?;
+        self.functions.insert(func_name.to_owned(), func);
+        Ok(())
     }
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the

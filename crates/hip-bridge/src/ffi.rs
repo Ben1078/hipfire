@@ -336,6 +336,8 @@ pub struct HipRuntime {
     fn_host_get_device_pointer:
         Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32>,
     fn_stream_query: Option<unsafe extern "C" fn(HipStream) -> u32>,
+    // claude: hipStreamCreateWithFlags (keepalive stream, non-blocking).
+    fn_stream_create_with_flags: Option<unsafe extern "C" fn(*mut HipStream, c_uint) -> u32>,
 }
 
 /// claude r2: pinned host memory mapped into the device address space
@@ -766,6 +768,11 @@ impl HipRuntime {
                     lib,
                     "hipStreamQuery",
                     unsafe extern "C" fn(HipStream) -> u32
+                ),
+                fn_stream_create_with_flags: load_optional_fn!(
+                    lib,
+                    "hipStreamCreateWithFlags",
+                    unsafe extern "C" fn(*mut HipStream, c_uint) -> u32
                 ),
                 _lib: lib,
             }
@@ -1367,6 +1374,18 @@ impl HipRuntime {
         let mut stream: HipStream = ptr::null_mut();
         let code = unsafe { (self.fn_stream_create)(&mut stream) };
         self.check(code, "hipStreamCreate")?;
+        Ok(Stream(stream))
+    }
+
+    /// claude: `hipStreamCreateWithFlags` (`0x01` = hipStreamNonBlocking);
+    /// falls back to `hipStreamCreate` when the symbol is missing.
+    pub fn stream_create_with_flags(&self, flags: u32) -> HipResult<Stream> {
+        let Some(f) = self.fn_stream_create_with_flags else {
+            return self.stream_create();
+        };
+        let mut stream: HipStream = ptr::null_mut();
+        let code = unsafe { f(&mut stream, flags as c_uint) };
+        self.check(code, "hipStreamCreateWithFlags")?;
         Ok(Stream(stream))
     }
 

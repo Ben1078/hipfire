@@ -812,5 +812,8 @@ name = "claude_prefill_parity"
 required-features = ["deltanet"]
 
 [[example]]
+name = "claude_pm_parity"
+
+[[example]]
 name = "claude_gdn_paths"
 required-features = ["deltanet"]

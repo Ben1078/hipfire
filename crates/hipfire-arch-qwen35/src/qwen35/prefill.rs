@@ -12807,7 +12807,18 @@ pub(crate) fn forward_batch_chunk_impl(
     }
     let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
+    // claude: keepalive queue (`CLAUDE_PREFILL_KEEPALIVE`, see
+    // rdna_compute::claude_keepalive): park a barrier on a private HW queue
+    // that retires when the active stream reaches it, once after the first
+    // layer's launches and once after the last, so the command processor
+    // never idles ~250 us after the chunk's >1 ms GEMM/FA dispatches.
+    // Launch order and results are unchanged.
+    let claude_ka = n >= rdna_compute::claude_keepalive::claude_keepalive_min_rows()
+        && rdna_compute::claude_keepalive::claude_keepalive_enabled();
     for layer_idx in layer_start..layer_end {
+        if claude_ka && layer_idx == layer_start + 1 {
+            gpu.claude_keepalive_arm()?;
+        }
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 let gdn_chunk_scan_admitted = gdn_chunk_scan_common_admitted
@@ -12997,6 +13008,9 @@ pub(crate) fn forward_batch_chunk_impl(
             }
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
+    }
+    if claude_ka {
+        gpu.claude_keepalive_arm()?;
     }
 
     batch_chunk_final_logits(
