@@ -359,7 +359,8 @@ fn mq_rotation_scratch(gpu: &mut Gpu) -> Result<GpuTensor, DispatchError> {
 
 /// `x += W_down · (silu(gate) ⊙ up)`. MQ weights fuse SiLU·mul with the input
 /// rotation and run the SwiGLU-residual GEMV; HFQ weights use the residual
-/// GEMV; everything else is a plain GEMV plus an in-place add.
+/// GEMV; every other format is a plain GEMV (with its own input rotation) plus
+/// an in-place add.
 pub fn swiglu_down_residual(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -379,6 +380,20 @@ pub fn swiglu_down_residual(
         ..*w_down
     };
     match w_down.dtype {
+        // CPU-executed offload (`memory.offload_exec=cpu`): the SiLU stays on the
+        // GPU; the down projection and its residual accumulate run on the CPU
+        // over the host-mapped weight bytes. The fused arms below hide the GEMV
+        // from `execute_steps`' cpu_exec seam, so this op splits here.
+        _ if crate::host_mapped_cpu_capable(gpu, &wr) => {
+            gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
+            // `wr` drops the AWQ sidecar because the fused GPU arm applies it in
+            // `fused_silu_mul_rotate_mq_awq`; the CPU path divides it itself.
+            let wr_cpu = WeightRef {
+                awq_scale: w_down.awq_scale,
+                ..wr
+            };
+            crate::run_host_mapped_gemv_residual(gpu, &wr_cpu, hidden, x)
+        }
         DType::MQ4G256
         | DType::MQ4G256V2
         | DType::MQ4G256V2Lloyd
@@ -429,21 +444,23 @@ pub fn swiglu_down_residual(
                 },
             )
         }
-        dtype if !dtype_needs_rotation(dtype) => {
+        dtype => {
             gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
             gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
+            // Rotated formats (MQ8, G128, Givens, FP4, ...) keep their rotation
+            // and AWQ sidecar so `run_auto` rotates the input first.
+            let w = if dtype_needs_rotation(dtype) {
+                gpu.ensure_mq_signs().map_err(hip)?;
+                w_down
+            } else {
+                &wr
+            };
             let tmp = gpu.alloc_tensor(&[w_down.m], DType::F32).map_err(hip)?;
-            let run = GEMV.run_auto(ctx, gpu, &wr, hidden, &tmp);
+            let run = GEMV.run_auto(ctx, gpu, w, hidden, &tmp);
             let add = run.and_then(|_| gpu.add_inplace_f32(x, &tmp).map_err(hip));
             let free = gpu.free_tensor(tmp).map_err(hip);
             add.and(free)
         }
-        other => Err(DispatchError::UnsupportedVariant {
-            family: "hybrid",
-            variant: "swiglu_down_residual",
-            arch: "",
-            quant: super::dtype_name(other),
-        }),
     }
 }
 
