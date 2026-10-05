@@ -267,16 +267,109 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-fn schema_expects(schema: &serde_json::Value, ty: &str) -> bool {
-    if let Some(t) = schema.get("type").and_then(|v| v.as_str()) {
-        return t == ty;
+/// Declared JSON-schema types of one parameter, in declaration order, read the
+/// way vLLM's `JsonParamType::from_schema` does: `type` (string or array), else
+/// the members of `anyOf`/`oneOf`, else `enum` (string; nullable when it lists
+/// `null`), `items` (array), `properties`/`additionalProperties` (object).
+/// Empty when the schema declares no known type.
+fn schema_types(schema: &serde_json::Value) -> Vec<&'static str> {
+    const KNOWN: [&str; 7] = [
+        "string", "integer", "number", "boolean", "object", "array", "null",
+    ];
+    let known = |name: &str| KNOWN.into_iter().find(|k| *k == name);
+    let mut types = Vec::new();
+    match schema.get("type") {
+        Some(serde_json::Value::String(name)) => types.extend(known(name)),
+        Some(serde_json::Value::Array(names)) => types.extend(
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(known),
+        ),
+        Some(_) => {}
+        None => {
+            if let Some(members) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for ty in members.iter().flat_map(schema_types) {
+                    if !types.contains(&ty) {
+                        types.push(ty);
+                    }
+                }
+            } else if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
+                types.push("string");
+                if values.iter().any(serde_json::Value::is_null) {
+                    types.push("null");
+                }
+            } else if schema.get("items").is_some() {
+                types.push("array");
+            } else if schema.get("properties").is_some()
+                || schema.get("additionalProperties").is_some()
+            {
+                types.push("object");
+            }
+        }
     }
-    if let Some(arr) = schema.get("type").and_then(|v| v.as_array()) {
-        return arr.iter().any(|v| v.as_str() == Some(ty));
-    }
-    false
+    types
 }
 
+/// Type one string argument by its declared types (vLLM
+/// `convert_with_optional_schema`): a `null`/`None` literal becomes JSON null
+/// unless the parameter is a plain `string`; otherwise the first declared type
+/// the text converts to wins, and reaching `string` first keeps the text
+/// verbatim. `None` means keep the string exactly as the model wrote it.
+fn type_string_arg(text: &str, types: &[&str]) -> Option<serde_json::Value> {
+    if types.is_empty() {
+        return None;
+    }
+    if types != ["string"]
+        && (text.eq_ignore_ascii_case("null") || text.eq_ignore_ascii_case("none"))
+    {
+        return Some(serde_json::Value::Null);
+    }
+    for ty in types {
+        let typed = match *ty {
+            "string" => return None,
+            "integer" => text.parse::<i64>().ok().map(serde_json::Value::from),
+            "number" => text
+                .parse::<i64>()
+                .ok()
+                .map(serde_json::Value::from)
+                .or_else(|| {
+                    text.parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(serde_json::Value::Number)
+                }),
+            "boolean" => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(serde_json::Value::Bool(true)),
+                "false" | "0" => Some(serde_json::Value::Bool(false)),
+                _ => None,
+            },
+            "object" if text.is_empty() => Some(serde_json::Value::Object(Default::default())),
+            "array" if text.is_empty() => Some(serde_json::Value::Array(Vec::new())),
+            "object" => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_object),
+            "array" => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_array),
+            _ => None,
+        };
+        if typed.is_some() {
+            return typed;
+        }
+    }
+    None
+}
+
+/// Type tool-call arguments by the request's declared schema. Strings (every
+/// native-XML parameter arrives as one) are typed per [`type_string_arg`], so a
+/// `string` parameter keeps the exact text even when it looks like JSON. A
+/// structured value in a slot that accepts only `string` (a JSON-format model
+/// emitting an object for a string field) is serialized to its JSON text.
 fn normalize_value(
     value: &mut serde_json::Value,
     schema: &serde_json::Value,
@@ -284,79 +377,36 @@ fn normalize_value(
     path: &str,
 ) {
     let before_kind = json_kind(value);
-    let mut repaired = false;
-    let mut expected = String::new();
-    match value {
-        serde_json::Value::String(s) => {
-            let owned = s.clone();
-            if schema_expects(schema, "boolean") {
-                let lower = owned.to_ascii_lowercase();
-                if lower == "true" || lower == "false" {
-                    let new_val = serde_json::Value::Bool(lower == "true");
-                    expected = "boolean".to_owned();
-                    *value = new_val;
-                    repaired = true;
-                }
-            } else if schema_expects(schema, "integer") {
-                if let Ok(n) = owned.parse::<i64>() {
-                    // Ensure the whole string was an integer (parse succeeded implies that,
-                    // but reject strings with whitespace which parse would fail anyway).
-                    expected = "integer".to_owned();
-                    *value = serde_json::Value::Number(serde_json::Number::from(n));
-                    repaired = true;
-                }
-            } else if schema_expects(schema, "number") {
-                if let Ok(n) = owned.parse::<i64>() {
-                    expected = "number".to_owned();
-                    *value = serde_json::Value::Number(serde_json::Number::from(n));
-                    repaired = true;
-                } else if let Ok(f) = owned.parse::<f64>() {
-                    if f.is_finite() {
-                        if let Some(num) = serde_json::Number::from_f64(f) {
-                            expected = "number".to_owned();
-                            *value = serde_json::Value::Number(num);
-                            repaired = true;
-                        }
-                    }
-                }
-            } else if schema_expects(schema, "object") {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
-                    if parsed.is_object() {
-                        expected = "object".to_owned();
-                        *value = parsed;
-                        repaired = true;
-                    }
-                }
-            } else if schema_expects(schema, "array") {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
-                    if parsed.is_array() {
-                        expected = "array".to_owned();
-                        *value = parsed;
-                        repaired = true;
-                    }
-                }
-            }
-        }
+    let types = schema_types(schema);
+    let repaired = match value {
+        serde_json::Value::String(s) => type_string_arg(s, &types),
         serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::Object(_)
         | serde_json::Value::Array(_) => {
-            if schema_expects(schema, "string") {
-                if let Ok(s) = serde_json::to_string(&*value) {
-                    expected = "string".to_owned();
-                    *value = serde_json::Value::String(s);
-                    repaired = true;
+            let accepts_own = match value {
+                serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                    types.contains(&"integer") || types.contains(&"number")
                 }
+                _ => types.contains(&before_kind),
+            };
+            if types.contains(&"string") && !accepts_own {
+                serde_json::to_string(&*value)
+                    .ok()
+                    .map(serde_json::Value::String)
+            } else {
+                None
             }
         }
-        serde_json::Value::Null => {}
-    }
-    if repaired {
+        serde_json::Value::Null => None,
+    };
+    if let Some(new_value) = repaired {
+        *value = new_value;
         let after_kind = json_kind(value);
         let display_path = if path.is_empty() { "<root>" } else { path };
         eprintln!(
             "[hipfire] tool_args_normalize tool={} path={} expected={} {}->{}",
-            tool_name, display_path, expected, before_kind, after_kind
+            tool_name, display_path, after_kind, before_kind, after_kind
         );
     }
     match value {
@@ -6404,6 +6454,188 @@ mod tests {
         let before2 = calls2[0].arguments.clone();
         normalize_tool_calls(&mut calls2, &body2);
         assert_eq!(calls2[0].arguments, before2);
+    }
+
+    /// Parse native-XML tool-call text with the daemon's parser, then type
+    /// the arguments against `tools` the way the gateway does.
+    fn parse_and_normalize_xml(text: &str, tools: serde_json::Value) -> Vec<ToolCall> {
+        let mut calls = hipfire_runtime::emit_text::extract_tool_calls_from_text(text);
+        normalize_tool_calls(&mut calls, &tool_body(tools));
+        calls
+    }
+
+    /// HA-12 (agent-harness case `http/00201`): the `skill_manage` file must land
+    /// as the exact 88 bytes, final newline included. `parameters` is the
+    /// captured request's schema, descriptions dropped.
+    #[test]
+    fn tool_xml_ha12_file_content_exact_bytes() {
+        let text = "<tool_call>\n<function=skill_manage>\n<parameter=action>\nwrite_file\n</parameter>\n<parameter=name>\nrelease-check\n</parameter>\n<parameter=file_path>\nscripts/validate_release.py\n</parameter>\n<parameter=file_content>\ndef validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_and_normalize_xml(
+            text,
+            serde_json::json!([{"type":"function","function":{"name":"skill_manage","parameters":{
+                "type":"object",
+                "properties":{
+                    "action":{"type":"string","enum":["create","patch","edit","delete","write_file","remove_file"]},
+                    "name":{"type":"string"},
+                    "content":{"type":"string"},
+                    "old_string":{"type":"string"},
+                    "new_string":{"type":"string"},
+                    "replace_all":{"type":"boolean"},
+                    "category":{"type":"string"},
+                    "file_path":{"type":"string"},
+                    "file_content":{"type":"string"}
+                },
+                "required":["action","name"]
+            }}}]),
+        );
+        let file = calls[0].arguments["file_content"].as_str().expect("string");
+        assert_eq!(
+            file,
+            "def validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n"
+        );
+        assert_eq!(file.len(), 88);
+        assert_eq!(calls[0].arguments["action"], "write_file");
+    }
+
+    /// HA-17 (agent-harness case `http/00313-00324`): `{"sum": 10}` written to a
+    /// `string` parameter must not come back as `{"sum":10}`. Schemas are the
+    /// captured `write_file`/`patch` ones, descriptions dropped.
+    #[test]
+    fn tool_xml_ha17_json_text_in_string_param_is_verbatim() {
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"write_file","parameters":{
+                "type":"object",
+                "properties":{"path":{"type":"string"},"content":{"type":"string"}},
+                "required":["path","content"]
+            }}},
+            {"type":"function","function":{"name":"patch","parameters":{
+                "type":"object",
+                "properties":{
+                    "mode":{"type":"string","enum":["replace","patch"],"default":"replace"},
+                    "path":{"type":"string"},
+                    "old_string":{"type":"string"},
+                    "new_string":{"type":"string"},
+                    "replace_all":{"type":"boolean"},
+                    "patch":{"type":"string"}
+                },
+                "required":["mode"]
+            }}}
+        ]);
+        let text = "<tool_call>\n<function=write_file>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=content>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=patch>\n<parameter=mode>\nreplace\n</parameter>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=old_string>\n{\"sum\":10}\n</parameter>\n<parameter=new_string>\n{\"sum\": 10}\n</parameter>\n<parameter=replace_all>\nfalse\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_and_normalize_xml(text, tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["content"], "{\"sum\": 10}");
+        assert_eq!(calls[1].arguments["old_string"], "{\"sum\":10}");
+        assert_eq!(calls[1].arguments["new_string"], "{\"sum\": 10}");
+        assert_eq!(calls[1].arguments["replace_all"], false);
+    }
+
+    #[test]
+    fn tool_xml_params_typed_by_declared_schema() {
+        let tools = serde_json::json!([{"type":"function","function":{"name":"probe","parameters":{
+            "type":"object",
+            "properties":{
+                "count":{"type":"integer"},
+                "ratio":{"type":"number"},
+                "whole":{"type":"number"},
+                "on":{"type":"boolean"},
+                "off":{"type":"boolean"},
+                "label":{"type":"string"},
+                "flag_text":{"type":"string"},
+                "nested_text":{"type":"string"},
+                "options":{"type":"object","properties":{"depth":{"type":"integer"}}},
+                "tags":{"type":"array","items":{"type":"string"}},
+                "no_options":{"type":"object"},
+                "maybe":{"type":["integer","null"]},
+                "literal_null":{"type":"string"},
+                "union_int_first":{"type":["integer","string"]},
+                "union_str_first":{"type":["string","integer"]},
+                "any_of":{"anyOf":[{"type":"integer"},{"type":"string"}]},
+                "any_of_text":{"anyOf":[{"type":"integer"},{"type":"string"}]},
+                "enum_null":{"enum":["a",null]},
+                "padded":{"type":"string"},
+                "bad_int":{"type":"integer"}
+            }
+        }}}]);
+        let p = |k: &str, v: &str| format!("<parameter={k}>\n{v}\n</parameter>\n");
+        let text = [
+            "<tool_call>\n<function=probe>\n".to_owned(),
+            p("count", "42"),
+            p("ratio", "1.25"),
+            p("whole", "3"),
+            p("on", "True"),
+            p("off", "0"),
+            p("label", "42"),
+            p("flag_text", "true"),
+            p("nested_text", "{\"a\": {\"b\": [1, 2]}}"),
+            p("options", "{\"depth\": 2}"),
+            p("tags", "[\"x\", \"y\"]"),
+            p("no_options", ""),
+            p("maybe", "null"),
+            p("literal_null", "null"),
+            p("union_int_first", "7"),
+            p("union_str_first", "7"),
+            p("any_of", "8"),
+            p("any_of_text", "eight"),
+            p("enum_null", "None"),
+            p("padded", "  two spaces\n"),
+            p("bad_int", "12.5"),
+            p("undeclared", "{\"keep\": true}"),
+            "</function>\n</tool_call>".to_owned(),
+        ]
+        .concat();
+        let calls = parse_and_normalize_xml(&text, tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({
+                "count": 42,
+                "ratio": 1.25,
+                "whole": 3,
+                "on": true,
+                "off": false,
+                "label": "42",
+                "flag_text": "true",
+                "nested_text": "{\"a\": {\"b\": [1, 2]}}",
+                "options": {"depth": 2},
+                "tags": ["x", "y"],
+                "no_options": {},
+                "maybe": null,
+                "literal_null": "null",
+                "union_int_first": 7,
+                "union_str_first": "7",
+                "any_of": 8,
+                "any_of_text": "eight",
+                "enum_null": null,
+                "padded": "  two spaces\n",
+                "bad_int": "12.5",
+                // No schema: the raw string, as vLLM.
+                "undeclared": "{\"keep\": true}"
+            })
+        );
+    }
+
+    #[test]
+    fn tool_normalize_keeps_structured_value_a_union_accepts() {
+        // JSON-format models emit typed values; only a slot that accepts
+        // nothing but `string` gets the value's JSON text.
+        let body = tool_body(serde_json::json!([{"type":"function","function":{"name":"f","parameters":{
+            "type":"object",
+            "properties":{
+                "n":{"type":["integer","string"]},
+                "o":{"anyOf":[{"type":"object"},{"type":"string"}]},
+                "s":{"type":"string"}
+            }
+        }}}]));
+        let mut calls = vec![sample_tc(
+            "f",
+            serde_json::json!({"n": 5, "o": {"k": 1}, "s": 5}),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"n": 5, "o": {"k": 1}, "s": "5"})
+        );
     }
 
     #[test]
