@@ -5,10 +5,10 @@
 //! Qwen3.5 config parsing (`Qwen35Config`), layer typing, EP batch attestation
 //! types, and the tree-verify / mrope context structs.
 
-pub use hipfire_dispatch::pipeline::batched_attention::TreeVerifyCtx;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_config::memory::GpuLayerBudget;
+pub use hipfire_dispatch::pipeline::batched_attention::TreeVerifyCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::tp_shard::ShardConfig;

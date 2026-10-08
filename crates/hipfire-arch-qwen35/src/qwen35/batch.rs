@@ -5,22 +5,22 @@
 //! Qwen3.5 continuous-batch state: `PrefillBatchScratch`, `Qwen35DecodeBatchState`,
 //! lane-mask helpers, and the independent-lane batched decode entry points.
 
-pub(crate) use hipfire_dispatch::pipeline::batched_attention::{valid_lane_mask, BatchSemantics};
 use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
-use super::prefill::HiddenCapture;
 use super::prefill::moe_grouped_m_total_max;
 use super::prefill::run_plain_gemm_key;
+use super::prefill::HiddenCapture;
 use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+pub(crate) use hipfire_dispatch::pipeline::batched_attention::{valid_lane_mask, BatchSemantics};
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;

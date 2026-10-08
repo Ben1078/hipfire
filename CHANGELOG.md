@@ -129,7 +129,18 @@
 - **GDN replay route no longer depends on memory pressure (exactness fix):** the gfx1201 multi-layer GDN tape replay (and the D8 snapshot-source tables) armed lazily at a tape's first accept, and an allocation failure there silently moved that tape to the per-layer replay for life, which commits different DeltaNet bytes on the production model. `GdnTape::new_for_config` now arms the tables when the tape is built (`GdnTape::new_for_dflash` adds the D8 tables), so an allocation failure refuses the lane or request at provision with a logged error; an admitted replay never falls back. The replay's q/k/v/out scratch is now a `Gpu`-owned map keyed by scratch shape (layers, rows, value width): every armed tape of one shape shares one refcounted buffer, released when no tape or replay graph references it and drained on model unload, so eager arming costs a lane only its pointer tables instead of ~75 MB on the 27B. The serve engine's batched verify tape, which is repaired per layer and never replayed, is built with `GdnTape::new_capture_only`. `HIPFIRE_GDN_REPLAY_ML_OFF=1` stays an explicit diagnostic opt-in and is documented as not byte-identical. `GpuPool::alloc` now returns its free lists to HIP and retries once when `hipMalloc` runs out of memory (freed scratch parked in the pool is invisible to HIP; 9 GiB in the reproduction). `DeltaNetSnapshot::new_for` frees partial buffers on a mid-way failure, and `take_dn_checkpoint` logs a skipped checkpoint and frees the snapshot when its save fails. Open: the per-layer `replay_gdn_inner` is still not byte-identical to the multi-layer replay.
 - **VMM maps reclaim pooled memory:** `hipMemCreate` cannot see buffers parked in `GpuPool` either (12.6–13.7 GiB pooled with 0.1–1.4 GiB reported free in the 4-lane MTP state oracle, which failed its 32K lanes with `hipMemCreate: out of memory`). A whole-segment VMM map (`alloc_vmm_tensor`, `grow_vmm_tensor`) that runs out of memory now returns the pool to HIP and retries once; a granule map (`grow_vmm_tensor_granules`, prefix forks), whose failure aborts its arena, returns the pool first when HIP's free figure cannot cover it plus 64 MiB. Both log a `GpuPool: VMM map ...` line.
 - **Removed config keys warn instead of failing the load:** 0.4.1 removed `kernel.mw16` (shipped in 0.3.1 and 0.4.0) from the schema outright, so a `config.toml` that still set it made every command fail with `unknown configuration key 'kernel.mw16'`. Removed keys that shipped now live in `hipfire_config::RETIRED_CONFIG_KEYS`; through their deprecation window (`kernel.mw16`: until 0.5.0) the load drops them and run/serve/chat and `hipfire config show` print `warning: ignored kernel.mw16 in <file>: removed in 0.4.1 (…)`. Keys that never shipped (such as `kernel.gfx11_iu4_swizzle`, which only existed on an experiment branch) and typos still fail the load. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).
-
+- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
+  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
+  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
+  steps now uses the same step program as plain decode, so the qwen35
+  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
+  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
+  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
+  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
+    token 3).
+  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
+    late.
+  - Qwen3.8-27B vision answers are byte-identical.
 
 ## v0.4.1.1 — release draft
 
@@ -778,23 +789,6 @@ This is a release draft, not a completed hardware-validation claim. Fill the tab
     - **gfx1151 decode norms as multi-workgroup grids.** `kernel.g12_dec_norm` now defaults on for exact gfx1151 too: the f32 AWQ RMSNorm+FWHT producer before every MQ4 input projection runs `fused_rmsnorm_mq_rotate_awq_g12dec` on grid K/256, the out-of-place single-row `rmsnorm_f32` (n > 256) runs `rmsnorm_f32_rowsplit` on n/256 workgroups, and the half-split partial RoPE runs `rope_partial_halfsplit_f32_headgrid` with one workgroup per head. Same sources as gfx1201; the outputs are byte-identical on real H2 decode activations at ctx 512/8,192/32,768 (whole buffer + guards, 3 poisons, negative controls detected, 200× serial and 200× under a one-CU mask, RoPE positions 0…262,144). Standalone on the Halo: AWQ K = 5,120 5.96 → 3.16 µs, `rmsnorm_f32` n = 5,120 6.77 → 2.49 µs, RoPE 5.08 → 2.20 µs. H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB, `hipfire bench --pp 8192 --ctx 512,8192,32768 --tg 128 --backend noslots --workload stateless`, graph on, Q8 KV: off → on 14.958 → 15.079 / 14.583 → 14.700 / 13.678 → 13.779 tok/s at ctx 512/8,192/32,768 (+0.81 %/+0.80 %/+0.74 %; ABBA +0.116/+0.113/+0.100, BAAB +0.121/+0.115/+0.100 tok/s), every on process ahead of every off process; pp8192 1,162.45 → 1,157.55 tok/s, within noise (halves +36.65 / −42.70).
     - **gfx1151 Q8_0 decode attention: GQA-shared flash tile + head-dim-split reduce.** On exact gfx1151, Q8_0 KV, head_dim 256, GQA group 6, tile 128, full causal and no output gate (H2 decode), `attention_flash_q8_0_tile_gqa_gfx1151` replaces `attention_flash_q8_0_tile`: one 256-thread workgroup per (kv head, tile) serves the six q heads, so each Q8_0 K/V tile is read once, and the whole tile's Q, V rows and K codes/scales are issued at entry; each 16-lane row reproduces the reference lanes' dequant (`scale * code`, one rounding), fma leaf order and xor-16…1 add tree, softmax and in-order V accumulation. `attention_flash_reduce_dsplit_gfx1151` (the gfx1201 head-dim-split reduce, renamed) replaces `attention_flash_q8_0_reduce`. The tile grid is capped at 512 tiles with a tile loop. Redline's replay tables type both kernels with their reference twins' 13/7-argument ABIs and pointer effects. Standalone on the Halo, the tile + reduce pair at seq 517 / 8,197 / 32,773: 45.77 → 22.56 / 200.62 → 120.59 / 663.24 → 401.71 µs. The outputs are byte-identical to beta's objects on real H2 decode activations (seq C+1…C+4 for C = 512/8,192/32,768, full-attention layers 0/7/15: 36/36 captures, 3 poisons, graph and eager grids, whole buffer + guards, a one-K-code-byte negative control detected in all 36, 200× serial and 200× under a one-CU mask, 60 s soak). H2 tg128, same binary, four fresh processes per arm, ABBA then BAAB: off → on 14.974 → 15.079 / 14.459 → 14.698 / 13.108 → 13.777 tok/s (+0.70 %/+1.65 %/+5.10 %; ABBA +0.106/+0.242/+0.671, BAAB +0.099/+0.233/+0.663 tok/s), every on process ahead of every off process; pp8192 1,154.90 → 1,154.25 tok/s, within noise (halves +38.35 / −8.30).
     - **Both levers together** (same binary, both opt-outs vs defaults, four fresh processes per arm, ABBA then BAAB): 14.853 → 15.080 / 14.346 → 14.699 / 13.014 → 13.778 tok/s at ctx 512/8,192/32,768 (+1.53 %/+2.46 %/+5.87 %; ABBA +0.225/+0.352/+0.761, BAAB +0.230/+0.355/+0.768 tok/s), every on process ahead of every off process; pp8192 1,152.2 → 1,156.6 tok/s, within noise (halves +7.55 / −0.95). Checks: 256-step greedy logits equal beta at ctx 512/8,192/32,768 (synthetic and WikiText-2 primes, every step's whole logits + hidden, final KV arena + DeltaNet), with the opt-out arm (both levers off) also equal to beta; one continuous 32,788-step greedy decode (positions 512 … 33,299) is byte-identical to beta at every step; the Halo KLD pins `c1056943…` (WT2) / `04f06883…` (code24) are unchanged.
-
-- Qwen3.5/3.6/3.8 layers run as engine `Step`s end to end. The prefill layer
-  bodies (dense and MoE, including PARO) moved into `hipfire_dispatch`
-  unchanged, bit-exact. Decode with DFlash hidden capture and vision (mrope)
-  steps now uses the same step program as plain decode, so the qwen35
-  `HIPFIRE_FORWARD_LOWERED=0` hand path is gone. The MTP layer runs as
-  `[GatedAttention, SwigluFfn | Moe]`, and MoE MTP experts load as a sealed
-  trunk MoE layer. These routes now take the trunk's MQ4 fusions:
-  - Ornith MTP battery tau is unchanged within noise (1 of 5 turns diverges at
-    token 3).
-  - Qwen3.5-9B DFlash battery is byte-identical; 1 of 5 chain turns diverges
-    late.
-  - Qwen3.8-27B vision answers are byte-identical.
-
-- PARO A3B checkpoints (z-lab Qwen3.5-35B-A3B-PARO, shisa Qwen3.6-35B-A3B-PARO)
-  load again: expert-group validation no longer requires one shape across a
-  layer's PARO rotation sidecars.
 
 - Qwen4 raw-I64 PLE metadata records are HFQM qt=54 (qt=52 is MQ4G256V2L).
   The published `qwen3.8:flash-next` and `qwen3.8:flash-next-mq6q8-pleq8`

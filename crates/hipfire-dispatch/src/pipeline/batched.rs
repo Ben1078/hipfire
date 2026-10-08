@@ -698,9 +698,7 @@ pub fn fp8_stream_consumer_takes_fp8(
     }
     match consumer {
         Fp8StreamConsumer::Qkvza => flags.gfx12_mq4v2_fp8_qkvza,
-        Fp8StreamConsumer::GateUp => {
-            flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma
-        }
+        Fp8StreamConsumer::GateUp => flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma,
         Fp8StreamConsumer::Qkv => flags.gfx12_mq4v2_fp8_qkv,
         Fp8StreamConsumer::Residual => flags.gfx12_mq4v2_fp8_resid,
     }
@@ -1732,13 +1730,7 @@ fn swiglu_ffn_down_batched(
             ));
         }
         fused_silu_mul_rotate_mq_batched_for(
-            gpu,
-            &op.w_down,
-            op.gate,
-            op.up,
-            op.hidden,
-            hidden_dim,
-            n,
+            gpu, &op.w_down, op.gate, op.up, op.hidden, hidden_dim, n,
         )?;
         return dispatch_batched_gemm_epilogue(
             gpu,
@@ -2020,16 +2012,27 @@ mod tests {
         on.gfx12_mq4v2_fp8_qkv = true;
         on.gfx12_mq4v2_fp8_resid = true;
         for (consumer, dtypes) in families {
-            assert!(fp8_stream_consumer_takes_fp8(&on, consumer, dtypes), "{consumer:?}");
+            assert!(
+                fp8_stream_consumer_takes_fp8(&on, consumer, dtypes),
+                "{consumer:?}"
+            );
         }
         // gate/up under the LDS-stage WMMA has no FP8 prepared consumer.
         on.hfq4g256_ldsstage_wmma = true;
         assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, U]));
         assert!(fp8_stream_consumer_takes_fp8(&on, Residual, &[U]));
         // Mixed, non-MQ4v2, or empty weight sets never admit a producer.
-        assert!(!fp8_stream_consumer_takes_fp8(&on, Qkvza, &[U, U, U, DType::Q8_0]));
+        assert!(!fp8_stream_consumer_takes_fp8(
+            &on,
+            Qkvza,
+            &[U, U, U, DType::Q8_0]
+        ));
         assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, L]));
-        assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[DType::MQ4G256]));
+        assert!(!fp8_stream_consumer_takes_fp8(
+            &on,
+            Residual,
+            &[DType::MQ4G256]
+        ));
         assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[]));
     }
 
@@ -2060,13 +2063,21 @@ mod tests {
         ] {
             assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
             assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
-            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(
+                true, rejected, rejected, 256
+            ));
         }
     }
 
     #[test]
     fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
-        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        assert!(!packed_mq4_down_admitted(
+            true,
+            true,
+            true,
+            (DType::MQ4G256V2, 5120, 17408),
+            17408
+        ));
         for dtype in [DType::MQ4G256] {
             let shape = (dtype, 5120, 17408);
             assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
@@ -2074,10 +2085,27 @@ mod tests {
             assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 2560, 17408),
+                17408
+            ));
         }
-        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        for dtype in [
+            DType::MQ4G256V2Lloyd,
+            DType::MQ4G256Lloyd,
+            DType::HFQ4G256,
+            DType::Q8_0,
+        ] {
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 5120, 17408),
+                17408
+            ));
         }
     }
 }

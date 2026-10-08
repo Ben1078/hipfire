@@ -1516,18 +1516,53 @@ fn ar_graph_binding(
     mix(s.pos_buf.as_ptr());
     mix(s.pos_buf3.as_ptr());
     for t in [
-        &s.x, &s.tmp, &s.dn_qkv, &s.dn_z, &s.dn_alpha, &s.dn_beta, &s.dn_conv_out, &s.dn_q,
-        &s.dn_k, &s.dn_v, &s.dn_q_raw, &s.dn_k_raw, &s.dn_attn_out, &s.dn_normed, &s.fa_q_full,
-        &s.fa_q, &s.fa_gate, &s.fa_k, &s.fa_v, &s.fa_attn_out, &s.o, &s.gate_ffn, &s.up,
-        &s.ffn_hidden, &s.ffn_out, &s.logits, &s.sample_buf, &s.repeat_buf, &s.x_rot,
+        &s.x,
+        &s.tmp,
+        &s.dn_qkv,
+        &s.dn_z,
+        &s.dn_alpha,
+        &s.dn_beta,
+        &s.dn_conv_out,
+        &s.dn_q,
+        &s.dn_k,
+        &s.dn_v,
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        &s.dn_attn_out,
+        &s.dn_normed,
+        &s.fa_q_full,
+        &s.fa_q,
+        &s.fa_gate,
+        &s.fa_k,
+        &s.fa_v,
+        &s.fa_attn_out,
+        &s.o,
+        &s.gate_ffn,
+        &s.up,
+        &s.ffn_hidden,
+        &s.ffn_out,
+        &s.logits,
+        &s.sample_buf,
+        &s.repeat_buf,
+        &s.x_rot,
         &s.flash_partials,
     ] {
         mix(t.buf.as_ptr());
     }
     for t in [
-        &s.moe_router_logits, &s.moe_scalar_buf, &s.moe_x_rot, &s.moe_gate_up_buf,
-        &s.moe_gate_buf, &s.moe_up_buf, &s.moe_ffn_hidden, &s.moe_ffn_out, &s.moe_gate_batch,
-        &s.moe_up_batch, &s.moe_rot_batch, &s.moe_topk_indices, &s.moe_topk_weights,
+        &s.moe_router_logits,
+        &s.moe_scalar_buf,
+        &s.moe_x_rot,
+        &s.moe_gate_up_buf,
+        &s.moe_gate_buf,
+        &s.moe_up_buf,
+        &s.moe_ffn_hidden,
+        &s.moe_ffn_out,
+        &s.moe_gate_batch,
+        &s.moe_up_batch,
+        &s.moe_rot_batch,
+        &s.moe_topk_indices,
+        &s.moe_topk_weights,
         &s.moe_down_expanded,
     ]
     .into_iter()
@@ -4910,7 +4945,9 @@ fn forward_prefill_dense_tp_batched(
                                 hd,
                                 BatchSemantics::Sequential,
                                 None,
-                                captures.as_ref().and_then(|caps| caps[rank].tape.as_deref()),
+                                captures
+                                    .as_ref()
+                                    .and_then(|caps| caps[rank].tape.as_deref()),
                                 0,
                                 delta_layer_idx,
                                 q8_flags[rank],
@@ -5887,13 +5924,16 @@ fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
         && config.linear_value_head_dim == 128
 }
 
-
 /// Fold the Qwen output gate plus MQ rotation into the flash-attention reduce
 /// epilogue on certified gfx1100/MQ4 shapes. Extending the existing Q8 reducer
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
-pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
+pub(crate) fn qwen35_fa_epilogue_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    wo: &WeightTensor,
+) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
@@ -5918,7 +5958,6 @@ pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &
             DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
         )
 }
-
 
 /// Certified gfx1100 Radiowave schedule: retain each non-final routed-MoE
 /// result in expanded scratch and let the next layer combine it while producing
@@ -6055,7 +6094,8 @@ mod tests {
     #[test]
     fn flash_partials_split_sizing_is_exact_gfx1100_only() {
         // Legacy: batch rows at min(q8 tile, 128, batched tile).
-        let legacy = |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
+        let legacy =
+            |heads: usize, kv: usize, tile: usize| 16 * heads * kv.div_ceil(tile) * 258 * 4;
 
         // gfx1100 Qwen3.8-27B at 8K (Q8 decode tile32, batched tile128): 32
         // batched rows at tile128 dominate one tile32 decode row, half the
@@ -6070,15 +6110,33 @@ mod tests {
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(1)), 6_340_608);
         assert_eq!(len("gfx1100", 24, 8_192, 32, 128, Some(64)), 101_449_728);
         // Past 8K gfx1100 decodes at tile128 too: legacy sizing.
-        assert_eq!(len("gfx1100", 24, 65_536, 128, 128, None), legacy(24, 65_536, 128));
+        assert_eq!(
+            len("gfx1100", 24, 65_536, 128, 128, None),
+            legacy(24, 65_536, 128)
+        );
 
         // Every other arch keeps the legacy buffer, including the shapes whose
         // decode tile is finer than the batched tile.
-        assert_eq!(len("gfx1201", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1151", 24, 8_192, 128, 128, None), legacy(24, 8_192, 128));
-        assert_eq!(len("gfx1201", 8, 8_192, 16, 128, None), legacy(8, 8_192, 16));
-        assert_eq!(len("gfx1151", 16, 2_048, 32, 128, None), legacy(16, 2_048, 32));
-        assert_eq!(len("gfx1101", 24, 8_192, 32, 128, None), legacy(24, 8_192, 32));
+        assert_eq!(
+            len("gfx1201", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1151", 24, 8_192, 128, 128, None),
+            legacy(24, 8_192, 128)
+        );
+        assert_eq!(
+            len("gfx1201", 8, 8_192, 16, 128, None),
+            legacy(8, 8_192, 16)
+        );
+        assert_eq!(
+            len("gfx1151", 16, 2_048, 32, 128, None),
+            legacy(16, 2_048, 32)
+        );
+        assert_eq!(
+            len("gfx1101", 24, 8_192, 32, 128, None),
+            legacy(24, 8_192, 32)
+        );
     }
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {

@@ -935,12 +935,13 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                             && read.input.buf.as_ptr() == write.output.buf.as_ptr()
                             && read.rows == write.rows =>
                     {
-                        paired_hyper_write(steps, i + 4, read).filter(|(_, next_write)| {
-                            crate::pipeline::layer_ops::hyper_read_prenorm_applies(
-                                gpu, read, next_write,
-                            )
-                        })
-                        .map(|(j, next_write)| (j, read, next_write))
+                        paired_hyper_write(steps, i + 4, read)
+                            .filter(|(_, next_write)| {
+                                crate::pipeline::layer_ops::hyper_read_prenorm_applies(
+                                    gpu, read, next_write,
+                                )
+                            })
+                            .map(|(j, next_write)| (j, read, next_write))
                     }
                     _ => None,
                 };

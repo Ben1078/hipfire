@@ -2826,7 +2826,8 @@ fn load_weights_inner(
     use std::time::Instant;
     // Every allocation of the weight sweep is immutable model data: railgun
     // check mode verifies it unchanged instead of snapshotting it (§2.4).
-    let _weights_role = hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+    let _weights_role =
+        hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
     let t_sweep = Instant::now();
     let LoadedWeights {
         token_embd,

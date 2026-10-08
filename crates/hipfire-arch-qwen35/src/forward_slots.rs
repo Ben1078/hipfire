@@ -89,7 +89,6 @@
 
 pub mod vmm;
 
-use hipfire_dispatch::families::fused_qkv::{fused_qkv_key_for, fused_qkvza_key_for};
 use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
     moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
@@ -98,14 +97,15 @@ use crate::qwen35::{
     FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights, MoeFfnWeights,
     PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
 };
-use hipfire_runtime::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for;
+use hipfire_dispatch::families::fused_qkv::{fused_qkv_key_for, fused_qkvza_key_for};
 use hipfire_dispatch::families::gemm::residual_gemm_key_for;
 use hipfire_dispatch::families::moe::{
     gated_moe_prefill_admissible, mq6_batched_admit_enabled_from_env,
 };
+use hipfire_runtime::slot_batch::SlotBatch;
 
 use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -438,9 +438,7 @@ fn layer_kv_write_attend(
                 }),
             )
         }
-        LayerKvAddr::Vmm(layer) => {
-            vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n)
-        }
+        LayerKvAddr::Vmm(layer) => vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n),
     }
 }
 
@@ -4274,10 +4272,22 @@ mod tests {
         // 0/1/38/39) route through these selectors; an HFQ4 key here reads the
         // 200 B/group container at the 136 B stride and decodes noise.
         for dt in [DType::MQ6G256, DType::HFQ6G256] {
-            assert_eq!(fused_qkvza_key_for(dt), KernelKey::FusedQkvzaHfq6G256, "{dt:?}");
+            assert_eq!(
+                fused_qkvza_key_for(dt),
+                KernelKey::FusedQkvzaHfq6G256,
+                "{dt:?}"
+            );
             assert_eq!(fused_qkv_key_for(dt), KernelKey::FusedQkvHfq6G256, "{dt:?}");
-            assert_eq!(fused_gate_up_key_for(dt), KernelKey::FusedGateUpHfq6G256, "{dt:?}");
-            assert_eq!(residual_gemm_key_for(dt), KernelKey::GemmHfq6G256Residual, "{dt:?}");
+            assert_eq!(
+                fused_gate_up_key_for(dt),
+                KernelKey::FusedGateUpHfq6G256,
+                "{dt:?}"
+            );
+            assert_eq!(
+                residual_gemm_key_for(dt),
+                KernelKey::GemmHfq6G256Residual,
+                "{dt:?}"
+            );
         }
     }
 

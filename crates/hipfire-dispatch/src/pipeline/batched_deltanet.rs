@@ -455,7 +455,12 @@ pub fn deltanet_input_projection_batched(
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "deltanet_input_projection_batched",
-            &[layer.wqkv.dtype, layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype],
+            &[
+                layer.wqkv.dtype,
+                layer.wz.dtype,
+                layer.w_beta.dtype,
+                layer.w_alpha.dtype,
+            ],
         )?;
         if gdn.is_some() {
             return Err(HipError::new(

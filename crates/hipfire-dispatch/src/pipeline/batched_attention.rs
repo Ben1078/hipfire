@@ -2236,7 +2236,13 @@ pub fn attention_output_projection_batched(
 /// HD256 with a 64-wide rotary. Shared by [`execute_gated_attention_batched`]
 /// and the multi-request chunk, which evaluates it per request with that
 /// request's `chain_verify`/`n`.
-pub fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &HybridDims, chain_verify: bool, tap: bool, n: usize) -> bool {
+pub fn gfx12_fa_prep_admitted(
+    gpu: &Gpu,
+    config: &HybridDims,
+    chain_verify: bool,
+    tap: bool,
+    n: usize,
+) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
         && !chain_verify

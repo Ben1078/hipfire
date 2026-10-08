@@ -1,14 +1,15 @@
 # Qwen3.5 declarative layer program
 
-Status: in progress on `feat/qwen35-declarative` (cut from #774).
+Status: landed (#795, carried by #813 on `beta`).
 
 ## Goal
 
 Qwen3.5 declares each decoder layer as one typed `Step` list, as Qwen4 does
 (`hipfire-arch-qwen4/src/gpu_forward.rs`). The dispatch crate owns every
-executor body and every arch- or dtype-gated route choice. The same program
-serves decode (`rows == 1`), batched prefill and speculative verify
-(`rows > 1`). Each op picks GEMV or GEMM from `rows`.
+executor body and every arch- or dtype-gated route choice. Decode runs the
+program with `rows == 1`. Batched prefill and speculative verify run the
+`pipeline::batched*` executors; of the decode steps only `SwigluFfn` has a
+`rows > 1` arm so far.
 
 The architecture crate keeps:
 
@@ -20,19 +21,16 @@ The architecture crate keeps:
 ## Vocabulary
 
 This port uses typed `Step` only. The #397 super-op path (`lower_variant` plus
-`Qwen35Bindings`) is removed for single-GPU decode once the Step program is
-bit-exact. The EP decode hooks (`ep_*`) keep their current binding until the EP
-schedule consumes the same program.
+`Qwen35Bindings`) no longer serves single-GPU decode; the EP decode hooks
+(`ep_*`) keep it until the EP schedule consumes the same program.
 
-New ops are model-neutral. They live in `hipfire-dispatch/src/pipeline/hybrid_ops.rs`:
+New ops are model-neutral. They live in `hipfire-dispatch/src/pipeline/hybrid.rs`:
 
-| Step | Replaces (qwen35 today) | Route choice owned by dispatch |
+| Step | Stages (replace qwen35's super-op handlers) | Route choice owned by dispatch |
 |---|---|---|
-| `GdnPrep` | `ATTEND_DN_PREP` | conv+qk-norm fusion, gfx1100 scalar prep, compact QK |
-| `GdnRecurrence` | `RECUR_GDN` | FP32 / Q8 / Q8-compact / Q4 state |
-| `GatedNorm` | `NORM_GATED` | fused gated-norm + MQ rotate |
-| `GatedAttention` | `ATTEND_FULL` | fused FA prep, TriAttention tap, compaction offset, fused epilogue |
-| `SwigluResidual` | `RESID_DOWN_SWIGLU` | GEMV family SwiGLU-residual variant |
+| `DeltaNetMixer` | `project` → `prepare` (`ATTEND_DN_PREP`) → `recur` (`RECUR_GDN`) → `gated_norm` (`NORM_GATED`) → `output` | conv+qk-norm fusion, gfx1100 scalar prep, compact QK; FP32 / Q8 / Q8-compact / Q4 state; fused gated-norm + MQ rotate |
+| `GatedAttention` | `project` → `attend` (`ATTEND_FULL`) → `output` | fused FA prep, TriAttention tap, compaction offset, fused epilogue |
+| `SwigluFfn` | `project` → `down` (`RESID_DOWN_SWIGLU`) | GEMV family SwiGLU-residual variant; `rows > 1` batched FFN |
 
 Projections keep the existing `RmsnormAutomatic`, `Gemv` and `GemvResidual`
 steps, which the fusion table already rewrites into qkv, qkvza or gate/up
@@ -94,3 +92,73 @@ Extra fixtures after the port:
 - `qwen3.8-27b.mq4-xt` + `qwen3.8-27b.mtp` (dense MTP, `SwigluFfn` arm). The
   MTP battery (`--thinking-effort none`) is byte-identical to the build before
   the MTP slice, with tau 2.65/2.69/1.85/…. The daemon-protocol text equals AR.
+
+## Rebased onto beta
+
+Rebased onto `beta` `e268a0798` with #813. The code beta changed after the
+port's merge base now lives in the dispatch executors: the packed-MQ4 FFN
+routes and the gfx1151 A4 gate/up epilogue (`FfnGateOutput::Iu4A4`), the
+widened `s4_residual_fast` gate, `fa2_gfx11_ctx_admitted` and the gfx1151
+multirow assert in the attend step, the MQ6/HFQ6 fused qkv/qkvza keys, the
+`memory.offload_exec=cpu` down projection, and `i_gpu_start` in the MTP MoE
+config. `swiglu_down_residual` again runs the rotated formats it had dropped
+(MFP4, MQ8, MQ4G128, ParoQ4G128, ...) as GEMV plus add; MFP4 is measured
+below, the others are not.
+
+Against the beta daemon (gfx1151, `serve_harness.py --thinking off --sampling
+greedy --compare-transcript`), every row is `transcript_byte_identical=true`:
+`qwen35-4b.mq4` battery, chain and a 2k-token prompt;
+`qwen3.8-27b.mq4-xts` 2k-token prompt (MQ4V2 + AWQ, A4 epilogue route);
+`ornith-1.5-35b-a3b.mq4r` AR and MTP; `qwen3.6-35b-a3b.mq4r` MTP;
+`qwen3.5-9b.mq4` DFlash and a 40k-token prompt (wide FA2 prefill past 32K).
+Greedy daemon runs: an MFP4 `Qwen3.5-4B` (MFP4G32 `w_down`) matches beta byte
+for byte where the pre-rebase head failed with `unsupported
+hybrid.swiglu_down_residual`; `qwen3.5-9b.mq4` with 20 resident layers and
+`offload_exec=cpu` matches beta, with every host-mapped step on the CPU (0
+left on the GPU). `qwen35-4b.mq4` Redline `--pm4` shadow exact on both (426
+dispatches).
+
+### Rebased onto beta `f4ea8109b`
+
+Beta's exact wide verify chunks (`DenseBatchMath`, `HIPFIRE_CB_VERIFY_CHUNK128`)
+edited the projection and FFN helpers this port moves. `DenseBatchMath` and
+its MQ4G256V2 guard now live in `pipeline::batched`. `SingletonWmma` runs in
+`dispatch_batched_gemm_epilogue`, the batched SwiGLU FFN
+(`SwigluFfnBatch::math`), the attention projections and the DeltaNet
+projections, with the same explicit `*VerifyExact` keys and the same refusals.
+The qwen35 helpers re-export the type. The multi-request verify chunk passes
+its per-request `ChainVerify` context (`with_verify_tile_attend`) to the moved
+prepare and attend steps.
+
+Against the beta daemon on gfx1151 (`serve_harness.py --thinking off
+--sampling greedy --compare-transcript`), every row is
+`transcript_byte_identical=true`: `qwen35-4b.mq4` battery, chain and 2k-token
+prompt; `qwen3.5-9b.mq4` AR and `--dflash on` battery and chain (DFlash does
+not engage on either arm); `qwen3.8-27b.mq4-xt` AR, 2k-token prompt, MTP and
+DFlash (same tau per turn); `qwen3.6-35b-a3b.mq4r` and
+`ornith-1.5-35b-a3b.mq4r` AR and MTP (same tau per turn). Daemon-protocol
+greedy text is identical for `Qwen3.5-35B-A3B-PARO` with and without
+`HIPFIRE_PARO_BATCHED=1`, and for one 27B vision request (mrope). Redline
+`--kv-mode q8 --pm4` is shadow exact on both arms with the same decode tape:
+`qwen35-4b.mq4` 426 launches (`a021b8f179688248`), `ornith-1.5-35b-a3b.mq4r`
+843 launches (`ea6689ccdda27a05`). The `SingletonWmma` arms run only on
+gfx1201 and were not exercised here.
+
+### Rebased onto beta `5a0dd38fd`
+
+Two beta changes edited bodies this port moves into `hipfire-dispatch`:
+
+- `fa27d3ce1` (gfx1201 FP8-stream producers honour the
+  `HIPFIRE_GFX12_MQ4V2_FP8_*` family opt-outs): `Fp8StreamConsumer`,
+  `fp8_stream_consumer_takes_fp8` and `gfx12_fp8_stream_admitted` live in
+  `pipeline::batched` with their regression test. The RMSNorm, SwiGLU, sigmoid
+  and GDN FP8-stream producers, the in-place FA gate and the gate/up `silu_h`
+  epilogue in `batched`, `batched_attention` and `batched_deltanet` admit
+  through it, and the uniform FP8 consumers no longer re-check the family flag.
+- `a47649a3b` (PM FP8 verify GEMMs, `HIPFIRE_CB_VERIFY_FP8`):
+  `verify_dense_math` moves to `pipeline::batched` (the qwen35 prefill module
+  re-exports it). The moved attention and DeltaNet layers take their
+  `DenseBatchMath` from it, and `mq_f16_projection_fast_route`,
+  `s4_residual_fast` and the fp8q FA prep stay off inside the verify scope.
+  The fail-closed MoE check and the GDN chunk-scan opt-out stay in
+  `forward_batch_chunk_impl`.
