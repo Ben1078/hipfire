@@ -1442,8 +1442,10 @@ pub struct FinishSummary {
     /// Final events to render (e.g. trailing visible Token + held ToolCalls).
     pub events: Vec<ClientEvent>,
     /// The emitter's finish reason (`stop`, `tool_calls`, `malformed_protocol`,
-    /// or `open_think`); the caller may override with `length` on a pure
-    /// token-cap exit.
+    /// `truncated_tool_call` — output ended inside a tool call — or
+    /// `open_think`); the caller may override with `length` on a pure
+    /// token-cap exit, which also wins over `truncated_tool_call` and
+    /// `open_think`.
     pub finish_reason: &'static str,
     /// Number of tool calls parsed this turn (for the `done` envelope).
     /// Zero when malformed or when calls must stay suppressed.
@@ -1456,7 +1458,9 @@ pub struct FinishSummary {
     /// filter stop_at spanning split byte fragments). Carried into terminal
     /// lowering so wrappers do not recompute solely from the last token id.
     pub decoded_eot: bool,
-    /// Unclosed thinking region at finish — nonretryable unsafe terminal.
+    /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
+    /// a reasoning-only `stop` with no tool calls and no cache store on the
+    /// single-slot spec route (multi-slot still fails closed).
     pub open_think: bool,
 }
 

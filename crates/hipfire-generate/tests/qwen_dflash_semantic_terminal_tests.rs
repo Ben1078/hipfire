@@ -436,95 +436,214 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
     }
 
-    #[test]
-    fn open_think_is_error_xor_done_no_cache() {
-        // Production emitter (prompt-started OpenThink) -> real FinishSummary
-        // -> production wire terminal. No hand-built open_think mirrors.
-        let (stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
-        let reasoning: String = stream
-            .iter()
-            .filter_map(|e| match e {
-                ClientEvent::Reasoning(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reasoning, "still thinking");
-        assert!(fin.open_think, "emitter must latch open_think");
-        assert_eq!(fin.finish_reason, "open_think");
-        assert!(fin.events.is_empty());
-        assert_eq!(fin.tool_calls, 0);
-        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
-        match &term {
-            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
-                class,
-                retryable,
-                message,
+    /// Tail of agent-harness case HA-13 (Flash-Next, xhigh): the model emitted
+    /// `<|im_end|>` inside its reasoning and serve answered with an "open
+    /// think span" stream error.
+    const HA13_REASONING_TAIL: &str = "Non-200 status (e.g. 500, or 503 even if the server \
+        responds) counts as down. Good.\n\nSchedule: \"0 8 * * *\" — every day at 8 AM.\n\n\
+        Now let's create the job.";
+
+    /// Production wire for one spec turn: the mid-loop events, the terminal
+    /// flush, then the wire terminal (done, or the fail-closed error).
+    fn render_spec_turn(
+        id: &str,
+        stream: &[ClientEvent],
+        fin: &FinishSummary,
+        term: &hipfire_generate::qwen::QwenDflashWireTerminal,
+    ) -> Vec<serde_json::Value> {
+        let mut sink = Vec::new();
+        hipfire_generate::qwen::render_client_events(&mut sink, id, stream, 0, false);
+        hipfire_generate::qwen::render_client_events(&mut sink, id, &fin.events, 0, true);
+        match term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                wire_tool_calls,
                 ..
             } => {
-                assert_eq!(*class, "validation");
-                assert!(!*retryable);
-                assert!(message.contains("open think"));
+                let mut done = hipfire_generate::qwen::qwen_dflash_done_value(
+                    id,
+                    fin.tool_calls,
+                    1.0,
+                    1,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1,
+                    0,
+                    finish_reason,
+                    21,
+                );
+                stage_terminal_tool_calls(&mut done, finish_reason, wire_tool_calls);
+                sink.extend_from_slice(format!("{done}\n").as_bytes());
             }
-            other => panic!("expected open_think Malformed, got {other:?}"),
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
+                message,
+                class,
+                retryable,
+                rolled_back,
+            } => {
+                let ep = attest_epilogue(*rolled_back);
+                hipfire_generate::qwen::emit_qwen_dflash_malformed_terminal(
+                    &mut sink, id, message, class, *retryable, &ep,
+                );
+            }
         }
-        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
-        assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
-        // Production Malformed writer: error XOR done (GPU-less attested epilogue).
+        parse_jsonl(&String::from_utf8(sink).unwrap())
+    }
+
+    /// Reasoning-only `stop`: every reasoning byte streamed, no answer, no
+    /// call, no cache, and one `done` as the last event — no error.
+    fn assert_spec_reasoning_only_stop(
+        label: &str,
+        stream: &[ClientEvent],
+        fin: &FinishSummary,
+        expected_reasoning: &str,
+    ) {
+        assert!(fin.open_think, "{label}: emitter must latch open_think");
+        assert_eq!(fin.finish_reason, "open_think", "{label}");
+        assert_eq!(fin.tool_calls, 0, "{label}");
+        assert!(!fin.events.iter().any(|e| matches!(e, ClientEvent::ToolCalls(_))), "{label}");
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(fin, false, false, "", false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "stop", "{label}");
+                assert!(!*release_tool_calls, "{label}");
+                assert!(!*store_cache, "{label}: an unclosed think span is never cached");
+                assert!(wire_tool_calls.is_empty(), "{label}");
+            }
+            other => panic!("{label}: expected stop Done, got {other:?}"),
+        }
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
+
         let _guard = begin_terminal_test("req-ot", 21);
-        set_active_attempt_id(21);
-        let mut sink = Vec::new();
-        if let hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
-            message,
-            class,
-            retryable,
-            rolled_back,
-        } = &term
-        {
-            let ep = attest_epilogue(*rolled_back);
-            hipfire_generate::qwen::emit_qwen_dflash_malformed_terminal(
-                &mut sink, "req-ot", message, class, *retryable, &ep,
-            );
-        }
-        let out = String::from_utf8(sink).unwrap();
-        let lines = parse_jsonl(&out);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["type"], "error");
-        assert_eq!(lines[0]["attempt_id"], 21);
-        assert!(!out.contains(r#""type":"done""#));
+        let wire = render_spec_turn("req-ot", stream, fin, &term);
+        let reasoning: String = wire
+            .iter()
+            .filter(|e| e["type"] == "reasoning")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasoning, expected_reasoning, "{label}");
+        assert!(wire.iter().all(|e| e["type"] != "error"), "{label}: {wire:?}");
+        assert!(wire.iter().all(|e| e["type"] != "tool_calls"), "{label}: {wire:?}");
+        let done: Vec<_> = wire.iter().filter(|e| e["type"] == "done").collect();
+        assert_eq!(done.len(), 1, "{label}: {wire:?}");
+        assert_eq!(done[0]["finish_reason"], "stop", "{label}");
+        assert_eq!(wire.last().unwrap()["type"], "done", "{label}");
     }
 
     #[test]
-    fn open_think_prompt_started_and_generated_flags() {
+    fn eos_inside_open_think_is_reasoning_only_stop_ha13() {
+        // HA-13 replay on the spec (MTP/DFlash) emitter: prompt-opened think,
+        // reasoning, then <|im_end|> (id 1) — on the final budget token too.
+        let tok = test_tokenizer();
+        let mut ids = tok.encode(HA13_REASONING_TAIL);
+        ids.push(1);
+        let (stream, fin, _raw) = drive_qwen_ids(&ids, AssistantPrefix::OpenThink);
+        assert!(fin.decoded_eot, "<|im_end|> is a decoded end of turn");
+        // EOS on the final budget token is not a length exit.
+        assert!(!qwen_dflash_hit_length_cap(ids.len(), ids.len(), fin.decoded_eot, true));
+        assert_spec_reasoning_only_stop("eos", &stream, &fin, HA13_REASONING_TAIL);
+    }
+
+    #[test]
+    fn open_think_without_eos_or_length_is_reasoning_only_stop() {
         // (a) prompt-started OpenThink; (b) generated unclosed <think>.
         let cases = [
-            ("prompt", AssistantPrefix::OpenThink, "still thinking"),
-            ("generated", AssistantPrefix::Plain, "pre <think>secret"),
+            ("prompt", AssistantPrefix::OpenThink, "still thinking", "still thinking"),
+            ("generated", AssistantPrefix::Plain, "pre <think>secret", "secret"),
         ];
-        for (label, prefix, body) in cases {
+        for (label, prefix, body, expected_reasoning) in cases {
             let (stream, fin, _raw) = drive_qwen_emit(body, prefix);
-            let reasoning: String = stream
-                .iter()
-                .filter_map(|e| match e {
-                    ClientEvent::Reasoning(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let expected_reasoning = if label == "prompt" {
-                "still thinking"
-            } else {
-                "secret"
-            };
-            assert_eq!(reasoning, expected_reasoning, "{label}");
-            assert!(fin.open_think, "{label}: open_think");
-            assert_eq!(fin.finish_reason, "open_think", "{label}");
-            assert_eq!(fin.tool_calls, 0, "{label}");
-            assert!(fin.events.is_empty(), "{label}: no release on open_think");
-            let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
-            assert!(
-                matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }),
-                "{label}: expected Malformed"
-            );
-            assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
+            assert_spec_reasoning_only_stop(label, &stream, &fin, expected_reasoning);
+        }
+    }
+
+    #[test]
+    fn tool_call_cut_by_length_cap_is_length_done_not_error() {
+        // Budget spent inside a tool call: AR ends finish=length with no call
+        // and no cache (`qwen_ar_finish_route`). The spec paths (DFlash, MTP)
+        // must end the same way instead of failing closed with
+        // "malformed tool protocol".
+        let body = "Saving it.<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.py\",\"content\":\"def";
+        let (stream, fin, _raw) = drive_qwen_emit(body, AssistantPrefix::Plain);
+        assert_eq!(fin.finish_reason, "truncated_tool_call");
+        assert_eq!(fin.tool_calls, 0);
+        let visible: String = stream
+            .iter()
+            .chain(fin.events.iter())
+            .filter_map(|e| match e {
+                ClientEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(visible, "Saving it.");
+        assert!(!fin.events.iter().any(|e| matches!(e, ClientEvent::ToolCalls(_))));
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, &visible, false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "length");
+                assert!(!*release_tool_calls);
+                assert!(!*store_cache);
+                assert!(wire_tool_calls.is_empty());
+            }
+            other => panic!("expected length Done, got {other:?}"),
+        }
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
+        // The model ending its turn inside the call still fails closed.
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, &visible, false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
+                message,
+                class,
+                retryable,
+                ..
+            } => {
+                assert_eq!(message, "malformed tool protocol");
+                assert_eq!(*class, "validation");
+                assert!(!*retryable);
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // A call that went malformed mid-stream fails closed even at the cap:
+        // AR errors on the spot there, before any length terminal.
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&summary_malformed(), true, false, "", false);
+        assert!(matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }));
+    }
+
+    #[test]
+    fn open_think_at_length_cap_is_length_done_no_cache() {
+        // Budget spent inside <think>: an ordinary `length` stop with the
+        // reasoning streamed so far — no calls, no cache, no error.
+        let (_stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        assert!(fin.open_think);
+        assert!(!fin.decoded_eot);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "", false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "length");
+                assert!(!*release_tool_calls);
+                assert!(!*store_cache);
+            }
+            other => panic!("expected length Done, got {other:?}"),
         }
     }
 
@@ -2179,20 +2298,14 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
 
     /// Legacy non-qwen hipfire_generate::qwen::generate_dflash else-branch: fail_closed_rollback.is_some()
     /// || grammar_violated → hipfire_generate::common::emit_fail_closed_error only; no extract/release/
-    /// cache store / done. Message classified by grammar / open_think /
-    /// malformed_protocol / generic.
+    /// cache store / done. Message classified by grammar / malformed_protocol /
+    /// generic.
     #[test]
     fn legacy_non_qwen_fail_closed_epilogue_error_only_no_extract() {
         // Production message selection (qwen_semantic_v2 == false branch).
-        fn legacy_fail_closed_message(
-            grammar_violated: bool,
-            open_think: bool,
-            finish_reason: &str,
-        ) -> &'static str {
+        fn legacy_fail_closed_message(grammar_violated: bool, finish_reason: &str) -> &'static str {
             if grammar_violated {
                 "grammar violation during speculative decode"
-            } else if open_think || finish_reason == "open_think" {
-                "open think span at end of generation (validation)"
             } else if finish_reason == "malformed_protocol" {
                 "malformed tool protocol"
             } else {
@@ -2201,37 +2314,15 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         }
 
         let cases = [
-            (
-                true,
-                false,
-                "stop",
-                "grammar violation during speculative decode",
-            ),
-            (
-                false,
-                true,
-                "stop",
-                "open think span at end of generation (validation)",
-            ),
-            (
-                false,
-                false,
-                "open_think",
-                "open think span at end of generation (validation)",
-            ),
-            (
-                false,
-                false,
-                "malformed_protocol",
-                "malformed tool protocol",
-            ),
-            (false, false, "length", "fail-closed speculative decode"),
+            (true, "stop", "grammar violation during speculative decode"),
+            (false, "malformed_protocol", "malformed tool protocol"),
+            (false, "length", "fail-closed speculative decode"),
         ];
 
         let _guard = begin_terminal_test("leg-fc", 500);
-        for (i, (grammar, open_think, reason, expected_msg)) in cases.iter().enumerate() {
+        for (i, (grammar, reason, expected_msg)) in cases.iter().enumerate() {
             assert_eq!(
-                legacy_fail_closed_message(*grammar, *open_think, reason),
+                legacy_fail_closed_message(*grammar, reason),
                 *expected_msg,
                 "case {i} message select"
             );

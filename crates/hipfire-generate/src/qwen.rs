@@ -3604,10 +3604,10 @@ pub fn generate_dflash_rendered(
             }
         }
     } else {
-        // Legacy non-qwen DFlash: grammar / open-think / malformed is
-        // error-only — never whole-output extract, release held calls,
-        // store cache, or emit done. Prefer generate_spec's production
-        // epilogue so rolled_back + sync-failure context stay truthful.
+        // Legacy non-qwen DFlash: grammar / malformed is error-only — never
+        // whole-output extract, release held calls, store cache, or emit
+        // done. Prefer generate_spec's production epilogue so rolled_back +
+        // sync-failure context stay truthful.
         if run.fail_closed_rollback.is_some() || run.grammar_violated {
             let fallback = RollbackEpilogue {
                 rolled_back: false,
@@ -3616,9 +3616,10 @@ pub fn generate_dflash_rendered(
             let ep = run.fail_closed_rollback.as_ref().unwrap_or(&fallback);
             let message = if run.grammar_violated {
                 "grammar violation during speculative decode"
-            } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
-                "open think span at end of generation (validation)"
-            } else if run.finish.finish_reason == "malformed_protocol" {
+            } else if matches!(
+                run.finish.finish_reason,
+                "malformed_protocol" | "truncated_tool_call"
+            ) {
                 "malformed tool protocol"
             } else {
                 "fail-closed speculative decode"
@@ -3630,9 +3631,16 @@ pub fn generate_dflash_rendered(
         // Legacy non-qwen DFlash: whole-output extract + cache only on a safe
         // completed terminal. Length still emits finish_reason=length but must
         // not release held tool calls or store asst_turn_cache (partial/truncated
-        // turns are not safe to prime). Fail-closed already returned above.
+        // turns are not safe to prime). Fail-closed already returned above. A
+        // turn that ended inside `<think>` is a reasoning-only stop: no calls,
+        // no cache.
+        let open_think = run.finish.open_think;
         let decoded_full = tokenizer.decode(&run.streamed_tokens);
-        let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+        let emit_tool_calls = if open_think {
+            Vec::new()
+        } else {
+            extract_tool_calls_from_text(&decoded_full)
+        };
         // Semantic stop / decoded_eot at the budget boundary is stop/tool_calls,
         // not length — same rule as the qwen_semantic_v2 path.
         let hit_length_cap = run.ctx_exhausted
@@ -3718,7 +3726,7 @@ pub fn generate_dflash_rendered(
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_calls);
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
         let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
-        let intended_store = !hit_length_cap && !cached_seq.is_empty();
+        let intended_store = !hit_length_cap && !open_think && !cached_seq.is_empty();
         let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -5066,12 +5074,22 @@ pub fn generate_spec(
     // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
     // returns a `SpecRun` summary instead of writing them itself.
     let finish = emit.finish();
-    // Open-think / malformed finish reasons also need a truthful rollback when
-    // grammar did not already reset (state may still be baked).
+    // A malformed finish reason also needs a truthful rollback when grammar did
+    // not already reset (state may still be baked), and so does an unfinished
+    // tool call the model ended the turn inside. At a pure length exit that
+    // call is an ordinary `length` terminal instead: state intact, same rule
+    // as the wrapper's classifier and AR. A turn that ended inside `<think>`
+    // keeps its state too: it is a reasoning-only `stop` (or `length`).
+    let length_exit = ctx_exhausted
+        || qwen_dflash_hit_length_cap(
+            generated,
+            max_tokens,
+            finish.decoded_eot,
+            semantic_stop.is_some(),
+        );
+    let truncated_call = finish.finish_reason == "truncated_tool_call";
     if fail_closed_rollback.is_none()
-        && (finish.open_think
-            || finish.finish_reason == "open_think"
-            || finish.finish_reason == "malformed_protocol")
+        && ((truncated_call && !length_exit) || finish.finish_reason == "malformed_protocol")
     {
         // Guard already dropped — reset via host-held bundle/speculator.
         fail_closed_rollback = Some(production_fail_closed_rollback(m, gpu, None, None));
@@ -6548,10 +6566,13 @@ pub fn qwen_dflash_wire_terminal(
             rolled_back,
         };
     }
-    // Open think is a nonretryable unsafe terminal (error XOR done).
-    if finish.open_think || finish.finish_reason == "open_think" {
+    // An unfinished tool call is a nonretryable unsafe terminal (error XOR
+    // done) when the model ended the turn inside it. Running out of budget
+    // there is an ordinary length stop — no calls, no cache — exactly as AR
+    // classifies it (`qwen_ar_finish_route`).
+    if finish.finish_reason == "truncated_tool_call" && !hit_length_cap {
         return QwenDflashWireTerminal::Malformed {
-            message: "open think span at end of generation (validation)".to_string(),
+            message: "malformed tool protocol".to_string(),
             class: "validation",
             retryable: false,
             rolled_back,
@@ -6569,6 +6590,18 @@ pub fn qwen_dflash_wire_terminal(
     if hit_length_cap {
         return QwenDflashWireTerminal::Done {
             finish_reason: "length",
+            release_tool_calls: false,
+            store_cache: false,
+            fingerprint_text: String::new(),
+            wire_tool_calls: Vec::new(),
+        };
+    }
+    // The model ended the turn inside `<think>`: the reasoning already
+    // streamed and the turn stops with no answer. No calls and no cache — the
+    // KV holds an unclosed think span that no rendered history reproduces.
+    if finish.open_think || finish.finish_reason == "open_think" {
+        return QwenDflashWireTerminal::Done {
+            finish_reason: "stop",
             release_tool_calls: false,
             store_cache: false,
             fingerprint_text: String::new(),

@@ -1004,7 +1004,15 @@ impl SlotBackend {
         }
         let summary = emitter.finish();
         render_events(summary.events, stdout, &mut terminal_tool_calls);
-        if matches!(summary.finish_reason, "malformed_protocol" | "open_think") {
+        // Multi-slot keeps failing closed on an unfinished tool call at any
+        // exit, under its previous `malformed_protocol` label (and, unlike the
+        // single-slot spec route, on a turn that ended inside `<think>`).
+        let unsafe_reason = match summary.finish_reason {
+            "truncated_tool_call" => Some("malformed_protocol"),
+            r @ ("malformed_protocol" | "open_think") => Some(r),
+            _ => None,
+        };
+        if let Some(unsafe_reason) = unsafe_reason {
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
             } else if let Some(session) = claimed_session {
@@ -1013,7 +1021,7 @@ impl SlotBackend {
             emit_qwen_ar_slot_error(
                 stdout,
                 id,
-                &format!("unsafe multi_slot terminal: {}", summary.finish_reason),
+                &format!("unsafe multi_slot terminal: {unsafe_reason}"),
                 "generation",
                 false,
                 false,
