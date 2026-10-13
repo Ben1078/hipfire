@@ -38,7 +38,8 @@ const SMX_SRC: &str = include_str!("../../../kernels/src/claude_softmax_mb.hip")
 /// for up to `rows` rows.
 pub struct ClaudeSoftmaxScratch {
     part: GpuTensor,
-    ghist: GpuTensor,
+    /// Per-block top-64 candidate values, `[rows][<=1024 blocks][64]`.
+    cand: GpuTensor,
     counter: GpuTensor,
     rows: usize,
 }
@@ -47,14 +48,14 @@ impl ClaudeSoftmaxScratch {
     pub fn new(gpu: &mut Gpu, rows: usize) -> HipResult<Self> {
         Ok(Self {
             part: gpu.zeros(&[3 * rows * 1024], DType::F32)?,
-            ghist: gpu.zeros(&[rows * 1024], DType::F32)?,
+            cand: gpu.zeros(&[rows * 1024 * 64], DType::F32)?,
             counter: gpu.zeros(&[rows.max(4)], DType::F32)?,
             rows,
         })
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.part);
-        let _ = gpu.free_tensor(self.ghist);
+        let _ = gpu.free_tensor(self.cand);
         let _ = gpu.free_tensor(self.counter);
     }
 }
@@ -92,8 +93,9 @@ pub fn claude_mtp_gpu_sample_enabled() -> bool {
 
 impl Gpu {
     /// Multi-block `softmax_temp_topp_batched_into_f32`: same outputs (probs,
-    /// nucleus tau, kept mass Z per row) and definitions, see
-    /// `kernels/src/claude_softmax_mb.hip`.
+    /// AR-law truncation tau, kept mass Z per row) and definitions, see
+    /// `kernels/src/claude_softmax_mb.hip`. `top_k` is the AR candidate cap
+    /// (`llama::ar_candidate_cap`); `<= 0` or `> 64` means 64.
     #[allow(clippy::too_many_arguments)]
     pub fn claude_softmax_topp_mb(
         &mut self,
@@ -145,7 +147,7 @@ impl Gpu {
         b.push_ptr(probs.buf.as_ptr());
         b.push_i32(n as i32);
         b.push_ptr(psum);
-        b.push_ptr(sc.ghist.buf.as_ptr());
+        b.push_ptr(sc.cand.buf.as_ptr());
         b.push_ptr(sc.counter.buf.as_ptr());
         b.push_ptr(tau.buf.as_ptr());
         b.push_ptr(z.buf.as_ptr());

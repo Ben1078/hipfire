@@ -360,7 +360,8 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored.
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
-        self.sample_top_k = cfg.top_k;
+        // AR candidate cap: the sampled verify reproduces AR's law.
+        self.sample_top_k = cfg.ar_candidate_cap();
         self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
     }
 

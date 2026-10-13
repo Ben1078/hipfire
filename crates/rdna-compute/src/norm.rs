@@ -772,21 +772,17 @@ impl Gpu {
         )
     }
 
-    /// Batched temperature-scaled softmax that ALSO emits, per row, the nucleus
-    /// (top_p) threshold `tau_cut[r]` and kept mass `Z[r]` so the host can apply
-    /// `p_i = (p_i >= tau_cut[r]) ? p_i / Z[r] : 0` (AR-equivalent nucleus
-    /// truncation). `tau_cut` and `Z` must each be `[rows]`-shaped F32 tensors.
+    /// Batched temperature-scaled softmax that ALSO emits, per row, the AR
+    /// sampler's truncation threshold `tau_cut[r]` and kept mass `Z[r]` so
+    /// consumers apply `p_i = (p_i >= tau_cut[r]) ? p_i / Z[r] : 0`.
+    /// `tau_cut` and `Z` must each be `[rows]`-shaped F32 tensors.
     ///
-    /// `probs` is left as the FULL normalized softmax (the kernel does NOT
-    /// truncate on-device; the host helper does, so the kernel stays a pure read
-    /// plus two scalars). When `top_p >= 1.0` the nucleus phase is skipped and
-    /// `tau_cut=0, Z=1` so host truncation is identity → byte-equivalent to
-    /// `softmax_temp_batched_into_f32`.
-    ///
-    /// `tau_cut` is found by bisection over the mass predicate (no sort); see the
-    /// kernel doc in `softmax_temp_batched.hip`. Distribution-parity (tree
-    /// reduction), not byte-parity, to the host softmax — used behind
-    /// HIPFIRE_DFLASH_FAST_SAMPLE.
+    /// `probs` is left as the FULL normalized softmax. The kept set is the
+    /// AR sampler's (`llama::ar_candidate_cap`): the `top_k` largest probs
+    /// (`top_k <= 0` or `> 64` → 64), min_p, then the nucleus over the pool's
+    /// own mass; see the kernel doc in `softmax_temp_batched.hip`. Callers pass
+    /// the AR candidate cap as `top_k`. Distribution-parity (tree reduction),
+    /// not byte-parity, to the host softmax.
     #[allow(clippy::too_many_arguments)]
     pub fn softmax_temp_topp_batched_into_f32(
         &mut self,

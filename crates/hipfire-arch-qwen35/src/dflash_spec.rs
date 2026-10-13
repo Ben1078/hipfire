@@ -578,7 +578,7 @@ impl DflashSpeculator {
             // Greedy by default until a request calls `set_sampling`.
             sample_temp: 0.0,
             sample_top_p: 1.0,
-            sample_top_k: 0,
+            sample_top_k: hipfire_runtime::llama::ar_candidate_cap(None),
             sample_cactus: 0.0,
             checkpoints: Vec::new(),
             resume_enabled,
@@ -1122,7 +1122,8 @@ impl Speculator for DflashSpeculator {
         // its draw sequence exactly).
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
-        self.sample_top_k = cfg.top_k;
+        // AR candidate cap: the sampled rows reproduce AR's law.
+        self.sample_top_k = cfg.ar_candidate_cap();
         self.sample_cactus = cfg.cactus_delta;
         self.rng_state = request_rng_state(cfg.rng_seed);
         self.last_window = None;

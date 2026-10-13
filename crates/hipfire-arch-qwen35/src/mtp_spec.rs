@@ -50,7 +50,7 @@ use std::time::Instant;
 #[derive(Copy, Clone, Debug)]
 pub struct MtpSamplingConfig {
     pub temp: f32,
-    pub top_k: usize, // 0 = disabled (no top-K cutoff)
+    pub top_k: usize, // AR candidate cap (`llama::ar_candidate_cap`); 0 = none on host, 64 on GPU
     pub top_p: f32,   // 1.0 = disabled (no nucleus cutoff)
     pub min_p: f32,   // 0.0 = disabled (no min-prob cutoff)
 }
@@ -3121,9 +3121,9 @@ fn mtp_sampled_accept(
     let _ = gpu.free_tensor(z_gpu);
     debug_assert_eq!(host_probs.len(), n_verify * vocab);
 
-    // Build a single position's TRUNCATED target nucleus row on demand. The
-    // softmax kernel already folded any top_k cutoff into tau (tau = max(tau_p,
-    // tau_k)), so apply_topp_trunc applies the combined top_k+top_p nucleus.
+    // Build a single position's TRUNCATED target row on demand. The softmax
+    // kernel's tau/Z encode AR's law (top_k pool, min_p, nucleus over the pool
+    // mass), so apply_topp_trunc yields AR's distribution for the row.
     let target_row_at = |pos: usize| -> Vec<f32> {
         let mut row = host_probs[pos * vocab..(pos + 1) * vocab].to_vec();
         apply_topp_trunc(&mut row, tau[pos], z[pos]);
@@ -4347,10 +4347,10 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                     0.0
                 };
 
-                // Host nucleus cut. The softmax kernel already folded
-                // sampling.top_k into tau (tau = max(tau_p, tau_k)), so
-                // apply_topp_trunc applies the combined top_k+top_p nucleus —
-                // the SAME cut the target side gets (keeps the accept lossless).
+                // Host truncation cut. The softmax kernel's tau/Z already
+                // encode AR's law (top_k pool, min_p, nucleus over the pool
+                // mass), so apply_topp_trunc applies the SAME cut the target
+                // side gets.
                 apply_topp_trunc(&mut probs, tau[0], z[0]);
 
                 // Host-RNG categorical sample from the SAME truncated nucleus we

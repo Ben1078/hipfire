@@ -927,7 +927,9 @@ pub struct SpecRequestConfig {
     pub temp: f32,
     /// Nucleus (top-p) mass. `1.0` disables nucleus truncation.
     pub top_p: f32,
-    /// Top-k truncation. `0` disables top-k.
+    /// Request top-k; `0` = absent (the daemon maps an absent or zero wire
+    /// `top_k` to `None` → 0 here). Verifiers that reproduce the AR sampler
+    /// take [`Self::ar_candidate_cap`] instead of this raw value.
     pub top_k: usize,
     /// Min-p truncation floor. `0.0` disables.
     pub min_p: f32,
@@ -937,6 +939,16 @@ pub struct SpecRequestConfig {
     pub rng_seed: u64,
     /// When true, allow n-gram draft modifiers that touch the proposal stream.
     pub allow_ngram_modifier: bool,
+}
+
+impl SpecRequestConfig {
+    /// The AR sampler's candidate cap for this request
+    /// ([`crate::llama::ar_candidate_cap`]): absent (`0`) → 20, `k` →
+    /// `min(k, 64)`. Never 0, so a verifier taking it as its top-k always
+    /// truncates to AR's pool.
+    pub fn ar_candidate_cap(&self) -> usize {
+        crate::llama::ar_candidate_cap((self.top_k > 0).then_some(self.top_k as u32))
+    }
 }
 
 impl Default for SpecRequestConfig {
@@ -1769,6 +1781,23 @@ impl PldMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AR candidate cap mirrors the GPU `sample_top_p` kernel's pool:
+    /// absent top_k → 20, k → min(k, 64); never 0 (a sampled verifier always
+    /// truncates to AR's pool).
+    #[test]
+    fn ar_candidate_cap_matches_ar_sampler_pool() {
+        let cfg = |top_k| SpecRequestConfig { top_k, ..SpecRequestConfig::default() };
+        assert_eq!(cfg(0).ar_candidate_cap(), 20);
+        assert_eq!(cfg(1).ar_candidate_cap(), 1);
+        assert_eq!(cfg(20).ar_candidate_cap(), 20);
+        assert_eq!(cfg(40).ar_candidate_cap(), 40);
+        assert_eq!(cfg(64).ar_candidate_cap(), 64);
+        assert_eq!(cfg(1000).ar_candidate_cap(), 64);
+        assert_eq!(crate::llama::ar_candidate_cap(None), 20);
+        assert_eq!(crate::llama::ar_candidate_cap(Some(0)), 64);
+        assert_eq!(crate::llama::ar_candidate_cap(Some(7)), 7);
+    }
 
     // Locks the load-bearing loop contract: the daemon advances `position` by
     // `emit.len()`, NOT by `accepted`. For a chain window that accepted 2 of 4

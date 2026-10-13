@@ -135,7 +135,10 @@ impl Qwen35MtpDrafter {
         state.set_sampling(
             MtpSamplingConfig {
                 temp: cfg.temp,
-                top_k: cfg.top_k,
+                // AR candidate cap: the sampled verify / draft rows reproduce
+                // the AR sampler's law (top-cap pool, min_p, nucleus over the
+                // pool mass), not a full-vocab nucleus.
+                top_k: cfg.ar_candidate_cap(),
                 top_p,
                 min_p: cfg.min_p,
             },

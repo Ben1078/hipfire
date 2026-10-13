@@ -7657,6 +7657,27 @@ pub fn apply_unclosed_attractor_block(
     }
 }
 
+/// Default candidate pool of the AR samplers: the GPU `sample_top_p` kernel
+/// with no request `top_k` (`sampling.rs` sends 20) and the CPU
+/// [`sample_top_p`] (`TOP_K = 20`).
+pub const AR_SAMPLE_DEFAULT_POOL: usize = 20;
+/// Gather budget of the GPU `sample_top_p` kernel: a request `top_k` above it
+/// is capped here.
+pub const AR_SAMPLE_WIDE_POOL: usize = 64;
+
+/// The candidate cap the AR sampler draws from for a request `top_k` (the
+/// daemon's `Option<u32>`, `0` already filtered to `None`): absent → 20,
+/// `0` → 64, `k` → `min(k, 64)`. A sampled speculative verifier reproduces AR
+/// by truncating to this many top candidates, then applying min_p and the
+/// nucleus over their own mass (`softmax_temp_topp_batched_f32`).
+pub fn ar_candidate_cap(top_k: Option<u32>) -> usize {
+    match top_k {
+        None => AR_SAMPLE_DEFAULT_POOL,
+        Some(0) => AR_SAMPLE_WIDE_POOL,
+        Some(k) => (k as usize).min(AR_SAMPLE_WIDE_POOL),
+    }
+}
+
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
