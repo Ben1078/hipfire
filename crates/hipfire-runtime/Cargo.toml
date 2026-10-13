@@ -89,6 +89,14 @@ smallvec = "1"
 # per-iteration costs but not the algorithmic shape — this regex restores
 # the canonical chunking.
 regex = "1"
+# NFC normalizer for HF tokenizer.json files that declare `normalizer: NFC`
+# (Qwen2 family). Pinned to the exact crate HF `tokenizers` 0.22.2 uses for
+# its NFC normalizer: its tables are Unicode 9.0.0, so characters assigned
+# later (e.g. U+089B, U+1DF7) are class-0 starters and are never reordered or
+# composed. Newer-Unicode normalizers (ICU) reorder them, diverging from HF.
+# Exact pin: any table change alters token ids. Only `smallvec` (already a
+# runtime dependency) is pulled in. License MIT/Apache-2.0.
+unicode-normalization-alignments = "=0.1.12"
 # Renders the upstream HF chat_template (Jinja) when present in
 # .hfq metadata, so prompt framing matches what the model was
 # trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`

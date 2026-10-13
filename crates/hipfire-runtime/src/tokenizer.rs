@@ -10,29 +10,365 @@ use regex::Regex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
-/// GPT-2 / cl100k-style pre-tokenization regex. Same family of pattern
-/// every reference byte-level BPE encoder uses (tiktoken, HF tokenizers,
-/// GPT-2): chunk input into contractions, letter words, digit runs ≤3,
-/// punctuation runs, and whitespace runs. BPE then runs per-chunk
-/// instead of on the whole prompt, restoring the canonical O(N) shape
-/// with bounded per-chunk constants.
+/// Canonical GPT-2 / cl100k-style pre-tokenization regex (llama.cpp `gpt2`
+/// pre-tokenizer). It is the fallback for GGUF sources and for HF
+/// tokenizer.json files without a usable `Split` regex: contractions,
+/// letter words, digit runs ≤3, punctuation runs, and whitespace runs. BPE
+/// then runs per chunk instead of on the whole prompt.
 ///
-/// Lookahead `\s+(?!\S)` is omitted from the canonical pattern; the
-/// `regex` crate doesn't support lookaround and the surviving `\s+`
-/// branch matches the same byte spans. Order of alternation preserves
-/// the priority the reference encoders use, so chunking boundaries
-/// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
-/// (verified against locked niah_4k token md5).
-const GPT2_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+/// The `\s+(?!\S)` lookahead alternative is kept in the source text and
+/// emulated exactly by [`PretokSplitter`] (the `regex` crate has no
+/// lookaround); see there for the mechanics.
+const CANONICAL_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-fn gpt2_pretok_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(GPT2_PRETOK_PATTERN)
-            .expect("GPT2_PRETOK_PATTERN must compile — pattern is a const")
-    })
+/// The only lookaround the splitter understands: a whitespace-run
+/// alternative with a trailing `(?!\S)`, immediately followed by its plain
+/// `\s+` fallback alternative.
+const WS_LOOKAHEAD_ALT: &str = r"\s+(?!\S)|";
+/// Name of the capture group wrapped around the plain `\s+` alternative so a
+/// match can be attributed to it.
+const WS_TAIL_GROUP: &str = "hf_ws_tail";
+
+/// Bookkeeping for the emulated `\s+(?!\S)` alternative.
+struct WsTail {
+    /// Capture index of the plain `\s+` alternative.
+    group: usize,
+    /// `\A\s+\z` — cheap pre-check that a match is whitespace-only before
+    /// paying for a capture search. Uses the same `\s` class as the pattern.
+    ws_only: Regex,
+}
+
+/// One compiled HF `Split` regex (behavior `Isolated`).
+///
+/// Pattern text containing the literal `\s+(?!\S)|` has it removed and the
+/// following plain `\s+` alternative wrapped in a named group. Matching is
+/// sequential (`find_at` from the end of the previous piece). In HF's
+/// leftmost-first alternation, `\s+(?!\S)` sits after `\s*[\r\n]+` and
+/// before `\s+`, so it only ever fires on a whitespace run without a
+/// newline: it takes the run minus its LAST char when the run has ≥2 chars
+/// and a non-space follows, or the whole run at end of text. The emulation
+/// reproduces that: when the group (plain `\s+`) matched ≥2 chars and the
+/// match does not reach the end of the text, the last Unicode char is
+/// handed back and matching resumes from it. (The `\s+` match is greedy, so
+/// the following char is by construction non-`\s`.) Whitespace identity is
+/// always the regex's own `\s`, never `char::is_whitespace`.
+struct PretokSplitter {
+    re: Regex,
+    ws_tail: Option<WsTail>,
+    /// The pattern text as given (pre-rewrite); part of the config digest.
+    source: String,
+}
+
+impl PretokSplitter {
+    fn compile(pattern: &str) -> Result<Self, String> {
+        let (src, has_tail) = match pattern.find(WS_LOOKAHEAD_ALT) {
+            None => (pattern.to_owned(), false),
+            Some(i) => {
+                let before = &pattern[..i];
+                let after = &pattern[i + WS_LOOKAHEAD_ALT.len()..];
+                let rest = after
+                    .strip_prefix(r"\s+")
+                    .filter(|r| r.is_empty() || r.starts_with('|') || r.starts_with(')'))
+                    .ok_or_else(|| {
+                        "`\\s+(?!\\S)` is not directly followed by a plain `\\s+` alternative"
+                            .to_string()
+                    })?;
+                (format!(r"{before}(?P<{WS_TAIL_GROUP}>\s+){rest}"), true)
+            }
+        };
+        let re = Regex::new(&src).map_err(|e| e.to_string())?;
+        let ws_tail = if has_tail {
+            let group = re
+                .capture_names()
+                .position(|n| n == Some(WS_TAIL_GROUP))
+                .ok_or_else(|| "whitespace tail group missing after rewrite".to_string())?;
+            let ws_only = Regex::new(r"\A\s+\z").map_err(|e| e.to_string())?;
+            Some(WsTail { group, ws_only })
+        } else {
+            None
+        };
+        Ok(Self {
+            re,
+            ws_tail,
+            source: pattern.to_owned(),
+        })
+    }
+
+    /// End of the piece starting at `start` after applying the `(?!\S)`
+    /// lookahead. Caller guarantees `end < text.len()`.
+    fn ws_lookahead_end(
+        &self,
+        tail: &WsTail,
+        text: &str,
+        start: usize,
+        end: usize,
+        locs: &mut Option<regex::CaptureLocations>,
+    ) -> usize {
+        let run = &text[start..end];
+        let Some(last) = run.chars().next_back() else {
+            return end;
+        };
+        if last.len_utf8() == run.len() || !tail.ws_only.is_match(run) {
+            return end;
+        }
+        let locs = locs.get_or_insert_with(|| self.re.capture_locations());
+        if self.re.captures_read_at(locs, text, start).is_none()
+            || locs.get(tail.group) != Some((start, end))
+        {
+            return end;
+        }
+        end - last.len_utf8()
+    }
+
+    /// Isolated split of `text`: every match is a piece, unmatched text
+    /// between matches is its own piece.
+    fn split<'a>(&self, text: &'a str, out: &mut Vec<&'a str>) {
+        let mut locs = None;
+        let (mut pos, mut gap) = (0usize, 0usize);
+        while pos < text.len() {
+            let Some(m) = self.re.find_at(text, pos) else {
+                break;
+            };
+            let (start, mut end) = (m.start(), m.end());
+            if end == start {
+                // Empty match consumes nothing: step over one char (it joins the gap).
+                match text[start..].chars().next() {
+                    Some(c) => {
+                        pos = start + c.len_utf8();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            if let Some(tail) = &self.ws_tail {
+                if end < text.len() {
+                    end = self.ws_lookahead_end(tail, text, start, end, &mut locs);
+                }
+            }
+            if start > gap {
+                out.push(&text[gap..start]);
+            }
+            out.push(&text[start..end]);
+            gap = end;
+            pos = end;
+        }
+        if gap < text.len() {
+            out.push(&text[gap..]);
+        }
+    }
+}
+
+/// Ordered chain of `Split` stages (HF `Sequence`); each stage re-splits the
+/// pieces of the previous one. Never empty. Compiled once per tokenizer.
+struct Gpt2Pretokenizer {
+    splitters: Vec<PretokSplitter>,
+}
+
+impl Gpt2Pretokenizer {
+    fn pieces<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        let mut cur = Vec::with_capacity(text.len() / 4 + 1);
+        self.splitters[0].split(text, &mut cur);
+        for s in &self.splitters[1..] {
+            let mut next = Vec::with_capacity(cur.len());
+            for &p in &cur {
+                s.split(p, &mut next);
+            }
+            cur = next;
+        }
+        cur
+    }
+}
+
+fn default_pretokenizer() -> &'static Gpt2Pretokenizer {
+    static DEFAULT: LazyLock<Gpt2Pretokenizer> = LazyLock::new(|| Gpt2Pretokenizer {
+        splitters: vec![PretokSplitter::compile(CANONICAL_PRETOK_PATTERN)
+            .expect("CANONICAL_PRETOK_PATTERN must compile — pattern is a const")],
+    });
+    &DEFAULT
+}
+
+/// Extract the `Split` regex chain from an HF `pre_tokenizer` node
+/// (`Split` directly or nested in `Sequence`). `None` — use the canonical
+/// fallback — when there is no regex `Split`, or any regex `Split` cannot be
+/// emulated faithfully (behavior ≠ `Isolated`, `invert`, or a pattern the
+/// `regex` crate cannot compile). A chain is honored whole or not at all.
+/// Other stage types (`ByteLevel`, string-pattern `Split`, …) are ignored,
+/// as before.
+fn pretokenizer_from_hf_json(pre: &serde_json::Value) -> Option<Gpt2Pretokenizer> {
+    fn collect(p: &serde_json::Value, patterns: &mut Vec<String>) -> bool {
+        match p.get("type").and_then(|v| v.as_str()) {
+            Some("Split") => {
+                let Some(re) = p
+                    .get("pattern")
+                    .and_then(|v| v.get("Regex"))
+                    .and_then(|v| v.as_str())
+                else {
+                    return true;
+                };
+                let behavior = p.get("behavior").and_then(|v| v.as_str());
+                let invert = p.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
+                if behavior != Some("Isolated") || invert {
+                    eprintln!(
+                        "[tokenizer] unsupported pre_tokenizer Split (behavior={behavior:?}, \
+                         invert={invert}); using canonical GPT-2 pre-tokenizer"
+                    );
+                    return false;
+                }
+                patterns.push(re.to_owned());
+                true
+            }
+            Some("Sequence") => p
+                .get("pretokenizers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let mut ok = true;
+                    for child in arr {
+                        ok &= collect(child, patterns);
+                    }
+                    ok
+                })
+                .unwrap_or(true),
+            _ => true,
+        }
+    }
+    let mut patterns = Vec::new();
+    if !collect(pre, &mut patterns) || patterns.is_empty() {
+        return None;
+    }
+    let mut splitters = Vec::with_capacity(patterns.len());
+    for pattern in &patterns {
+        match PretokSplitter::compile(pattern) {
+            Ok(s) => splitters.push(s),
+            Err(e) => {
+                eprintln!(
+                    "[tokenizer] unsupported pre_tokenizer regex ({e}); \
+                     using canonical GPT-2 pre-tokenizer"
+                );
+                return None;
+            }
+        }
+    }
+    Some(Gpt2Pretokenizer { splitters })
+}
+
+/// NFC-normalize `text` exactly as HF `tokenizers` does; borrowed (no
+/// allocation) when `text` is already NFC.
+///
+/// HF's `NFC` normalizer is `unicode-normalization-alignments` 0.1.12, whose
+/// tables are **Unicode 9.0.0**. Characters assigned later (e.g. U+089B,
+/// U+1DF7) have combining class 0 there and are never reordered or composed,
+/// so newer-Unicode normalizers (ICU) diverge from HF on them. Using the same
+/// crate and tables makes the result identical by construction.
+fn nfc_normalize(text: &str) -> std::borrow::Cow<'_, str> {
+    use unicode_normalization_alignments::UnicodeNormalization;
+    // ASCII is always NFC. The byte scan is vectorized and avoids Unicode
+    // table probes per character on the dominant code/JSON prompt path.
+    if text.is_ascii() || is_nfc_no_alloc(text) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.nfc().map(|(c, _)| c).collect())
+    }
+}
+
+/// Allocation-free `text.nfc() == text` under the Unicode 9 tables.
+///
+/// The library's own `is_nfc` falls back to `s.chars().eq(s.chars().nfc())`
+/// on a quick-check `Maybe`; that iterator buffers every pending combining
+/// mark in a `SmallVec<[_; 4]>` and spills to the heap on long combining
+/// runs. This keeps the library's quick check (no allocation) and replaces
+/// only the `Maybe` fallback with [`is_nfc_maybe`]. May return `false` for a
+/// text that is in fact NFC (the caller then builds an owned, identical
+/// string); never returns `true` for a text that is not.
+fn is_nfc_no_alloc(text: &str) -> bool {
+    use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
+    match is_nfc_quick(text.chars()) {
+        IsNormalized::Yes => true,
+        IsNormalized::No => false,
+        IsNormalized::Maybe => is_nfc_maybe(text),
+    }
+}
+
+/// Streaming UAX #15 composition check for a text that passed the quick
+/// check's ordering test and contains no QC=No character (so combining marks
+/// are in non-decreasing class order within each run). Mirrors the library's
+/// `Recompositions` state machine while holding only the current starter and
+/// the class of the last mark after it. Returns `false` as soon as a
+/// composition (or a reorder that could compose) would change the text.
+///
+/// Two details beyond "does `starter + mark` compose":
+/// * A starter that is itself precomposed (`ớ` = o U+031B U+0301) hides the
+///   marks of its decomposition. A following mark with a lower class than the
+///   last hidden mark is reordered *into* that decomposition and may compose
+///   there (`ớ` U+0323 → `ợ` U+0301). The check cannot see that from the
+///   precomposed char, so it conservatively reports "not NFC".
+/// * A new starter composes with the previous one when the previous starter
+///   and the *first* character of the new starter's decomposition compose
+///   (Hangul L+V; Indic vowel signs), so that first character is tested.
+fn is_nfc_maybe(text: &str) -> bool {
+    use unicode_normalization_alignments::char::{
+        canonical_combining_class, compose, decompose_canonical,
+    };
+    let mut starter: Option<char> = None;
+    // Class of the last decomposed mark of `starter`, computed on first need.
+    let mut starter_tail_ccc: Option<u8> = None;
+    // Class of the last mark after `starter`; 0 = none pending.
+    let mut last_ccc = 0u8;
+    for ch in text.chars() {
+        let ccc = canonical_combining_class(ch);
+        if ccc == 0 {
+            if let (Some(prev), 0) = (starter, last_ccc) {
+                let mut first = None;
+                decompose_canonical(ch, |d| {
+                    if first.is_none() {
+                        first = Some(d);
+                    }
+                });
+                if compose(prev, first.unwrap_or(ch)).is_some() {
+                    return false;
+                }
+            }
+            starter = Some(ch);
+            starter_tail_ccc = None;
+            last_ccc = 0;
+            continue;
+        }
+        // A mark before any starter is emitted as-is by the library.
+        let Some(s) = starter else { continue };
+        if last_ccc == 0 {
+            let tail = *starter_tail_ccc.get_or_insert_with(|| {
+                let mut last = s;
+                decompose_canonical(s, |d| last = d);
+                canonical_combining_class(last)
+            });
+            if ccc < tail {
+                return false;
+            }
+        }
+        // Unblocked iff the previous mark's class is strictly lower.
+        if last_ccc < ccc && compose(s, ch).is_some() {
+            return false;
+        }
+        last_ccc = ccc;
+    }
+    true
+}
+
+/// True iff an HF `normalizer` node is exactly NFC: `{"type":"NFC"}`, or a
+/// non-empty `Sequence` made only of NFC entries. Anything else (NFD,
+/// Lowercase, Replace, mixed chains, absent) is not recognized and encodes
+/// without normalization, as before.
+fn normalizer_is_nfc(n: &serde_json::Value) -> bool {
+    match n.get("type").and_then(|v| v.as_str()) {
+        Some("NFC") => true,
+        Some("Sequence") => n
+            .get("normalizers")
+            .and_then(|v| v.as_array())
+            .map(|arr| !arr.is_empty() && arr.iter().all(normalizer_is_nfc))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
@@ -172,6 +508,15 @@ pub struct Tokenizer {
     ///     llama.cpp SPM convention).
     /// Unused on the GPT-2 BPE path.
     sp_dummy_prefix: bool,
+    /// GPT-2 BPE pre-tokenizer built from the HF tokenizer.json `Split`
+    /// regex(es) at load. `None` → the canonical pattern
+    /// (`default_pretokenizer`), used by GGUF sources and by HF JSON that
+    /// carries no (or no supported) regex. Always `None` for SentencePiece.
+    hf_pretok: Option<Gpt2Pretokenizer>,
+    /// The tokenizer.json declares an NFC `normalizer` (Qwen2 family):
+    /// non-special text segments are NFC-normalized before pre-tokenization.
+    /// GPT-2 BPE only; `false` for GGUF sources and SentencePiece.
+    normalizer_nfc: bool,
 }
 
 /// Resolve a list of `(left_string, right_string)` merge pairs into a
@@ -425,6 +770,8 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sp_dummy_prefix,
+            hf_pretok: None,
+            normalizer_nfc: false,
         })
     }
 
@@ -552,6 +899,23 @@ impl Tokenizer {
         // pre_tokenizer config, NOT of SentencePiece itself — read it from
         // the tokenizer.json instead of assuming the LLaMA convention.
         let sp_dummy_prefix = sp_dummy_prefix_from_hf_json(&tok);
+        // GPT-2 pre-tokenizer: honor the tokenizer.json `Split` regex(es)
+        // (compiled once, here); `None` → canonical fallback.
+        let hf_pretok = if is_gpt2_bpe {
+            tok.get("pre_tokenizer")
+                .filter(|v| !v.is_null())
+                .and_then(pretokenizer_from_hf_json)
+        } else {
+            None
+        };
+        // Recognized tokenizer.json `normalizer: NFC` (GPT-2 path only; the
+        // SentencePiece path is untouched). Any other normalizer shape is
+        // ignored, as before.
+        let normalizer_nfc = is_gpt2_bpe
+            && tok
+                .get("normalizer")
+                .map(normalizer_is_nfc)
+                .unwrap_or(false);
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -573,6 +937,8 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sp_dummy_prefix,
+            hf_pretok,
+            normalizer_nfc,
         })
     }
 
@@ -757,7 +1123,15 @@ impl Tokenizer {
             eot_id,
             is_gpt2_bpe,
             sp_dummy_prefix,
+            hf_pretok: None,
+            normalizer_nfc: false,
         })
+    }
+
+    /// GPT-2 BPE pre-tokenizer: the tokenizer.json `Split` chain when one was
+    /// loaded, else the shared canonical splitter (compiled once, lazily).
+    fn pretokenizer(&self) -> &Gpt2Pretokenizer {
+        self.hf_pretok.as_ref().unwrap_or_else(|| default_pretokenizer())
     }
 
     /// True if `id` is any end-of-generation terminator (`eos_id` or the
@@ -893,6 +1267,12 @@ impl Tokenizer {
         if !self.is_gpt2_bpe {
             return self.encode_sentencepiece(text);
         }
+        if self.normalizer_nfc {
+            // HF normalizes each non-special segment on its own; `encode`
+            // hands this function exactly those segments. Borrowed (no
+            // allocation) when the segment is already NFC.
+            return self.encode_gpt2_bpe(&nfc_normalize(text));
+        }
         self.encode_gpt2_bpe(text)
     }
 
@@ -1020,7 +1400,8 @@ impl Tokenizer {
     /// encoded token IDs will silently diverge from every reference
     /// implementation.
     fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
-        // Pre-tokenize via GPT-2 / cl100k regex, then BPE each chunk
+        // Pre-tokenize via the HF `Split` regex (or the canonical GPT-2 /
+        // cl100k fallback), then BPE each chunk
         // independently. Reference behaviour for byte-level BPE; without
         // this step the merge PQ degenerates to a single O(N log N)
         // problem over the whole prompt (~150K cross-word merges with
@@ -1033,14 +1414,14 @@ impl Tokenizer {
         // → tokens, so `len/4` is a sane lower bound that avoids early
         // reallocs without wasting memory on short inputs.
         let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
-        for m in gpt2_pretok_re().find_iter(text) {
-            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        for piece in self.pretokenizer().pieces(text) {
+            self.encode_gpt2_chunk(piece.as_bytes(), &mut result);
         }
         result
     }
 
     /// BPE-encode a single pre-tokenized chunk (byte slice from
-    /// `gpt2_pretok_re().find_iter`) and append the resulting token ids
+    /// `pretokenizer().pieces`) and append the resulting token ids
     /// to `out`. Splitting this out of `encode_gpt2_bpe` lets the regex
     /// driver feed many small chunks through the same PQ machinery
     /// without re-allocating the heap/linked-list state across the full
@@ -1779,6 +2160,8 @@ mod bpe_tests {
             eot_id: None,
             is_gpt2_bpe: true,
             sp_dummy_prefix: true,
+            hf_pretok: None,
+            normalizer_nfc: false,
         }
     }
 
@@ -1874,6 +2257,342 @@ mod bpe_tests {
         // pointing at vocab id 2 ("aaaa").
         assert_eq!(out.len(), 256);
         assert!(out.iter().all(|&id| id == 2));
+    }
+}
+
+#[cfg(test)]
+mod pretok_tests {
+    //! Pre-tokenizer splitter: exact `\s+(?!\S)` emulation, HF `Split` regex
+    //! selection from tokenizer.json, GGUF canonical fallback.
+    use super::*;
+    use serde_json::json;
+
+    /// Qwen2 / dots.ocr tokenizer.json `Split` regex (single-digit `\pN`,
+    /// `[\pL\pM]+` letter branch), contractions spelled out.
+    const QWEN_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\pL\pN]?[\pL\pM]+|\pN| ?[^\s\pL\pM\pN]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// Canonical (GGUF fallback) pretokenizer pieces.
+    fn canon(text: &str) -> Vec<&str> {
+        default_pretokenizer().pieces(text)
+    }
+
+    fn single(pattern: &str) -> Gpt2Pretokenizer {
+        Gpt2Pretokenizer {
+            splitters: vec![PretokSplitter::compile(pattern).expect("pattern compiles")],
+        }
+    }
+
+    #[test]
+    fn whitespace_run_before_nonspace_leaves_last_char() {
+        assert_eq!(canon("a  b"), vec!["a", " ", " b"]);
+        assert_eq!(canon("a   b"), vec!["a", "  ", " b"]);
+        assert_eq!(canon("a b"), vec!["a", " b"]);
+        assert_eq!(canon("I'm  here"), vec!["I", "'m", " ", " here"]);
+    }
+
+    #[test]
+    fn tabs_and_mixed_whitespace() {
+        assert_eq!(canon("a\t\tb"), vec!["a", "\t", "\tb"]);
+        assert_eq!(canon("a \t b"), vec!["a", " \t", " b"]);
+        assert_eq!(canon("a\t \tb"), vec!["a", "\t ", "\tb"]);
+    }
+
+    #[test]
+    fn newline_alternative_is_not_split() {
+        assert_eq!(canon("a  \n  b"), vec!["a", "  \n", " ", " b"]);
+        assert_eq!(canon("x \n\n  y"), vec!["x", " \n\n", " ", " y"]);
+        assert_eq!(canon("a\r\n b"), vec!["a", "\r\n", " b"]);
+        assert_eq!(canon("a\n\nb"), vec!["a", "\n\n", "b"]);
+    }
+
+    #[test]
+    fn trailing_whitespace_stays_whole() {
+        assert_eq!(canon("a  "), vec!["a", "  "]);
+        assert_eq!(canon("a \t"), vec!["a", " \t"]);
+        assert_eq!(canon("   "), vec!["   "]);
+        assert_eq!(canon("a \n"), vec!["a", " \n"]);
+        assert_eq!(canon("a\n  "), vec!["a", "\n", "  "]);
+    }
+
+    #[test]
+    fn one_char_and_empty_inputs() {
+        assert_eq!(canon(""), Vec::<&str>::new());
+        assert_eq!(canon(" "), vec![" "]);
+        assert_eq!(canon("  "), vec!["  "]);
+        assert_eq!(canon("1 2"), vec!["1", " ", "2"]);
+    }
+
+    #[test]
+    fn last_space_before_digit_or_punct() {
+        // The kept last space is re-matched from its own position; it
+        // attaches to a following letter/punct run but not to a digit.
+        assert_eq!(canon("a  1"), vec!["a", " ", " ", "1"]);
+        assert_eq!(canon("a  ,"), vec!["a", " ", " ,"]);
+        assert_eq!(canon("a   12"), vec!["a", "  ", " ", "12"]);
+    }
+
+    #[test]
+    fn unicode_whitespace_class() {
+        // Every char below is `\s` (Unicode White_Space) and none is a
+        // newline for `[\r\n]`; the split keeps all but the last CHAR
+        // (not byte) of the run.
+        for ws in [
+            '\u{00A0}', '\u{0085}', '\u{1680}', '\u{2003}', '\u{202F}', '\u{3000}', '\u{000B}',
+            '\u{000C}',
+        ] {
+            let text = format!("a{ws}{ws}b");
+            let first = ws.to_string();
+            let tail = format!("{ws}b");
+            assert_eq!(
+                canon(&text),
+                vec!["a", first.as_str(), tail.as_str()],
+                "U+{:04X}",
+                ws as u32
+            );
+        }
+        // Mixed byte widths: the 3-byte last char is the one handed on.
+        assert_eq!(
+            canon("a\u{00A0}\u{3000}b"),
+            vec!["a", "\u{00A0}", "\u{3000}b"]
+        );
+        // Trailing unicode whitespace is not split.
+        assert_eq!(canon("a\u{00A0}\u{3000}"), vec!["a", "\u{00A0}\u{3000}"]);
+        // Pins the compiled `\s` class: U+FEFF is not White_Space, so it
+        // lands in the punctuation branch, not the whitespace alternatives.
+        assert_eq!(
+            canon("a\u{FEFF}\u{FEFF}b"),
+            vec!["a", "\u{FEFF}\u{FEFF}", "b"]
+        );
+    }
+
+    #[test]
+    fn hf_split_regex_digit_and_mark_branches() {
+        let qwen = single(QWEN_PATTERN);
+        // `\pN` (single digit) vs canonical `\p{N}{1,3}`.
+        assert_eq!(qwen.pieces("a123"), vec!["a", "1", "2", "3"]);
+        assert_eq!(canon("a123"), vec!["a", "123"]);
+        // `[\pL\pM]+` keeps combining marks in the word; canonical
+        // `\p{L}+` does not.
+        assert_eq!(qwen.pieces("e\u{0301}x"), vec!["e\u{0301}x"]);
+        assert_eq!(canon("e\u{0301}x"), vec!["e", "\u{0301}x"]);
+        assert_eq!(qwen.pieces("e\u{0301}"), vec!["e\u{0301}"]);
+        assert_eq!(canon("e\u{0301}"), vec!["e", "\u{0301}"]);
+        // Whitespace emulation applies to the HF pattern as well.
+        assert_eq!(qwen.pieces("a  b"), vec!["a", " ", " b"]);
+        // Indented code: the indent run leaves its last space to the word
+        // (HF Qwen encodes "    return" as `ĠĠĠ` + `Ġreturn`).
+        assert_eq!(qwen.pieces("    return"), vec!["   ", " return"]);
+        assert_eq!(qwen.pieces("\n        x"), vec!["\n", "       ", " x"]);
+        assert_eq!(qwen.pieces("a  \n  b"), vec!["a", "  \n", " ", " b"]);
+        assert_eq!(qwen.pieces("a  "), vec!["a", "  "]);
+    }
+
+    #[test]
+    fn pattern_without_lookahead_is_not_trimmed() {
+        let p = single(r"\p{L}+|\s+");
+        assert_eq!(p.pieces("a  b"), vec!["a", "  ", "b"]);
+    }
+
+    #[test]
+    fn unsupported_patterns_are_rejected() {
+        // Lookahead without a following plain `\s+` fallback alternative.
+        assert!(PretokSplitter::compile(r"\p{L}+|\s+(?!\S)").is_err());
+        assert!(PretokSplitter::compile(r"\p{L}+|\s+(?!\S)|\S+").is_err());
+        // Any other lookaround is beyond the `regex` crate.
+        assert!(PretokSplitter::compile(r"(?<=a)b").is_err());
+        assert!(PretokSplitter::compile(r"a(?=b)|\s+").is_err());
+    }
+
+    #[test]
+    fn chained_splits_keep_gaps() {
+        let digits = single(r"\d+");
+        assert_eq!(digits.pieces("ab12cd"), vec!["ab", "12", "cd"]);
+        let chain = Gpt2Pretokenizer {
+            splitters: vec![
+                PretokSplitter::compile(r"\d+").unwrap(),
+                PretokSplitter::compile(r"[a-z]").unwrap(),
+            ],
+        };
+        assert_eq!(chain.pieces("ab12cd"), vec!["a", "b", "12", "c", "d"]);
+    }
+
+    /// Byte-level BPE tokenizer.json: ids 0..=255 are the GPT-2 byte
+    /// symbols, `extra` follows at 256.., `merges` as `"a b"` strings.
+    fn byte_level_json(extra: &[&str], merges: &[&str], pre_tokenizer: serde_json::Value) -> String {
+        let mut vocab = serde_json::Map::new();
+        for b in 0u32..=255 {
+            vocab.insert(byte_to_gpt2_char(b as u8).to_string(), json!(b));
+        }
+        for (i, t) in extra.iter().enumerate() {
+            vocab.insert((*t).to_string(), json!(256 + i));
+        }
+        json!({
+            "model": {"type": "BPE", "vocab": vocab, "merges": merges},
+            "pre_tokenizer": pre_tokenizer,
+        })
+        .to_string()
+    }
+
+    fn split_node(pattern: &str, behavior: &str) -> serde_json::Value {
+        json!({"type": "Split", "pattern": {"Regex": pattern}, "behavior": behavior, "invert": false})
+    }
+
+    fn qwen_like_pretok() -> serde_json::Value {
+        json!({"type": "Sequence", "pretokenizers": [
+            split_node(QWEN_PATTERN, "Isolated"),
+            {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}
+        ]})
+    }
+
+    fn load(extra: &[&str], merges: &[&str], pre: serde_json::Value) -> Tokenizer {
+        let tok = Tokenizer::from_hf_json(&byte_level_json(extra, merges, pre))
+            .expect("byte-level tokenizer.json loads");
+        assert!(tok.is_gpt2_bpe);
+        tok
+    }
+
+    #[test]
+    fn from_hf_json_honors_nested_split_regex() {
+        let tok = load(&["12"], &["1 2"], qwen_like_pretok());
+        assert!(tok.hf_pretok.is_some());
+        assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "1", "2", "3"]);
+        // Digits are single-char chunks, so the ("1","2") merge never fires.
+        assert_eq!(tok.encode_gpt2_bpe("a123"), vec![97, 49, 50, 51]);
+        assert_eq!(
+            tok.pretokenizer().pieces("x  y"),
+            vec!["x", " ", " y"]
+        );
+    }
+
+    #[test]
+    fn from_hf_json_honors_top_level_split_regex() {
+        let tok = load(&[], &[], split_node(QWEN_PATTERN, "Isolated"));
+        assert!(tok.hf_pretok.is_some());
+        assert_eq!(tok.pretokenizer().pieces("a12"), vec!["a", "1", "2"]);
+    }
+
+    #[test]
+    fn from_hf_json_without_regex_uses_canonical() {
+        for pre in [
+            serde_json::Value::Null,
+            json!({"type": "ByteLevel", "add_prefix_space": false, "use_regex": true}),
+            json!({"type": "Split", "pattern": {"String": " "}, "behavior": "Isolated", "invert": false}),
+        ] {
+            let tok = load(&["12"], &["1 2"], pre);
+            assert!(tok.hf_pretok.is_none());
+            assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "123"]);
+            // Canonical `\p{N}{1,3}` keeps "123" together so the merge fires.
+            assert_eq!(tok.encode_gpt2_bpe("a123"), vec![97, 256, 51]);
+        }
+    }
+
+    #[test]
+    fn from_hf_json_unsupported_regex_falls_back_to_canonical() {
+        // Non-Isolated behavior cannot be emulated by the splitter.
+        let tok = load(&[], &[], split_node(QWEN_PATTERN, "Removed"));
+        assert!(tok.hf_pretok.is_none());
+        assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "123"]);
+        // Lookbehind is not expressible in the `regex` crate.
+        let tok = load(&[], &[], split_node(r"(?<=a)b|\s+", "Isolated"));
+        assert!(tok.hf_pretok.is_none());
+        assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "123"]);
+        // One unsupported Split poisons the whole chain (no partial honor).
+        let mixed = json!({"type": "Sequence", "pretokenizers": [
+            split_node(r"\d+", "Isolated"),
+            split_node(r"(?<=a)b", "Isolated"),
+        ]});
+        let tok = load(&[], &[], mixed);
+        assert!(tok.hf_pretok.is_none());
+    }
+
+    #[test]
+    fn gguf_fallback_keeps_canonical_digit_run_and_lookahead() {
+        let tokens: Vec<String> = (0u32..=255)
+            .map(|b| byte_to_gpt2_char(b as u8).to_string())
+            .collect();
+        let meta = json!({
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.tokens": tokens,
+        });
+        let tok = Tokenizer::from_gguf_meta_json(&meta).expect("gguf-meta tokenizer loads");
+        assert!(tok.is_gpt2_bpe);
+        assert!(tok.hf_pretok.is_none());
+        assert!(std::ptr::eq(tok.pretokenizer(), default_pretokenizer()));
+        assert_eq!(
+            tok.pretokenizer().pieces("a1234  b"),
+            vec!["a", "123", "4", " ", " b"]
+        );
+    }
+
+    /// tokenizer.json with `normalizer`/`added_tokens` grafted on.
+    fn byte_level_json_nfc(
+        extra: &[&str],
+        merges: &[&str],
+        normalizer: serde_json::Value,
+        added: serde_json::Value,
+    ) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&byte_level_json(extra, merges, serde_json::Value::Null))
+                .unwrap();
+        v["normalizer"] = normalizer;
+        v["added_tokens"] = added;
+        v.to_string()
+    }
+
+    #[test]
+    fn nfc_normalizer_recognition() {
+        assert!(normalizer_is_nfc(&json!({"type": "NFC"})));
+        assert!(normalizer_is_nfc(
+            &json!({"type": "Sequence", "normalizers": [{"type": "NFC"}]})
+        ));
+        assert!(!normalizer_is_nfc(&json!({"type": "NFD"})));
+        assert!(!normalizer_is_nfc(&json!({"type": "Lowercase"})));
+        assert!(!normalizer_is_nfc(
+            &json!({"type": "Sequence", "normalizers": [{"type": "NFC"}, {"type": "Lowercase"}]})
+        ));
+        assert!(!normalizer_is_nfc(&json!({"type": "Sequence", "normalizers": []})));
+        assert!(!normalizer_is_nfc(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn nfc_composes_before_bpe_and_per_segment() {
+        // U+00E9 = bytes C3 A9 = GPT-2 symbols "Ã" "©"; merge → id 256.
+        let json = byte_level_json_nfc(
+            &["Ã©", "<|x|>"],
+            &["Ã ©"],
+            json!({"type": "NFC"}),
+            json!([{"id": 257, "content": "<|x|>", "special": true}]),
+        );
+        let tok = Tokenizer::from_hf_json(&json).unwrap();
+        assert!(tok.normalizer_nfc);
+        // Decomposed e + U+0301 composes to é before BPE.
+        assert_eq!(tok.encode("e\u{0301}"), vec![256]);
+        // Already-NFC text is unchanged.
+        assert_eq!(tok.encode("\u{00E9}"), vec![256]);
+        // Normalization runs per segment between special tokens (HF
+        // `normalized: false` added tokens): a mark after a special token
+        // does not compose with the char before it.
+        assert_eq!(tok.encode("e\u{0301}<|x|>\u{0301}"), vec![256, 257, 204, 129]);
+        assert_eq!(tok.encode("<|x|>e\u{0301}"), vec![257, 256]);
+
+        // Same vocab without a normalizer: no composition.
+        let plain = byte_level_json_nfc(
+            &["Ã©", "<|x|>"],
+            &["Ã ©"],
+            serde_json::Value::Null,
+            json!([{"id": 257, "content": "<|x|>", "special": true}]),
+        );
+        let plain = Tokenizer::from_hf_json(&plain).unwrap();
+        assert!(!plain.normalizer_nfc);
+        assert_eq!(plain.encode("e\u{0301}"), vec![101, 204, 129]);
+    }
+
+    #[test]
+    fn nfc_fast_path_does_not_allocate_for_nfc_text() {
+        assert!(matches!(nfc_normalize("héllo wörld"), std::borrow::Cow::Borrowed(_)));
+        let composed = nfc_normalize("e\u{0301}");
+        assert!(matches!(composed, std::borrow::Cow::Owned(_)));
+        assert_eq!(composed, "\u{00E9}");
     }
 }
 
@@ -2092,6 +2811,8 @@ mod sp_tests {
             // convention. Config-driven coverage lives in
             // `sp_dummy_prefix_tests`.
             sp_dummy_prefix: true,
+            hf_pretok: None,
+            normalizer_nfc: false,
         }
     }
 
@@ -2729,5 +3450,166 @@ mod lfm2_bos_tests {
             1,
             "must not double-prepend when text already starts with BOS literal"
         );
+    }
+}
+
+#[cfg(test)]
+mod nfc_exactness_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use unicode_normalization_alignments::{is_nfc, UnicodeNormalization};
+
+    thread_local! {
+        static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts allocations per thread so a test only sees its own.
+    struct CountingAlloc;
+
+    // SAFETY: delegates every operation to `System`; only bumps a
+    // const-initialized thread-local counter (no allocation, no destructor).
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.alloc(layout)
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.alloc_zeroed(layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.realloc(ptr, layout, new_size)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
+
+    fn allocs_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+        let before = ALLOCS.with(|c| c.get());
+        let r = f();
+        (r, ALLOCS.with(|c| c.get()) - before)
+    }
+
+    /// HF's NFC: `text.nfc()` collected, always owned.
+    fn hf_nfc(text: &str) -> String {
+        text.nfc().map(|(c, _)| c).collect()
+    }
+
+    #[test]
+    fn hf_nfc_tables_are_unicode_9() {
+        assert_eq!(unicode_normalization_alignments::UNICODE_VERSION, (9, 0, 0));
+    }
+
+    #[test]
+    fn post_unicode9_marks_are_untouched_like_hf() {
+        // U+089B (Unicode 14) and U+1DF7 (Unicode 10) are unassigned in
+        // Unicode 9: class 0, never reordered. ICU (newer data) reorders
+        // both pairs; HF keeps them.
+        for s in ["\u{0302}\u{089B}", "\u{065D}\u{1DF7}"] {
+            assert_eq!(hf_nfc(s), s);
+            let out = nfc_normalize(s);
+            assert!(matches!(out, Cow::Borrowed(_)), "{s:?} must stay borrowed");
+            assert_eq!(out, s);
+        }
+    }
+
+    #[test]
+    fn common_composition_ordering_and_hangul() {
+        let out = nfc_normalize("e\u{0301}");
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out, "\u{00E9}");
+        assert!(matches!(nfc_normalize("\u{00E9}"), Cow::Borrowed(_)));
+        assert!(matches!(nfc_normalize("plain ascii"), Cow::Borrowed(_)));
+
+        // Canonical reordering (U+0301 ccc 230 after U+0323 ccc 220), then
+        // composition of the unblocked mark: a + U+0301 + U+0323 → ạ U+0301.
+        assert_eq!(nfc_normalize("a\u{0301}\u{0323}"), "\u{1EA1}\u{0301}");
+        assert_eq!(nfc_normalize("a\u{0323}\u{0301}"), "\u{1EA1}\u{0301}");
+        assert!(matches!(nfc_normalize("\u{1EA1}\u{0301}"), Cow::Borrowed(_)));
+
+        // Hangul L V T and LV T compose; the syllable stays borrowed.
+        assert_eq!(nfc_normalize("\u{1112}\u{1161}\u{11AB}"), "\u{D55C}");
+        assert_eq!(nfc_normalize("\u{D558}\u{11AB}"), "\u{D55C}");
+        assert!(matches!(nfc_normalize("\u{D55C}"), Cow::Borrowed(_)));
+
+        // Precomposed starter hides its marks: ớ + U+0323 reorders into the
+        // decomposition (→ ợ U+0301), so it must NOT be reported as NFC.
+        let tricky = "\u{1EDB}\u{0323}";
+        let out = nfc_normalize(tricky);
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out, hf_nfc(tricky));
+        assert_ne!(out, tricky);
+    }
+
+    #[test]
+    fn long_normalized_combining_sequence_borrows_without_allocating() {
+        // 'a' + 40 × U+0346 (ccc 230, does not compose) + U+0301 (QC Maybe,
+        // blocked by the equal-class marks): already NFC, takes the Maybe
+        // path, and far exceeds the library iterator's 4-slot inline buffer.
+        let mut s = String::from("a");
+        for _ in 0..40 {
+            s.push('\u{0346}');
+        }
+        s.push('\u{0301}');
+        assert_eq!(
+            unicode_normalization_alignments::is_nfc_quick(s.chars()),
+            unicode_normalization_alignments::IsNormalized::Maybe
+        );
+        assert_eq!(hf_nfc(&s), s);
+
+        let (borrowed, n) = allocs_during(|| matches!(nfc_normalize(&s), Cow::Borrowed(_)));
+        assert!(borrowed, "already-NFC long combining run must borrow");
+        assert_eq!(n, 0, "borrowed NFC fast path allocated");
+
+        // Why the library checker is not used: on the same input it
+        // allocates (SmallVec spill) while ours does not.
+        let (lib_ok, lib_allocs) = allocs_during(|| is_nfc(&s));
+        assert!(lib_ok);
+        assert!(lib_allocs > 0, "library is_nfc expected to spill on long runs");
+    }
+
+    #[test]
+    fn matches_hf_on_generated_mixed_text() {
+        // Pool: ASCII/precomposed starters, marks of several classes (some
+        // composing, some not), Hangul jamo/syllables, Indic composing
+        // pairs, QC=No chars, and post-Unicode-9 code points.
+        const POOL: &[char] = &[
+            'a', 'e', 'o', 'c', 's', 'x', '\u{00E7}', '\u{1EB7}', '\u{1EDB}', '\u{1E69}',
+            '\u{1EA1}', '\u{01A1}', '\u{0301}', '\u{0302}', '\u{0307}', '\u{0316}',
+            '\u{031B}', '\u{0323}', '\u{0327}', '\u{0328}', '\u{0346}', '\u{0344}',
+            '\u{1100}', '\u{1161}', '\u{11A8}', '\u{AC00}', '\u{AC01}', '\u{0B47}',
+            '\u{0B3E}', '\u{0958}', '\u{065D}', '\u{089B}', '\u{1DF7}',
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = 1 + (next() % 8) as usize;
+            let s: String = (0..len)
+                .map(|_| POOL[(next() % POOL.len() as u64) as usize])
+                .collect();
+            let reference = hf_nfc(&s);
+            let out = nfc_normalize(&s);
+            assert_eq!(out, reference, "output differs for {s:?}");
+            if matches!(out, Cow::Borrowed(_)) {
+                assert_eq!(reference, s, "borrowed but not NFC: {s:?}");
+            }
+            // Never claims NFC where the library's authoritative check
+            // disagrees.
+            if is_nfc_no_alloc(&s) {
+                assert!(is_nfc(&s), "no-alloc check accepted non-NFC {s:?}");
+            }
+        }
     }
 }
