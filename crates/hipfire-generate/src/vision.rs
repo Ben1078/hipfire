@@ -1748,6 +1748,8 @@ pub fn generate_vl(
     // attractor loops that the think cap and repeat penalty miss.
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+    // A terminator ended the turn (vs. the budget running out).
+    let mut decoded_eot = false;
 
     'vl_generate: while generated < max_tokens {
         // Decode-side client-cancel poll — roll back synchronously (same
@@ -1870,16 +1872,12 @@ pub fn generate_vl(
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[emitted_bytes..];
         emitted_bytes = all_bytes.len();
-        if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes) {
-            break;
-        }
-        if next_token == config.eos_token {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-        if tokenizer.is_terminator(next_token) {
+        if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes)
+            || next_token == config.eos_token
+            || im_end_token == Some(next_token)
+            || tokenizer.is_terminator(next_token)
+        {
+            decoded_eot = true;
             break;
         }
 
@@ -2041,6 +2039,7 @@ pub fn generate_vl(
                             new_bytes,
                         ) {
                             generated += 1;
+                            decoded_eot = true;
                             break 'vl_generate;
                         }
                         generated += 1;
@@ -2212,6 +2211,7 @@ pub fn generate_vl(
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
         "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
+        "finish_reason": crate::common::length_or_stop(generated, max_tokens, decoded_eot),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => {

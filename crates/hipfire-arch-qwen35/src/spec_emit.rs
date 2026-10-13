@@ -29,9 +29,14 @@ use hipfire_runtime::tokenizer::Tokenizer;
 pub struct Qwen35Emit<'a> {
     tokenizer: &'a Tokenizer,
     filter: EosFilter,
-    /// Index into the freshly-decoded byte stream past which bytes have not yet
-    /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
-    bytes_fed_to_filter: usize,
+    /// Raw bytes of `streamed_tokens`, grown one token at a time; its length
+    /// is the offset past which bytes have not yet been fed to the filter.
+    /// (Was a full `decode_bytes(&streamed_tokens)` per committed token —
+    /// O(n²) over a long turn.)
+    stream_bytes: Vec<u8>,
+    /// Incremental `currently_in_think` over `stream_bytes` for the
+    /// max_think budget (was a full re-decode + rfind per token).
+    think_scan: ThinkScan,
     /// Every committed token in order, for byte decoding + the cache-store the
     /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
     streamed_tokens: Vec<u32>,
@@ -66,6 +71,85 @@ pub struct Qwen35Emit<'a> {
     /// `generated` counter at the point of the most recent `observe` — only used
     /// for the attractor-detect log message (byte-for-byte stderr parity).
     generated_hint: usize,
+}
+
+/// Incremental, exact equivalent of
+/// `currently_in_think(std::str::from_utf8(bytes).unwrap_or(""), open)` over
+/// a byte buffer that only grows: tracks the last `<think>` / `</think>`
+/// offsets and whether the whole buffer is valid UTF-8 (an invalid or
+/// incomplete buffer reads as `""`, i.e. "no tags", as before).
+#[derive(Default)]
+struct ThinkScan {
+    /// Buffer length already searched for markers.
+    scanned: usize,
+    last_open: Option<usize>,
+    last_close: Option<usize>,
+    /// Prefix length known to be valid UTF-8 (ends on a char boundary).
+    utf8_valid: usize,
+    /// A byte sequence that can never become valid was seen.
+    utf8_broken: bool,
+}
+
+impl ThinkScan {
+    const OPEN: &'static [u8] = b"<think>";
+    const CLOSE: &'static [u8] = b"</think>";
+
+    fn update(&mut self, buf: &[u8]) {
+        if buf.len() == self.scanned {
+            return;
+        }
+        for (marker, last) in [
+            (Self::OPEN, &mut self.last_open),
+            (Self::CLOSE, &mut self.last_close),
+        ] {
+            // Start positions whose match could not complete before.
+            let from = self.scanned.saturating_sub(marker.len() - 1);
+            if buf.len() >= marker.len() {
+                for i in from..=buf.len() - marker.len() {
+                    if &buf[i..i + marker.len()] == marker {
+                        *last = Some(i);
+                    }
+                }
+            }
+        }
+        self.scanned = buf.len();
+        if !self.utf8_broken {
+            match std::str::from_utf8(&buf[self.utf8_valid..]) {
+                Ok(_) => self.utf8_valid = buf.len(),
+                Err(e) => {
+                    self.utf8_valid += e.valid_up_to();
+                    self.utf8_broken = e.error_len().is_some();
+                }
+            }
+        }
+    }
+
+    fn in_think(&self, started_in_think: bool) -> bool {
+        if self.utf8_broken || self.utf8_valid != self.scanned {
+            return currently_in_think("", started_in_think);
+        }
+        match (self.last_open, self.last_close) {
+            (Some(o), Some(c)) => o > c,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => started_in_think,
+        }
+    }
+}
+
+/// `String::from_utf8_lossy(bytes)` ends with one of `stops`, decoding only a
+/// bounded tail. Lossy decoding restarts at every non-continuation byte and
+/// never yields fewer bytes than it consumes, so the decode of a tail that
+/// starts at such a byte and is at least as long as the longest stop ends
+/// exactly like the decode of the whole buffer.
+fn lossy_ends_with_any(bytes: &[u8], stops: &[String]) -> bool {
+    let longest = stops.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut start = bytes.len().saturating_sub(longest);
+    while start > 0 && start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+        start -= 1;
+    }
+    let tail = String::from_utf8_lossy(&bytes[start..]);
+    stops.iter().any(|s| tail.ends_with(s.as_str()))
 }
 
 fn think_continuation_text() -> String {
@@ -127,7 +211,8 @@ impl<'a> Qwen35Emit<'a> {
         Box::new(Self {
             tokenizer: ctx.tokenizer,
             filter: EosFilter::new(qwen_dflash_eos_filter_config()),
-            bytes_fed_to_filter: 0,
+            stream_bytes: Vec::new(),
+            think_scan: ThinkScan::default(),
             streamed_tokens: Vec::new(),
             router: if tool_protocol_enabled {
                 ToolOutputRouter::new()
@@ -244,10 +329,10 @@ impl<'a> Qwen35Emit<'a> {
             id: token,
             idx: self.streamed_tokens.len() - 1,
         });
-        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
-        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
-        self.bytes_fed_to_filter = all_bytes.len();
-        let action = self.filter.observe(new_bytes);
+        let fed = self.stream_bytes.len();
+        self.tokenizer
+            .decode_token_bytes_into(token, &mut self.stream_bytes);
+        let action = self.filter.observe(&self.stream_bytes[fed..]);
         self.apply_filter_action(action, &mut events);
         events
     }
@@ -278,10 +363,8 @@ impl<'a> Qwen35Emit<'a> {
         if self.stop.is_empty() {
             return false;
         }
-        let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
-        self.stop
-            .iter()
-            .any(|s| decoded_suffix.ends_with(s.as_str()))
+        // `decode(&streamed_tokens)` is `from_utf8_lossy(stream_bytes)`.
+        lossy_ends_with_any(&self.stream_bytes, &self.stop)
     }
 
     /// True when this turn ended on a decoded EOT (token id or filter stop_at).
@@ -384,9 +467,8 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         // max_think_tokens enforcement. Mirrors 4632-4664.
         if self.max_think_tokens > 0 {
-            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(raw_str, self.open_think_prefix);
+            self.think_scan.update(&self.stream_bytes);
+            let in_think = self.think_scan.in_think(self.open_think_prefix);
             if in_think && !self.prev_in_think {
                 self.think_count = 0;
             }
@@ -960,4 +1042,89 @@ mod tests {
         assert!(cfg.stop_at.iter().any(|s| s == b"<|im_end|>"));
         assert!(cfg.stop_at.iter().any(|s| s == b"<|endoftext|>"));
     }
+
+    /// Tiny xorshift for the reference-equivalence tests below.
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut x = seed | 1;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        }
+    }
+
+    /// Byte pieces that exercise markers split across appends, multi-byte
+    /// and invalid UTF-8.
+    const PIECES: &[&[u8]] = &[
+        b"<think>", b"</think>", b"<", b"/", b"think", b">", b"<th", b"ink>", b"</th",
+        b"a", b" b", b"\n", "中".as_bytes(), &[0xE4], &[0xB8], &[0xAD], &[0xFF], &[0x80],
+        "🎉".as_bytes(), &[0xF0, 0x9F], &[0x8E, 0x89], b"stop", b"END",
+    ];
+
+    #[test]
+    fn think_scan_matches_full_redecode_reference() {
+        let mut next = rng(0x5eed);
+        for case in 0..3000 {
+            let started = case % 2 == 0;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut scan = ThinkScan::default();
+            for step in 0..(1 + next() % 24) {
+                buf.extend_from_slice(PIECES[(next() % PIECES.len() as u64) as usize]);
+                // The emitter only updates when the budget check runs; skip
+                // some updates to cover catch-up over several appends.
+                if step % 3 == 0 || next() % 2 == 0 {
+                    scan.update(&buf);
+                    let reference =
+                        currently_in_think(std::str::from_utf8(&buf).unwrap_or(""), started);
+                    assert_eq!(scan.in_think(started), reference, "{buf:?} started={started}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_stop_suffix_matches_full_lossy_decode() {
+        let mut next = rng(0xabcdef);
+        let stop_sets: Vec<Vec<String>> = vec![
+            vec!["stop".into()],
+            vec!["END".into(), "\u{FFFD}".into()],
+            vec!["中".into(), "b\n".into()],
+            vec!["\u{FFFD}stop".into()],
+            vec!["🎉".into()],
+            vec!["".into()],
+        ];
+        for _ in 0..5000 {
+            let mut buf: Vec<u8> = Vec::new();
+            for _ in 0..(next() % 12) {
+                buf.extend_from_slice(PIECES[(next() % PIECES.len() as u64) as usize]);
+            }
+            for stops in &stop_sets {
+                let full = String::from_utf8_lossy(&buf);
+                let reference = stops.iter().any(|s| full.ends_with(s.as_str()));
+                assert_eq!(lossy_ends_with_any(&buf, stops), reference, "{buf:?} {stops:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn stream_bytes_equal_full_decode_bytes() {
+        let tok = test_tokenizer();
+        let mut emit = make_emit(&tok);
+        let text = "pre <think>\nwhy 中🎉</think>\nanswer";
+        let ids = tok.encode(text);
+        let _ = emit.begin(ids[0]);
+        for &t in &ids[1..] {
+            let _ = emit.observe(t);
+        }
+        let streamed = emit.streamed_tokens().to_vec();
+        assert_eq!(streamed, ids);
+        assert_eq!(tok.decode_bytes(&streamed), text.as_bytes());
+        let mut acc = Vec::new();
+        for &t in &streamed {
+            tok.decode_token_bytes_into(t, &mut acc);
+        }
+        assert_eq!(acc, tok.decode_bytes(&streamed));
+    }
+
 }

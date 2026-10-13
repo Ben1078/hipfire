@@ -730,6 +730,17 @@ pub fn qwen_dflash_hit_length_cap(
     generated >= max_tokens && !decoded_eot && !semantic_stop
 }
 
+/// Wire `finish_reason` for a route without tool calls or stop sequences:
+/// `"length"` when the budget ran out, `"stop"` otherwise. A decoded EOT on
+/// the final budget token is a stop, not a length cap (AR parity).
+pub fn length_or_stop(generated: usize, max_tokens: usize, decoded_eot: bool) -> &'static str {
+    if generated >= max_tokens && !decoded_eot {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 /// Shared ctx-capacity margin for the spec entry guard (`generate_dflash`
 /// AR fallback) and the in-loop guard (`generate_spec` hard error). A
 /// request fits only when prompt + budget + one full draft block fits the

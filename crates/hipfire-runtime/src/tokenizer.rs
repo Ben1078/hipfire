@@ -1173,34 +1173,44 @@ impl Tokenizer {
     pub fn decode_bytes(&self, tokens: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for &id in tokens {
-            if let Some(tok) = self.vocab.get(id as usize) {
-                if self.is_gpt2_bpe {
-                    for ch in tok.chars() {
-                        match ch {
-                            'Ġ' => bytes.push(b' '),
-                            'Ċ' => bytes.push(b'\n'),
-                            'ĉ' => bytes.push(b'\t'),
-                            c if c.is_ascii() => bytes.push(c as u8),
-                            c => {
-                                if let Some(b) = gpt2_char_to_byte(c) {
-                                    bytes.push(b);
-                                } else {
-                                    let mut buf = [0u8; 4];
-                                    let s = c.encode_utf8(&mut buf);
-                                    bytes.extend_from_slice(s.as_bytes());
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // hunt3 H-C: byte-correct path — <0xHH> fallback tokens must
-                    // emit raw bytes, not `byte as char` re-UTF8-encoded codepoints.
-                    let decoded = tok.replace('▁', " ");
-                    bytes.extend_from_slice(&decode_hex_escapes_bytes(&decoded));
-                }
-            }
+            self.decode_token_bytes_into(id, &mut bytes);
         }
         bytes
+    }
+
+    /// Append one token's raw bytes to `out`. Decoding is per token, so
+    /// appending each id in turn yields exactly [`Self::decode_bytes`] of
+    /// the whole sequence: a decode loop keeps one growing buffer instead of
+    /// re-decoding its full history every token. Out-of-range ids append
+    /// nothing.
+    pub fn decode_token_bytes_into(&self, id: u32, out: &mut Vec<u8>) {
+        let Some(tok) = self.vocab.get(id as usize) else {
+            return;
+        };
+        if self.is_gpt2_bpe {
+            for ch in tok.chars() {
+                match ch {
+                    'Ġ' => out.push(b' '),
+                    'Ċ' => out.push(b'\n'),
+                    'ĉ' => out.push(b'\t'),
+                    c if c.is_ascii() => out.push(c as u8),
+                    c => {
+                        if let Some(b) = gpt2_char_to_byte(c) {
+                            out.push(b);
+                        } else {
+                            let mut buf = [0u8; 4];
+                            let s = c.encode_utf8(&mut buf);
+                            out.extend_from_slice(s.as_bytes());
+                        }
+                    }
+                }
+            }
+        } else {
+            // hunt3 H-C: byte-correct path — <0xHH> fallback tokens must
+            // emit raw bytes, not `byte as char` re-UTF8-encoded codepoints.
+            let decoded = tok.replace('▁', " ");
+            out.extend_from_slice(&decode_hex_escapes_bytes(&decoded));
+        }
     }
 
     /// Encode text to token IDs.
