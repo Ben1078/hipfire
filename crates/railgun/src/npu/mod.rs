@@ -408,10 +408,11 @@ impl Device {
     /// SHMEM BO over caller-owned user pages (`ptr`, `len` page aligned): the driver pins them (`amdxdna_get_ubuf`,
     /// `pin_user_pages_fast(FOLL_WRITE | FOLL_LONGTERM)`) and charges them to `RLIMIT_MEMLOCK` through the process's
     /// pinned_vm (`amdxdna_ubuf.c:127-133`, `ENOMEM` above the limit); see [`ensure_pin_headroom`].
-    /// It imports the resulting dma-buf (`amdxdna_drm_va_tbl`
-    /// with one entry). The returned `Bo` owns the GEM handle and its own mmap (`Bo::host`, a second CPU view of the
-    /// same pages); under identity SVA the NPU reaches the buffer through that VA. The pages must stay mapped until
-    /// the `Bo` is dropped.
+    /// It imports the resulting dma-buf (`amdxdna_drm_va_tbl` with one entry). `Bo::host` is the caller's own mapping
+    /// (`ptr`, unowned: Drop does not munmap it); under identity SVA the NPU reaches the buffer through that VA. The pages
+    /// must stay mapped until the `Bo` is dropped. The BO is never mmapped: amdxdna's ubuf dma-buf has no mmap since Linux
+    /// 7.1 ("accel/amdxdna: Remove mmap and export support for ubuf"), so every attempt failed `-EINVAL` and logged
+    /// `amdxdna_insert_pages: Failed to mmap dma buf -22` / `amdxdna_gem_obj_mmap: Failed insert pages, ret -22`.
     pub fn userptr_bo(&self, ptr: *mut u8, len: usize) -> Result<Bo, String> {
         if ptr.is_null() || len == 0 || (ptr as usize) % 4096 != 0 || len % 4096 != 0 {
             return Err(format!("userptr_bo: {ptr:p} + {len:#x} must be non-empty and page aligned"));
@@ -426,18 +427,7 @@ impl Device {
         let mut bo = Bo { handle: cb.handle, xdna: u64::MAX, host: core::ptr::null_mut(), len, mapped: false, fd: self.fd };
         let mut gi = GetBoInfo { handle: cb.handle, ..Default::default() };
         ioctl(self.fd, amdxdna::<GetBoInfo>(GET_BO_INFO), &mut gi, "get_bo_info userptr")?;
-        let host = unsafe { sys::mmap(core::ptr::null_mut(), len, sys::PROT_RW, sys::MAP_SHARED, self.fd, gi.map_offset as i64) };
-        // Linux 7.2 amdxdna refuses mmap of a userptr BO (EINVAL); the caller's mapping is a view of the same pinned
-        // pages, so fall back to it (unowned: `mapped` stays false and Drop does not munmap it).
-        if host == sys::MAP_FAILED {
-            if errno() != 22 {
-                return Err(format!("mmap userptr bo: errno={}", errno()));
-            }
-            bo.host = ptr;
-        } else {
-            bo.host = host as *mut u8;
-            bo.mapped = true;
-        }
+        bo.host = ptr;
         bo.xdna = gi.xdna_addr;
         Ok(bo)
     }
