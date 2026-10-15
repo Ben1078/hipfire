@@ -263,9 +263,12 @@ struct BankState { generation: u32, kicked: bool, retired: bool, prepared: bool 
 pub struct OpenOptions {
     pub watchdog: Duration,
     pub cpu_reads: bool,
+    /// Developer-only fault injection: the relay forces a 1 ns chain watchdog on the 1-based Nth chain it runs, counting
+    /// every job it receives in order. This exercises the real "NPU chain watchdog timed out" path with the chain in flight.
+    pub fault_chain: Option<u64>,
 }
 impl Default for OpenOptions {
-    fn default() -> Self { Self { watchdog: CHAIN_WATCHDOG, cpu_reads: false } }
+    fn default() -> Self { Self { watchdog: CHAIN_WATCHDOG, cpu_reads: false, fault_chain: None } }
 }
 impl OpenOptions {
     fn flush_for_cpu_reads(self, flush: impl FnOnce()) {
@@ -512,6 +515,10 @@ impl NpuTrunkRuntime {
     /// Checked teardown. If a GPU consumer does not retire within 3 s, keeps
     /// registrations/pages alive rather than unmapping memory still in use.
     pub fn close(mut self) -> Result<(), String> { self.shutdown() }
+    /// Non-blocking, idempotent: releases every outstanding GPU wait by publishing the terminal signal of every pending
+    /// bank, records the sticky failure (the first reason wins) and stops the relay from running further chains, so later
+    /// kicks fail. Use on any fault in the pair executor before the GPU continues on the same stream.
+    pub fn abort(&self, reason: &str) { self.shared.stop(reason); }
     fn shutdown(&mut self) -> Result<(), String> {
         // Release every outstanding GPU wait BEFORE joining/destructing the
         // NPU context. A late completion cannot replace the cancellation result.
@@ -519,7 +526,7 @@ impl NpuTrunkRuntime {
         self.tx.take();
         let mut failure = None;
         if let Some(relay) = self.relay.take() {
-            if relay.join().is_err() { failure = Some("trunk relay panicked".to_string()); }
+            if let Err(e) = join_within(relay, WAIT_TIMEOUT) { failure = Some(e); }
         }
         let deadline = Instant::now() + WAIT_TIMEOUT;
         for (b, state) in self.banks.iter().zip(self.state.borrow().iter()) {
@@ -737,7 +744,8 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
     impl Drop for RelayExit<'_> { fn drop(&mut self) { self.0.stop("trunk relay exited before completion"); } }
     let _exit = RelayExit(&shared);
     let mut fatal: Option<String> = None;
-    for job in rx {
+    // 1-based relay chain number (`OpenOptions::fault_chain`).
+    for (chain_no, job) in (1u64..).zip(rx) {
         let result = (|| {
             if let Some(e) = &fatal { return Err(format!("trunk relay poisoned: {e}")); }
             if shared.status.lock().stopping { return Err("runtime shutdown before NPU completion".into()); }
@@ -783,7 +791,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
                 (None, None) => (&resources.chains[layer * pages.len() + job.seq.bank], &resources.ctxs[pdi_of_program[program]]),
             };
             let start = Instant::now();
-            let watchdog = options.watchdog;
+            let watchdog = chain_watchdog(&options, chain_no);
             let chain_watchdog = Watchdog::new(start, watchdog);
             let submit_ns = monotonic_ns();
             let point = ctx.submit_chain(chain)?;
@@ -805,6 +813,23 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
         shared.finish(job.seq, result);
     }
     drop(resources); // destroys context before any operand BO, even on timeout
+}
+/// Bounded join: a relay stuck in an NPU driver ioctl is detached (never blocks teardown); the caller must quarantine
+/// everything the relay may still reference.
+fn join_within(handle: thread::JoinHandle<()>, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            std::mem::forget(handle);
+            return Err(format!("trunk relay did not exit within {timeout:?} (stuck in the NPU driver?); runtime quarantined"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    handle.join().map_err(|_| "trunk relay panicked".to_string())
+}
+/// Chain watchdog of the 1-based `chain`th job the relay received: 1 ns on the `fault_chain` one, else `options.watchdog`.
+fn chain_watchdog(options: &OpenOptions, chain: u64) -> Duration {
+    if options.fault_chain == Some(chain) { Duration::from_nanos(1) } else { options.watchdog }
 }
 
 #[cfg(test)]
@@ -1052,5 +1077,53 @@ mod tests {
             assert_eq!(stats.shapes[i], stats.shape(shape));
             assert_eq!(stats.shape(shape).npu_busy_ns, (i as u64 + 1) * 1000);
         }
+    }
+    // `NpuTrunkRuntime` needs HIP, so abort() is exercised at the `Shared` level it delegates to (`abort` = `Shared::stop`).
+    #[test] fn abort_releases_every_pending_wait_once() {
+        let signals = [Signal(AtomicU32::new(0)), Signal(AtomicU32::new(0)), Signal(AtomicU32::new(0))];
+        let s = shared(&signals, 7);
+        let seq = |bank| Seq { bank, value: 7 };
+        s.finish(seq(0), Ok(completion()));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 7);
+        signals[0].0.store(99, Ordering::Release); // a republish would overwrite this
+        s.stop("first reason");
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 99);
+        assert_eq!(signals[1].0.load(Ordering::Acquire), 7);
+        assert_eq!(signals[2].0.load(Ordering::Acquire), 7);
+        assert!(s.status.lock().stopping);
+        assert!(s.wait(seq(0), Duration::from_millis(10)).is_ok());
+        assert!(s.wait(seq(1), Duration::from_millis(10)).unwrap_err().contains("first reason"));
+        assert!(s.wait(seq(2), Duration::from_millis(10)).unwrap_err().contains("first reason"));
+        assert!(s.check_error().unwrap_err().contains("first reason"));
+        s.stop("second reason");
+        s.finish(seq(1), Ok(completion()));
+        s.finish(seq(2), Err("late failure".into()));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 99);
+        let err = s.check_error().unwrap_err();
+        assert!(err.contains("first reason") && !err.contains("second reason") && !err.contains("late failure"));
+        assert!(s.wait(seq(0), Duration::from_millis(10)).is_ok());
+        for bank in [1, 2] { assert!(s.wait(seq(bank), Duration::from_millis(10)).unwrap_err().contains("first reason")); }
+    }
+    #[test] fn fault_chain_forces_only_the_named_chain() {
+        assert_eq!(OpenOptions::default().fault_chain, None);
+        let plain = OpenOptions::default();
+        let faulted = OpenOptions { fault_chain: Some(3), ..OpenOptions::default() };
+        for chain in 1..=5u64 {
+            assert_eq!(chain_watchdog(&plain, chain), plain.watchdog);
+            let expect = if chain == 3 { Duration::from_nanos(1) } else { faulted.watchdog };
+            assert_eq!(chain_watchdog(&faulted, chain), expect);
+        }
+    }
+    #[test] fn join_within_is_bounded() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let blocked = thread::spawn(move || { let _ = rx.recv(); });
+        let start = Instant::now();
+        let err = join_within(blocked, Duration::from_millis(50)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2), "join was not bounded");
+        assert!(err.contains("did not exit"), "{err}");
+        drop(tx); // lets the detached thread exit
+        assert!(join_within(thread::spawn(|| {}), Duration::from_secs(2)).is_ok());
+        let err = join_within(thread::spawn(|| { panic!("relay test panic"); }), Duration::from_secs(2)).unwrap_err();
+        assert!(err.contains("panicked"), "{err}");
     }
 }

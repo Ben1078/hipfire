@@ -238,7 +238,7 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
     let runtime = at(None, "negative-timeout-open", NpuTrunkRuntime::open_with_options(
         vec![PanelProgram { shape, pdi, txn, padded_rows: ROWS, pitch: shape.pitch() }],
         vec![LayerPanels { layer: 0, shape, panels }], 1, ROWS, pci,
-        OpenOptions { watchdog: Duration::from_nanos(1), cpu_reads: true }))?;
+        OpenOptions { watchdog: Duration::from_nanos(1), cpu_reads: true, ..OpenOptions::default() }))?;
     let outcome = (|| {
         let hip = runtime.hip();
         let stream = at(None, "negative-timeout-stream", hip.stream())?;
