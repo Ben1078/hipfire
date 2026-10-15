@@ -5442,9 +5442,18 @@ impl Qwen4GpuForward {
         { false }
     }
 
+    /// A faulted (latched) route plans nothing: callers take exactly the `off` scheduling.
     pub(crate) fn npu_trunk_planned(&self) -> bool {
         #[cfg(target_os = "linux")]
-        { self.npu_trunk.is_some() }
+        { self.npu_trunk.as_ref().is_some_and(|n| !n.faulted()) }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+
+    /// Whether the request in flight tripped the route's fault latch; clears the per-request flag.
+    pub(crate) fn take_npu_trunk_fault(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.as_mut().is_some_and(|n| n.take_request_fault()) }
         #[cfg(not(target_os = "linux"))]
         { false }
     }

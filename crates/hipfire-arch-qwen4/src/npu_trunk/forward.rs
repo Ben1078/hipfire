@@ -43,6 +43,10 @@ pub(super) struct NpuForward {
     request_origin: usize,
     /// Wave-padded bank rows below 8192 whose row-adaptive NPU programs this load admitted ([`admitted_plan`]).
     adaptive: Vec<usize>,
+    /// The fault latch: set by the first pair fault under `auto`, it keeps the route off for the process.
+    latch: trunk::containment::FaultLatch,
+    /// PCI bus id the runtime opened on (host facts in the fault line); `None` when no runtime opened.
+    gpu_pci: Option<String>,
 }
 
 // SAFETY: this private owner exclusively owns the entire railgun HIP Rc graph;
@@ -404,6 +408,7 @@ impl NpuForward {
                 std::fs::OpenOptions::new().create(true).append(true).open(path).map(std::io::BufWriter::new).map_err(fail)
             }).transpose()?;
             pack_ms += started.elapsed().as_secs_f64() * 1000.0;
+            let mut gpu_pci: Option<String> = None;
             let runtime = if physical {
                 let programs = trunk::build_rowmajor_programs_for_families(8192, families).map_err(fail)?;
                 let programs = programs.per_shape.into_iter().filter(|p| p.panel_count != 0).map(|p| PanelProgram {
@@ -418,7 +423,13 @@ impl NpuForward {
                     let (shape, cols) = match shape { T::GdnIn => (Shape::GdnIn, cols[0]), T::QsaIn => (Shape::QsaIn, cols[1]), T::GdnOut => (Shape::GdnOut, 0), T::QsaO => (Shape::QsaO, 0) };
                     trunk::build_program_for_rows(shape, cols, rows).map(|(pdi, txn)| PanelBuild { pdi, txn })
                 });
-                Some(NpuTrunkRuntime::open_with_builder(programs, resident, 2, 8192, &pci, OpenOptions::default(), Some(builder)).map_err(fail)?)
+                gpu_pci = Some(pci.clone());
+                // Developer fault injection: force the chain watchdog of the Nth relay chain (the real NPU-timeout path).
+                let fault_chain = hipfire_config::developer_var("HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN").ok().filter(|v| !v.trim().is_empty()).and_then(|v| match v.trim().parse::<u64>() {
+                    Ok(n) if n > 0 => Some(n),
+                    _ => { eprintln!("npu-trunk: HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN={v:?} ignored (expects a chain number >= 1)"); None }
+                });
+                Some(NpuTrunkRuntime::open_with_builder(programs, resident, 2, 8192, &pci, OpenOptions { fault_chain, ..OpenOptions::default() }, Some(builder)).map_err(fail)?)
             } else { None };
             let arenas = runtime.as_ref().map(|rt| -> Result<_, Qwen4GpuForwardError> {
                 Ok([
@@ -440,9 +451,9 @@ impl NpuForward {
                 None => 0,
             };
             if let (Some(cal), Some(key)) = (&calibration, &cal_key) {
-                eprintln!("{} cal_source={cal_source}", trunk::load_log_line(cal, &trunk::LoadLogKey {
+                eprintln!("{} cal_source={cal_source} host=[{}]", trunk::load_log_line(cal, &trunk::LoadLogKey {
                     current: key, mode: mode.as_str(), families,
-                }, n_star, &trunk::plan(cal, families, 16384), &trunk::plan(cal, families, 65536)));
+                }, n_star, &trunk::plan(cal, families, 16384), &trunk::plan(cal, families, 65536)), trunk::host_facts(gpu_pci.as_deref()));
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
             let rates = (mode == NpuTrunkMode::Auto && runtime.is_some())
@@ -452,7 +463,7 @@ impl NpuForward {
             Ok(Some(Self { mode, families, request_families, family_override, rates, sampling, request_epoch: 0, guard_tripped: false,
                 sample_log, request_cal: None,
                 layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
-                calibration, n_star_cache: None, request_plan: None, request_origin: 0, adaptive: Vec::new() }))
+                calibration, n_star_cache: None, request_plan: None, request_origin: 0, adaptive: Vec::new(), latch: trunk::containment::FaultLatch::default(), gpu_pci }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
@@ -460,7 +471,27 @@ impl NpuForward {
     /// Pairs run layer-major through the pair executor: `on`/`auto` on the NPU,
     /// `emulate` with the GPU twin projection in its place.
     pub(super) fn pipelined(&self) -> bool { self.bank_b.is_some() }
+    /// The NPU fault latch is set: the route is off for the rest of the process (a field read).
+    pub(super) fn faulted(&self) -> bool { self.latch.tripped() }
+    /// Whether the request in flight faulted; clears the per-request flag.
+    pub(super) fn take_request_fault(&mut self) -> bool { self.latch.take_request_fault() }
+    /// A pair executor error: release every outstanding GPU wait (all hardware modes) and, under `auto`, latch the route
+    /// off for the process. An NPU runtime fault logs one WARN and marks the request for its GPU-only rerun; a GPU HipError
+    /// (sticky context: a rerun could only fail) logs nothing here and the request fails with its original error. `on`
+    /// keeps failing closed (the runtime's sticky failure); `emulate` has no runtime.
+    pub(super) fn contain_fault(&mut self, error: &Qwen4GpuForwardError) {
+        use trunk::containment::FaultClass;
+        let class = if matches!(error, Qwen4GpuForwardError::Hip(_)) { FaultClass::GpuHip } else { FaultClass::NpuRuntime };
+        let reason = format!("{}: {error}", class.as_str());
+        let Some(rt) = &self.runtime else { return; };
+        rt.abort(&reason);
+        if self.mode == NpuTrunkMode::Auto && self.latch.trip(class, &reason) && class == FaultClass::NpuRuntime {
+            eprintln!("WARN npu-trunk: NPU pair fault, the route is off for the rest of this process and prefill runs GPU-only ({reason}); host {}", trunk::host_facts(self.gpu_pci.as_deref()));
+        }
+    }
     pub(super) fn begin_request(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if self.latch.tripped() { self.latch.begin_request(); return Ok(()); }
+        self.latch.begin_request();
         self.poll(gpu)?;
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.guard_tripped = false;
@@ -471,6 +502,7 @@ impl NpuForward {
     /// With a matched calibration every mode (`auto`, `on`, `emulate`) executes the planner's pairs, including the
     /// rebalanced last pair; `auto` logs the plan. Without one the forced modes keep the natural 8192 + B pairing.
     pub(super) fn plan_request(&mut self, gpu: &Gpu, rows: usize, position: usize) -> Result<(), Qwen4GpuForwardError> {
+        if self.latch.tripped() { return Ok(()); }
         self.poll(gpu)?;
         if self.request_plan.is_some() { return Ok(()); }
         let snapshot = self.rates.as_ref().map(|rates| rates.snapshot());
@@ -514,6 +546,7 @@ impl NpuForward {
     /// 8192 + B. `None` without a bank-B scratch (an `emulate` load that cannot
     /// hold one runs every chunk native).
     pub(super) fn selected_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
+        if self.latch.tripped() { return None; }
         self.bank_b.as_ref()?;
         if self.guard_tripped || self.request_families.is_empty() { return None; }
         if self.calibration.is_none() { return pair_rows(remaining, chunk).map(|rows| [chunk, rows - chunk]); }
@@ -784,6 +817,7 @@ impl NpuForward {
 
     /// Query completed sets only: no synchronization, and no elapsed-time read until pair_end is complete.
     pub(super) fn poll(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if self.latch.tripped() { return Ok(()); }
         let (Some(sampling), Some(rates)) = (&mut self.sampling, &mut self.rates) else { return Ok(()); };
         for set in &mut sampling.sets {
             if set.pending.is_none() || !gpu.hip.event_query(set.pair_end())? { continue; }
@@ -1869,6 +1903,7 @@ pub(super) fn run_pair_request(owner: &mut Qwen4GpuForward, bundle: &mut Qwen4Bu
     let capture=capture.map(|t|t.sub_offset(offset*program_dims(&bundle.config).wide(),tokens.len()*program_dims(&bundle.config).wide()));
     let mut npu=owner.npu_trunk.take().expect("on owner");
     let result=npu.pair(owner,bundle,gpu,tokens,banks,logits.as_ref(),top1.as_ref(),capture.as_ref(),output);
+    if let Err(e)=&result { npu.contain_fault(e); }
     owner.npu_trunk=Some(npu);
     result
 }

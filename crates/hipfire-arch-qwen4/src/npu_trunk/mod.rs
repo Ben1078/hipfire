@@ -3,9 +3,10 @@
 //! Flash-Next NPU trunk. References live in peacemaker-npu; no device opens here.
 
 pub(crate) mod admission;
-pub(crate) use calibration::{npu_firmware, runtime_key_with_firmware};
+pub(crate) use calibration::{host_facts, npu_firmware, runtime_key_with_firmware};
 mod calibration;
 mod config;
+pub(crate) mod containment;
 mod gpu;
 mod packing;
 mod plan;

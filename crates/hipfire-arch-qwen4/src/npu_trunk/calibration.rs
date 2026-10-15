@@ -311,6 +311,39 @@ pub(crate) fn npu_firmware() -> Result<String, String> {
     Err("NPU accel0 unavailable on this platform".into())
 }
 
+/// Host facts the armed `npu-trunk:` line reports so stock-kernel reports are triageable:
+/// `kernel=<k> iommu=gpu:<g>,npu:<n> amdxdna=<x> npu_fw=<f>`. `<k>` is the kernel release;
+/// `<g>`/`<n>` are the IOMMU group domain types of the GPU (by PCI address) and `accel0`, i.e. the
+/// kernel's `identity` (iommu=pt), `DMA`, or `DMA-FQ` (the default translated domain); `<x>` is the
+/// out-of-tree xdna-driver version, `in-tree` for the mainline module without a version, else
+/// `unknown`; `<f>` is the NPU firmware version. Values are trimmed, whitespace becomes `_`, and
+/// missing/empty/unreadable values are `unknown`. Reads only unprivileged proc/sysfs files.
+#[cfg(unix)]
+pub(crate) fn host_facts(gpu_pci: Option<&str>) -> String { host_facts_from(Path::new("/"), gpu_pci) }
+
+#[cfg(not(unix))]
+pub(crate) fn host_facts(_gpu_pci: Option<&str>) -> String {
+    "kernel=unknown iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown".into()
+}
+
+#[cfg(unix)]
+fn host_facts_from(root: &Path, gpu_pci: Option<&str>) -> String {
+    fn fact(path: &Path) -> Option<String> {
+        let text = fs::read_to_string(path).ok()?;
+        let text = text.split_whitespace().collect::<Vec<_>>().join("_");
+        (!text.is_empty()).then_some(text)
+    }
+    let unknown = |value: Option<String>| value.unwrap_or_else(|| "unknown".into());
+    let kernel = unknown(fact(&root.join("proc/sys/kernel/osrelease")));
+    let gpu = unknown(gpu_pci.and_then(|pci| fact(&root.join("sys/bus/pci/devices").join(pci.to_lowercase()).join("iommu_group/type"))));
+    let accel = root.join("sys/class/accel/accel0/device");
+    let npu = unknown(fact(&accel.join("iommu_group/type")));
+    let module = root.join("sys/module/amdxdna");
+    let amdxdna = fact(&module.join("version")).unwrap_or_else(|| if module.is_dir() { "in-tree".into() } else { "unknown".into() });
+    let npu_fw = unknown(fact(&accel.join("fw_version")));
+    format!("kernel={kernel} iommu=gpu:{gpu},npu:{npu} amdxdna={amdxdna} npu_fw={npu_fw}")
+}
+
 /// Read only unprivileged metadata, never open a GPU/NPU or time work.
 pub fn runtime_calibration_key(arch: &str, pci_bdf: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
     // railgun opens accel0; key that exact device, not the first PCI directory.
@@ -443,5 +476,61 @@ mod builtin_tests {
         assert_eq!(source, "builtin");
         assert_eq!(overlay.key.trunk_route, "overlay:gfx1151-zab-v1");
         fs::remove_dir(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod host_facts_tests {
+    use super::*;
+
+    struct TempRoot(std::path::PathBuf);
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("hipfire-host-facts-{tag}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn put(&self, rel: &str, text: &str) {
+            let path = self.0.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+    impl Drop for TempRoot { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+
+    #[test]
+    fn host_facts_stock_kernel_fixture() {
+        let root = TempRoot::new("stock");
+        root.put("proc/sys/kernel/osrelease", "7.2.8\n");
+        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "DMA-FQ\n");
+        root.put("sys/class/accel/accel0/device/iommu_group/type", "DMA-FQ\n");
+        fs::create_dir_all(root.0.join("sys/module/amdxdna")).unwrap();
+        root.put("sys/class/accel/accel0/device/fw_version", "1.1.2.65\n");
+        assert_eq!(host_facts_from(&root.0, Some("0000:C0:00.0")),
+            "kernel=7.2.8 iommu=gpu:DMA-FQ,npu:DMA-FQ amdxdna=in-tree npu_fw=1.1.2.65");
+    }
+
+    #[test]
+    fn host_facts_perfopt_kernel_fixture() {
+        let root = TempRoot::new("perfopt");
+        root.put("proc/sys/kernel/osrelease", "7.3.0-rc7-perfopt+\n");
+        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "identity\n");
+        root.put("sys/class/accel/accel0/device/iommu_group/type", "identity\n");
+        root.put("sys/module/amdxdna/version", "2.21.0\n");
+        root.put("sys/class/accel/accel0/device/fw_version", "1.1.2.65\n");
+        assert_eq!(host_facts_from(&root.0, Some("0000:c0:00.0")),
+            "kernel=7.3.0-rc7-perfopt+ iommu=gpu:identity,npu:identity amdxdna=2.21.0 npu_fw=1.1.2.65");
+    }
+
+    #[test]
+    fn host_facts_missing_values_are_unknown() {
+        let root = TempRoot::new("empty");
+        let unknown = "kernel=unknown iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown";
+        assert_eq!(host_facts_from(&root.0, Some("0000:c0:00.0")), unknown);
+        assert_eq!(host_facts_from(&root.0, None), unknown);
+        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "DMA\n");
+        root.put("proc/sys/kernel/osrelease", "7.2.8\n");
+        assert_eq!(host_facts_from(&root.0, None), "kernel=7.2.8 iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown");
     }
 }

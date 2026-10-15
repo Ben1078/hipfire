@@ -1088,6 +1088,13 @@ impl Qwen4Bundle {
             .is_some_and(|f| f.npu_trunk_planned())
     }
 
+    /// Whether the request in flight tripped the NPU trunk fault latch; clears the per-request flag.
+    pub(crate) fn take_npu_trunk_fault(&mut self) -> bool {
+        self.execution
+            .as_mut()
+            .is_some_and(|f| f.take_npu_trunk_fault())
+    }
+
     pub(crate) fn begin_npu_trunk_request(&mut self, gpu: &Gpu) -> Result<(), BundleError> {
         if let Some(forward) = &mut self.execution {
             forward
@@ -2830,6 +2837,25 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_prefill_final(gpu, prompt, reused, logits);
         }
+        // An NPU fault latches the route off; the request then reruns from the re-planned session start with the
+        // exact GPU-only schedule.
+        crate::npu_trunk::containment::rerun_after_fault(
+            self,
+            prompt.len(),
+            reused,
+            |bundle, start| bundle.prefill_final_from(gpu, prompt, start, logits),
+            |bundle| bundle.take_npu_trunk_fault(),
+            |bundle| bundle.session_plan_capped(prompt, SessionRoute::Ar, prompt.len()),
+        )
+    }
+
+    fn prefill_final_from(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+        logits: &GpuTensor,
+    ) -> Result<(), BundleError> {
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
         let mut pos = reused;
         while pos < prompt.len() {

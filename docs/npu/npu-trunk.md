@@ -655,8 +655,25 @@ Every auto refusal on gfx1151 logs exactly one line and never fails a load. A mo
 does not qualify (step 1) logs `npu-trunk: off (<reason>)`. A qualifying model whose
 NPU path fails (steps 2–4: firmware, calibration, preparation, runtime open) logs
 `WARN npu-trunk: off (<reason>); npu_trunk=auto requested the NPU but the trunk did not arm, ...`.
-`npu_trunk=on` turns either refusal into a load error. After admission, sticky runtime errors still fail the
-request closed; GPU fallback must not publish partial NPU results.
+`npu_trunk=on` turns either refusal into a load error.
+
+Faults. After admission an NPU runtime fault (chain watchdog, submit error, ERT state other than COMPLETED, relay exit)
+never publishes a partial NPU result and never hangs the process: the pair executor commits position, PLE, QSA and
+session boundaries only on success, and every fault aborts the runtime, which releases every GPU wait on the NPU at
+once. Under `auto` the route then latches off for the rest of the process, logs one
+`WARN npu-trunk: NPU pair fault, the route is off for the rest of this process and prefill runs GPU-only (<reason>); host kernel=.. iommu=..`
+line, and the faulted request restarts GPU-only from its session start (the committed snapshot, or row 0; the live
+continuation was consumed by the attempt), logging `npu-trunk: the faulted request restarts GPU-only from row N of M`.
+From that start its output is byte-identical to `npu_trunk=off`: the latched route plans no pair, so scheduling is
+exactly the `off` one. Later requests in the process are GPU-only, never touch the runtime, and add no sync or I/O.
+`on` fails the request closed and stays failed (sticky), but still aborts the runtime so it never hangs; `emulate` has
+no runtime and is unchanged. A forced advance in the middle of a turn (`spec_advance` without reset) cannot be
+replayed, so it fails closed; the route stays off for later requests. Relay teardown is bounded at 3 s: a relay that
+does not exit is detached and its banks are quarantined. `HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN=<n>` injects a fault on
+the nth relay chain for testing. The armed load line ends with
+`host=[kernel=.. iommu=gpu:..,npu:.. amdxdna=.. npu_fw=..]`, the same facts the fault line carries. A GPU HIP error
+inside a pair (the GPU context is sticky, so a rerun could only fail) also aborts the runtime and latches the route off,
+but it logs no WARN and is not rerun: the request fails with its original error, as without the NPU.
 
 The first default-on measurement used the Halo default serve config with the zab
 overlay, three fresh processes per arm, before rebalanced pairs and row-adaptive

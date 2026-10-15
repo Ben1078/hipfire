@@ -449,6 +449,90 @@ impl Qwen4Bundle {
         self.verify_block_rows(gpu, block, position, scratch, false)
             .map(|_| ())
     }
+
+    /// The non-EP advance body of [`SpecTarget::spec_advance`]: reset when asked, validate, then run the rows. A reset
+    /// advance is re-entrant after an NPU fault (it starts cold again).
+    fn spec_advance_from(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        reset: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)?;
+        }
+        if tokens.is_empty() {
+            return Err("Qwen4 spec_advance cannot process an empty token slice".to_string());
+        }
+        if self.state.position != start_pos {
+            return Err(format!(
+                "Qwen4 spec_advance position mismatch: expected {}, got {start_pos}",
+                self.state.position
+            ));
+        }
+        let end_pos = start_pos
+            .checked_add(tokens.len())
+            .ok_or_else(|| "Qwen4 spec position overflow".to_string())?;
+        if end_pos > self.state.max_seq_len {
+            return Err(format!(
+                "Qwen4 spec advance end {end_pos} exceeds context capacity {}",
+                self.state.max_seq_len
+            ));
+        }
+        let max_chunk = self
+            .execution
+            .as_ref()
+            .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?
+            .scratch
+            .max_chunk;
+        self.begin_npu_trunk_request(gpu)
+            .map_err(|error| error.to_string())?;
+        let plan_end = self.session_lineage_after(start_pos).map_or(end_pos, |p| p.min(end_pos));
+        if let Some(forward) = &mut self.execution {
+            forward
+                .plan_npu_trunk_request(gpu, plan_end - start_pos, start_pos)
+                .map_err(|error| error.to_string())?;
+        }
+        let mut offset = 0usize;
+        let mut last_argmax = None;
+        while offset < tokens.len() {
+            if abort() {
+                self.reset_recurrent(gpu)?;
+                return Ok(SpecAdvance::Aborted);
+            }
+            self.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
+            let planned=self.npu_trunk_planned();
+            let rows = self.prefill_schedule_rows(start_pos + offset, end_pos, max_chunk);
+            let end=offset+rows;
+            // A planned pair group (rows above one chunk) runs through the pair
+            // executor inside the forward, in every NPU mode.
+            let covered=planned && rows>max_chunk;
+            self.set_ple_lookahead(&tokens[end..]);
+            if covered && end<tokens.len() {
+                self.spec_prefill_rows_without_pick(gpu,&tokens[offset..end],false)
+                    .map_err(|error|error.to_string())?;
+            } else {
+                last_argmax=Some(self.spec_prefill_rows(gpu,&tokens[offset..end],false)
+                    .map_err(|error|error.to_string())?);
+            }
+            if self.session_next_boundary() == Some(start_pos + end) {
+                self.spec_advance_session_boundary(gpu, start_pos + end).map_err(|e|e.to_string())?;
+            }
+            offset = end;
+        }
+        if self.state.position != end_pos {
+            return Err(format!(
+                "Qwen4 spec advance ended at {}, expected {end_pos}",
+                self.state.position
+            ));
+        }
+        Ok(SpecAdvance::Ready {
+            last_argmax: last_argmax.expect("non-empty spec advance produced no argmax"),
+            last_logits: None,
+        })
+    }
 }
 
 /// Developer hooks of the wide-verify oracle (`wide_verify_oracle`): thin
@@ -570,78 +654,23 @@ impl SpecTarget for Qwen4Bundle {
                 last_logits: None,
             });
         }
+        // An NPU fault latches the route off. A reset advance starts cold, so it reruns whole GPU-only (the replan is always
+        // row 0); a forced advance mid-turn cannot be replayed and fails closed, the route staying off for later requests.
         if reset {
-            self.reset_recurrent(gpu)?;
+            return crate::npu_trunk::containment::rerun_after_fault(
+                self,
+                tokens.len(),
+                0,
+                |bundle, _| bundle.spec_advance_from(gpu, tokens, start_pos, true, abort),
+                |bundle| bundle.take_npu_trunk_fault(),
+                |_| 0,
+            );
         }
-        if tokens.is_empty() {
-            return Err("Qwen4 spec_advance cannot process an empty token slice".to_string());
+        let result = self.spec_advance_from(gpu, tokens, start_pos, false, abort);
+        if result.is_err() {
+            self.take_npu_trunk_fault();
         }
-        if self.state.position != start_pos {
-            return Err(format!(
-                "Qwen4 spec_advance position mismatch: expected {}, got {start_pos}",
-                self.state.position
-            ));
-        }
-        let end_pos = start_pos
-            .checked_add(tokens.len())
-            .ok_or_else(|| "Qwen4 spec position overflow".to_string())?;
-        if end_pos > self.state.max_seq_len {
-            return Err(format!(
-                "Qwen4 spec advance end {end_pos} exceeds context capacity {}",
-                self.state.max_seq_len
-            ));
-        }
-        let max_chunk = self
-            .execution
-            .as_ref()
-            .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?
-            .scratch
-            .max_chunk;
-        self.begin_npu_trunk_request(gpu)
-            .map_err(|error| error.to_string())?;
-        let plan_end = self.session_lineage_after(start_pos).map_or(end_pos, |p| p.min(end_pos));
-        if let Some(forward) = &mut self.execution {
-            forward
-                .plan_npu_trunk_request(gpu, plan_end - start_pos, start_pos)
-                .map_err(|error| error.to_string())?;
-        }
-        let mut offset = 0usize;
-        let mut last_argmax = None;
-        while offset < tokens.len() {
-            if abort() {
-                self.reset_recurrent(gpu)?;
-                return Ok(SpecAdvance::Aborted);
-            }
-            self.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
-            let planned=self.npu_trunk_planned();
-            let rows = self.prefill_schedule_rows(start_pos + offset, end_pos, max_chunk);
-            let end=offset+rows;
-            // A planned pair group (rows above one chunk) runs through the pair
-            // executor inside the forward, in every NPU mode.
-            let covered=planned && rows>max_chunk;
-            self.set_ple_lookahead(&tokens[end..]);
-            if covered && end<tokens.len() {
-                self.spec_prefill_rows_without_pick(gpu,&tokens[offset..end],false)
-                    .map_err(|error|error.to_string())?;
-            } else {
-                last_argmax=Some(self.spec_prefill_rows(gpu,&tokens[offset..end],false)
-                    .map_err(|error|error.to_string())?);
-            }
-            if self.session_next_boundary() == Some(start_pos + end) {
-                self.spec_advance_session_boundary(gpu, start_pos + end).map_err(|e|e.to_string())?;
-            }
-            offset = end;
-        }
-        if self.state.position != end_pos {
-            return Err(format!(
-                "Qwen4 spec advance ended at {}, expected {end_pos}",
-                self.state.position
-            ));
-        }
-        Ok(SpecAdvance::Ready {
-            last_argmax: last_argmax.expect("non-empty spec advance produced no argmax"),
-            last_logits: None,
-        })
+        result
     }
 
     fn verify_block(
@@ -6283,59 +6312,20 @@ impl Qwen4MtpDrafter {
     }
 }
 
-impl MtpDrafter for Qwen4MtpDrafter {
-    fn mtp_prefill(
+impl Qwen4MtpDrafter {
+    /// The prefill after validation and the EP branch: restore or reset target, head and draft policy at `start_pos`
+    /// (`cache_hit`: the session snapshot there; else cold), fill the rest, and draw the seed. Re-entrant after an NPU
+    /// fault: [`Self::mtp_prefill`] reruns it from the re-planned start, and the n-gram history and the sampled
+    /// penalty prompt are set once per request.
+    fn mtp_prefill_from(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
         prompt_tokens: &[u32],
-        fill_tokens: &[u32],
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<u32, String> {
-        self.require_supported_request()?;
-        validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
-        // Expert parallelism: rank 0 and every peer's replica run the whole
-        // prefill in one fan-out. A request this drafter cannot serve under EP
-        // is refused, and an abort is polled, here on rank 0, before any
-        // rank starts: an error or an abort inside the fan-out would strand the
-        // others (inside it every rank uses a never-abort closure).
-        if Self::bundle(target)?.ep_mesh().is_some() {
-            self.refuse_naive_under_ep()?;
-            if abort() {
-                target.reset_recurrent(gpu)?;
-                return Err("Qwen4 native MTP prefill aborted".to_string());
-            }
-            let never = || false;
-            return Self::bundle(target)?.ep_drafter_fanout(
-                "mtp_prefill",
-                gpu,
-                self,
-                |drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
-                        bundle,
-                        prompt_tokens,
-                        fill_tokens,
-                        start_pos,
-                        cache_hit,
-                        &never,
-                    )
-                },
-                &|drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
-                        bundle,
-                        prompt_tokens,
-                        fill_tokens,
-                        start_pos,
-                        cache_hit,
-                        &never,
-                    )
-                },
-            );
-        }
         self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
         // The request's n-gram history starts from the full canonical prompt
         // (cache hit or miss), once per request: a realignment re-prefill
@@ -6459,6 +6449,89 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             None => Ok(pick),
         }
+    }
+}
+
+/// The rerun context of [`Qwen4MtpDrafter::mtp_prefill`]: both owners, and the restart row the fault check re-planned.
+struct MtpPrefillRun<'a> {
+    drafter: &'a mut Qwen4MtpDrafter,
+    target: &'a mut dyn SpecTarget,
+    restart: usize,
+}
+
+impl MtpDrafter for Qwen4MtpDrafter {
+    fn mtp_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        fill_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<u32, String> {
+        self.require_supported_request()?;
+        validate_native_mtp_prefill_request(prompt_tokens, fill_tokens, start_pos, cache_hit)?;
+        // Expert parallelism: rank 0 and every peer's replica run the whole
+        // prefill in one fan-out. A request this drafter cannot serve under EP
+        // is refused, and an abort is polled, here on rank 0, before any
+        // rank starts: an error or an abort inside the fan-out would strand the
+        // others (inside it every rank uses a never-abort closure).
+        if Self::bundle(target)?.ep_mesh().is_some() {
+            self.refuse_naive_under_ep()?;
+            if abort() {
+                target.reset_recurrent(gpu)?;
+                return Err("Qwen4 native MTP prefill aborted".to_string());
+            }
+            let never = || false;
+            return Self::bundle(target)?.ep_drafter_fanout(
+                "mtp_prefill",
+                gpu,
+                self,
+                |drafter, bundle, gpu| {
+                    drafter.mtp_prefill(
+                        gpu,
+                        bundle,
+                        prompt_tokens,
+                        fill_tokens,
+                        start_pos,
+                        cache_hit,
+                        &never,
+                    )
+                },
+                &|drafter, bundle, gpu| {
+                    drafter.mtp_prefill(
+                        gpu,
+                        bundle,
+                        prompt_tokens,
+                        fill_tokens,
+                        start_pos,
+                        cache_hit,
+                        &never,
+                    )
+                },
+            );
+        }
+        // An NPU fault latches the route off; the request then reruns from the re-planned session start with the exact
+        // GPU-only schedule (`mtp_prefill_from` restores or resets target, head and draft policy before its first row).
+        let prompt_len = prompt_tokens.len();
+        let mut run = MtpPrefillRun { drafter: self, target, restart: 0 };
+        crate::npu_trunk::containment::rerun_after_fault(
+            &mut run,
+            prompt_len,
+            start_pos,
+            |run, start| {
+                let hit = if start == start_pos { cache_hit } else { start > 0 };
+                run.drafter.mtp_prefill_from(gpu, &mut *run.target, prompt_tokens, start, hit, abort)
+            },
+            |run| {
+                let Ok(bundle) = Qwen4MtpDrafter::bundle(&mut *run.target) else { return false; };
+                if !bundle.take_npu_trunk_fault() { return false; }
+                run.restart = bundle.session_plan_capped(prompt_tokens, SessionRoute::Mtp, prompt_len);
+                true
+            },
+            |run| run.restart,
+        )
     }
 
     /// `plan_window` (rank 0) then `run_window`. Single card: the two run
