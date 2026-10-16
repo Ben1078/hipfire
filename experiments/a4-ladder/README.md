@@ -1,6 +1,45 @@
 # A4 fused-ladder study harness
 
-> **Timing subcommand is stale / not product:** it drives `bench_qwen35_mq4` with q8 KV. Its tok/s are not product numbers (see RESULTS.md status). The quality subcommand is unaffected.
+> **`runner.py timing` is stale / not product:** it drives `bench_qwen35_mq4` with q8 KV and literal token ids. Its tok/s are not product numbers (see RESULTS.md status); use `product_runner.py` below. The `quality` subcommand is unaffected.
+
+## Product timing (`product_runner.py`)
+
+Times the shipped CLI: `hipfire bench MODEL --backend noslots --workload stateless --prompt-file FILE
+--max-tokens 1 --runs 6 --json` (not `--matrix`, not `bench_qwen35_mq4`). Every process is a fresh CLI +
+fresh stdio daemon (`HIPFIRE_DAEMON_BIN` pinned), fresh `mkhome.sh` HOME, empty `HIPFIRE_KERNEL_CACHE`,
+own process group (killed as a group on timeout/SIGTERM; no `pkill`). Inherited `HIPFIRE_*` (except
+`HIPFIRE_DEVICES`/`LOCK_DIR`/`FABRIC_ADMISSION`), `HIP_*`/`HSA_*`/`ROCR_*`/`GPU_*`/`AMD_*` (except
+visible-device vars) are scrubbed and recorded. Product defaults stay: no `HIPFIRE_KV*`/`GRAPH*`/
+`NORMALIZE*`, no `--spec`, no DPM override (use a recorded `--env HIPFIRE_DPM_WARMUP_SECS=N` only if the
+parent orders it). Only `HIPFIRE_G12_A4_CANDIDATES` varies: unset (default C2) / `4` / `8`.
+`--backend/--workload` are recorded flags only (they matter just with `--concurrency`).
+
+Prompts: `prompts/product-pp512.txt` (500 words) and `product-pp8192.txt` (8180 words), pinned by sha256;
+the closed-think template adds 12 tokens so the daemon must report `prompt_tokens` exactly 512 / 8192.
+
+```
+python3 experiments/a4-ladder/product_runner.py baseline|abba --cli target/release/hipfire --daemon target/release/daemon \
+  --model <canonical model> --prompt512 experiments/a4-ladder/prompts/product-pp512.txt \
+  --prompt8192 experiments/a4-ladder/prompts/product-pp8192.txt --out <new dir>   # abba: --candidates 4,8 --blocks 2
+python3 experiments/a4-ladder/product_runner.py summary <out>
+```
+
+`baseline` runs only unset C2 at 512 and 8192 (one process each); exit 4 if pp8192 is outside 4590..5610
+tok/s (+-10% of ~5100) so the parent can explain before ABBA. `abba` runs, per candidate and length,
+`--blocks` (default 2) palindromic `C2 cand cand C2` blocks = 4 fresh processes per arm per comparison
+length, block-major. Both require `FABRIC_JOB` and stop at `--budget-secs` (1740).
+
+Metric: per process, `samples.prefill` sample 0 is discarded (the Hello/16 warmup does not JIT the
+long-prompt shapes), value = median of the last 5 (`prefill_tok_s` = daemon prefill_tokens / prefill_s);
+arm = geomean of process medians; block ratio = geomean(cand procs) / geomean(C2 procs) in the block;
+reported: block ratios, their geomean/median, arm spread/CV. No significance claim. A process is invalid
+unless: exit 0, `native-generate-v1`, `gpu.arch` = `gfx1201`, effective `kv_mode` = `fp8`, exact
+`prompt_tokens`, `prompt_md5` = file md5, 6 samples, and `prefill_tok_s*ttft_ms` (rows actually
+prefilled) >= 99% of the prompt for every sample (a cached prefix would shrink it). Per process the dir
+holds raw `stdout.json`, `stderr.txt`, `command.json` (argv, scrubbed/recorded env); `manifest.json`
+records binary/model/prompt sha256, source HEAD/diff hash; `raw.jsonl` rows embed the full bench JSON and
+effective `kv_mode`/`kv_backend*`/speculation fields.
+
 
 `runner.py` (Python 3, stdlib only) is the quality and timing harness for the widened fused C2 A4
 candidate ladder. It never opens a fabric hold itself: `quality` and `timing` refuse to run unless
