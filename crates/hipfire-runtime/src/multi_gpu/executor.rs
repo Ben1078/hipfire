@@ -81,6 +81,18 @@ pub trait MeshStepBindings {
         gpu: &mut Gpu,
         epoch: &ForwardEpoch,
     ) -> Result<MeshCheckpointId>;
+    /// Host-only, pure session-piece probe: confirm this owner could restore
+    /// `piece` (still resident, reset/window generation current). Must not
+    /// touch a `Gpu`, enqueue work, pin or mutate any state:
+    /// `Gpus::restore_mesh_session` probes EVERY owner before the first
+    /// `restore_session_rank`, so a failed probe on any owner leaves every
+    /// owner untouched.
+    fn probe_session_rank(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
+    ) -> Result<()>;
     fn restore_session_rank(
         &mut self,
         owner: usize,
@@ -212,7 +224,9 @@ impl MeshCheckpoint {
 /// Which lifecycle step produced a [`MeshLifecycleError`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MeshLifecyclePhase {
-    /// A ticket set was malformed/stale; no callback ran and no rollback was possible.
+    /// A ticket set was malformed/stale, or a `Gpus` lifecycle call was refused
+    /// by mesh admission (stale, poisoned, quarantined, or mismatched identity);
+    /// no callback ran and no rollback was possible.
     Shape,
     Checkpoint,
     /// `validate_finalize_rank` failed; no `finalize_rank` ran.
@@ -276,6 +290,13 @@ impl std::error::Error for MeshLifecycleError {}
 /// device-touching methods receive the owner's borrowed `&mut Gpu`. A callback
 /// provider resolves logical owner indices to its locally borrowed resources;
 /// the head's logical owner is distinct even when it shares the output GPU.
+///
+/// This trait is the coordinators' CPU-testable seam. The only production
+/// implementer is the private `BoundOwners` adapter used by `Gpus`
+/// (`checkpoint_mesh`/`restore_mesh`/`finalize_mesh`): it maps trunk owner `i`
+/// to `devices[i]` and the head owner to `mesh_output_owner()`, binds the
+/// device thread before each GPU-touching call, and delegates to
+/// [`MeshStepBindings`]. Families never call the coordinators themselves.
 ///
 /// `owner` is `0..trunk_owners` for trunk stages and `trunk_owners` for the
 /// output head. `key` is the live window's generation key.
@@ -545,6 +566,66 @@ impl MeshExecutionState {
             );
         }
         Ok(())
+    }
+
+    /// Mesh health/identity admission shared by every lifecycle call; pure.
+    /// Requires the exact provisioned mesh epoch, a healthy (not poisoned, not
+    /// quarantined) mesh, and a valid owner/device mapping for `owners`
+    /// trunk owners (the output owner, which hosts the head, must name a
+    /// device). Unlike [`Self::admit`] this never looks at op ids: lifecycle
+    /// calls legitimately follow an already executed epoch.
+    fn admit_lifecycle_mesh(&self, mesh_epoch: MeshEpoch, owners: usize) -> Result<()> {
+        if self.mesh_epoch != Some(mesh_epoch) || self.poisoned || self.quarantined {
+            return Err(
+                "mesh epoch is stale, poisoned, quarantined, or unprovisioned; no lifecycle \
+                 callback was run"
+                    .into(),
+            );
+        }
+        match self.output_owner {
+            Some(output) if owners != 0 && output < owners => Ok(()),
+            _ => Err("mesh owner/device mapping is invalid; no lifecycle callback was run".into()),
+        }
+    }
+
+    /// Load/request identities that are known to the executor: the pinned load
+    /// (set by the first submission) and, while epochs are outstanding, the one
+    /// request they belong to. Unknown identities are not invented.
+    fn check_lifecycle_identity(&self, load_id: u64, request_id: u64) -> Result<()> {
+        if self.scope.is_some_and(|(load, _)| load != load_id) {
+            return Err("lifecycle call names a different model load than the mesh".into());
+        }
+        if self
+            .outstanding
+            .last()
+            .is_some_and(|last| last.request_id != request_id)
+        {
+            return Err(
+                "lifecycle call names a different request than the undrained epochs".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Admission for lifecycle calls that carry a [`ForwardEpoch`]: mesh
+    /// health/identity, pinned load and numerical policy, outstanding request.
+    fn admit_lifecycle_epoch(&self, epoch: &ForwardEpoch, owners: usize) -> Result<()> {
+        self.admit_lifecycle_mesh(epoch.mesh_epoch, owners)?;
+        if self
+            .scope
+            .is_some_and(|scope| scope != (epoch.load_id, epoch.policy_id))
+        {
+            return Err("lifecycle epoch changes the pinned load/numerical policy".into());
+        }
+        self.check_lifecycle_identity(epoch.load_id, epoch.request_id)
+    }
+
+    /// Admission for checkpoint-window lifecycle calls that carry a
+    /// [`MeshCheckpointKey`] (`load_gen`/`request_gen` are the load and request
+    /// ids of the epochs the window runs under).
+    fn admit_lifecycle_key(&self, key: &MeshCheckpointKey, owners: usize) -> Result<()> {
+        self.admit_lifecycle_mesh(key.mesh_epoch, owners)?;
+        self.check_lifecycle_identity(key.load_gen, key.request_gen)
     }
 }
 
@@ -892,7 +973,7 @@ fn drain_tickets<B: DrainBackend + HasState>(
 }
 
 struct HipBackend<'a> {
-    devices: &'a mut [Gpu],
+    devices: &'a mut Vec<Gpu>,
     state: &'a mut MeshExecutionState,
     bindings: &'a mut dyn MeshStepBindings,
 }
@@ -911,6 +992,10 @@ impl DrainBackend for HipBackend<'_> {
     }
     fn quarantine(&mut self) {
         self.state.quarantined = true;
+        // Reached only after a failed device synchronization (see `drain` and
+        // `reset_all`): like `HipDrain`, keep device ownership until teardown
+        // because in-flight work may still reference registered VMM/host state.
+        std::mem::forget(std::mem::take(self.devices));
     }
 }
 
@@ -995,6 +1080,518 @@ impl Backend for HipBackend<'_> {
 impl HasState for HipBackend<'_> {
     fn state(&mut self) -> &mut MeshExecutionState {
         self.state
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate lifecycle (S6-W1): `Gpus` owns the owner sequencing. Families only
+// implement the per-owner `MeshStepBindings` callbacks.
+// ---------------------------------------------------------------------------
+
+/// Per-owner lifecycle operations behind the aggregate coordinators. HIP
+/// (`HipBackend`) and the CPU toy tests implement this one seam, and every
+/// sequencing, admission and fail-closed rule lives in the generic helpers
+/// below, so the tests execute the production algorithm.
+///
+/// `device` is the index into the admitted device list. For trunk owner `i` it
+/// is `i`; for the head owner (`rank_count()`) it is the output owner. The
+/// helpers call [`OwnerOps::bind`] before every GPU-touching method.
+trait OwnerOps: DrainBackend + HasState {
+    /// Bind the calling thread to `device`'s context.
+    fn bind(&mut self, device: usize) -> Result<()>;
+    fn checkpoint(
+        &mut self,
+        owner: usize,
+        device: usize,
+        key: &MeshCheckpointKey,
+    ) -> Result<MeshCheckpointId>;
+    fn restore(
+        &mut self,
+        owner: usize,
+        device: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
+    ) -> Result<()>;
+    /// Host-only; touches no `Gpu`.
+    fn validate_finalize(
+        &mut self,
+        owner: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
+    ) -> Result<()>;
+    /// Host-only and infallible; touches no `Gpu`.
+    fn finalize(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId);
+    /// Trunk owner `owner` runs on device `owner`.
+    fn repair_prefix(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        keep: usize,
+        tokens: &[u32],
+    ) -> Result<()>;
+    fn capture_session(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<MeshCheckpointId>;
+    /// Host-only and pure; touches no `Gpu`.
+    fn probe_session(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
+    ) -> Result<()>;
+    fn restore_session(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
+    ) -> Result<()>;
+    fn reset(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()>;
+}
+
+/// The only production [`MeshCheckpointCallbacks`] implementer. Trunk owner `i`
+/// maps to `devices[i]`; the head owner (`devices.len()`) maps to
+/// `mesh_output_owner()`. Every GPU-touching callback binds the owner's device
+/// thread first; a bind or mapping failure is that owner's callback failure.
+struct BoundOwners<'a, B: OwnerOps> {
+    backend: &'a mut B,
+}
+
+impl<B: OwnerOps> BoundOwners<'_, B> {
+    fn device(&mut self, owner: usize) -> Result<usize> {
+        let trunk = self.backend.rank_count();
+        if owner < trunk {
+            return Ok(owner);
+        }
+        if owner == trunk {
+            return match self.backend.state().output_owner {
+                Some(output) if output < trunk => Ok(output),
+                _ => Err("head owner has no valid mesh output owner device".into()),
+            };
+        }
+        Err(format!("owner {owner} is outside the mesh owners"))
+    }
+
+    /// Resolve `owner` to its device and bind the thread to it.
+    fn bound(&mut self, owner: usize) -> Result<usize> {
+        let device = self.device(owner)?;
+        self.backend.bind(device)?;
+        Ok(device)
+    }
+}
+
+impl<B: OwnerOps> MeshCheckpointCallbacks for BoundOwners<'_, B> {
+    fn checkpoint_rank(
+        &mut self,
+        owner: usize,
+        key: &MeshCheckpointKey,
+    ) -> Result<MeshCheckpointId> {
+        let device = self.bound(owner)?;
+        self.backend.checkpoint(owner, device, key)
+    }
+
+    fn restore_rank(
+        &mut self,
+        owner: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
+    ) -> Result<()> {
+        let device = self.bound(owner)?;
+        self.backend.restore(owner, device, key, ticket)
+    }
+
+    fn validate_finalize_rank(
+        &mut self,
+        owner: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
+    ) -> Result<()> {
+        // The fallible bind/mapping step of the commit lives here, in the
+        // validation phase that `finalize_all` runs for every owner before any
+        // finalize.
+        self.bound(owner)?;
+        self.backend.validate_finalize(owner, key, ticket)
+    }
+
+    fn finalize_rank(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId) {
+        // Finalization is host-only (no `Gpu` argument, no submission) and
+        // infallible by contract, so it neither binds nor can fail: binding is
+        // fallible and was already exercised for this owner by
+        // `validate_finalize_rank`. Ignoring a bind error or panicking here
+        // would break that contract.
+        self.backend.finalize(owner, key, ticket);
+    }
+}
+
+/// Fail closed: poison the mesh (and its leases) and quarantine it. Does not
+/// forget devices; that is reserved for a failed device synchronization
+/// (`DrainBackend::quarantine`).
+fn fail_closed(backend: &mut impl OwnerOps) {
+    backend.poison();
+    backend.state().quarantined = true;
+}
+
+/// Refusal before any callback. Reported as `Shape`: no rollback was possible
+/// and the tickets cannot be used on this mesh.
+fn refused(cause: &str) -> MeshLifecycleError {
+    MeshLifecycleError::shape(0, cause)
+}
+
+/// An aggregate rollback that could not make every owner consistent again
+/// (a restore failed after callbacks ran) leaves state unknown: fail closed.
+/// Clean rollbacks and pre-callback refusals do not.
+fn close_if_unrecovered<T>(backend: &mut impl OwnerOps, result: &Result<T, MeshLifecycleError>) {
+    if let Err(error) = result {
+        if error.phase != MeshLifecyclePhase::Shape && !error.restore_failures.is_empty() {
+            fail_closed(backend);
+        }
+    }
+}
+
+fn check_checkpoint_fits(
+    checkpoint: &MeshCheckpoint,
+    owners: usize,
+) -> Result<(), MeshLifecycleError> {
+    if checkpoint.per_owner.len() != owners {
+        return Err(MeshLifecycleError::shape(
+            checkpoint.per_owner.len().min(owners),
+            "checkpoint trunk owner count does not match the mesh devices",
+        ));
+    }
+    Ok(())
+}
+
+fn checkpoint_window<B: OwnerOps>(
+    backend: &mut B,
+    key: &MeshCheckpointKey,
+    with_head: bool,
+) -> Result<MeshCheckpoint, MeshLifecycleError> {
+    let owners = backend.rank_count();
+    backend
+        .state()
+        .admit_lifecycle_key(key, owners)
+        .map_err(|e| refused(&e))?;
+    let result = checkpoint_all(
+        &mut BoundOwners {
+            backend: &mut *backend,
+        },
+        key,
+        owners,
+        with_head,
+    );
+    close_if_unrecovered(backend, &result);
+    result
+}
+
+fn restore_window<B: OwnerOps>(
+    backend: &mut B,
+    key: &MeshCheckpointKey,
+    checkpoint: MeshCheckpoint,
+) -> Result<(), MeshLifecycleError> {
+    let owners = backend.rank_count();
+    backend
+        .state()
+        .admit_lifecycle_key(key, owners)
+        .map_err(|e| refused(&e))?;
+    checkpoint.check_shape(key)?;
+    check_checkpoint_fits(&checkpoint, owners)?;
+    let result = restore_all(
+        &mut BoundOwners {
+            backend: &mut *backend,
+        },
+        key,
+        checkpoint,
+    );
+    close_if_unrecovered(backend, &result);
+    result
+}
+
+fn finalize_window<B: OwnerOps>(
+    backend: &mut B,
+    key: &MeshCheckpointKey,
+    checkpoint: MeshCheckpoint,
+) -> Result<(), MeshLifecycleError> {
+    let owners = backend.rank_count();
+    backend
+        .state()
+        .admit_lifecycle_key(key, owners)
+        .map_err(|e| refused(&e))?;
+    checkpoint.check_shape(key)?;
+    check_checkpoint_fits(&checkpoint, owners)?;
+    let result = finalize_all(
+        &mut BoundOwners {
+            backend: &mut *backend,
+        },
+        key,
+        checkpoint,
+    );
+    close_if_unrecovered(backend, &result);
+    result
+}
+
+/// Trunk owners ascending, stop at the first failure, then fail closed: the
+/// owners hold mixed prefixes and no ticket can reconcile them.
+fn repair_prefix_all<B: OwnerOps>(
+    backend: &mut B,
+    epoch: &ForwardEpoch,
+    keep: usize,
+    tokens: &[u32],
+) -> Result<()> {
+    let owners = backend.rank_count();
+    backend.state().admit_lifecycle_epoch(epoch, owners)?;
+    for owner in 0..owners {
+        let result = backend
+            .bind(owner)
+            .and_then(|()| backend.repair_prefix(owner, epoch, keep, tokens));
+        if let Err(error) = result {
+            fail_closed(backend);
+            return Err(format!(
+                "mesh prefix repair failed on owner {owner}; mesh poisoned and quarantined: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A session ticket must correspond to the epoch's mesh, load and request.
+fn session_key_matches(key: &MeshCheckpointKey, epoch: &ForwardEpoch) -> bool {
+    key.mesh_epoch == epoch.mesh_epoch
+        && key.load_gen == epoch.load_id
+        && key.request_gen == epoch.request_id
+}
+
+/// Every owner ascending, stopping at the first failure (reported with its
+/// owner; the family releases already captured pieces through its own state).
+/// Each returned piece must carry the capturing owner's index and a key that
+/// corresponds to `epoch` and to every earlier piece.
+fn capture_session_all<B: OwnerOps>(
+    backend: &mut B,
+    epoch: &ForwardEpoch,
+) -> Result<Vec<MeshCheckpointId>> {
+    let owners = backend.rank_count();
+    backend.state().admit_lifecycle_epoch(epoch, owners)?;
+    let mut pieces: Vec<MeshCheckpointId> = Vec::with_capacity(owners);
+    for owner in 0..owners {
+        let piece = backend
+            .bind(owner)
+            .and_then(|()| backend.capture_session(owner, epoch))
+            .map_err(|e| format!("capture_session_rank failed on owner {owner}: {e}"))?;
+        if piece.owner() != owner {
+            return Err(format!(
+                "capture_session_rank on owner {owner} returned a piece issued for owner {}",
+                piece.owner()
+            ));
+        }
+        if !session_key_matches(&piece.key(), epoch)
+            || pieces
+                .first()
+                .is_some_and(|first| first.key() != piece.key())
+        {
+            return Err(format!(
+                "capture_session_rank on owner {owner} returned a piece whose key does not \
+                 match the epoch or the other owners' pieces"
+            ));
+        }
+        pieces.push(piece);
+    }
+    Ok(pieces)
+}
+
+fn check_session_pieces(
+    pieces: &[MeshCheckpointId],
+    epoch: &ForwardEpoch,
+    owners: usize,
+) -> Result<()> {
+    if pieces.len() != owners {
+        return Err(format!(
+            "session has {} pieces for {owners} mesh owners",
+            pieces.len()
+        ));
+    }
+    let key = pieces[0].key();
+    if !session_key_matches(&key, epoch) {
+        return Err("session pieces do not correspond to the epoch's mesh/load/request".into());
+    }
+    for (owner, piece) in pieces.iter().enumerate() {
+        if piece.owner() != owner {
+            return Err(format!(
+                "session piece {owner} was issued for owner {}",
+                piece.owner()
+            ));
+        }
+        if piece.key() != key {
+            return Err(format!(
+                "session piece {owner} belongs to a different checkpoint window than piece 0"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Shape check, then a host-only probe of EVERY owner (continuing past
+/// failures, first failure remembered), and only if all succeed the restores in
+/// ascending order. A probe failure or refusal restores nothing and leaves the
+/// mesh healthy. Once a `restore_session_rank` has started, any failure leaves
+/// owners with mixed state, so it fails closed.
+fn restore_session_all<B: OwnerOps>(
+    backend: &mut B,
+    epoch: &ForwardEpoch,
+    pieces: &[MeshCheckpointId],
+) -> Result<()> {
+    let owners = backend.rank_count();
+    backend.state().admit_lifecycle_epoch(epoch, owners)?;
+    check_session_pieces(pieces, epoch, owners)?;
+
+    let mut probe_failure: Option<(usize, String)> = None;
+    for (owner, piece) in pieces.iter().enumerate() {
+        let result = backend
+            .bind(owner)
+            .and_then(|()| backend.probe_session(owner, epoch, *piece));
+        if let Err(error) = result {
+            probe_failure.get_or_insert((owner, error));
+        }
+    }
+    if let Some((owner, error)) = probe_failure {
+        return Err(format!(
+            "session probe failed on owner {owner}; no owner was restored: {error}"
+        ));
+    }
+
+    let mut attempted = false;
+    for (owner, piece) in pieces.iter().enumerate() {
+        let result = backend.bind(owner).and_then(|()| {
+            attempted = true;
+            backend.restore_session(owner, epoch, *piece)
+        });
+        if let Err(error) = result {
+            if !attempted {
+                return Err(format!(
+                    "session restore could not start on owner {owner}; no owner was restored: \
+                     {error}"
+                ));
+            }
+            fail_closed(backend);
+            return Err(format!(
+                "session restore failed on owner {owner}; mesh poisoned and quarantined: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Drain first (a failed drain poisons/quarantines like any failed drain and
+/// no `reset_rank` runs), then `reset_rank` on EVERY owner regardless of
+/// failures, then synchronize EVERY device regardless of reset failures. Any
+/// failure fails closed and names every failing owner. Transport op ids are
+/// deliberately untouched, so they stay monotonic across resets.
+///
+/// The pre-reset drain runs even with no outstanding epoch: family-enqueued
+/// work (checkpoint copies, session captures) is not tracked as outstanding.
+fn reset_all<B: OwnerOps>(backend: &mut B, epoch: &ForwardEpoch) -> Result<()> {
+    let owners = backend.rank_count();
+    backend.state().admit_lifecycle_epoch(epoch, owners)?;
+    drain(backend).map_err(|e| format!("mesh reset aborted before any reset_rank: {e}"))?;
+    backend.state().outstanding.clear();
+
+    let mut failures: Vec<String> = Vec::new();
+    for owner in 0..owners {
+        let result = backend
+            .bind(owner)
+            .and_then(|()| backend.reset(owner, epoch));
+        if let Err(error) = result {
+            failures.push(format!("owner {owner} reset_rank: {error}"));
+        }
+    }
+    let mut sync_failed = false;
+    for owner in 0..owners {
+        if let Err(error) = backend.synchronize(owner) {
+            sync_failed = true;
+            failures.push(format!("owner {owner} post-reset synchronize: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    if sync_failed {
+        // A device that cannot synchronize may still run work against its
+        // state: quarantine exactly like a failed drain.
+        backend.poison();
+        backend.quarantine();
+    }
+    fail_closed(backend);
+    Err(format!(
+        "mesh reset failed; mesh poisoned and quarantined: {}",
+        failures.join("; ")
+    ))
+}
+
+impl OwnerOps for HipBackend<'_> {
+    fn bind(&mut self, device: usize) -> Result<()> {
+        self.devices[device]
+            .bind_thread()
+            .map_err(|e| e.to_string())
+    }
+    fn checkpoint(
+        &mut self,
+        owner: usize,
+        device: usize,
+        key: &MeshCheckpointKey,
+    ) -> Result<MeshCheckpointId> {
+        self.bindings
+            .checkpoint_rank(owner, &mut self.devices[device], key)
+    }
+    fn restore(
+        &mut self,
+        owner: usize,
+        device: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
+    ) -> Result<()> {
+        self.bindings
+            .restore_rank(owner, &mut self.devices[device], key, ticket)
+    }
+    fn validate_finalize(
+        &mut self,
+        owner: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
+    ) -> Result<()> {
+        self.bindings.validate_finalize_rank(owner, key, ticket)
+    }
+    fn finalize(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId) {
+        self.bindings.finalize_rank(owner, key, ticket);
+    }
+    fn repair_prefix(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        keep: usize,
+        tokens: &[u32],
+    ) -> Result<()> {
+        self.bindings
+            .repair_prefix_rank(owner, &mut self.devices[owner], epoch, keep, tokens)
+    }
+    fn capture_session(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<MeshCheckpointId> {
+        self.bindings
+            .capture_session_rank(owner, &mut self.devices[owner], epoch)
+    }
+    fn probe_session(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
+    ) -> Result<()> {
+        self.bindings.probe_session_rank(owner, epoch, piece)
+    }
+    fn restore_session(
+        &mut self,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
+    ) -> Result<()> {
+        self.bindings
+            .restore_session_rank(owner, &mut self.devices[owner], epoch, piece)
+    }
+    fn reset(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()> {
+        self.bindings
+            .reset_rank(owner, &mut self.devices[owner], epoch)
     }
 }
 
@@ -1209,6 +1806,122 @@ impl Gpus {
                 state: &mut self.mesh_execution,
             },
         )
+    }
+
+    /// Capture every trunk owner (ascending) and, with `with_head`, the head
+    /// on `mesh_output_owner()` (callback owner `devices.len()`), each on its
+    /// own bound device thread. `key.mesh_epoch` must be the provisioned mesh
+    /// epoch of a healthy mesh (not poisoned, not quarantined); the key's
+    /// load/request must match the pinned load and the undrained epochs'
+    /// request when those are known. Otherwise nothing is called and a
+    /// `Shape` error is returned. Rollback follows [`checkpoint_all`]; if any
+    /// owner's rollback also fails the mesh is poisoned and quarantined.
+    pub fn checkpoint_mesh(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        key: &MeshCheckpointKey,
+        with_head: bool,
+    ) -> Result<MeshCheckpoint, MeshLifecycleError> {
+        checkpoint_window(&mut self.lifecycle_backend(bindings), key, with_head)
+    }
+
+    /// Roll every owner back (head first, then trunk descending, continuing
+    /// past failures: [`restore_all`]). The same mesh health/identity
+    /// admission as [`Self::checkpoint_mesh`], plus the checkpoint's key and
+    /// shape (one ticket per device, owner indices exact) are validated before
+    /// any callback. Any failed owner restore poisons and quarantines the mesh.
+    pub fn restore_mesh(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        key: &MeshCheckpointKey,
+        checkpoint: MeshCheckpoint,
+    ) -> Result<(), MeshLifecycleError> {
+        restore_window(&mut self.lifecycle_backend(bindings), key, checkpoint)
+    }
+
+    /// Commit the checkpoint ([`finalize_all`]): every owner validates before
+    /// any owner finalizes; a validation failure restores every owner. Same
+    /// admission and shape checks as [`Self::restore_mesh`]; a rollback that
+    /// itself fails poisons and quarantines the mesh, a clean one does not.
+    /// The infallible host-only `finalize_rank` runs without binding; the
+    /// fallible binding happened in the validation phase.
+    pub fn finalize_mesh(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        key: &MeshCheckpointKey,
+        checkpoint: MeshCheckpoint,
+    ) -> Result<(), MeshLifecycleError> {
+        finalize_window(&mut self.lifecycle_backend(bindings), key, checkpoint)
+    }
+
+    /// Accepted-prefix repair on every trunk owner, ascending, stopping at the
+    /// first error. Refuses a stale/poisoned/quarantined mesh or an epoch whose
+    /// load/policy/request disagrees with the mesh before any callback (its
+    /// op id is NOT checked: the epoch has usually already executed). A
+    /// failing owner poisons and quarantines the mesh and is named in the error.
+    pub fn repair_mesh_prefix(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        epoch: &ForwardEpoch,
+        keep: usize,
+        tokens: &[u32],
+    ) -> Result<()> {
+        repair_prefix_all(&mut self.lifecycle_backend(bindings), epoch, keep, tokens)
+    }
+
+    /// Capture one session piece per trunk owner, ascending, stopping at the
+    /// first failure (named by owner; the family releases already captured
+    /// pieces through its own state). Piece `i` carries owner `i`, and all
+    /// pieces share one key whose mesh/load/request correspond to `epoch`.
+    /// Same admission as [`Self::repair_mesh_prefix`].
+    pub fn capture_mesh_session(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        epoch: &ForwardEpoch,
+    ) -> Result<Vec<MeshCheckpointId>> {
+        capture_session_all(&mut self.lifecycle_backend(bindings), epoch)
+    }
+
+    /// Restore a session. `pieces` must be exactly one per device with exact
+    /// owner indices and one shared key corresponding to `epoch`; the host-only
+    /// `probe_session_rank` then runs on EVERY owner (even after a failed
+    /// probe) before any `restore_session_rank`. A refusal or failed probe
+    /// restores nothing and leaves the mesh healthy; a failure once restores
+    /// have started poisons and quarantines it.
+    pub fn restore_mesh_session(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        epoch: &ForwardEpoch,
+        pieces: &[MeshCheckpointId],
+    ) -> Result<()> {
+        restore_session_all(&mut self.lifecycle_backend(bindings), epoch, pieces)
+    }
+
+    /// Reset request state on every owner. First drains every device (a failed
+    /// drain quarantines as in `drain_mesh_epochs` and NO `reset_rank` runs)
+    /// and retires the outstanding epochs; then runs `reset_rank` on every
+    /// owner regardless of failures; then synchronizes every device regardless
+    /// of reset failures. Any failure poisons and quarantines the mesh and
+    /// names the failing owners. The transport op-id frontier is untouched, so
+    /// op ids stay monotonic across resets. Same admission as
+    /// [`Self::repair_mesh_prefix`].
+    pub fn reset_mesh(
+        &mut self,
+        bindings: &mut dyn MeshStepBindings,
+        epoch: &ForwardEpoch,
+    ) -> Result<()> {
+        reset_all(&mut self.lifecycle_backend(bindings), epoch)
+    }
+
+    fn lifecycle_backend<'a>(
+        &'a mut self,
+        bindings: &'a mut dyn MeshStepBindings,
+    ) -> HipBackend<'a> {
+        HipBackend {
+            devices: &mut self.devices,
+            state: &mut self.mesh_execution,
+            bindings,
+        }
     }
 
     /// Stop and drain every device before releasing any bank/event. A failed
@@ -2424,5 +3137,815 @@ mod checkpoint_tests {
         let err = finalize_all(&mut cb, &k, cp).unwrap_err();
         assert_eq!(err.owner, 1);
         assert!(cb.log.contains(&Ev::Validate(2)));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::device_mesh::DeviceMesh;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum Op {
+        Bind,
+        Checkpoint,
+        Restore,
+        Validate,
+        Repair,
+        Capture,
+        Probe,
+        RestoreSession,
+        Reset,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Ev {
+        Bind(usize),
+        /// (owner, device)
+        Checkpoint(usize, usize),
+        /// (owner, device)
+        Restore(usize, usize),
+        Validate(usize),
+        Finalize(usize),
+        Repair(usize),
+        Capture(usize),
+        Probe(usize),
+        RestoreSession(usize),
+        Reset(usize),
+        Sync(usize),
+    }
+
+    /// CPU backend driven by the production `*_window`/`*_all` helpers through
+    /// `OwnerOps`/`DrainBackend`/`HasState`, exactly like `HipBackend`.
+    struct Toy {
+        ranks: usize,
+        log: Vec<Ev>,
+        fail: HashSet<(Op, usize)>,
+        /// Fail the n-th (0-based, global) `synchronize` call.
+        fail_sync_call: Option<usize>,
+        sync_calls: usize,
+        capture_wrong_owner: Option<usize>,
+        capture_wrong_request: Option<usize>,
+        repair_args: Vec<(usize, usize, Vec<u32>)>,
+        poisoned: bool,
+        quarantined: bool,
+        state: MeshExecutionState,
+    }
+
+    fn mesh_epoch() -> MeshEpoch {
+        static EPOCH: std::sync::LazyLock<MeshEpoch> =
+            std::sync::LazyLock::new(|| DeviceMesh::rect(&[(DimKind::Pp, 3)]).unwrap().epoch());
+        *EPOCH
+    }
+
+    fn stale_epoch() -> MeshEpoch {
+        DeviceMesh::single().unwrap().epoch()
+    }
+
+    fn epoch() -> ForwardEpoch {
+        ForwardEpoch {
+            mesh_epoch: mesh_epoch(),
+            load_id: 1,
+            request_id: 2,
+            op_id: 3,
+            route: MeshRoute::Decode,
+            start_position: 0,
+            actual_rows: 1,
+            route_rows: 1,
+            policy_id: 4,
+        }
+    }
+
+    fn key() -> MeshCheckpointKey {
+        session_key(&epoch())
+    }
+
+    fn session_key(epoch: &ForwardEpoch) -> MeshCheckpointKey {
+        MeshCheckpointKey {
+            mesh_epoch: epoch.mesh_epoch,
+            load_gen: epoch.load_id,
+            reset_gen: 5,
+            request_gen: epoch.request_id,
+            window_gen: 6,
+        }
+    }
+
+    impl Toy {
+        fn new(ranks: usize) -> Self {
+            let mut state = MeshExecutionState::default();
+            state.mesh_epoch = Some(mesh_epoch());
+            state.output_owner = Some(ranks - 1);
+            state.issuer = 1;
+            Self {
+                ranks,
+                log: Vec::new(),
+                fail: HashSet::new(),
+                fail_sync_call: None,
+                sync_calls: 0,
+                capture_wrong_owner: None,
+                capture_wrong_request: None,
+                repair_args: Vec::new(),
+                poisoned: false,
+                quarantined: false,
+                state,
+            }
+        }
+
+        fn failing(mut self, op: Op, owner: usize) -> Self {
+            self.fail.insert((op, owner));
+            self
+        }
+
+        fn hit(&self, op: Op, owner: usize) -> Result<()> {
+            if self.fail.contains(&(op, owner)) {
+                Err(format!("injected {op:?} failure on {owner}"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn count(&self, pred: impl Fn(&Ev) -> bool) -> usize {
+            self.log.iter().filter(|ev| pred(ev)).count()
+        }
+
+        fn fail_closed(&self) -> bool {
+            self.state.poisoned && self.state.quarantined
+        }
+
+        fn healthy(&self) -> bool {
+            !self.state.poisoned && !self.state.quarantined
+        }
+    }
+
+    impl DrainBackend for Toy {
+        fn rank_count(&self) -> usize {
+            self.ranks
+        }
+        fn synchronize(&mut self, owner: usize) -> Result<()> {
+            self.log.push(Ev::Sync(owner));
+            let call = self.sync_calls;
+            self.sync_calls += 1;
+            if self.fail_sync_call == Some(call) {
+                Err("injected sync failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn poison(&mut self) {
+            self.poisoned = true;
+            self.state.poison();
+        }
+        fn quarantine(&mut self) {
+            self.quarantined = true;
+            self.state.quarantined = true;
+        }
+    }
+
+    impl HasState for Toy {
+        fn state(&mut self) -> &mut MeshExecutionState {
+            &mut self.state
+        }
+    }
+
+    impl OwnerOps for Toy {
+        fn bind(&mut self, device: usize) -> Result<()> {
+            self.log.push(Ev::Bind(device));
+            self.hit(Op::Bind, device)
+        }
+        fn checkpoint(
+            &mut self,
+            owner: usize,
+            device: usize,
+            key: &MeshCheckpointKey,
+        ) -> Result<MeshCheckpointId> {
+            self.log.push(Ev::Checkpoint(owner, device));
+            self.hit(Op::Checkpoint, owner)?;
+            Ok(MeshCheckpointId::issue(*key, owner, 700 + owner as u64))
+        }
+        fn restore(
+            &mut self,
+            owner: usize,
+            device: usize,
+            key: &MeshCheckpointKey,
+            ticket: MeshCheckpointId,
+        ) -> Result<()> {
+            assert_eq!((ticket.owner(), ticket.key()), (owner, *key));
+            self.log.push(Ev::Restore(owner, device));
+            self.hit(Op::Restore, owner)
+        }
+        fn validate_finalize(
+            &mut self,
+            owner: usize,
+            _: &MeshCheckpointKey,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            self.log.push(Ev::Validate(owner));
+            self.hit(Op::Validate, owner)
+        }
+        fn finalize(&mut self, owner: usize, _: &MeshCheckpointKey, _: MeshCheckpointId) {
+            self.log.push(Ev::Finalize(owner));
+        }
+        fn repair_prefix(
+            &mut self,
+            owner: usize,
+            _: &ForwardEpoch,
+            keep: usize,
+            tokens: &[u32],
+        ) -> Result<()> {
+            self.log.push(Ev::Repair(owner));
+            self.repair_args.push((owner, keep, tokens.to_vec()));
+            self.hit(Op::Repair, owner)
+        }
+        fn capture_session(
+            &mut self,
+            owner: usize,
+            epoch: &ForwardEpoch,
+        ) -> Result<MeshCheckpointId> {
+            self.log.push(Ev::Capture(owner));
+            self.hit(Op::Capture, owner)?;
+            let minted = if self.capture_wrong_owner == Some(owner) {
+                owner + 1
+            } else {
+                owner
+            };
+            let mut key = session_key(epoch);
+            if self.capture_wrong_request == Some(owner) {
+                key.request_gen += 1;
+            }
+            Ok(MeshCheckpointId::issue(key, minted, 900 + owner as u64))
+        }
+        fn probe_session(
+            &mut self,
+            owner: usize,
+            _: &ForwardEpoch,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            self.log.push(Ev::Probe(owner));
+            self.hit(Op::Probe, owner)
+        }
+        fn restore_session(
+            &mut self,
+            owner: usize,
+            _: &ForwardEpoch,
+            _: MeshCheckpointId,
+        ) -> Result<()> {
+            self.log.push(Ev::RestoreSession(owner));
+            self.hit(Op::RestoreSession, owner)
+        }
+        fn reset(&mut self, owner: usize, _: &ForwardEpoch) -> Result<()> {
+            self.log.push(Ev::Reset(owner));
+            self.hit(Op::Reset, owner)
+        }
+    }
+
+    /// Every GPU-touching callback is immediately preceded by a bind of the
+    /// device it runs on.
+    fn assert_bound_before_gpu_calls(log: &[Ev]) {
+        for (i, ev) in log.iter().enumerate() {
+            let device = match *ev {
+                Ev::Checkpoint(_, device) | Ev::Restore(_, device) => device,
+                Ev::Repair(owner)
+                | Ev::Capture(owner)
+                | Ev::Probe(owner)
+                | Ev::RestoreSession(owner)
+                | Ev::Reset(owner) => owner,
+                _ => continue,
+            };
+            assert!(
+                i > 0 && log[i - 1] == Ev::Bind(device),
+                "{ev:?} not bound: {log:?}"
+            );
+        }
+    }
+
+    fn healthy_artifacts() -> (MeshCheckpoint, Vec<MeshCheckpointId>) {
+        let mut toy = Toy::new(3);
+        let cp = checkpoint_window(&mut toy, &key(), true).unwrap();
+        let pieces = capture_session_all(&mut toy, &epoch()).unwrap();
+        (cp, pieces)
+    }
+
+    #[test]
+    fn owners_map_to_devices_and_head_to_output_owner() {
+        let mut toy = Toy::new(3);
+        toy.state.output_owner = Some(1);
+        let k = key();
+        let cp = checkpoint_window(&mut toy, &k, true).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Checkpoint(0, 0),
+                Ev::Bind(1),
+                Ev::Checkpoint(1, 1),
+                Ev::Bind(2),
+                Ev::Checkpoint(2, 2),
+                Ev::Bind(1),
+                Ev::Checkpoint(3, 1),
+            ]
+        );
+        assert_eq!(cp.head.unwrap().owner(), 3);
+
+        toy.log.clear();
+        restore_window(&mut toy, &k, cp.clone()).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(1),
+                Ev::Restore(3, 1),
+                Ev::Bind(2),
+                Ev::Restore(2, 2),
+                Ev::Bind(1),
+                Ev::Restore(1, 1),
+                Ev::Bind(0),
+                Ev::Restore(0, 0),
+            ]
+        );
+        assert!(toy.healthy());
+
+        // Validation binds each owner (head on the output device); the
+        // infallible host-only finalize never binds.
+        toy.log.clear();
+        finalize_window(&mut toy, &k, cp).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Validate(0),
+                Ev::Bind(1),
+                Ev::Validate(1),
+                Ev::Bind(2),
+                Ev::Validate(2),
+                Ev::Bind(1),
+                Ev::Validate(3),
+                Ev::Finalize(0),
+                Ev::Finalize(1),
+                Ev::Finalize(2),
+                Ev::Finalize(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn headless_checkpoint_has_no_head_callbacks() {
+        let mut toy = Toy::new(2);
+        let cp = checkpoint_window(&mut toy, &key(), false).unwrap();
+        assert!(cp.head.is_none());
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Checkpoint(0, 0),
+                Ev::Bind(1),
+                Ev::Checkpoint(1, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_output_owner_mapping_is_refused_before_callbacks() {
+        for output in [None, Some(3), Some(9)] {
+            let mut toy = Toy::new(3);
+            toy.state.output_owner = output;
+            assert!(checkpoint_window(&mut toy, &key(), true).is_err());
+            assert!(reset_all(&mut toy, &epoch()).is_err());
+            assert!(toy.log.is_empty());
+        }
+    }
+
+    #[test]
+    fn stale_poisoned_quarantined_and_foreign_meshes_refused_before_any_callback() {
+        let (cp, pieces) = healthy_artifacts();
+        let mutations: [(&str, fn(&mut MeshExecutionState)); 6] = [
+            ("quarantined", |s| s.quarantined = true),
+            ("poisoned", |s| s.poisoned = true),
+            ("unprovisioned", |s| s.mesh_epoch = None),
+            ("stale mesh", |s| s.mesh_epoch = Some(stale_epoch())),
+            ("other load", |s| s.scope = Some((99, 4))),
+            ("other request outstanding", |s| {
+                s.outstanding.push(ForwardEpoch {
+                    request_id: 77,
+                    ..epoch()
+                })
+            }),
+        ];
+        for (name, mutate) in &mutations {
+            let mut toy = Toy::new(3);
+            mutate(&mut toy.state);
+            let e = epoch();
+            let k = key();
+            let err = checkpoint_window(&mut toy, &k, true).unwrap_err();
+            assert_eq!(err.phase, MeshLifecyclePhase::Shape, "{name}");
+            assert!(restore_window(&mut toy, &k, cp.clone()).is_err(), "{name}");
+            assert!(finalize_window(&mut toy, &k, cp.clone()).is_err(), "{name}");
+            assert!(
+                repair_prefix_all(&mut toy, &e, 1, &[1, 2]).is_err(),
+                "{name}"
+            );
+            assert!(capture_session_all(&mut toy, &e).is_err(), "{name}");
+            assert!(
+                restore_session_all(&mut toy, &e, &pieces).is_err(),
+                "{name}"
+            );
+            assert!(reset_all(&mut toy, &e).is_err(), "{name}");
+            assert!(toy.log.is_empty(), "{name}: callbacks ran: {:?}", toy.log);
+        }
+        // Foreign checkpoint key / epoch identities.
+        let mut toy = Toy::new(3);
+        let foreign_mesh = MeshCheckpointKey {
+            mesh_epoch: stale_epoch(),
+            ..key()
+        };
+        assert!(checkpoint_window(&mut toy, &foreign_mesh, true).is_err());
+        let foreign_epoch = ForwardEpoch {
+            mesh_epoch: stale_epoch(),
+            ..epoch()
+        };
+        assert!(repair_prefix_all(&mut toy, &foreign_epoch, 0, &[]).is_err());
+        assert!(reset_all(&mut toy, &foreign_epoch).is_err());
+        // Policy change is refused for epoch calls once the mesh is pinned.
+        toy.state.scope = Some((1, 99));
+        assert!(repair_prefix_all(&mut toy, &epoch(), 0, &[]).is_err());
+        assert!(toy.log.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_does_not_enforce_submit_op_ids_on_executed_epochs() {
+        let mut toy = Toy::new(3);
+        toy.state.last_op = Some(50);
+        toy.state.scope = Some((1, 4));
+        toy.state.outstanding.push(epoch());
+        let cp = checkpoint_window(&mut toy, &key(), false).unwrap();
+        restore_window(&mut toy, &key(), cp).unwrap();
+        repair_prefix_all(&mut toy, &epoch(), 1, &[7]).unwrap();
+        assert!(toy.healthy());
+        assert_eq!(toy.state.last_op, Some(50));
+    }
+
+    #[test]
+    fn restore_and_finalize_refuse_wrong_shape_or_key_before_callbacks() {
+        let mut other = Toy::new(2);
+        let two_owner = checkpoint_window(&mut other, &key(), true).unwrap();
+        let (three_owner, _) = healthy_artifacts();
+        let newer = MeshCheckpointKey {
+            window_gen: 99,
+            ..key()
+        };
+        let mut toy = Toy::new(3);
+        // Two tickets on a three-device mesh.
+        assert!(restore_window(&mut toy, &key(), two_owner.clone()).is_err());
+        assert!(finalize_window(&mut toy, &key(), two_owner).is_err());
+        // Stale window generation.
+        assert!(restore_window(&mut toy, &newer, three_owner.clone()).is_err());
+        assert!(finalize_window(&mut toy, &newer, three_owner).is_err());
+        assert!(toy.log.is_empty());
+        assert!(
+            toy.healthy(),
+            "pre-callback refusal does not poison the mesh"
+        );
+    }
+
+    #[test]
+    fn checkpoint_failures_quarantine_only_when_rollback_fails() {
+        // Clean rollback: recoverable, mesh stays healthy.
+        let mut toy = Toy::new(3).failing(Op::Checkpoint, 2);
+        let err = checkpoint_window(&mut toy, &key(), true).unwrap_err();
+        assert_eq!((err.phase, err.owner), (MeshLifecyclePhase::Checkpoint, 2));
+        assert!(toy.healthy());
+        assert_bound_before_gpu_calls(&toy.log);
+        assert_eq!(toy.count(|e| matches!(e, Ev::Restore(..))), 2);
+
+        // Rollback failure: unknown state, fail closed.
+        let mut toy = Toy::new(3)
+            .failing(Op::Checkpoint, 2)
+            .failing(Op::Restore, 1);
+        let err = checkpoint_window(&mut toy, &key(), true).unwrap_err();
+        assert!(err.poisoned());
+        assert!(toy.fail_closed());
+        assert_eq!(toy.count(|e| matches!(e, Ev::Restore(..))), 2);
+
+        // A bind failure is the owner's callback failure: the owner's capture
+        // never runs, the earlier owner is rolled back.
+        let mut toy = Toy::new(3).failing(Op::Bind, 1);
+        let err = checkpoint_window(&mut toy, &key(), false).unwrap_err();
+        assert_eq!((err.phase, err.owner), (MeshLifecyclePhase::Checkpoint, 1));
+        assert!(!toy.log.contains(&Ev::Checkpoint(1, 1)));
+        assert!(toy.log.contains(&Ev::Restore(0, 0)));
+        assert!(toy.healthy());
+    }
+
+    #[test]
+    fn finalize_and_restore_failures_quarantine_per_rollback_result() {
+        let (cp, _) = healthy_artifacts();
+        // Validation failure, clean rollback: nothing finalized, mesh healthy.
+        let mut toy = Toy::new(3).failing(Op::Validate, 1);
+        let err = finalize_window(&mut toy, &key(), cp.clone()).unwrap_err();
+        assert_eq!((err.phase, err.owner), (MeshLifecyclePhase::Validate, 1));
+        assert!(!err.poisoned());
+        assert_eq!(toy.count(|e| matches!(e, Ev::Finalize(_))), 0);
+        assert_eq!(toy.count(|e| matches!(e, Ev::Restore(..))), 4);
+        assert!(toy.healthy());
+
+        // Validation bind failure on a device whose restore bind fails too.
+        let mut toy = Toy::new(3).failing(Op::Bind, 1);
+        let err = finalize_window(&mut toy, &key(), cp.clone()).unwrap_err();
+        assert_eq!((err.phase, err.owner), (MeshLifecyclePhase::Validate, 1));
+        assert_eq!(toy.count(|e| matches!(e, Ev::Finalize(_))), 0);
+        assert!(toy.fail_closed());
+
+        // Restore failures always fail closed.
+        let mut toy = Toy::new(3).failing(Op::Restore, 0);
+        let err = restore_window(&mut toy, &key(), cp.clone()).unwrap_err();
+        assert_eq!((err.phase, err.owner), (MeshLifecyclePhase::Restore, 0));
+        assert!(toy.fail_closed());
+        assert_eq!(toy.count(|e| matches!(e, Ev::Restore(..))), 4);
+        assert_bound_before_gpu_calls(&toy.log);
+    }
+
+    #[test]
+    fn session_restore_probes_every_owner_before_the_first_restore() {
+        let (_, pieces) = healthy_artifacts();
+        let mut toy = Toy::new(3);
+        restore_session_all(&mut toy, &epoch(), &pieces).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Probe(0),
+                Ev::Bind(1),
+                Ev::Probe(1),
+                Ev::Bind(2),
+                Ev::Probe(2),
+                Ev::Bind(0),
+                Ev::RestoreSession(0),
+                Ev::Bind(1),
+                Ev::RestoreSession(1),
+                Ev::Bind(2),
+                Ev::RestoreSession(2),
+            ]
+        );
+        assert!(toy.healthy());
+    }
+
+    #[test]
+    fn failed_probe_restores_nothing_and_still_probes_every_owner() {
+        let (_, pieces) = healthy_artifacts();
+        for failing in [vec![0], vec![2], vec![0, 1]] {
+            let mut toy = Toy::new(3);
+            for owner in &failing {
+                toy.fail.insert((Op::Probe, *owner));
+            }
+            let error = restore_session_all(&mut toy, &epoch(), &pieces).unwrap_err();
+            assert!(
+                error.contains(&format!("owner {}", failing[0])),
+                "first failure is named: {error}"
+            );
+            assert_eq!(toy.count(|e| matches!(e, Ev::Probe(_))), 3, "{failing:?}");
+            assert_eq!(toy.count(|e| matches!(e, Ev::RestoreSession(_))), 0);
+            assert!(toy.healthy(), "nothing mutated, mesh stays usable");
+        }
+        // A bind failure while probing is a probe failure for that owner only.
+        let mut toy = Toy::new(3).failing(Op::Bind, 1);
+        assert!(restore_session_all(&mut toy, &epoch(), &pieces).is_err());
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Probe(0),
+                Ev::Bind(1),
+                Ev::Bind(2),
+                Ev::Probe(2)
+            ]
+        );
+        assert!(toy.healthy());
+    }
+
+    #[test]
+    fn session_restore_failure_after_start_quarantines_and_stops() {
+        let (_, pieces) = healthy_artifacts();
+        let mut toy = Toy::new(3).failing(Op::RestoreSession, 1);
+        let error = restore_session_all(&mut toy, &epoch(), &pieces).unwrap_err();
+        assert!(error.contains("owner 1"), "{error}");
+        assert_eq!(
+            toy.log[6..],
+            [
+                Ev::Bind(0),
+                Ev::RestoreSession(0),
+                Ev::Bind(1),
+                Ev::RestoreSession(1)
+            ]
+        );
+        assert!(toy.fail_closed());
+    }
+
+    #[test]
+    fn session_shape_key_and_owner_mismatches_refused_before_callbacks() {
+        let (_, pieces) = healthy_artifacts();
+        let e = epoch();
+        let k = session_key(&e);
+        let other_window = MeshCheckpointKey {
+            window_gen: k.window_gen + 1,
+            ..k
+        };
+        let foreign_load = MeshCheckpointKey { load_gen: 99, ..k };
+        let foreign_request = MeshCheckpointKey {
+            request_gen: 99,
+            ..k
+        };
+        let foreign_mesh = MeshCheckpointKey {
+            mesh_epoch: stale_epoch(),
+            ..k
+        };
+        let all_with = |key: MeshCheckpointKey| -> Vec<MeshCheckpointId> {
+            (0..3).map(|o| MeshCheckpointId::issue(key, o, 1)).collect()
+        };
+        let cases: Vec<(&str, Vec<MeshCheckpointId>)> = vec![
+            ("empty", vec![]),
+            ("too few", pieces[..2].to_vec()),
+            (
+                "too many",
+                [pieces.clone(), vec![MeshCheckpointId::issue(k, 3, 1)]].concat(),
+            ),
+            ("swapped", vec![pieces[1], pieces[0], pieces[2]]),
+            ("duplicated owner", vec![pieces[0], pieces[0], pieces[2]]),
+            (
+                "one key differs",
+                vec![
+                    pieces[0],
+                    MeshCheckpointId::issue(other_window, 1, 1),
+                    pieces[2],
+                ],
+            ),
+            ("foreign load", all_with(foreign_load)),
+            ("foreign request", all_with(foreign_request)),
+            ("foreign mesh", all_with(foreign_mesh)),
+        ];
+        for (name, bad) in cases {
+            let mut toy = Toy::new(3);
+            assert!(restore_session_all(&mut toy, &e, &bad).is_err(), "{name}");
+            assert!(toy.log.is_empty(), "{name}: {:?}", toy.log);
+            assert!(toy.healthy(), "{name}");
+        }
+    }
+
+    #[test]
+    fn capture_session_is_ascending_validated_and_reports_named_failures() {
+        let mut toy = Toy::new(3);
+        let pieces = capture_session_all(&mut toy, &epoch()).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Capture(0),
+                Ev::Bind(1),
+                Ev::Capture(1),
+                Ev::Bind(2),
+                Ev::Capture(2)
+            ]
+        );
+        for (owner, piece) in pieces.iter().enumerate() {
+            assert_eq!((piece.owner(), piece.key()), (owner, key()));
+        }
+
+        // Family failure: reported, later owners untouched, mesh not poisoned.
+        let mut toy = Toy::new(3).failing(Op::Capture, 1);
+        let error = capture_session_all(&mut toy, &epoch()).unwrap_err();
+        assert!(error.contains("owner 1"), "{error}");
+        assert_eq!(toy.count(|e| matches!(e, Ev::Capture(_))), 2);
+        assert!(toy.healthy());
+
+        // Wrong ticket owner and wrong request key are named failures too.
+        let mut toy = Toy::new(3);
+        toy.capture_wrong_owner = Some(2);
+        let error = capture_session_all(&mut toy, &epoch()).unwrap_err();
+        assert!(error.contains("owner 2"), "{error}");
+        let mut toy = Toy::new(3);
+        toy.capture_wrong_request = Some(1);
+        let error = capture_session_all(&mut toy, &epoch()).unwrap_err();
+        assert!(error.contains("owner 1"), "{error}");
+        assert_bound_before_gpu_calls(&toy.log);
+    }
+
+    #[test]
+    fn repair_is_ascending_and_first_failure_quarantines() {
+        let mut toy = Toy::new(3);
+        repair_prefix_all(&mut toy, &epoch(), 5, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Bind(0),
+                Ev::Repair(0),
+                Ev::Bind(1),
+                Ev::Repair(1),
+                Ev::Bind(2),
+                Ev::Repair(2)
+            ]
+        );
+        assert_eq!(toy.repair_args[2], (2, 5, vec![1, 2, 3]));
+        assert!(toy.healthy());
+
+        let mut toy = Toy::new(3).failing(Op::Repair, 1);
+        let error = repair_prefix_all(&mut toy, &epoch(), 5, &[1]).unwrap_err();
+        assert!(error.contains("owner 1"), "{error}");
+        assert_eq!(
+            toy.count(|e| matches!(e, Ev::Repair(_))),
+            2,
+            "stop on first"
+        );
+        assert!(toy.fail_closed());
+        // Quarantine is terminal for every later lifecycle call.
+        let calls = toy.log.len();
+        assert!(repair_prefix_all(&mut toy, &epoch(), 5, &[1]).is_err());
+        assert!(reset_all(&mut toy, &epoch()).is_err());
+        assert_eq!(toy.log.len(), calls);
+
+        // A bind failure is the owner's failure as well.
+        let mut toy = Toy::new(3).failing(Op::Bind, 0);
+        assert!(repair_prefix_all(&mut toy, &epoch(), 5, &[1]).is_err());
+        assert_eq!(toy.log, vec![Ev::Bind(0)]);
+        assert!(toy.fail_closed());
+    }
+
+    #[test]
+    fn reset_drains_first_then_resets_every_owner_then_synchronizes_every_device() {
+        let mut toy = Toy::new(3);
+        toy.state.last_op = Some(9);
+        toy.state.scope = Some((1, 4));
+        toy.state.outstanding.push(epoch());
+        reset_all(&mut toy, &epoch()).unwrap();
+        assert_eq!(
+            toy.log,
+            vec![
+                Ev::Sync(0),
+                Ev::Sync(1),
+                Ev::Sync(2),
+                Ev::Bind(0),
+                Ev::Reset(0),
+                Ev::Bind(1),
+                Ev::Reset(1),
+                Ev::Bind(2),
+                Ev::Reset(2),
+                Ev::Sync(0),
+                Ev::Sync(1),
+                Ev::Sync(2),
+            ]
+        );
+        assert!(toy.state.outstanding.is_empty());
+        assert!(toy.healthy());
+        assert_eq!(
+            toy.state.last_op,
+            Some(9),
+            "op ids stay monotonic across resets"
+        );
+        assert_eq!(toy.state.scope, Some((1, 4)));
+    }
+
+    #[test]
+    fn failed_predrain_never_resets_and_quarantines() {
+        let mut toy = Toy::new(3);
+        toy.fail_sync_call = Some(1);
+        toy.state.outstanding.push(epoch());
+        let error = reset_all(&mut toy, &epoch()).unwrap_err();
+        assert!(error.contains("before any reset_rank"), "{error}");
+        assert_eq!(toy.log, vec![Ev::Sync(0), Ev::Sync(1), Ev::Sync(2)]);
+        assert!(toy.fail_closed());
+        assert!(
+            toy.quarantined,
+            "failed drain quarantines like drain_mesh_epochs"
+        );
+        assert_eq!(toy.state.outstanding.len(), 1, "outstanding not retired");
+    }
+
+    #[test]
+    fn reset_failures_do_not_stop_other_owners_or_the_final_sync() {
+        let mut toy = Toy::new(3).failing(Op::Reset, 1).failing(Op::Bind, 2);
+        let error = reset_all(&mut toy, &epoch()).unwrap_err();
+        assert!(error.contains("owner 1 reset_rank"), "{error}");
+        assert!(error.contains("owner 2 reset_rank"), "{error}");
+        assert_eq!(toy.count(|e| matches!(e, Ev::Reset(_))), 2);
+        assert!(toy.log.contains(&Ev::Reset(0)));
+        assert!(toy.log.contains(&Ev::Reset(1)));
+        assert_eq!(
+            toy.log[toy.log.len() - 3..],
+            [Ev::Sync(0), Ev::Sync(1), Ev::Sync(2)]
+        );
+        assert_eq!(toy.count(|e| matches!(e, Ev::Sync(_))), 6);
+        assert!(toy.fail_closed());
+        assert!(
+            !toy.quarantined,
+            "reset failure alone does not forget devices"
+        );
+        assert_bound_before_gpu_calls(&toy.log);
+    }
+
+    #[test]
+    fn post_reset_sync_failure_quarantines_like_a_failed_drain() {
+        let mut toy = Toy::new(3);
+        toy.fail_sync_call = Some(4);
+        let error = reset_all(&mut toy, &epoch()).unwrap_err();
+        assert!(error.contains("owner 1 post-reset synchronize"), "{error}");
+        assert_eq!(toy.count(|e| matches!(e, Ev::Reset(_))), 3);
+        assert_eq!(toy.count(|e| matches!(e, Ev::Sync(_))), 6);
+        assert!(toy.fail_closed() && toy.quarantined);
     }
 }

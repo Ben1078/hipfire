@@ -354,6 +354,14 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
     ) -> Result<MeshCheckpointId> {
         Err(TRANSACTIONS_REFUSED.into())
     }
+    fn probe_session_rank(
+        &mut self,
+        _: usize,
+        _: &ForwardEpoch,
+        _: MeshCheckpointId,
+    ) -> Result<()> {
+        Err(TRANSACTIONS_REFUSED.into())
+    }
     fn restore_session_rank(
         &mut self,
         _: usize,
