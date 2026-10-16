@@ -3281,6 +3281,20 @@ pub struct PinnedTransferBuffer {
     synchronize: unsafe extern "C" fn() -> u32,
 }
 
+// SAFETY: this is the unique owner of its pinned allocation. Moving it does
+// not move the allocation, expose host aliases, or change stream ordering.
+// Submission, completion and host access all require exclusive `&mut self`;
+// the caller must bind the recorded device before HIP operations. Drop binds
+// that device itself, drains pending accesses and restores the prior binding,
+// retaining storage if retirement fails. HIP stream handles are not
+// thread-affine. Deliberately NOT Sync: concurrent access is not supported.
+unsafe impl Send for PinnedTransferBuffer {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<PinnedTransferBuffer>();
+};
+
 impl PinnedTransferBuffer {
     pub fn size(&self) -> usize {
         self.storage.as_ref().expect("live transfer storage").size()

@@ -321,13 +321,18 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
     // the `RefCell`/map itself). On other arches the batched path is unchanged.
     #[cfg(target_arch = "x86_64")]
     {
-        let split = ACTIVATION_SUMS.with(|cell| {
-            // Keep the borrow alive as an owned guard and reborrow it as a
-            // plain `&mut ActivationSumCache`: field-splitting (`lookup` vs
-            // `sums`) is then visible to the borrow checker, which a `RefMut`
-            // target hides behind `DerefMut`.
-            let mut cache_guard = cell.borrow_mut();
-            let cache = &mut *cache_guard;
+        let split = {
+            // Check the scratch out of the thread-local instead of holding a
+            // `RefCell` borrow across the rayon region: `run_shared_jobs` blocks
+            // this thread in a join, and rayon may steal another task onto it
+            // that is itself a sourced GEMV (nested/concurrent callers on one
+            // pool). That task finds an empty slot and prepares into its own
+            // scratch, so the borrow is only ever held for the swap. The guard
+            // returns the warm capacity on drop, including during unwind.
+            // `&mut guard.0` is a plain reborrow so field-splitting (`lookup`
+            // vs `sums`) stays visible to the borrow checker.
+            let mut guard = CheckedOutSums::take();
+            let cache = &mut guard.0;
             cache.reset();
             for j in 0..jobs {
                 let n = src.n(j);
@@ -384,8 +389,9 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
                     cache.offsets.push(off);
                 }
             }
-            // The outer TLS borrow is held for the whole region; the workers
-            // only ever see `&[…]` slices, so nothing shared-mutable is touched.
+            // No TLS borrow is held here (the scratch is checked out): a task
+            // stolen onto this thread may re-enter. The workers only ever see
+            // `&[…]` slices, so nothing shared-mutable is touched.
             // `prep` ends here: the `exec` span starts at the region boundary,
             // so the two are adjacent, not nested.
             let t_exec = std::time::Instant::now();
@@ -407,7 +413,7 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
                 exec_ns,
                 total_ns,
             }
-        });
+        };
         split
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -453,6 +459,36 @@ struct ActivationSumCache {
 thread_local! {
     static ACTIVATION_SUMS: RefCell<ActivationSumCache> =
         RefCell::new(ActivationSumCache::default());
+}
+
+/// Owns the thread's [`ActivationSumCache`] for the span of one sourced GEMV
+/// call. The thread-local slot is left holding an empty default (no heap
+/// allocation) so a reentrant call on the same thread never contends for it.
+#[cfg(target_arch = "x86_64")]
+struct CheckedOutSums(ActivationSumCache);
+
+#[cfg(target_arch = "x86_64")]
+impl CheckedOutSums {
+    fn take() -> Self {
+        Self(ACTIVATION_SUMS.with(|cell| std::mem::take(&mut *cell.borrow_mut())))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for CheckedOutSums {
+    fn drop(&mut self) {
+        let owned = std::mem::take(&mut self.0);
+        // `try_with`: the slot may already be destroyed at thread exit.
+        let _ = ACTIVATION_SUMS.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut() {
+                // A reentrant call may have parked its own scratch meanwhile;
+                // keep whichever holds more capacity so warm calls stay warm.
+                if owned.sums.capacity() >= slot.sums.capacity() {
+                    *slot = owned;
+                }
+            }
+        });
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1285,6 +1321,145 @@ mod test {
                 }
                 off += m * n;
             }
+        }
+    }
+
+    /// The activation-sum scratch is checked out of the thread-local, not
+    /// borrowed across the rayon region. A source callback that re-enters
+    /// `gemv_shared_sourced` on the same thread (during Σ prep, and inside the
+    /// region, where a one-worker pool runs every task on the caller) and
+    /// concurrent callers on a small pool (a worker blocked in the region steals
+    /// another call onto itself) must neither panic with `RefCell already
+    /// borrowed` nor perturb the outer call's bits.
+    #[test]
+    fn shared_sourced_is_reentrant_from_source_callbacks_and_stolen_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Plain<'a> {
+            w: &'a [u8],
+            xs: &'a [Vec<f32>],
+        }
+        impl SharedJobSource for Plain<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, _: usize) -> usize {
+                self.xs.len()
+            }
+            fn quant(&self, _: usize) -> CpuQuant {
+                CpuQuant::Mq4G256V2
+            }
+            fn packed(&self, _: usize) -> &[u8] {
+                self.w
+            }
+            fn xs_row(&self, _: usize, t: usize) -> &[f32] {
+                &self.xs[t]
+            }
+        }
+        /// Every activation read first runs a whole nested sourced GEMV over
+        /// different weights/activations and checks it against its reference.
+        struct Nesting<'a> {
+            outer: Plain<'a>,
+            inner: Plain<'a>,
+            inner_want: &'a [f32],
+            m: usize,
+            k: usize,
+            nested_calls: AtomicUsize,
+        }
+        impl SharedJobSource for Nesting<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, j: usize) -> usize {
+                self.outer.n(j)
+            }
+            fn quant(&self, j: usize) -> CpuQuant {
+                self.outer.quant(j)
+            }
+            fn packed(&self, j: usize) -> &[u8] {
+                self.outer.packed(j)
+            }
+            fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+                let mut got = vec![0.0f32; self.inner_want.len()];
+                gemv_shared_sourced(self.m, self.k, &mut got, &self.inner, None);
+                assert!(
+                    got.iter()
+                        .zip(self.inner_want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "nested call diverged"
+                );
+                self.nested_calls.fetch_add(1, Ordering::Relaxed);
+                self.outer.xs_row(j, t)
+            }
+        }
+
+        let q = CpuQuant::Mq4G256V2;
+        let (m, k) = (9usize, 256usize);
+        let w_outer = crate::testfix::weight_bytes(q, m, k);
+        // Different weights with valid headers: the same rows, reversed.
+        let w_inner: Vec<u8> = w_outer
+            .chunks(row_bytes(q, k))
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
+        let xs_outer: Vec<Vec<f32>> = (0..3)
+            .map(|t| x_of(k).iter().map(|v| v + t as f32 * 0.37).collect())
+            .collect();
+        let xs_inner: Vec<Vec<f32>> = (0..2)
+            .map(|t| x_of(k).iter().map(|v| v * 0.5 - t as f32 * 0.11).collect())
+            .collect();
+        let plain_outer = Plain {
+            w: &w_outer,
+            xs: &xs_outer,
+        };
+        let plain_inner = Plain {
+            w: &w_inner,
+            xs: &xs_inner,
+        };
+        let mut want_outer = vec![0.0f32; m * xs_outer.len()];
+        gemv_shared_sourced(m, k, &mut want_outer, &plain_outer, None);
+        let mut want_inner = vec![0.0f32; m * xs_inner.len()];
+        gemv_shared_sourced(m, k, &mut want_inner, &plain_inner, None);
+
+        let run_once = || {
+            let src = Nesting {
+                outer: Plain {
+                    w: &w_outer,
+                    xs: &xs_outer,
+                },
+                inner: Plain {
+                    w: &w_inner,
+                    xs: &xs_inner,
+                },
+                inner_want: &want_inner,
+                m,
+                k,
+                nested_calls: AtomicUsize::new(0),
+            };
+            let mut got = vec![0.0f32; want_outer.len()];
+            gemv_shared_sourced(m, k, &mut got, &src, None);
+            assert!(src.nested_calls.load(Ordering::Relaxed) > 0);
+            assert!(
+                got.iter()
+                    .zip(&want_outer)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "outer call perturbed by reentrancy"
+            );
+        };
+
+        for threads in [1usize, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            // Single call from a pool worker: nested calls land on the thread
+            // that owns the outer scratch.
+            pool.install(&run_once);
+            // Concurrent calls: a worker blocked in the region steals another
+            // whole call onto itself.
+            pool.install(|| {
+                (0..16usize).into_par_iter().for_each(|_| run_once());
+            });
         }
     }
 

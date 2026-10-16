@@ -303,8 +303,14 @@ impl SessionState for Qwen4Bundle {
                 .and_then(Qwen4GpuForward::igpu_manifest)
                 .as_deref(),
         );
+        // Approximate CPU arithmetic is a different prefix-state domain. Bind
+        // both the actual armed layers and the immutable hot-set/placement
+        // digest, never raw owner addresses. GPU-only scopes stay unchanged.
+        let host = self.execution.as_ref()
+            .map(Qwen4GpuForward::host_exec_identity).unwrap_or_default();
+        let host = if host.is_empty() { String::new() } else { format!("/{host}") };
         Some(format!(
-            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}{igpu}",
+            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}{igpu}{host}",
             self.state_format
         ))
     }
@@ -833,6 +839,35 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .is_some_and(Qwen4GpuForward::has_cpu_deferred_experts)
+    }
+
+    /// Trunk layers armed for the opt-in CPU-cold/GPU-hot routed slot join.
+    pub fn split_layers(&self) -> Vec<usize> {
+        self.execution.as_ref().map(Qwen4GpuForward::split_layers).unwrap_or_default()
+    }
+
+    /// Stable numerical identity of the frozen CPU split and expert hot set.
+    pub fn split_digest(&self) -> Option<String> {
+        self.execution.as_ref().and_then(Qwen4GpuForward::split_digest)
+    }
+
+    /// Lab-only slot capture / serial-overlap controls. Off leaves production
+    /// execution unchanged; endpoint overrides require explicit configuration.
+    pub fn split_parity_configure(
+        &mut self,
+        config: hipfire_dispatch::cpu_split::SplitParityConfig,
+    ) -> Result<(), BundleError> {
+        self.execution.as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 forward resources are not attached".into()))?
+            .split_parity_configure(config)
+            .map_err(|e| BundleError::Forward(e.to_string()))
+    }
+
+    /// Drain bounded lab parity records in execution order.
+    pub fn split_take_parity_records(
+        &mut self,
+    ) -> Vec<hipfire_dispatch::cpu_split::SplitParityRecord> {
+        self.execution.as_ref().map(Qwen4GpuForward::split_take_parity_records).unwrap_or_default()
     }
 
     /// Whether any host-placed trunk layer runs its prefill experts on the iGPU
