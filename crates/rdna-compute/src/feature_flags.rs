@@ -770,9 +770,22 @@ impl FeatureFlags {
             // gfx1201 IU4 producers search {5,7} like gfx11 (`HIPFIRE_G12_A4C2`,
             // default on): the gfx1201 emit takes the one-pass producer-layout
             // path in block_i4_128_quant.hip, bit-identical to this flag's
-            // reference search. `=0` restores RTN (d = amax/7).
+            // reference search. `=0` restores RTN (d = amax/7) whatever
+            // `HIPFIRE_G12_A4_CANDIDATES` says. That knob widens the search
+            // like gfx11's: 4 and 8 take the generic emit (no one-pass, no
+            // A4 slab, no sym-IU4 MoE); unset/empty/invalid use 2.
             if parse_bool("HIPFIRE_G12_A4C2").unwrap_or(true) {
-                append_hipcc_flag("-DIU4_A4_CANDIDATES=2");
+                let candidates = match value("HIPFIRE_G12_A4_CANDIDATES").ok().as_deref() {
+                    Some(candidate @ ("1" | "2" | "4" | "8")) => candidate.to_string(),
+                    None | Some("") => "2".to_string(),
+                    Some(other) => {
+                        eprintln!(
+                            "unknown HIPFIRE_G12_A4_CANDIDATES={other:?}; using default value 2"
+                        );
+                        "2".to_string()
+                    }
+                };
+                append_hipcc_flag(&format!("-DIU4_A4_CANDIDATES={candidates}"));
             }
         }
 
@@ -1632,6 +1645,70 @@ mod tests {
             });
             assert_eq!(flags.qwen4_qsa_code_check, enabled, "{value:?}");
         }
+    }
+
+    fn gfx1201_a4_flags(candidates: Option<&str>, a4c2: Option<&str>) -> String {
+        FeatureFlags::from_lookup("gfx1201", |name| match name {
+            "HIPFIRE_G12_A4_CANDIDATES" => candidates.map(str::to_owned).ok_or(()),
+            "HIPFIRE_G12_A4C2" => a4c2.map(str::to_owned).ok_or(()),
+            _ => Err(()),
+        })
+        .hipcc_extra_flags
+    }
+
+    #[test]
+    fn g12_a4_candidates_defaults_to_two_and_accepts_ladder_values() {
+        // Default flag string is byte-identical to the pre-knob literal.
+        assert_eq!(gfx1201_a4_flags(None, None), "-DIU4_A4_CANDIDATES=2");
+        assert_eq!(gfx1201_a4_flags(Some(""), None), "-DIU4_A4_CANDIDATES=2");
+        for value in ["1", "2", "4", "8"] {
+            assert_eq!(
+                gfx1201_a4_flags(Some(value), None),
+                format!("-DIU4_A4_CANDIDATES={value}"),
+            );
+        }
+    }
+
+    #[test]
+    fn g12_a4_candidates_invalid_values_fall_back_to_two() {
+        for value in ["0", "3", "16", "02", " 4", "4 ", "two", "true"] {
+            assert_eq!(
+                gfx1201_a4_flags(Some(value), None),
+                "-DIU4_A4_CANDIDATES=2",
+                "{value:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn g12_a4c2_off_ignores_candidate_count() {
+        for value in [None, Some("2"), Some("4"), Some("8"), Some("bogus")] {
+            for off in ["0", "false", "off"] {
+                assert_eq!(gfx1201_a4_flags(value, Some(off)), "", "{value:?} {off}");
+            }
+        }
+    }
+
+    #[test]
+    fn g12_a4_candidates_is_gfx1201_only() {
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_lookup(arch, |name| {
+                if name == "HIPFIRE_G12_A4_CANDIDATES" {
+                    Ok("8".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(flags.hipcc_extra_flags, "-DIU4_A4_CANDIDATES=2", "{arch}");
+        }
+        let flags = FeatureFlags::from_lookup("gfx1100", |name| {
+            if name == "HIPFIRE_GFX11_A4_CANDIDATES" {
+                Ok("4".into())
+            } else {
+                Err(())
+            }
+        });
+        assert_eq!(flags.hipcc_extra_flags, "-DIU4_A4_CANDIDATES=4");
     }
 
     #[test]

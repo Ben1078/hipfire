@@ -249,7 +249,7 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
 | Developer key | Env | Default | Effect |
 |---|---|---|---|
 | `developer.ep_owner_routed_prefill` | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | on under EP (2..=8 ranks) | Owner-routed chunk MoE: a prefill chunk of at least 512 rows computes only its own experts' tiles and pulls the other ranks' tiles over P2P; every other chunk keeps the full-table route. Admitted on gfx1201 (every layer verified symmetric on every rank, the symmetric IU4 MoE route requested, below) and on gfx1100 (the F16 WMMA grouped MoE route, QT44/QT53 experts on every layer), always with the Flash-Next profile, `kernel.moe_grouped_gemm` on and the full (non-compact) scratch plan; a refusal logs `qwen4 EP rank r/n: owner-routed prefill not admitted (reason)`. |
-| `developer.qwen4_moe_sym_iu4` | `HIPFIRE_QWEN4_MOE_SYM_IU4` | unset = requested on gfx1151 / gfx1201 | Grouped symmetric IU4 MoE prefill route for Qwen4. `1` requests it, `0` keeps the whole incumbent route. The request also needs the IU4 producers built with exactly the two-candidate activation search: on gfx1201 that is `kernel.g12_a4c2` (default `true`), on gfx1151 `kernel.gfx11_a4_candidates = "2"` (default), and any other `-DIU4_A4_CANDIDATES` value in `diagnostic.compiler.hipcc_extra_flags` withdraws it. Layers whose routed-expert headers fail the symmetry check (asymmetric artifacts) stay on the incumbent route. On gfx1201, owner-routed prefill therefore has no single request key: it follows this developer lever plus those typed keys; on gfx1100 it runs on the F16 WMMA grouped route and does not read this lever. |
+| `developer.qwen4_moe_sym_iu4` | `HIPFIRE_QWEN4_MOE_SYM_IU4` | unset = requested on gfx1151 / gfx1201 | Grouped symmetric IU4 MoE prefill route for Qwen4. `1` requests it, `0` keeps the whole incumbent route. The request also needs the IU4 producers built with exactly the two-candidate activation search: on gfx1201 that is `kernel.g12_a4c2` (default `true`) with `kernel.g12_a4_candidates = "2"` (default), on gfx1151 `kernel.gfx11_a4_candidates = "2"` (default), and any other `-DIU4_A4_CANDIDATES` value (including `kernel.g12_a4_candidates = "4"` or `"8"`, or one in `diagnostic.compiler.hipcc_extra_flags`) withdraws it. Layers whose routed-expert headers fail the symmetry check (asymmetric artifacts) stay on the incumbent route. On gfx1201, owner-routed prefill therefore has no single request key: it follows this developer lever plus those typed keys; on gfx1100 it runs on the F16 WMMA grouped route and does not read this lever. |
 | `developer.qwen4_moe_x_lds` | `HIPFIRE_QWEN4_MOE_X_LDS` | `auto` | Exact gfx1151 F16 WMMA MoE route: the grouped gate/up SiLU and down GEMMs take X-through-LDS entries, bytewise the per-wave entries. `auto` arms exactly when a layer's MoE runs on the F16 WMMA route (its symmetric IU4 arm, above, is not selected); the default IU4 route is unchanged. `1` forces it wherever admissible, `0` keeps the per-wave entries. See `docs/env-vars.md`. |
 | `developer.ep_balanced_owners` | `HIPFIRE_EP_BALANCED_OWNERS` | on under EP (gfx1201 at 2..=4 ranks only) | Per-call balanced expert ownership on the host-mapped trunk MoE layers of an EP rank. Admitted on exact gfx1201 at 2..=4 ranks only (the certified owner-assign kernel's range); on gfx1100 the rank logs `balanced ownership not admitted (needs gfx1201); static split`, at 5..=8 ranks `... (needs at most 4 ranks); static split`, and runs the exact static `e % N` split. Off builds nothing. |
 | `developer.ep_expert_stage` | `HIPFIRE_EP_EXPERT_STAGE` | on (gfx1201 only) | Admits long-prefill expert staging under EP. Applies only when the owner-routed route is installed on gfx1201 (a gfx1100 rank logs `expert staging not admitted (needs gfx1201)` and builds nothing) and every trunk MoE layer in the forward binds the compact table. |
@@ -1341,6 +1341,17 @@ daemon after changing them.
 the number of activation-quantization candidates searched inside the fused
 gfx1100/gfx1151 IU4 producers; `"8"` restores the full-grid search.
 
+`kernel.g12_a4_candidates` (default `"2"`; `"1"`, `"2"`, `"4"` or `"8"`) is the
+gfx1201 counterpart, read only while `kernel.g12_a4c2` is on (`kernel.g12_a4c2 =
+false` still restores round-to-nearest whatever the count). `"2"` is the
+`{5,7}` one-pass producer-layout search and leaves the JIT flag string
+(`-DIU4_A4_CANDIDATES=2`) and cache keys unchanged. `"4"` and `"8"` compile the
+fused producers with the generic candidate loop (the `{1, 9/7, 12/7, 2}` subset
+and the full grid): no one-pass search, no A4 slab, and the grouped symmetric
+IU4 MoE route falls back to the incumbent route, because those two stay
+C2-only. `"1"` is round-to-nearest through the same loop. Invalid values warn
+and use `"2"`. The standalone quantizer is unchanged.
+
 `kernel.gfx11_iu4_gridspec` (default `true`; opt out with `false` or
 `HIPFIRE_GFX11_IU4_GRIDSPEC=0`) splits partial-N gfx11 IU4 GEMMs so full
 interior tiles use the unchecked specialization and only the final tile uses
@@ -1639,6 +1650,7 @@ misspelled key is unknown and fails the load with
 | `kernel.flash_partials_batch` | `flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` | experimental |
 | `kernel.fp16` | `fp16` | `HIPFIRE_FP16` | stable |
 | `kernel.fp8_wmma` | `fp8_wmma` | `HIPFIRE_FP8_WMMA` | experimental |
+| `kernel.g12_a4_candidates` | `g12_a4_candidates` | `HIPFIRE_G12_A4_CANDIDATES` | experimental |
 | `kernel.g12_a4c2` | `g12_a4c2` | `HIPFIRE_G12_A4C2` | stable |
 | `kernel.g12_dec_norm` | `g12_dec_norm` | `HIPFIRE_G12_DEC_NORM` | stable |
 | `kernel.g12_norm` | `g12_norm` | `HIPFIRE_G12_NORM` | stable |

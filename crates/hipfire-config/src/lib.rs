@@ -2839,6 +2839,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_G12_A4C2",
         "Search two activation-quantization scales ({5,7}, as on gfx11) inside the gfx1201 int4 producers (default on exact gfx1201; set to false or HIPFIRE_G12_A4C2=0 to restore round-to-nearest d = amax/7; compiles the gfx1201 JIT with -DIU4_A4_CANDIDATES=2, whose one-pass producer-layout search is bit-identical to the generic candidate loop)."
     ),
+    process_field!(
+        "kernel.g12_a4_candidates",
+        "g12_a4_candidates",
+        Kernel,
+        DefaultValue::String("2"),
+        ValueRule::Enum(&["1", "2", "4", "8"]),
+        true,
+        "HIPFIRE_G12_A4_CANDIDATES",
+        "Number of activation-quantization candidates searched inside the fused gfx1201 IU4 producers when kernel.g12_a4c2 is on (default 2, selecting {5,7} with the one-pass producer-layout search); 4 searches the {1, 9/7, 12/7, 2} subset of the grid and 8 the full grid through the generic candidate loop (the gfx11 HIPFIRE_GFX11_A4_CANDIDATES convention). Any value other than 2 disables the C2-only A4 slab and grouped symmetric IU4 MoE routes (they fall back to the incumbent routes). kernel.g12_a4c2 = false still restores round-to-nearest regardless of this value; the standalone quantizer is unchanged."
+    ),
     process_bool_field!(
         "kernel.gfx11_producer_quant_fused",
         "gfx11_producer_quant_fused",
