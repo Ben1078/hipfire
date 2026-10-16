@@ -2739,6 +2739,8 @@ fn load_qwen4_rank_scoped(
             write!(&mut digest_hex, "{byte:02x}").expect("writing to a String");
         }
         let sidecar = hotset.as_ref().expect("a hotset plan has a sidecar");
+        lease.bind_hotset_sidecar_sha256(sidecar.sha256())
+            .map_err(|error| format!("hotset numerical identity: {error}"))?;
         eprintln!(
             "  qwen4 expert hot set: {} sha256 {}, budget {} MiB, {} experts in VRAM ({} MiB), {} host-mapped ({} MiB), generation {}, digest {}, bound to base {} B, index sha256 {}",
             hotset_path.as_ref().expect("a hotset plan has a path").display(),

@@ -276,6 +276,14 @@ pub enum Qwen4FfnBinding<'a> {
 /// grouped read of the host-placed experts.
 pub const QWEN4_CPU_SPLICE_MAX_ROWS: usize = NARROW_VERIFY_MAX_ROWS;
 
+// The D2 tier split serves exactly the same narrow window as the D1 splice
+// (AR decode, every admitted verify/replay width up to the cap), so the one
+// speculative cap (`QWEN4_CPU_SPLICE_MAX_ROWS`, `spec_verify_rows_cap`) covers
+// both CPU numerical modes.
+const _: () = assert!(
+    hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS == QWEN4_CPU_SPLICE_MAX_ROWS
+);
+
 /// MoE resources are source-bound once by the family and consumed by the
 /// shared prefill sealer/lowering. The dispatch layer owns all route policy.
 #[derive(Clone, Copy)]

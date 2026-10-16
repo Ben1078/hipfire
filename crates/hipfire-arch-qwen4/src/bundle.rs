@@ -362,7 +362,7 @@ impl SessionState for Qwen4Bundle {
         if route == SessionRoute::Mtp && self.mtp.is_none() {
             return None;
         }
-        Some(session_scope(
+        let mut scope = session_scope(
             route,
             chunk,
             self.state_format,
@@ -370,7 +370,18 @@ impl SessionState for Qwen4Bundle {
             self.pp_band
                 .as_ref()
                 .map(|band| (band, self.pp_session_policy())),
-        ))
+        );
+        // Approximate CPU arithmetic is a different prefix-state domain. Bind
+        // the actual armed layers and immutable hot-set/placement digest while
+        // preserving the GPU-only and pipeline-band scope.
+        if let Some(execution) = self.execution.as_ref() {
+            let host = execution.host_exec_identity();
+            if !host.is_empty() {
+                scope.push('/');
+                scope.push_str(&host);
+            }
+        }
+        Some(scope)
     }
 
     fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
@@ -983,11 +994,40 @@ impl Qwen4Bundle {
         Ok(None)
     }
 
-    /// Whether any host-placed trunk routed experts use the opt-in CPU splice.
+    /// Whether trunk routed experts use the D1 CPU splice or D2 tier split.
     pub fn has_cpu_deferred_experts(&self) -> bool {
         self.execution
             .as_ref()
             .is_some_and(Qwen4GpuForward::has_cpu_deferred_experts)
+    }
+
+    /// Trunk layers armed for the opt-in CPU-cold/GPU-hot routed slot join.
+    pub fn split_layers(&self) -> Vec<usize> {
+        self.execution.as_ref().map(Qwen4GpuForward::split_layers).unwrap_or_default()
+    }
+
+    /// Stable numerical identity of the frozen CPU split and expert hot set.
+    pub fn split_digest(&self) -> Option<String> {
+        self.execution.as_ref().and_then(Qwen4GpuForward::split_digest)
+    }
+
+    /// Lab-only slot capture / serial-overlap controls. Off leaves production
+    /// execution unchanged; endpoint overrides require explicit configuration.
+    pub fn split_parity_configure(
+        &mut self,
+        config: hipfire_dispatch::cpu_split::SplitParityConfig,
+    ) -> Result<(), BundleError> {
+        self.execution.as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 forward resources are not attached".into()))?
+            .split_parity_configure(config)
+            .map_err(|e| BundleError::Forward(e.to_string()))
+    }
+
+    /// Drain bounded lab parity records in execution order.
+    pub fn split_take_parity_records(
+        &mut self,
+    ) -> Vec<hipfire_dispatch::cpu_split::SplitParityRecord> {
+        self.execution.as_ref().map(Qwen4GpuForward::split_take_parity_records).unwrap_or_default()
     }
 
     /// Attach reusable ordinary-HIP execution resources after the manifest
