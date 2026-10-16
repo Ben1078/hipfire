@@ -10,15 +10,15 @@
 //! with the caller and is passed to every entry point. The root's own
 //! `execution` is its forward; each peer's `execution` is its band's forward.
 //! There is no family topology, thread pool or generation loop here: a call
-//! splits the request into canonical tiles, and every tile is one
-//! submit/drain of the generic executor over borrowed per-band adapters.
+//! splits the request into canonical tiles, submits them in order through the
+//! generic executor, then drains the whole request once.
 //!
 //! * Every GPU model operation runs on `gpus.devices` (logical device `i` is
 //!   band `i`). The daemon's `Gpu` is ignored for PP forwards.
 //! * Generation logits/top-1 tensors are allocated by the daemon on the
 //!   output band's physical device and are written directly by the output
-//!   band. Every tile is drained (all-device synchronization) before the call
-//!   returns, so the daemon observes the rows complete.
+//!   band. All tiles are drained (one all-device synchronization) before the
+//!   call returns, so the daemon observes the rows complete.
 //! * Tiles are the common canonical prefill chunk, in order, never padded;
 //!   only the last tile computes the head for `Final` rows. Routing rows are
 //!   the actual rows; the explicit [`MeshRoute`] is preserved.
@@ -341,8 +341,28 @@ fn prepare_tiles(
     Ok(layouts)
 }
 
-/// Submit and drain every tile in order. Returns `Ok` only when every tile
-/// drained.
+/// Submit every canonical tile in order, then acknowledge the request with one
+/// all-device drain. Band positions/QSA marks are enqueue frontiers until that
+/// drain succeeds; an error quarantines them, never acknowledges a partial
+/// request or permits another request to consume the partial state.
+/// Failed enqueue marks are not rolled back independently: the quarantined
+/// mesh cannot reuse/publish them, and S4 recovery remains unload/reload.
+///
+/// Backpressure stays on the devices: `EdgeLease`'s two ready/done banks order
+/// boundary copies, and each band's stream orders receive -> compute -> send
+/// -> next receive, protecting its reusable device scratch.
+///
+/// Host inputs have separate, local lifetime fences, not mesh barriers:
+/// * `forward_chunk_scoped` uploads token ids through `mesh_tokens.stage_buffer`
+///   and `upload_async`; `PleHostStage::stage_buffer` drains the previous upload
+///   fence before any overwrite (including a shorter tail).
+/// * Its PLE upload copies the `RowFetch::wait` lease into `host_ple` through
+///   the same fenced staging API before releasing the lease. The next tile may
+///   reuse that host allocation only after its copy event completes.
+/// * `ple_ahead` is a row-store ticket, not an alias of either upload buffer:
+///   `RowFetch::begin_or_adopt` validates its epoch/ids, and the forward releases
+///   its lease only after staging/upload. Lookahead never overwrites in-flight
+///   host staging bytes. These fences must remain even without per-tile drains.
 fn run_tiles(
     root: &mut Qwen4Bundle,
     mesh: &mut Qwen4PpMesh,
@@ -355,94 +375,106 @@ fn run_tiles(
     let stages = mesh.stages();
     let vocab = root.config.vocab_size;
     let count = tiles.len();
-    for (index, tile) in tiles.iter().enumerate() {
-        let last = index + 1 == count;
-        let mode = tile_mode(
-            request.logits.is_some(),
-            request.top1.is_some(),
-            request.rows,
-            last,
-        );
-        // Output views; they outlive the adapter that borrows them.
-        let (logits_view, top1_view) = match (mode, request.logits) {
-            (MODE_TRUNK, _) | (_, None) => (None, None),
-            (_, Some(logits)) => {
-                let (logits_offset, top1_offset, rows) = match request.rows {
-                    Qwen4OutputRows::All => (tile.offset * vocab, tile.offset * 4, tile.rows),
-                    Qwen4OutputRows::Final => (0, 0, 1),
-                };
-                (
-                    Some(logits.sub_offset(logits_offset, rows * vocab)),
-                    request.top1.map(|top1| {
-                        top1.sub_offset(top1_offset, rows * std::mem::size_of::<i32>())
-                    }),
-                )
-            }
-        };
-        let tile_layouts = &layouts[index * stages..(index + 1) * stages];
-        let op_id = mesh.next_op;
-        mesh.next_op = op_id
-            .checked_add(1)
-            .ok_or_else(|| TileError::refused("mesh operation ids are exhausted"))?;
-        let epoch = ForwardEpoch {
-            mesh_epoch: gpus.mesh.epoch(),
-            load_id: mesh.load_id,
-            request_id: mesh.request_id,
-            op_id,
-            route: request.route,
-            start_position: root.state.position,
-            actual_rows: tile.rows,
-            route_rows: tile_layouts[0].route_rows,
-            policy_id: PP_POLICY_ID,
-        };
-        let mut edge_epochs = Vec::with_capacity(stages - 1);
-        for src in 0..stages - 1 {
-            let id = EdgeId {
-                src_device: src,
-                dst_device: src + 1,
+    let mut tickets = Vec::with_capacity(count);
+    let mut submitted = false;
+    let submitted_all = (|| {
+        for (index, tile) in tiles.iter().enumerate() {
+            let last = index + 1 == count;
+            let mode = tile_mode(
+                request.logits.is_some(),
+                request.top1.is_some(),
+                request.rows,
+                last,
+            );
+            // Output views; they outlive the adapter that borrows them.
+            let (logits_view, top1_view) = match (mode, request.logits) {
+                (MODE_TRUNK, _) | (_, None) => (None, None),
+                (_, Some(logits)) => {
+                    let (logits_offset, top1_offset, rows) = match request.rows {
+                        Qwen4OutputRows::All => (tile.offset * vocab, tile.offset * 4, tile.rows),
+                        Qwen4OutputRows::Final => (0, 0, 1),
+                    };
+                    (
+                        Some(logits.sub_offset(logits_offset, rows * vocab)),
+                        request.top1.map(|top1| {
+                            top1.sub_offset(top1_offset, rows * std::mem::size_of::<i32>())
+                        }),
+                    )
+                }
             };
-            match gpus.mesh_edge_epoch(id) {
-                Some(epoch) if epoch != 0 => edge_epochs.push(epoch),
-                _ => return Err(TileError::refused("a band boundary has no transport lease")),
+            let tile_layouts = &layouts[index * stages..(index + 1) * stages];
+            let op_id = mesh.next_op;
+            mesh.next_op = op_id
+                .checked_add(1)
+                .ok_or_else(|| TileError::refused("mesh operation ids are exhausted"))?;
+            let epoch = ForwardEpoch {
+                mesh_epoch: gpus.mesh.epoch(),
+                load_id: mesh.load_id,
+                request_id: mesh.request_id,
+                op_id,
+                route: request.route,
+                start_position: root.state.position,
+                actual_rows: tile.rows,
+                route_rows: tile_layouts[0].route_rows,
+                policy_id: PP_POLICY_ID,
+            };
+            let mut edge_epochs = Vec::with_capacity(stages - 1);
+            for src in 0..stages - 1 {
+                let id = EdgeId {
+                    src_device: src,
+                    dst_device: src + 1,
+                };
+                match gpus.mesh_edge_epoch(id) {
+                    Some(epoch) if epoch != 0 => edge_epochs.push(epoch),
+                    _ => return Err(TileError::refused("a band boundary has no transport lease")),
+                }
             }
+            let (peer_forwards, root_forward) = forwards.split_at_mut(stages - 1);
+            let mut ranks = Vec::with_capacity(stages);
+            for (bundle, forward) in mesh.bands.iter_mut().zip(peer_forwards.iter_mut()) {
+                ranks.push(Qwen4RankBand { bundle, forward });
+            }
+            ranks.push(Qwen4RankBand {
+                bundle: &mut *root,
+                forward: &mut root_forward[0],
+            });
+            let mut bindings = Qwen4MeshBindings::new(ranks).map_err(TileError::refused)?;
+            bindings.set_tokens(&request.tokens[tile.offset..tile.offset + tile.rows]);
+            bindings.set_edge_epochs(edge_epochs);
+            for (owner, layout) in tile_layouts.iter().enumerate() {
+                bindings
+                    .set_rank_layout(owner, *layout)
+                    .map_err(TileError::refused)?;
+            }
+            bindings.set_head(logits_view.as_ref().map(|logits| Qwen4MeshHead {
+                logits,
+                top1: top1_view.as_ref(),
+                rows: request.rows,
+            }));
+            // Treat even a refused submit conservatively once it may have entered
+            // a callback: a later tile's failure also invalidates all earlier work.
+            submitted = true;
+            tickets.push(
+                gpus.submit_mesh_epoch(&mesh.plans[mode], &epoch, &mut bindings)
+                    .map_err(|error| TileError::fatal(format!("submission failed: {error}")))?,
+            );
         }
-        let (peer_forwards, root_forward) = forwards.split_at_mut(stages - 1);
-        let mut ranks = Vec::with_capacity(stages);
-        for (bundle, forward) in mesh.bands.iter_mut().zip(peer_forwards.iter_mut()) {
-            ranks.push(Qwen4RankBand { bundle, forward });
+        Ok::<(), TileError>(())
+    })();
+    if let Err(error) = submitted_all {
+        if !submitted {
+            return Err(error);
         }
-        ranks.push(Qwen4RankBand {
-            bundle: &mut *root,
-            forward: &mut root_forward[0],
-        });
-        let mut bindings = Qwen4MeshBindings::new(ranks).map_err(TileError::refused)?;
-        bindings.set_tokens(&request.tokens[tile.offset..tile.offset + tile.rows]);
-        bindings.set_edge_epochs(edge_epochs);
-        for (owner, layout) in tile_layouts.iter().enumerate() {
-            bindings
-                .set_rank_layout(owner, *layout)
-                .map_err(TileError::refused)?;
-        }
-        bindings.set_head(logits_view.as_ref().map(|logits| Qwen4MeshHead {
-            logits,
-            top1: top1_view.as_ref(),
-            rows: request.rows,
+        // Also covers local validation/id exhaustion after earlier tiles were
+        // enqueued. Stop all edges/devices before releasing borrowed resources;
+        // the caller quarantines the request even when this drain succeeds.
+        return Err(TileError::fatal(match gpus.drain_mesh_edges() {
+            Ok(()) => error.message,
+            Err(drain) => format!("{}; {drain}", error.message),
         }));
-        let ticket = match gpus.submit_mesh_epoch(&mesh.plans[mode], &epoch, &mut bindings) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                // Work may be partially enqueued: stop every device before
-                // anything is touched again.
-                return Err(TileError::fatal(match gpus.drain_mesh_edges() {
-                    Ok(()) => format!("submission failed: {error}"),
-                    Err(drain) => format!("submission failed: {error}; {drain}"),
-                }));
-            }
-        };
-        gpus.drain_mesh_epoch(ticket)
-            .map_err(|error| TileError::fatal(format!("drain failed: {error}")))?;
     }
-    Ok(())
+    gpus.drain_mesh_epochs(tickets)
+        .map_err(|error| TileError::fatal(format!("drain failed: {error}")))
 }
 
 impl Qwen4Bundle {

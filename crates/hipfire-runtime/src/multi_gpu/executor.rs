@@ -484,7 +484,10 @@ pub(super) struct MeshExecutionState {
     issuer: u64,
     last_op: Option<u64>,
     scope: Option<(u64, u64)>,
-    pending: Option<ForwardEpoch>,
+    /// Successfully issued, not yet drained epochs, oldest first. They all
+    /// belong to one request and one mesh epoch with strictly increasing op
+    /// ids (`admit`). A failed issue never appears here: it poisons the state.
+    outstanding: Vec<ForwardEpoch>,
     poisoned: bool,
     quarantined: bool,
 }
@@ -495,6 +498,53 @@ impl MeshExecutionState {
         for edge in self.edges.values() {
             edge.lease.poison();
         }
+    }
+
+    /// Pure admission check; mutates nothing. A new epoch may join undrained
+    /// earlier epochs only for the same request (mesh epoch, load and numerical
+    /// policy are pinned by `mesh_epoch`/`scope`) with a strictly larger op id.
+    fn admit(&self, epoch: &ForwardEpoch) -> Result<()> {
+        if self.mesh_epoch != Some(epoch.mesh_epoch) || self.poisoned || self.quarantined {
+            return Err("mesh epoch is stale, busy, poisoned, or unprovisioned".into());
+        }
+        if self
+            .outstanding
+            .last()
+            .is_some_and(|last| last.request_id != epoch.request_id)
+        {
+            return Err("mesh epoch is busy with another request's undrained epochs".into());
+        }
+        if self.last_op.is_some_and(|last| epoch.op_id <= last)
+            || self
+                .scope
+                .is_some_and(|scope| scope != (epoch.load_id, epoch.policy_id))
+        {
+            return Err(
+                "mesh operation id is not monotonic or load/numerical policy changed".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Side-effect-free ticket validation. The tickets must be exactly the
+    /// outstanding epochs, oldest first, issued by this state: a device drain
+    /// retires every outstanding epoch, so a subset, reordering, stale or
+    /// foreign ticket is refused before any device is touched.
+    fn validate_tickets(&self, tickets: &[MeshTicket]) -> Result<()> {
+        if self.quarantined
+            || tickets.is_empty()
+            || tickets.len() != self.outstanding.len()
+            || tickets
+                .iter()
+                .zip(&self.outstanding)
+                .any(|(ticket, epoch)| ticket.issuer != self.issuer || ticket.epoch != *epoch)
+        {
+            return Err(
+                "mesh tickets do not name exactly the outstanding healthy transport epochs in order"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -534,6 +584,8 @@ trait Backend: DrainBackend {
         publish: bool,
     ) -> Result<()>;
     fn marks(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()>;
+    /// Host-side validation hook run before any enqueue of `epoch`.
+    fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -791,6 +843,54 @@ fn drain(backend: &mut impl DrainBackend) -> Result<()> {
     Ok(())
 }
 
+/// Access to the executor state machine from a backend; HIP and the CPU toy
+/// tests drive the very same `submit`/`drain_tickets` through it.
+trait HasState {
+    fn state(&mut self) -> &mut MeshExecutionState;
+}
+
+/// Admit, prepare, enqueue. Validation (admission, `prepare_epoch`, `prepare`)
+/// happens before any device enqueue and refuses without poisoning: outstanding
+/// earlier epochs stay drainable. Only an enqueue failure (`issue`) poisons, and
+/// the failed epoch is never recorded outstanding, so no ticket exists for it.
+fn submit<B: Backend + HasState>(
+    plan: &SplitPlan,
+    epoch: &ForwardEpoch,
+    backend: &mut B,
+) -> Result<MeshTicket> {
+    backend.state().admit(epoch)?;
+    backend.prepare_epoch(epoch)?;
+    let mut prepared = prepare(plan, epoch, &*backend)?;
+    let state = backend.state();
+    state.last_op = Some(epoch.op_id);
+    state.scope = Some((epoch.load_id, epoch.policy_id));
+    issue(&mut prepared, plan, epoch, backend)?;
+    let state = backend.state();
+    state.outstanding.push(*epoch);
+    Ok(MeshTicket {
+        issuer: state.issuer,
+        epoch: *epoch,
+    })
+}
+
+/// Validate every ticket before touching a device, synchronize every device
+/// once, then retire all outstanding epochs. Failed sync poisons and
+/// quarantines (S3 `drain`); a poisoned mesh retires its epochs but reports an
+/// error for all of them.
+fn drain_tickets<B: DrainBackend + HasState>(
+    tickets: &[MeshTicket],
+    backend: &mut B,
+) -> Result<()> {
+    backend.state().validate_tickets(tickets)?;
+    drain(backend)?;
+    let state = backend.state();
+    state.outstanding.clear();
+    if state.poisoned {
+        return Err("mesh submission failed before drain".into());
+    }
+    Ok(())
+}
+
 struct HipBackend<'a> {
     devices: &'a mut [Gpu],
     state: &'a mut MeshExecutionState,
@@ -887,6 +987,15 @@ impl Backend for HipBackend<'_> {
     fn marks(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()> {
         self.bindings.apply_rank_marks(owner, epoch)
     }
+    fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()> {
+        self.bindings.prepare_epoch(epoch)
+    }
+}
+
+impl HasState for HipBackend<'_> {
+    fn state(&mut self) -> &mut MeshExecutionState {
+        self.state
+    }
 }
 
 /// Drain backend over the admitted device list.
@@ -918,6 +1027,12 @@ impl DrainBackend for HipDrain<'_> {
         // Gpu::drop frees registered VMM/host-mapped state; a failed drain keeps
         // device ownership until process teardown.
         std::mem::forget(std::mem::take(self.devices));
+    }
+}
+
+impl HasState for HipDrain<'_> {
+    fn state(&mut self) -> &mut MeshExecutionState {
+        self.state
     }
 }
 
@@ -1048,62 +1163,52 @@ impl Gpus {
             .map(|e| e.lease.epoch())
     }
 
+    /// Submit one epoch. Epochs of the same request may be outstanding at once
+    /// (strictly increasing op ids); every ticket must be drained together by
+    /// `drain_mesh_epochs`. A submission failure after any device enqueue
+    /// poisons the mesh: all earlier outstanding tickets then drain to an error.
     pub fn submit_mesh_epoch(
         &mut self,
         plan: &SplitPlan,
         epoch: &ForwardEpoch,
         bindings: &mut dyn MeshStepBindings,
     ) -> Result<MeshTicket> {
-        let state = &mut self.mesh_execution;
-        if state.mesh_epoch != Some(epoch.mesh_epoch)
-            || state.poisoned
-            || state.quarantined
-            || state.pending.is_some()
-        {
-            return Err("mesh epoch is stale, busy, poisoned, or unprovisioned".into());
-        }
-        if state.last_op.is_some_and(|last| epoch.op_id <= last)
-            || state
-                .scope
-                .is_some_and(|scope| scope != (epoch.load_id, epoch.policy_id))
-        {
-            return Err(
-                "mesh operation id is not monotonic or load/numerical policy changed".into(),
-            );
-        }
-        bindings.prepare_epoch(epoch)?;
-        let mut backend = HipBackend {
-            devices: &mut self.devices,
-            state,
-            bindings,
-        };
-        let mut prepared = prepare(plan, epoch, &backend)?;
-        backend.state.last_op = Some(epoch.op_id);
-        backend.state.scope = Some((epoch.load_id, epoch.policy_id));
-        backend.state.pending = Some(*epoch);
-        issue(&mut prepared, plan, epoch, &mut backend)?;
-        Ok(MeshTicket {
-            issuer: backend.state.issuer,
-            epoch: *epoch,
-        })
+        submit(
+            plan,
+            epoch,
+            &mut HipBackend {
+                devices: &mut self.devices,
+                state: &mut self.mesh_execution,
+                bindings,
+            },
+        )
     }
 
+    /// Single-ticket drain: valid only while that ticket names the sole
+    /// outstanding epoch.
     pub fn drain_mesh_epoch(&mut self, ticket: MeshTicket) -> Result<()> {
-        if ticket.issuer != self.mesh_execution.issuer
-            || self.mesh_execution.pending != Some(ticket.epoch)
-            || self.mesh_execution.quarantined
-        {
-            return Err("mesh ticket does not name the pending healthy transport epoch".into());
-        }
-        drain(&mut HipDrain {
-            devices: &mut self.devices,
-            state: &mut self.mesh_execution,
-        })?;
-        self.mesh_execution.pending = None;
-        if self.mesh_execution.poisoned {
-            return Err("mesh submission failed before drain".into());
-        }
-        Ok(())
+        drain_tickets(
+            &[ticket],
+            &mut HipDrain {
+                devices: &mut self.devices,
+                state: &mut self.mesh_execution,
+            },
+        )
+    }
+
+    /// Drain every outstanding epoch with one synchronization of each device.
+    /// `tickets` must be exactly the outstanding tickets, oldest first; any
+    /// stale, foreign, missing or out-of-order ticket is refused before a
+    /// device is touched and leaves the state unchanged. A failed device sync
+    /// quarantines exactly as `drain_mesh_edges` does.
+    pub fn drain_mesh_epochs(&mut self, tickets: Vec<MeshTicket>) -> Result<()> {
+        drain_tickets(
+            &tickets,
+            &mut HipDrain {
+                devices: &mut self.devices,
+                state: &mut self.mesh_execution,
+            },
+        )
     }
 
     /// Stop and drain every device before releasing any bank/event. A failed
@@ -1156,8 +1261,13 @@ mod tests {
         no_stream: bool,
         fail_ops: Option<usize>,
         fail_drain: Option<usize>,
+        fail_prepare: bool,
+        prepared: Vec<u64>,
         poisoned: bool,
         quarantined: bool,
+        /// The real executor state machine, driven by the production
+        /// `submit`/`drain_tickets` through `HasState`.
+        state: MeshExecutionState,
     }
 
     impl Toy {
@@ -1171,9 +1281,30 @@ mod tests {
                 no_stream: false,
                 fail_ops: None,
                 fail_drain: None,
+                fail_prepare: false,
+                prepared: Vec::new(),
                 poisoned: false,
                 quarantined: false,
+                state: MeshExecutionState::default(),
             }
+        }
+
+        /// Provisioned for `epoch`'s mesh with a distinct ticket issuer.
+        fn provisioned(ranks: usize, epoch: &ForwardEpoch, issuer: u64) -> Self {
+            let mut toy = Self::new(ranks);
+            toy.state.mesh_epoch = Some(epoch.mesh_epoch);
+            toy.state.issuer = issuer;
+            toy
+        }
+
+        fn syncs(&self) -> Vec<usize> {
+            self.calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Sync(owner) => Some(*owner),
+                    _ => None,
+                })
+                .collect()
         }
     }
 
@@ -1191,9 +1322,11 @@ mod tests {
         }
         fn poison(&mut self) {
             self.poisoned = true;
+            self.state.poison();
         }
         fn quarantine(&mut self) {
             self.quarantined = true;
+            self.state.quarantined = true;
         }
     }
 
@@ -1250,6 +1383,20 @@ mod tests {
         fn marks(&mut self, owner: usize, _: &ForwardEpoch) -> Result<()> {
             self.calls.push(Call::Marks(owner));
             Ok(())
+        }
+        fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()> {
+            self.prepared.push(epoch.op_id);
+            if self.fail_prepare {
+                Err("injected prepare failure".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl HasState for Toy {
+        fn state(&mut self) -> &mut MeshExecutionState {
+            &mut self.state
         }
     }
 
@@ -1572,6 +1719,236 @@ mod tests {
         plan.ranks[1].items.swap(first, second);
         assert!(prepare(&plan, &epoch, &toy).is_err());
         assert!(toy.calls.is_empty());
+    }
+
+    fn at(epoch: &ForwardEpoch, op_id: u64) -> ForwardEpoch {
+        ForwardEpoch { op_id, ..*epoch }
+    }
+
+    fn submit_n(
+        toy: &mut Toy,
+        plan: &SplitPlan,
+        epoch: &ForwardEpoch,
+        first_op: u64,
+        n: u64,
+    ) -> Vec<MeshTicket> {
+        (first_op..first_op + n)
+            .map(|op| submit(plan, &at(epoch, op), toy).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn n_outstanding_epochs_drain_with_one_sync_per_device() {
+        let (_, plan, epoch) = toy_plan(3, 1);
+        let mut toy = Toy::provisioned(3, &epoch, 1);
+        let tickets = submit_n(&mut toy, &plan, &epoch, 10, 4);
+        assert_eq!(toy.prepared, vec![10, 11, 12, 13]);
+        assert_eq!(toy.state.outstanding.len(), 4);
+        assert!(toy.syncs().is_empty(), "submission never waits on devices");
+        let publishes = toy
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Publish(_)))
+            .count();
+        assert_eq!(publishes, 4 * 2);
+        drain_tickets(&tickets, &mut toy).unwrap();
+        assert_eq!(toy.syncs(), vec![0, 1, 2], "every device synchronized once");
+        assert!(toy.state.outstanding.is_empty());
+        assert!(!toy.poisoned && !toy.quarantined && !toy.state.poisoned);
+        // The healthy mesh admits the next epoch (and even a new request) after
+        // the drain, with the op id still strictly increasing.
+        let next = ForwardEpoch {
+            request_id: 99,
+            ..at(&epoch, 14)
+        };
+        submit(&plan, &next, &mut toy).unwrap();
+        assert!(submit(&plan, &at(&epoch, 14), &mut toy).is_err());
+    }
+
+    #[test]
+    fn single_ticket_drain_keeps_its_meaning() {
+        let (_, plan, epoch) = toy_plan(2, 1);
+        let mut toy = Toy::provisioned(2, &epoch, 1);
+        let tickets = submit_n(&mut toy, &plan, &epoch, 3, 1);
+        drain_tickets(&tickets, &mut toy).unwrap();
+        assert_eq!(toy.syncs(), vec![0, 1]);
+        assert!(toy.state.outstanding.is_empty());
+        // A second drain of the same (now stale) ticket is refused and does not
+        // synchronize again.
+        assert!(drain_tickets(&tickets, &mut toy).is_err());
+        assert_eq!(toy.syncs(), vec![0, 1]);
+        // One ticket cannot drain two outstanding epochs.
+        let mut toy = Toy::provisioned(2, &epoch, 1);
+        let mut tickets = submit_n(&mut toy, &plan, &epoch, 3, 2);
+        let newest = tickets.pop().unwrap();
+        assert!(drain_tickets(&[newest], &mut toy).is_err());
+        assert!(drain_tickets(&tickets, &mut toy).is_err());
+        assert!(toy.syncs().is_empty());
+        assert_eq!(toy.state.outstanding.len(), 2);
+    }
+
+    #[test]
+    fn admission_requires_same_request_and_increasing_ops() {
+        let (_, plan, epoch) = toy_plan(2, 1);
+        let mut toy = Toy::provisioned(2, &epoch, 1);
+        submit_n(&mut toy, &plan, &epoch, 10, 2);
+        let prepared = toy.prepared.len();
+        let calls = toy.calls.len();
+        let other_request = ForwardEpoch {
+            request_id: epoch.request_id + 1,
+            ..at(&epoch, 12)
+        };
+        let other_load = ForwardEpoch {
+            load_id: epoch.load_id + 1,
+            ..at(&epoch, 12)
+        };
+        let other_policy = ForwardEpoch {
+            policy_id: epoch.policy_id + 1,
+            ..at(&epoch, 12)
+        };
+        let stale_mesh = ForwardEpoch {
+            mesh_epoch: DeviceMesh::single().unwrap().epoch(),
+            ..at(&epoch, 12)
+        };
+        for refused in [
+            at(&epoch, 10),
+            at(&epoch, 9),
+            at(&epoch, 11),
+            other_request,
+            other_load,
+            other_policy,
+            stale_mesh,
+        ] {
+            assert!(submit(&plan, &refused, &mut toy).is_err());
+        }
+        // Admission refusals have no side effects at all: no bindings hook, no
+        // enqueue, no poisoning, outstanding epochs untouched.
+        assert_eq!(toy.prepared.len(), prepared);
+        assert_eq!(toy.calls.len(), calls);
+        assert!(!toy.poisoned && !toy.state.poisoned);
+        assert_eq!(toy.state.outstanding.len(), 2);
+        submit(&plan, &at(&epoch, 12), &mut toy).unwrap();
+        assert_eq!(toy.state.outstanding.len(), 3);
+    }
+
+    #[test]
+    fn validation_refusal_keeps_outstanding_epochs_drainable() {
+        let (_, plan, epoch) = toy_plan(2, 1);
+        let mut toy = Toy::provisioned(2, &epoch, 1);
+        let tickets = submit_n(&mut toy, &plan, &epoch, 10, 2);
+        let calls = toy.calls.len();
+        toy.fail_prepare = true;
+        assert!(submit(&plan, &at(&epoch, 12), &mut toy).is_err());
+        toy.fail_prepare = false;
+        toy.oversize = true;
+        assert!(submit(&plan, &at(&epoch, 12), &mut toy).is_err());
+        toy.oversize = false;
+        assert_eq!(toy.calls.len(), calls, "validation never enqueues");
+        assert!(!toy.poisoned && !toy.state.poisoned);
+        assert_eq!(toy.state.last_op, Some(11), "op id burned only by enqueue");
+        drain_tickets(&tickets, &mut toy).unwrap();
+        assert!(!toy.poisoned && !toy.quarantined);
+    }
+
+    #[test]
+    fn out_of_order_foreign_and_stale_tickets_refused_before_any_sync() {
+        let (_, plan, epoch) = toy_plan(2, 1);
+        let mut toy = Toy::provisioned(2, &epoch, 1);
+        let mut tickets = submit_n(&mut toy, &plan, &epoch, 10, 3);
+        let mut foreign = Toy::provisioned(2, &epoch, 2);
+        let foreign_tickets = submit_n(&mut foreign, &plan, &epoch, 10, 3);
+
+        assert!(drain_tickets(&[], &mut toy).is_err());
+        // Missing newest, missing oldest, or not all of them.
+        assert!(drain_tickets(&tickets[..2], &mut toy).is_err());
+        assert!(drain_tickets(&tickets[1..], &mut toy).is_err());
+        // Out of order.
+        tickets.swap(0, 2);
+        assert!(drain_tickets(&tickets, &mut toy).is_err());
+        tickets.swap(0, 2);
+        // Foreign issuer, whole set and mixed.
+        assert!(drain_tickets(&foreign_tickets, &mut toy).is_err());
+        let mixed = vec![
+            MeshTicket {
+                issuer: 1,
+                epoch: tickets[0].epoch,
+            },
+            MeshTicket {
+                issuer: 2,
+                epoch: tickets[1].epoch,
+            },
+            MeshTicket {
+                issuer: 1,
+                epoch: tickets[2].epoch,
+            },
+        ];
+        assert!(drain_tickets(&mixed, &mut toy).is_err());
+        // Right issuer, epoch that was never outstanding.
+        let forged: Vec<_> = tickets
+            .iter()
+            .map(|t| MeshTicket {
+                issuer: t.issuer,
+                epoch: ForwardEpoch {
+                    request_id: t.epoch.request_id + 1,
+                    ..t.epoch
+                },
+            })
+            .collect();
+        assert!(drain_tickets(&forged, &mut toy).is_err());
+
+        // Every refusal left the state untouched: no sync, no poison, no
+        // quarantine, all three epochs still outstanding and drainable.
+        assert!(toy.syncs().is_empty());
+        assert!(!toy.poisoned && !toy.quarantined && !toy.state.poisoned);
+        assert_eq!(toy.state.outstanding.len(), 3);
+        drain_tickets(&tickets, &mut toy).unwrap();
+        assert_eq!(toy.syncs(), vec![0, 1]);
+        // Now stale.
+        assert!(drain_tickets(&tickets, &mut toy).is_err());
+        assert_eq!(toy.syncs(), vec![0, 1]);
+        assert!(foreign.syncs().is_empty());
+    }
+
+    #[test]
+    fn mid_sequence_submission_failure_poisons_every_outstanding_ticket() {
+        let (_, plan, epoch) = toy_plan(3, 2);
+        let mut toy = Toy::provisioned(3, &epoch, 1);
+        let tickets = submit_n(&mut toy, &plan, &epoch, 10, 2);
+        toy.fail_ops = Some(0);
+        assert!(submit(&plan, &at(&epoch, 12), &mut toy).is_err());
+        assert!(toy.poisoned && toy.state.poisoned);
+        assert!(!toy.quarantined);
+        // The failed epoch holds no ticket; the earlier ones stay outstanding.
+        assert_eq!(toy.state.outstanding.len(), 2);
+        assert_eq!(toy.state.last_op, Some(12), "failed op id is burned");
+        // Poisoned mesh admits nothing more, even once the cause is gone.
+        toy.fail_ops = None;
+        assert!(submit(&plan, &at(&epoch, 13), &mut toy).is_err());
+        // Drain still quiesces every device once and retires the tickets, but
+        // none of them reports success.
+        let error = drain_tickets(&tickets, &mut toy).unwrap_err();
+        assert!(error.contains("failed before drain"), "{error}");
+        assert_eq!(toy.syncs(), vec![0, 1, 2]);
+        assert!(toy.state.outstanding.is_empty());
+        assert!(toy.state.poisoned && !toy.quarantined);
+        assert!(submit(&plan, &at(&epoch, 14), &mut toy).is_err());
+    }
+
+    #[test]
+    fn drain_failure_with_outstanding_epochs_quarantines_like_s3() {
+        let (_, plan, epoch) = toy_plan(3, 1);
+        let mut toy = Toy::provisioned(3, &epoch, 1);
+        let tickets = submit_n(&mut toy, &plan, &epoch, 10, 3);
+        toy.fail_drain = Some(1);
+        let error = drain_tickets(&tickets, &mut toy).unwrap_err();
+        assert!(error.contains("quarantined"), "{error}");
+        assert!(toy.poisoned && toy.quarantined);
+        assert!(toy.state.poisoned && toy.state.quarantined);
+        assert_eq!(toy.syncs(), vec![0, 1, 2], "every owner attempted once");
+        // Quarantine is terminal: nothing is admitted, drained or re-synced.
+        assert!(submit(&plan, &at(&epoch, 13), &mut toy).is_err());
+        assert!(drain_tickets(&tickets, &mut toy).is_err());
+        assert_eq!(toy.syncs(), vec![0, 1, 2]);
     }
 }
 
