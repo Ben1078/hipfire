@@ -633,11 +633,16 @@ impl Qwen4LaneStore {
             return Err("lane store: row_budget must be at least 1".to_string());
         }
         if let Some(spec) = spec {
-            if spec.k == 0 || spec.k + 1 > LANE_MAX_ROWS {
+            let verify_rows = if bundle.has_cpu_deferred_experts() {
+                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+            } else {
+                LANE_MAX_ROWS
+            };
+            if spec.k == 0 || spec.k >= verify_rows {
                 return Err(format!(
-                    "lane store: MTP k {} outside 1..={}",
+                    "lane store: MTP k {} outside 1..={} for this execution mode",
                     spec.k,
-                    LANE_MAX_ROWS - 1
+                    verify_rows - 1
                 ));
             }
             if bundle.mtp.is_none() {

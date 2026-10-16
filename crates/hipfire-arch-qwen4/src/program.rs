@@ -16,6 +16,7 @@ use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
     MoeQ8RouterPolicy, MoeRecipe, MoeRouteCapability, MoeRoutePolicy, MoeSharedDecode,
     MoeSharedDtypes, MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
+    NARROW_VERIFY_MAX_ROWS,
 };
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 use hipfire_dispatch::pipeline::step_graph::{
@@ -270,6 +271,11 @@ pub enum Qwen4FfnBinding<'a> {
     Moe(Qwen4MoeBinding<'a>),
 }
 
+/// Widest window the CPU expert splice serves: single-token decode and a
+/// speculative verify of at most this many rows. Anything wider keeps the PCIe
+/// grouped read of the host-placed experts.
+pub const QWEN4_CPU_SPLICE_MAX_ROWS: usize = NARROW_VERIFY_MAX_ROWS;
+
 /// MoE resources are source-bound once by the family and consumed by the
 /// shared prefill sealer/lowering. The dispatch layer owns all route policy.
 #[derive(Clone, Copy)]
@@ -297,6 +303,11 @@ pub struct Qwen4MoeBinding<'a> {
     pub expert_down_entries: &'a [usize],
     pub layer_idx: u16,
     pub norm_topk_prob: bool,
+    /// The layer's routed experts are armed for the CPU splice
+    /// (`Qwen4MoeLayerRuntime::cpu_deferred_experts`, set at load). Layer-level
+    /// flag only: [`seal_moe_for_layer`] narrows it per call to a decode or
+    /// `<= QWEN4_CPU_SPLICE_MAX_ROWS`-row verify window.
+    pub cpu_deferred_experts: bool,
     /// Expert-parallel row exchange (`None` outside EP): installed into the
     /// one-row decode MoE and the few-row grouped prefill MoE so non-owned
     /// expanded rows are filled from their owners.
@@ -869,12 +880,38 @@ pub fn seal_moe_for_layer<'a>(
     }
     let bound = BoundMoeExperts::from_cache(moe.table, moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
+    // An armed layer splices only a window whose routing rows are its real rows
+    // (the invariant prefill profile pins `route_rows` to the canonical chunk, so
+    // a short prefill there keeps the PCIe grouped read) and which is at most
+    // the narrow verify width; every wider window is unchanged.
+    let cpu_deferred = moe.cpu_deferred_experts
+        && rows != 0
+        && rows == route_rows
+        && rows <= QWEN4_CPU_SPLICE_MAX_ROWS;
+    if cpu_deferred
+        && (moe.route_policy.capability.is_fp8_grouped()
+            || moe.row_gather.is_some()
+            || moe.tile_exchange.is_some()
+            || moe.shared_down_out.is_some())
+    {
+        return Err(DispatchError::Hip(format!(
+            "Qwen4 layer {}: the CPU expert splice cannot combine with stock FP8 or expert parallelism",
+            moe.layer_idx
+        )));
+    }
     if route_rows == 1 && !moe.route_policy.capability.is_fp8_grouped() {
-        let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch)?;
+        let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch, cpu_deferred)?;
         seal_decode(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 decode MoE: {error:?}")))
     } else {
-        let params = build_moe_prefill(dims, moe, scratch, scratch.moe_router_logits, rows)?;
+        let params = build_moe_prefill(
+            dims,
+            moe,
+            scratch,
+            scratch.moe_router_logits,
+            rows,
+            cpu_deferred,
+        )?;
         seal_prefill(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 prefill MoE: {error:?}")))
     }
@@ -981,6 +1018,7 @@ fn build_moe_decode<'a>(
     moe: Qwen4MoeBinding<'a>,
     input: &'a GpuTensor,
     scratch: &'a Qwen4LayerScratch<'a>,
+    cpu_deferred_experts: bool,
 ) -> Result<MoeParams<'a>, DispatchError> {
     let moe_dims = moe_dims(dims)?;
     let (first_gate_up, first_down) = moe
@@ -1020,7 +1058,7 @@ fn build_moe_decode<'a>(
         norm_topk_prob: moe.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
-        cpu_deferred_experts: false,
+        cpu_deferred_experts,
         ep_mode: MoeEpMode::None,
         layer_idx: moe.layer_idx,
         x_norm: input,
@@ -1075,6 +1113,7 @@ fn build_moe_prefill<'a>(
     scratch: &'a Qwen4LayerScratch<'a>,
     router_matrix: &'a GpuTensor,
     rows: usize,
+    cpu_deferred_experts: bool,
 ) -> Result<MoePrefillParams<'a>, DispatchError> {
     let (first_gate_up, first_down) = moe
         .routed_experts
@@ -1139,7 +1178,7 @@ fn build_moe_prefill<'a>(
         n_exp: moe_dims.num_experts,
         m_total_max,
         force_mq4_grouped_fp16: false,
-        cpu_deferred_experts: false,
+        cpu_deferred_experts,
         topk_indices: scratch.moe_topk_indices,
         topk_weights: scratch.moe_topk_weights,
         x_batch: scratch.ffn_output,

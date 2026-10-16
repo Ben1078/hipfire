@@ -8497,6 +8497,7 @@ mod packed_host_expert_tests {
                     &w,
                     &residual,
                     false,
+                    false,
                     |e| {
                         Ok(CpuMoeExpert {
                             gate_up_quant: q,

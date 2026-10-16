@@ -86,7 +86,7 @@ use crate::context::DispatchCtx;
 use crate::cpu_exec::{self, HostExec, StepTiming};
 use crate::families::gemv::{weight_row_bytes, WeightRef};
 use crate::pipeline::steps::{launch_op_rows, GemvInput, Step};
-use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
+use crate::types::{DispatchError, KernelKey};
 
 /// Split offsets are rounded down to a multiple of this many rows: 2 covers the
 /// residual kernels' `row0 = blockIdx.x << 1` + `float2` store at `y + row0` (an
@@ -651,7 +651,7 @@ fn hip_err(e: hip_bridge::HipError) -> DispatchError {
 fn probe_activation<'a>(step: &'a Step<'a>, w: &WeightRef) -> Option<(&'a GpuTensor, bool)> {
     match step {
         Step::Gemv { input, .. } | Step::GemvResidual { input, .. } => match input {
-            GemvInput::Raw(t) => Some((*t, dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256)),
+            GemvInput::Raw(t) => Some((*t, cpu_exec::raw_input_is_rotated(w.dtype))),
             GemvInput::Prerotated(t) => Some((*t, false)),
         },
         _ => None,
@@ -861,7 +861,7 @@ pub fn probe_synthetic(
             input: GemvInput::Raw(&x_act),
             out: &scratch,
         };
-        let rotate = dtype_rotation_plan(dtype) == RotationPlan::FwhtG256;
+        let rotate = cpu_exec::raw_input_is_rotated(dtype);
         let (x_host, _) = cpu_exec::prepare_activation(gpu, &w_ref, &x_act, rotate)?;
         measure_both(gpu, ctx, &probe, &w_ref, q, row_bytes, &x_host, reps)?
     };

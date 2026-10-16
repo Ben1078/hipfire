@@ -1181,6 +1181,7 @@ impl<'a> SealedMoeOp<'a> {
                     params.topk_weights,
                     params.x_residual,
                     params.expert_down_awq_ptrs.is_some(),
+                    params.recipe.bf16_round_trip(),
                     |id| {
                         params
                             .routed_experts
@@ -1216,6 +1217,7 @@ impl<'a> SealedMoeOp<'a> {
                     params.topk_weights,
                     params.routed_out.unwrap_or(params.x_batch),
                     params.expert_down_awq_ptrs.is_some(),
+                    params.recipe.bf16_round_trip(),
                     |id| {
                         params
                             .routed_experts
@@ -1507,17 +1509,24 @@ fn lower_decode<'a>(
             }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
         }
+        // A CPU-deferred call lowers no routed `Combine`: the splice takes its
+        // place. A `shared_after_combine` recipe (Qwen4) folds the routed
+        // contribution first and the shared expert second, so the splice runs
+        // before `SharedDown`; the other recipes keep the splice last, exactly
+        // where the arch ran it before the stage existed. The splice and
+        // `SharedDown` accumulate into the same residual, so each arrangement
+        // keeps its recipe's fp accumulation sequence.
+        let splice_first = selection.cpu_deferred_experts && params.recipe.shared_after_combine();
+        if splice_first {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
+        }
         if combine_after_down {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         }
         if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
-        if selection.cpu_deferred_experts {
-            // Last, exactly where the arch ran its splice: after every sealed
-            // stage of this program. The splice and `SharedDown` both accumulate
-            // into the same residual buffer, so this ordering keeps the fp
-            // accumulation sequence identical to the pre-stage arrangement.
+        if selection.cpu_deferred_experts && !splice_first {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
         }
     } else {
@@ -1609,14 +1618,15 @@ fn lower_prefill<'a>(
                 &mut steps,
                 Step::MoeStage(op(state), MoeStage::MutationFence),
             )?;
+            // The splice stands where the routed `Combine` would be: before a
+            // `shared_after_combine` recipe's `SharedDown` (routed first, shared
+            // second, like the GPU tail), and last for the other recipes whose
+            // shared expert already ran above. Both accumulate into one
+            // residual, so this keeps each recipe's fp accumulation sequence.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
             if params.recipe.shared_after_combine() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
-            // Last, exactly where the arch ran its splice: after every sealed
-            // stage of this program. The splice and `SharedDown` both accumulate
-            // into the same residual buffer, so this ordering keeps the fp
-            // accumulation sequence identical to the pre-stage arrangement.
-            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
             return Ok(steps);
         }
         if selection.uses_grouped_rows() {
@@ -1716,14 +1726,18 @@ fn lower_prefill<'a>(
     {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
     }
+    let splice_first = selection.cpu_deferred_experts && params.recipe.shared_after_combine();
+    if splice_first {
+        // Where the routed `Combine` would be: a `shared_after_combine` recipe
+        // folds the routed contribution before the shared expert.
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
+    }
     if params.recipe.shared_after_combine() {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
     }
-    if selection.cpu_deferred_experts {
-        // Last, exactly where the arch ran its splice: after every sealed
-        // stage of this program. The splice and `SharedDown` both accumulate
-        // into the same residual buffer, so this ordering keeps the fp
-        // accumulation sequence identical to the pre-stage arrangement.
+    if selection.cpu_deferred_experts && !splice_first {
+        // The shared expert ran before the routed tail for this recipe, so the
+        // splice is the last stage, as the arch's own splice was.
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
     }
     Ok(steps)
@@ -1958,9 +1972,18 @@ pub(super) fn select_decode(
                     .into(),
             ));
         }
-        if params.recipe.bf16_round_trip() {
+        // A BF16 recipe is admitted only on the grouped QT44/QT53 route: the
+        // router and shared stages this program still lowers carry its BF16
+        // round trips themselves, and the omitted routed stages' round trips
+        // (gate/up, activation, weighted combine) are the CPU splice's, which
+        // receives the recipe flag. The generic route also rounds the rotated
+        // input, which the CPU does not emulate.
+        if params.recipe.bf16_round_trip()
+            && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        {
             return Err(DispatchError::Hip(
-                "CPU-deferred routed experts cannot omit a recipe's bf16 round trip".into(),
+                "CPU-deferred routed experts emulate a recipe's bf16 round trips only on the grouped QT44/QT53 route"
+                    .into(),
             ));
         }
     }
@@ -2364,9 +2387,18 @@ pub(super) fn select_prefill(
                 "CPU-deferred routed experts require a replicated (non-EP) prefill".into(),
             ));
         }
-        if params.recipe.bf16_round_trip() {
+        // A BF16 recipe is admitted only on the grouped QT44/QT53 route: the
+        // router and shared stages this program still lowers carry its BF16
+        // round trips themselves, and the omitted routed stages' round trips
+        // (gate/up, activation, weighted combine) are the CPU splice's, which
+        // receives the recipe flag. The generic route also rounds the rotated
+        // input, which the CPU does not emulate.
+        if params.recipe.bf16_round_trip()
+            && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        {
             return Err(DispatchError::Hip(
-                "CPU-deferred routed experts cannot omit a recipe's bf16 round trip".into(),
+                "CPU-deferred routed experts emulate a recipe's bf16 round trips only on the grouped QT44/QT53 route"
+                    .into(),
             ));
         }
     }

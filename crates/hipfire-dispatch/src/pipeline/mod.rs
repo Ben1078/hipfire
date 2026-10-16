@@ -4451,6 +4451,9 @@ fn qt44_shared_activation_in_routed(
     route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
         && p.recipe.bf16_round_trip()
         && !p.skip_shared
+        // The fused launch is the routed Activation stage, which a CPU-deferred
+        // call does not lower: its shared expert activation runs in its own stage.
+        && !p.cpu_deferred_experts
         && p.ep_mode == crate::families::moe::MoeEpMode::None
         && p.shared
             .as_ref()

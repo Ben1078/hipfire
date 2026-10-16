@@ -956,6 +956,13 @@ impl Qwen4Bundle {
         Ok(None)
     }
 
+    /// Whether any host-placed trunk routed experts use the opt-in CPU splice.
+    pub fn has_cpu_deferred_experts(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(Qwen4GpuForward::has_cpu_deferred_experts)
+    }
+
     /// Attach reusable ordinary-HIP execution resources after the manifest
     /// transaction and model state have assembled successfully.
     ///
@@ -1568,6 +1575,16 @@ impl Qwen4Bundle {
             return Err(BundleError::Forward(
                 "Qwen4 spec forward cannot process an empty block".to_string(),
             ));
+        }
+        if !prefill
+            && self.has_cpu_deferred_experts()
+            && tokens.len() > crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+        {
+            return Err(BundleError::Forward(format!(
+                "Qwen4 spec verify of {} rows exceeds the {}-row CPU routed-expert window",
+                tokens.len(),
+                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+            )));
         }
         let max_chunk = self
             .execution
@@ -3286,15 +3303,20 @@ impl Qwen4Bundle {
             ));
         }
         if let Some(spec) = spec {
+            let verify_rows = if self.has_cpu_deferred_experts() {
+                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+            } else {
+                crate::gpu_forward_lanes::LANE_MAX_ROWS
+            };
             if self.mtp.is_none() {
                 return Err(BundleError::Forward(
                     "Qwen4 MTP lanes need the attached MTP head".to_string(),
                 ));
             }
-            if spec.k == 0 || spec.k + 1 > crate::gpu_forward_lanes::LANE_MAX_ROWS {
+            if spec.k == 0 || spec.k >= verify_rows {
                 return Err(BundleError::Forward(format!(
-                    "Qwen4 MTP lanes need 1 <= k <= {}, got {}",
-                    crate::gpu_forward_lanes::LANE_MAX_ROWS - 1,
+                    "Qwen4 MTP lanes need 1 <= k <= {} for this execution mode, got {}",
+                    verify_rows - 1,
                     spec.k
                 )));
             }

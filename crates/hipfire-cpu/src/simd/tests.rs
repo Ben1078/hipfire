@@ -58,6 +58,7 @@ fn kernel_formats() -> Vec<(CpuQuant, bool)> {
         (CpuQuant::Mq5G256V2, true),
         (CpuQuant::Mq3G256V2, true),
         (CpuQuant::Mq2G256V2, true),
+        (CpuQuant::Mq4G128V2, true),
         // Per-group fp16 codebook.
         (CpuQuant::Mq2G256Lloyd, true),
         (CpuQuant::Mq2G256LloydU, true),
@@ -181,6 +182,11 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
                     if q == CpuQuant::Mq4CG256 {
                         packed[at + 2..at + 4].copy_from_slice(&F16X4[1].to_le_bytes());
                     }
+                }
+                CpuQuant::Mq4G128V2 => {
+                    // fp16 [scale][zero] at the group's start.
+                    packed[at..at + 2].copy_from_slice(&F16X4[0].to_le_bytes());
+                    packed[at + 2..at + 4].copy_from_slice(&F16X4[1].to_le_bytes());
                 }
                 CpuQuant::Mq4G256V2
                 | CpuQuant::Mq6G256V2
@@ -375,5 +381,49 @@ fn cached_and_uncached_agree_on_awkward_inputs() {
                 }
             }
         }
+    }
+}
+
+/// qt 53 takes any `k % 128`, including the Flash-Next down shape `k = 640`
+/// (5 groups, 340 B per row) that no 256-group format can express. The shared
+/// `kernel_formats` loop above only visits 256-multiples, so this walks the
+/// 128-granular shapes — on awkward fp16 headers and on rows the (transcribed)
+/// real encoder produced.
+#[test]
+fn mq4g128v2_avx2_and_scalar_agree_on_128_granular_shapes() {
+    let q = CpuQuant::Mq4G128V2;
+    if !row_dot_enabled(q, Some(true)) {
+        eprintln!("skip {q:?}: AVX2/F16C absent on this runner");
+        return;
+    }
+    let check = |packed: &[u8], m: usize, k: usize, what: &str| {
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
+            .collect();
+        let mut simd = vec![0.0f32; m];
+        let mut scalar = vec![0.0f32; m];
+        gemv_with_simd(q, packed, m, k, &x, &mut simd, Some(true));
+        gemv_with_simd(q, packed, m, k, &x, &mut scalar, Some(false));
+        for row in 0..m {
+            let scale = scalar[row].abs().max(1e-6);
+            let rel = (simd[row] - scalar[row]).abs() / scale;
+            assert!(
+                rel <= 1e-4,
+                "{what} {m}x{k} row {row}: simd {} vs scalar {} (rel {rel:.3e})",
+                simd[row],
+                scalar[row]
+            );
+        }
+    };
+    for (m, k) in [(1usize, 128usize), (3, 384), (5, 640), (2, 1280), (1, 5120)] {
+        assert_eq!(row_bytes(q, k), k / 128 * 68);
+        let mut packed = testfix::weight_bytes(q, m, k);
+        awkward_headers(q, &mut packed, m, k);
+        check(&packed, m, k, "awkward headers");
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as u64 * 40503 + 17) % 1999) as f32 * 0.001 - 1.0)
+            .collect();
+        let encoded = testfix::encode_mq4g128v2_ref(&w, m, k);
+        check(&encoded, m, k, "encoder output");
     }
 }

@@ -993,6 +993,7 @@ pub(crate) fn layer_desc<'a>(
                 down: copy(6, &moe.shared_down),
             };
             Qwen4FfnBinding::Moe(Qwen4MoeBinding {
+                cpu_deferred_experts: moe.cpu_deferred_experts,
                 route_policy: qwen4_route_policy(
                     config,
                     &shared,
@@ -1129,6 +1130,9 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// local owning tensor's residency, never a dummy or peer view's bit.
     /// Residency changes weight-stream reuse, not each output's fold order.
     host_mapped: bool,
+    /// Opt-in routed CPU splice, only for whole host-mapped trunk aggregates.
+    pub(crate) cpu_deferred_experts: bool,
+    cpu_expert_owners: Option<cpu_splice::CpuExpertOwners>,
     /// Keeps the frozen payload owners and borrowed pointer tables alive.
     tier: Option<crate::expert_tier_owners::ExpertTierLease>,
     tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
@@ -1193,6 +1197,8 @@ fn slab_codec_tag_bytes(codecs: &[u8]) -> Vec<u8> {
     bytes
 }
 
+mod cpu_splice;
+
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn len(&self) -> usize {
         self.experts.len()
@@ -1210,6 +1216,19 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
 
     fn host_mapped(&self) -> bool {
         self.host_mapped
+    }
+
+    fn cpu_splice_expert(
+        &self,
+        _gpu: &Gpu,
+        expert_idx: usize,
+    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
+        let expert = self.experts.get(expert_idx)?;
+        self.cpu_expert_owners.as_ref()?.payload(
+            expert_idx,
+            expert.gate_up.dtype,
+            expert.down.dtype,
+        )
     }
 
     fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
@@ -2746,6 +2765,37 @@ impl Qwen4MoeLayerRuntime {
                 "expert live binding: {error:?}"
             )));
         }
+        let cpu_admission = cpu_splice::CpuSpliceAdmission {
+            enabled: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+                && allow_tiers
+                && layer_label < config.num_hidden_layers,
+            host_mapped: local_host_mapped && down_source.buf.is_host_mapped(),
+            ep: weights.ep_placement().is_some(),
+            slab: false,
+            tier: tier_layer.is_some(),
+            awq: experts.iter().any(|expert| {
+                expert.gate_up.dispatch_ref().awq_scale.is_some()
+                    || expert.down.dispatch_ref().awq_scale.is_some()
+            }),
+            supported: experts.iter().all(|expert| {
+                hipfire_dispatch::cpu_exec::cpu_quant_for(expert.gate_up.dtype).is_some()
+                    && hipfire_dispatch::cpu_exec::cpu_quant_for(expert.down.dtype).is_some()
+            }),
+        };
+        let cpu_expert_owners = cpu_admission
+            .armed()
+            .then(|| {
+                cpu_splice::CpuExpertOwners::new(
+                    gpu,
+                    gate_up_source,
+                    down_source,
+                    config.num_experts,
+                    gate_up_expert_bytes,
+                    down_expert_bytes,
+                )
+            })
+            .flatten();
+        let cpu_deferred_experts = cpu_expert_owners.is_some();
         Ok(Self {
             table,
             cache,
@@ -2764,6 +2814,8 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
+            cpu_deferred_experts,
+            cpu_expert_owners,
             tier: tier_layer.as_ref().map(|view| view.lease()),
             tier_identity,
             slab: None,
@@ -3058,6 +3110,8 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: false,
             host_mapped,
+            cpu_deferred_experts: false,
+            cpu_expert_owners: None,
             tier: None,
             tier_identity: None,
             label: layer_label,
@@ -3962,7 +4016,7 @@ pub(crate) fn seal_moe_decode<'a>(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
-        cpu_deferred_experts: false,
+        cpu_deferred_experts: runtime.cpu_deferred_experts,
         ep_mode: MoeEpMode::None,
         layer_idx: layer_index as u16,
         x_norm: input,
@@ -5332,6 +5386,7 @@ pub struct Qwen4GpuForward {
     /// MoE runtime of each absolute trunk layer (`None`: a layer without a
     /// MoE FFN or one this band does not own); length `num_hidden_layers`.
     pub(crate) moe: Vec<Option<Qwen4MoeLayerRuntime>>,
+    cpu_deferred_experts: bool,
     expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
     /// placement): the zero dummy expert, the full per-layer tables for chunk
@@ -5823,6 +5878,26 @@ fn populate_moe_runtimes<T, E>(
 }
 
 impl Qwen4GpuForward {
+    pub(crate) fn has_cpu_deferred_experts(&self) -> bool {
+        self.cpu_deferred_experts
+    }
+    pub(crate) fn ensure_cpu_splice_eager(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if !self.has_cpu_deferred_experts() {
+            return Ok(());
+        }
+        let stream_capture = match gpu.active_stream.as_ref() {
+            Some(stream) => gpu.hip.stream_is_capturing(stream)?,
+            None => false,
+        };
+        if gpu.graphs.capture_mode || gpu.replay.is_recording() || stream_capture {
+            return Err(invalid(
+                "qwen4 CPU routed experts require eager HIP; graph capture/recording cannot \
+                 retain host-executed steps. Set replay.backend=hip or memory.offload_exec=pcie",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse, before any allocation, a profile this forward cannot run: a
     /// full-attention layer needs the QSA RoPE kernels' hard-coded base.  PLE
     /// is optional: a profile without it has no PLE step, rows, staging,
@@ -5929,6 +6004,42 @@ impl Qwen4GpuForward {
                 return Err(invalid(
                     "a pipeline-parallel band refuses host-mapped and slab expert layers",
                 ));
+            }
+            let cpu_layers = moe
+                .iter()
+                .flatten()
+                .filter(|layer| layer.cpu_deferred_experts)
+                .count();
+            if hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled() {
+                eprintln!(
+                    "  [moe-cpu-expert] qwen4: {cpu_layers}/{} trunk layers armed for CPU routed FFN (armed layers use eager HIP for decode and <=4-row verify; wide prefill keeps PCIe); EP, slab, expert-tier/hot-set, AWQ, unsupported dtypes and resident layers keep the GPU path",
+                    moe_count
+                );
+            }
+            if cpu_layers > 0 {
+                let stream_capture = match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.stream_is_capturing(stream)?,
+                    None => false,
+                };
+                if gpu.graphs.capture_mode || gpu.replay.is_recording() || stream_capture {
+                    return Err(invalid(
+                        "qwen4 CPU routed experts cannot be attached during capture/recording: \
+                         set replay.backend=hip or memory.offload_exec=pcie",
+                    ));
+                }
+                if gpu.replay.request() == rdna_compute::replay::ReplayBackendRequest::Shadow {
+                    return Err(invalid(
+                        "qwen4 CPU routed experts conflict with replay.backend=shadow: \
+                         retained replay cannot execute the host splice. Set replay.backend=hip \
+                         or memory.offload_exec=pcie",
+                    ));
+                }
+                // A CPU splice is a host synchronization boundary, absent from
+                // a retained tape. Auto replay is disabled before publication.
+                gpu.replay.poison(
+                    "qwen4 CPU routed experts require eager HIP (memory.offload_exec=cpu|passback)",
+                );
+                hipfire_dispatch::cpu_exec::log_capture_disabled_once();
             }
             let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
             if compact && moe.iter().flatten().any(|layer| layer.slab.is_some()) {
@@ -6194,6 +6305,10 @@ impl Qwen4GpuForward {
                 "HIPFIRE_QWEN4_TOKEN_READBACK_EARLY",
                 true,
             ),
+            cpu_deferred_experts: moe
+                .iter()
+                .flatten()
+                .any(|layer| layer.cpu_deferred_experts),
             moe,
             decode_q8,
             route_trace,
@@ -7329,12 +7444,16 @@ impl Qwen4GpuForward {
     /// either end counts). gfx1201 resolves to per-head attention in both modes,
     /// so it keeps the table value; gfx1151 F32 splits eagerly only.
     pub(crate) fn guarded_wide_verify_rows(&self, bundle: &Qwen4Bundle, gpu: &Gpu) -> usize {
+        if self.has_cpu_deferred_experts() {
+            return cpu_splice::NARROW_VERIFY_MAX_ROWS;
+        }
         let requested = qwen4_row_exact_verify_rows(gpu);
         if requested <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS {
             return requested;
         }
         let config = &bundle.config;
         let retained_candidate = self.ep.is_none()
+            && !self.has_cpu_deferred_experts()
             && config.profile.is_flash_next()
             && !self.lane_scope
             && self.qsa_tap.is_none()
@@ -7735,6 +7854,8 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        self.ensure_cpu_splice_eager(gpu)?;
+        let cpu_deferred_experts = self.cpu_deferred_experts;
         let ple_lookahead = std::mem::take(&mut self.ple_lookahead);
         if argmax_of.is_some() && tokens.len() != 1 {
             return Err(invalid("an argmax-token Qwen4 forward carries one token"));
@@ -8845,6 +8966,7 @@ impl Qwen4GpuForward {
             // carries a position kernarg linear AQL cannot rebind.
             let eligible = n == 1
                 && self.ep.is_none()
+                && !cpu_deferred_experts
                 && config.profile.is_flash_next()
                 && !self.lane_scope
                 && !gpu.prefill_invariant_scope

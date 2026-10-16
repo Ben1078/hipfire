@@ -785,6 +785,19 @@ impl Carrier for Qwen4Carrier {
             sequence.card_cap = card_cap;
         }
         let (native_mtp, max_k, max_seq) = (loaded.native_mtp, loaded.max_k, loaded.max_seq);
+        let cpu_splice = loaded.bundle.has_cpu_deferred_experts();
+        let max_k = if cpu_splice {
+            max_k.min(hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS - 1)
+        } else {
+            max_k
+        };
+        // Host-placed experts on the CPU splice verify at most the 4-row CPU
+        // window; otherwise the per-GPU proven row-exact verify rows apply.
+        let verify_rows = if cpu_splice {
+            hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS
+        } else {
+            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.gpu.arch)
+        };
         let speculator = native_mtp.then(|| {
             qwen4_native_mtp_speculator(
                 max_k,
@@ -792,6 +805,7 @@ impl Carrier for Qwen4Carrier {
                 &ctx.gpu.arch,
                 meta.tokenizer.special_token_id("<|im_end|>"),
                 true,
+                verify_rows,
             )
         });
 
@@ -946,12 +960,16 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
 /// lines. `end_of_turn` is the tokenizer's `<|im_end|>` id. `ngram_modifier`
 /// false (a pipeline-parallel load) builds it without an n-gram pool whatever
 /// `speculation.mtp_ngram` resolves to, so no request can arm a takeover.
+/// `verify_rows` is the verify window the n-gram copy lane's take cap reads:
+/// the per-GPU row-exact rows, or the 4-row CPU splice window when host-placed
+/// routed experts run on the CPU.
 fn qwen4_native_mtp_speculator(
     max_k: usize,
     max_seq: usize,
     gpu_arch: &str,
     end_of_turn: Option<u32>,
     ngram_modifier: bool,
+    verify_rows: usize,
 ) -> Box<dyn hipfire_runtime::spec::Speculator> {
     eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
     let arch = hipfire_arch_qwen4::ARCH_ID;
@@ -978,7 +996,7 @@ fn qwen4_native_mtp_speculator(
                         "  qwen4 native MTP n-gram copy lane: on (take_cap={})",
                         hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(
                             &config,
-                            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch),
+                            verify_rows,
                         )
                     );
                 }
@@ -2676,6 +2694,14 @@ fn load_qwen4_rank_scoped(
             ));
         }
     }
+    // The CPU splice arms inside `attach_forward` (`memory.offload_exec=cpu`
+    // over host-placed routed experts), so the loaded placement is only
+    // known here; the native-MTP admission above is unchanged by it.
+    if bundle.has_cpu_deferred_experts() {
+        eprintln!(
+            "  qwen4 routed experts: CPU splice armed (offload_exec=cpu): decode and <=4-row verify run host-placed experts on the CPU; wider prefill stays on PCIe"
+        );
+    }
     if native_mtp {
         if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
@@ -3450,6 +3476,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             &ctx.gpu.arch,
             meta.tokenizer.special_token_id("<|im_end|>"),
             false,
+            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.gpu.arch),
         )
     });
     let mut model = LoadedModel {

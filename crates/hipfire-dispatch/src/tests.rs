@@ -2645,10 +2645,26 @@ fn cpu_quant_rotation_agrees_with_plan() {
     for &dtype in crate::CPU_EXECUTED_DTYPES {
         let q = crate::cpu_quant_for(dtype)
             .unwrap_or_else(|| panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for"));
+        let want = match dtype_rotation_plan(dtype) {
+            RotationPlan::FwhtG256 => hipfire_cpu::quant::InputRotation::FwhtG256,
+            RotationPlan::FwhtG128 => hipfire_cpu::quant::InputRotation::FwhtG128V2,
+            RotationPlan::None => hipfire_cpu::quant::InputRotation::None,
+            other => panic!("{dtype:?}: plan {other:?} has no CPU rotation"),
+        };
+        assert_eq!(
+            q.input_rotation(),
+            want,
+            "{dtype:?}: CPU rotation disagrees with dtype_rotation_plan"
+        );
         assert_eq!(
             q.is_fwht_g256(),
             dtype_rotation_plan(dtype) == RotationPlan::FwhtG256,
-            "{dtype:?}: CPU rotation disagrees with dtype_rotation_plan"
+            "{dtype:?}: is_fwht_g256 disagrees with dtype_rotation_plan"
+        );
+        assert_eq!(
+            crate::cpu_exec::raw_input_is_rotated(dtype),
+            want != hipfire_cpu::quant::InputRotation::None,
+            "{dtype:?}: seam rotates a Raw input differently from the launcher"
         );
     }
 }
