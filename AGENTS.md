@@ -924,6 +924,16 @@ Caveats that are part of the fixture, not trivia:
   rows when the n-gram source arms (`native_mtp_proposal_drafts`, which the
   loader passes to `native_mtp_device_bytes` / `native_mtp_request_bytes`),
   and the drafter grows its row capture and verify scratch to the armed cap.
+  The lane also arms the floor's re-probe (`MtpFloor::with_reprobe`,
+  `MTP_FLOOR_REPROBE_WINDOWS` = 8): after 8 priced batched windows in a row
+  drafted the whole routed cap, the next measured batched route runs one cap
+  up (within `k`), an ordinary window with the same verify. A request that
+  drafts one depth prices the next from the cost fit's row slope, which with
+  one depth decays to `MTP_ROW_COST_PRIOR` x the calibration token's AR
+  price, and a fresh process's first decode token over-prices AR (Halo:
+  55.6 ms against 30.0 ms; about 140 ms in the ags run that stayed at one
+  draft for 625 windows); the re-probe gives the fit a second depth. With
+  the lane off the floor is beta's.
   **A request the floor retired keeps the copy lane.** Retirement says native
   drafting loses to AR, nothing about the copy source, whose acceptance the
   shadow table measures independently (on R9700 at the agentic chain's

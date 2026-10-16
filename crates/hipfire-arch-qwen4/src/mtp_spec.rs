@@ -960,6 +960,12 @@ fn trace_rows(drafts: &[u32], picks: &[u32]) -> String {
 /// at most one head append plus this many windows.
 const MTP_FLOOR_PROBE_WINDOWS: usize = 3;
 
+/// Priced batched windows in a row that drafted one whole cap after which a
+/// copy-lane request's floor routes the next window one cap up
+/// ([`MtpFloor::with_reprobe`]): the re-exploration that keeps the cost
+/// fit's row slope measured instead of decaying to the AR-scaled prior.
+const MTP_FLOOR_REPROBE_WINDOWS: usize = 8;
+
 /// Speculative windows a singleton request's floor observes before it may
 /// retire.  Measured routing still starts after [`MTP_FLOOR_PROBE_WINDOWS`];
 /// only the sticky retirement waits.  The first windows of a response accept
@@ -1268,6 +1274,14 @@ pub(crate) struct MtpFloor {
     probe_samples: Vec<f32>,
     /// `observed` when the last probe set started.
     probed_at: Option<usize>,
+    /// Priced batched windows in a row drafting one whole cap that make the
+    /// next such route a one-cap-up re-probe (0: never;
+    /// [`Self::with_reprobe`]).
+    reprobe_after: usize,
+    /// `(depth, run)`: the drafted depth of the last priced batched window
+    /// and how many priced batched windows in a row drafted it since the
+    /// last re-probe.
+    depth_run: (usize, usize),
 }
 
 impl MtpFloor {
@@ -1300,6 +1314,8 @@ impl MtpFloor {
             probe_left: 0,
             probe_samples: Vec::new(),
             probed_at: None,
+            reprobe_after: 0,
+            depth_run: (0, 0),
         }
     }
 
@@ -1316,6 +1332,32 @@ impl MtpFloor {
     /// The same floor decaying its measured costs by `decay`.
     pub(crate) fn with_decay(self, decay: f32) -> Self {
         Self { decay, ..self }
+    }
+
+    /// The same floor re-probing one cap up after `windows` priced batched
+    /// windows in a row drafted the whole routed cap (0: never; the copy
+    /// lane arms [`MTP_FLOOR_REPROBE_WINDOWS`]).
+    ///
+    /// A request that drafts one depth only prices its unmeasured
+    /// neighbours ([`Self::cap_cost`]) with the cost fit's row slope, and
+    /// with one depth in the fit that slope decays to the prior,
+    /// [`MTP_ROW_COST_PRIOR`] AR steps of the request's one calibration
+    /// token.  When that token over-prices AR (a fresh process's first
+    /// decode token: on Halo 55.6 ms against the next request's 30.0 ms in
+    /// the same process, and about 140 ms in the ags run that collapsed),
+    /// the prior row is several real rows (Halo: 6-8 ms), cap + 1 never
+    /// again prices below cap, and the request stays at its depth after the
+    /// acceptance that drove it there has recovered: the copy lane takes
+    /// the confident spans and leaves the native windows a low-acceptance
+    /// stretch to fall in (Halo ags transcript: 625 native windows at one
+    /// draft, 72% accepted).  A re-probe is an ordinary window at cap + 1
+    /// (same verify, so exact); it gives the fit a second depth and cap + 1
+    /// its own price.
+    pub(crate) fn with_reprobe(self, windows: usize) -> Self {
+        Self {
+            reprobe_after: windows,
+            ..self
+        }
     }
 
     /// Whether the floor retired stickily to head-free AR.
@@ -1589,6 +1631,10 @@ impl MtpFloor {
                         for (sum, x) in self.fit.iter_mut().zip([1.0, d, us, d * d, d * us]) {
                             *sum = *sum * decay + x;
                         }
+                        self.depth_run = match self.depth_run {
+                            (last, run) if last == depth => (depth, run + 1),
+                            _ => (depth, 1),
+                        };
                     }
                     // Every cap's evidence ages with every batched window, so
                     // a cap not run lately counts for less than the one that
@@ -1811,7 +1857,10 @@ impl MtpFloor {
     /// its cheapest measured option within `k`, else the provisional depth;
     /// and a floor with retire evidence ([`Self::with_retire_evidence`])
     /// first runs [`FloorRoute::ArSample`] probe tokens, then keeps drafting
-    /// while the slow-memory realized cost beats the probed AR price.
+    /// while the slow-memory realized cost beats the probed AR price.  A
+    /// floor armed with [`Self::with_reprobe`] turns a measured batched route
+    /// one cap up once per run of priced windows at one whole cap
+    /// ([`Self::reprobed`]).
     pub(crate) fn route(
         &mut self,
         agreement: &Agreement,
@@ -1835,16 +1884,18 @@ impl MtpFloor {
             if cost < self.ar_us {
                 // The candidates include every measured option, so the
                 // cheapest one costs no more than `cost`.
-                return self
+                let chosen = self
                     .best_candidate(agreement, k)
                     .map_or(route, |(candidate, _)| candidate);
+                return self.reprobed(chosen, k);
             }
         }
         if (self.external_alive() && self.combined_wins()) || self.slow_wins() {
             // Losing native route kept alive for the external windows or the
             // realized mixture: the cheapest measured option within `k`,
             // else interleaved.
-            return best.map_or(FloorRoute::Interleaved, |(route, _)| route);
+            let chosen = best.map_or(FloorRoute::Interleaved, |(route, _)| route);
+            return self.reprobed(chosen, k);
         }
         if self.in_grace() && valid_us(self.ar_us) {
             return best.map_or_else(
@@ -1856,6 +1907,30 @@ impl MtpFloor {
             );
         }
         self.retire_or_probe()
+    }
+
+    /// `route`, or one cap up when the floor re-probes
+    /// ([`Self::with_reprobe`]): a batched route at the cap the last
+    /// `reprobe_after` priced batched windows in a row drafted whole, with
+    /// cap + 1 within `k` and the cost table.  Issuing the re-probe restarts
+    /// the run, so a re-probe the margin prune cuts back to the cap still
+    /// costs one window per run, not every window after it.
+    fn reprobed(&mut self, route: FloorRoute, k: usize) -> FloorRoute {
+        let FloorRoute::Batched(cap) = route else {
+            return route;
+        };
+        let (depth, run) = self.depth_run;
+        let up = cap + 1;
+        if self.reprobe_after == 0
+            || run < self.reprobe_after
+            || depth != cap
+            || up > k
+            || up >= self.caps.len()
+        {
+            return route;
+        }
+        self.depth_run.1 = 0;
+        FloorRoute::Batched(up)
     }
 
     /// One `QWEN4_FLOOR_TRACE` JSON line (`HIPFIRE_MTP_FLOOR_TRACE=1`): the
@@ -6921,9 +6996,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.head_lag.clear();
         self.retained = None;
         self.floor_pending = None;
+        // The copy lane re-probes one cap up (`MtpFloor::with_reprobe`);
+        // with it off the floor is beta's.
+        let reprobe = if self.copy_lane {
+            MTP_FLOOR_REPROBE_WINDOWS
+        } else {
+            0
+        };
         self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows())
             .with_decay(self.agreement_decay)
-            .with_retire_evidence(singleton_floor_ar_probe_tokens());
+            .with_retire_evidence(singleton_floor_ar_probe_tokens())
+            .with_reprobe(reprobe);
         self.floor_enabled =
             hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
         if let Some(device) = self.sampled.as_mut().and_then(|state| state.device.take()) {
@@ -8997,6 +9080,58 @@ mod tests {
         assert!(s.rate >= 0.95 * s.forced[s.best_depth()], "{s:?}");
     }
 
+    /// The copy lane's re-probe ([`MtpFloor::with_reprobe`]): the armed run
+    /// of priced windows drafting the whole routed cap turns one route one
+    /// cap up and restarts the run; the budget, a run at another depth and
+    /// an unarmed floor never re-probe.  Cap 1 wins here only on the
+    /// AR-scaled prior row: one depth priced, AR at 100 ms (prior row 27 ms,
+    /// several real ones), so beta's floor keeps cap 1 for good.
+    #[test]
+    fn floor_reprobe_routes_one_cap_up_once_per_whole_cap_run() {
+        let good = agreement(1.6, 2.0);
+        let one_draft = |floor: &mut MtpFloor, n| batched_windows(floor, &good, 1, 40_000.0, n);
+        let mut armed = calibrated(100_000.0, &good).with_reprobe(4);
+        let mut beta = calibrated(100_000.0, &good);
+        one_draft(&mut armed, 3);
+        assert_eq!(armed.depth_run, (1, 3));
+        assert_eq!(armed.route(&good, 3, 1), FloorRoute::Batched(1));
+        one_draft(&mut armed, 1);
+        assert_eq!(
+            armed.route(&good, 1, 1),
+            FloorRoute::Batched(1),
+            "cap 2 is past k"
+        );
+        assert_eq!(armed.route(&good, 3, 1), FloorRoute::Batched(2));
+        assert_eq!(
+            armed.depth_run,
+            (1, 0),
+            "issuing the re-probe restarts the run"
+        );
+        assert_eq!(armed.route(&good, 3, 1), FloorRoute::Batched(1));
+        // The re-probe's window drafts the new depth; the next one-draft
+        // window starts a fresh run.
+        batched_windows(&mut armed, &good, 2, 46_000.0, 1);
+        assert_eq!(armed.depth_run, (2, 1));
+        one_draft(&mut armed, 1);
+        assert_eq!(armed.depth_run, (1, 1));
+        // A run of drafts below the routed cap (the margin prune) and a
+        // route that is not batched are left alone.
+        armed.depth_run = (1, 10);
+        assert_eq!(
+            armed.reprobed(FloorRoute::Batched(2), 3),
+            FloorRoute::Batched(2)
+        );
+        assert_eq!(
+            armed.reprobed(FloorRoute::Interleaved, 3),
+            FloorRoute::Interleaved
+        );
+        assert_eq!(armed.depth_run, (1, 10));
+        // Unarmed (the lane off): one draft for good.
+        one_draft(&mut beta, 40);
+        assert_eq!(beta.depth_run, (1, 40));
+        assert_eq!(beta.route(&good, 3, 1), FloorRoute::Batched(1));
+    }
+
     /// A window of `emitted` committed tokens that drafted `drafts`.
     fn emitted_window(emitted: usize, drafts: usize) -> MtpWindow {
         MtpWindow {
@@ -11030,6 +11165,9 @@ mod tests {
             assert!(drafter.ngram_active, "copy={copy}");
             assert_eq!(drafter.ngram.is_some(), !copy, "copy={copy}");
             assert_eq!(drafter.ngram_copy.is_some(), copy, "copy={copy}");
+            // The lane arms the floor's re-probe; off, the floor is beta's.
+            let reprobe = if copy { MTP_FLOOR_REPROBE_WINDOWS } else { 0 };
+            assert_eq!(drafter.floor.reprobe_after, reprobe, "copy={copy}");
             // A later request that does not arm n-gram disarms it and keeps the
             // pool of the lane's mode only.
             MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
@@ -11039,6 +11177,136 @@ mod tests {
             // An EP peer's replica runs the same lane.
             let replica = Qwen4MtpDrafter::new_replica(drafter.replica_params());
             assert_eq!(replica.copy_lane, copy);
+        }
+    }
+
+    /// One request through the drafter as `mtp_step` drives it (plan, route,
+    /// observe) with budget `k` and n-gram disarmed for the request, so only
+    /// the floor's routing differs between the lanes: the calibration token
+    /// priced at `calibration_us` and every later AR token at
+    /// [`HALO_AR_US`], a batched window at [`HALO_WINDOW_US`] of its drafts
+    /// accepting each draft while a draw stays below `acceptance(window)`,
+    /// the interleaved route one AR step per emitted token.  Returns, from
+    /// window `late` on, `(one-draft native windows, native windows, emitted
+    /// tokens, wall us)`.
+    fn halo_floor_request(
+        copy: bool,
+        k: usize,
+        calibration_us: f32,
+        seed: u32,
+        windows: usize,
+        late: usize,
+        acceptance: impl Fn(usize) -> f32,
+    ) -> (usize, usize, f64, f64) {
+        let mut drafter = Qwen4MtpDrafter::new(k, 32_768, None).with_copy_lane(copy);
+        drafter.agreement_decay = MTP_AGREEMENT_DECAY_GFX1151;
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        drafter.floor_enabled = true;
+        let mut draws = Draws(seed.max(1));
+        let mut emitted = vec![0u32];
+        let (mut native, mut one_draft, mut tokens, mut us_late) = (0, 0, 0.0f64, 0.0f64);
+        for w in 0..windows {
+            let plan = loop {
+                let plan = drafter
+                    .plan_window_with(&emitted, k, None, false)
+                    .expect("plan");
+                if plan.route != WindowRoute::ArCalibrate {
+                    break plan;
+                }
+                let us = if drafter.floor.calibrated {
+                    HALO_AR_US
+                } else {
+                    calibration_us
+                };
+                drafter.floor.observe_calibration(us, &drafter.agreement);
+                emitted.push(0);
+            };
+            let p = acceptance(w);
+            let (accepted, us) = match plan.route {
+                WindowRoute::Native { depth } => {
+                    let rows = if depth == 0 { plan.k } else { depth };
+                    let accepted = (0..rows).take_while(|_| draws.next() < p).count();
+                    let (drafts, us, route) = if depth == 0 {
+                        let us = HALO_AR_US * (accepted + 1) as f32;
+                        ((accepted + 1).min(plan.k), us, NativeWindow::Interleaved)
+                    } else {
+                        (depth, HALO_WINDOW_US[depth], NativeWindow::Batched)
+                    };
+                    let window = window(accepted, drafts);
+                    drafter.observe_agreement(&window);
+                    drafter.floor_observe_native(false, route, &window, us, plan.k);
+                    if w >= late {
+                        native += 1;
+                        one_draft += usize::from(depth == 1);
+                    }
+                    (accepted, us)
+                }
+                _ => (0, HALO_AR_US),
+            };
+            emitted.resize(emitted.len() + accepted + 1, 0);
+            if w >= late {
+                tokens += (accepted + 1) as f64;
+                us_late += f64::from(us);
+            }
+        }
+        (one_draft, native, tokens, us_late)
+    }
+
+    /// The Halo ags collapse and its fix.  The request's AR price is its one
+    /// calibration token, priced here at four ordinary AR tokens (the Halo
+    /// ags run that collapsed priced it at about 140 ms against a 30 ms AR
+    /// token), so the cost fit's prior row is four real ones.  Native
+    /// acceptance dips to 0.45 for 200 windows (the copy lane takes the
+    /// confident spans and leaves the native windows the rest)
+    /// and recovers to 0.72.  Beta's floor drops to one draft in the dip,
+    /// its row slope decays to the prior, and it keeps one draft after the
+    /// recovery (Halo ags: 625 native windows at one draft, 72% accepted).
+    /// The copy lane's re-probe climbs back.  At a true AR price neither
+    /// locks and the re-probe costs under 1%.  Budgets 7 (gfx1151's `auto`)
+    /// and 3 (gfx1201's).
+    #[test]
+    fn copy_lane_reprobe_escapes_the_one_draft_lock() {
+        let run = |copy: bool, k: usize, calibration_us: f32, acceptance: fn(usize) -> f32| {
+            let (mut one_draft, mut native, mut tokens, mut us) = (0, 0, 0.0, 0.0);
+            for seed in 1..=16u32 {
+                let r =
+                    halo_floor_request(copy, k, calibration_us, seed * 7919, 600, 450, acceptance);
+                one_draft += r.0;
+                native += r.1;
+                tokens += r.2;
+                us += r.3;
+            }
+            (one_draft as f64 / native.max(1) as f64, tokens / us * 1e6)
+        };
+        let dip: fn(usize) -> f32 = |w| if (100..300).contains(&w) { 0.45 } else { 0.72 };
+        let flat: fn(usize) -> f32 = |_| 0.72;
+        for k in [7usize, 3] {
+            let (beta_share, beta_rate) = run(false, k, 4.0 * HALO_AR_US, dip);
+            let (copy_share, copy_rate) = run(true, k, 4.0 * HALO_AR_US, dip);
+            eprintln!("k={k} AR over-priced 4x: one-draft share / tok/s beta {beta_share:.3} {beta_rate:.2}, copy {copy_share:.3} {copy_rate:.2}");
+            assert!(
+                beta_share >= 0.5,
+                "k={k}: beta's floor locks at one draft: {beta_share}"
+            );
+            assert!(
+                copy_share <= 0.05,
+                "k={k}: the re-probe climbs back: {copy_share}"
+            );
+            assert!(
+                copy_rate >= 1.06 * beta_rate,
+                "k={k}: {copy_rate} vs {beta_rate}"
+            );
+            let (beta_share, beta_rate) = run(false, k, HALO_AR_US, flat);
+            let (copy_share, copy_rate) = run(true, k, HALO_AR_US, flat);
+            eprintln!("k={k} true AR: one-draft share / tok/s beta {beta_share:.3} {beta_rate:.2}, copy {copy_share:.3} {copy_rate:.2}");
+            assert!(
+                beta_share <= 0.05 && copy_share <= 0.05,
+                "k={k}: {beta_share} {copy_share}"
+            );
+            assert!(
+                copy_rate >= 0.99 * beta_rate,
+                "k={k}: {copy_rate} vs {beta_rate}"
+            );
         }
     }
 }
