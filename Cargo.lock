@@ -1628,6 +1628,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-cpu",
+ "rayon",
  "rdna-compute",
  "smallvec",
 ]
