@@ -19,9 +19,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use hipfire_arch_qwen4::expert_slabs::ExpertFormat;
+use hipfire_arch_qwen4::ExpertKeep;
 use hipfire_quantize::i4_records::I4RecordShapes;
 use hipfire_quantize::i4_slabs::{
-    load_allocation, uniform_formats, write_i4_expert_slabs, AllocationSource, ExpertRecordProvider,
+    load_allocation_with_keep, apply_keep_tiers, size_i4_expert_slabs,
+    uniform_formats, write_i4_expert_slabs_with_keep, AllocationSource, ExpertRecordProvider,
     NpzDirProvider, SlabGeometry, SlabWriteConfig,
 };
 
@@ -41,6 +43,12 @@ struct Args {
     /// Pinned MQ4-XTS source HFQ.
     #[arg(long)]
     source: PathBuf,
+    /// hipfire.coder.keep.v1 original-id membership; optional tiers override allocation.
+    #[arg(long)]
+    expert_keep: Option<PathBuf>,
+    /// Print exact base bytes without writing output or receipt (use a PLE-split source for a split base).
+    #[arg(long)]
+    size_only: bool,
     /// R1 allocation JSON (`alloc.ep2.json`); needs --point.
     #[arg(long, requires = "point", conflicts_with = "uniform")]
     alloc: Option<PathBuf>,
@@ -105,9 +113,21 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
     let geometry = SlabGeometry::FN;
-    let (formats, allocation) = match (&args.alloc, &args.point, args.uniform) {
+    let keep_json = args.expert_keep.as_ref().map(|path| {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
+    }).transpose()?;
+    let keep = keep_json.as_ref().map(ExpertKeep::from_coder_keep_file).transpose()?;
+    if keep.as_ref().is_some_and(|k| k.n_experts() != geometry.experts || k.n_layers() != geometry.layers) {
+        return Err("keep geometry must be 48 layers x 512 original ids".into());
+    }
+    if keep.as_ref().is_some_and(|k| (0..k.n_layers()).any(|l| k.kept(l).len() < 10)
+        || k.mtp_kept().is_some_and(|ids| ids.len() < 10)) {
+        return Err("every kept trunk/MTP layer must retain at least top_k=10 experts".into());
+    }
+    let (mut formats, allocation) = match (&args.alloc, &args.point, args.uniform) {
         (Some(alloc), Some(point), None) => {
-            let a = load_allocation(alloc, point, geometry).map_err(|e| e.to_string())?;
+            let a = load_allocation_with_keep(alloc, point, geometry, keep.as_ref()).map_err(|e| e.to_string())?;
             (
                 a.formats,
                 AllocationSource::File {
@@ -126,6 +146,20 @@ fn run(args: Args) -> Result<(), String> {
         }
         _ => return Err("give either --alloc with --point, or --uniform w3|w2|mq4".into()),
     };
+    if let (Some(root), Some(keep)) = (&keep_json, &keep) {
+        apply_keep_tiers(root, keep, &mut formats).map_err(|e| e.to_string())?;
+    }
+    for item in 0..formats.len() {
+        let (layer, expert) = (item / geometry.experts, item % geometry.experts);
+        if keep.as_ref().is_some_and(|k| !k.is_kept(layer, expert)) { continue }
+        let records = match formats[item] {
+            ExpertFormat::Mq3I4 => args.records_w3.as_ref(),
+            ExpertFormat::Mq2I4 => args.records_w2.as_ref(),
+            ExpertFormat::Mq4Xts => continue,
+        }.ok_or_else(|| format!("missing records directory for L{layer}/E{expert}"))?;
+        let path = records.join(format!("L{layer}/E{expert}.npz"));
+        if !path.is_file() { return Err(format!("missing record {}", path.display())) }
+    }
     let w3 = provider(
         args.records_w3.clone(),
         args.manifests_w3.clone(),
@@ -138,7 +172,7 @@ fn run(args: Args) -> Result<(), String> {
         args.cross_check_packs_w2.clone(),
         ExpertFormat::Mq2I4,
     );
-    let receipt = write_i4_expert_slabs(&SlabWriteConfig {
+    let config = SlabWriteConfig {
         geometry,
         source: &args.source,
         out: &args.out,
@@ -149,8 +183,16 @@ fn run(args: Args) -> Result<(), String> {
         threads: args.threads,
         expected_source_sha256: args.source_sha256.as_deref(),
         progress: true,
-    })
-    .map_err(|e| e.to_string())?;
+    };
+    let receipt = if args.size_only {
+        size_i4_expert_slabs(&config, keep.as_ref())
+    } else {
+        write_i4_expert_slabs_with_keep(&config, keep.as_ref())
+    }.map_err(|e| e.to_string())?;
+    if args.size_only {
+        println!("{}", serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
     let text = serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?;
     std::fs::write(&args.receipt, text + "\n")
         .map_err(|e| format!("writing {}: {e}", args.receipt.display()))?;

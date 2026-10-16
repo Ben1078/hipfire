@@ -404,6 +404,44 @@ decoded back to its codes and scale bits, the output is reopened and every paylo
 re-hashed, and `--cross-check-packs-w3/-w2` additionally compares each slab byte-for-byte with the Python R1
 pack. `--receipt` writes the JSON receipt. An existing `--out` is never overwritten.
 
+**Pruned coder split bases.** `--expert-keep keep.json` accepts
+`hipfire.coder.keep.v1` through `ExpertKeep::from_coder_keep_file`. Expert ids
+remain in the original 512-id space; sorted, ragged layer lists are allowed
+(at least top-10 per layer). Absent experts have no index entries or payload.
+The loader synthesizes their zero-byte slab slots. Allocation rows may remain
+dense (absent entries are ignored) or contain only kept experts in keep-list
+order. Optional `tiers` is null or an object keyed by original layer and expert
+ids, e.g. `{"0":{"3":"w3","17":"mq4"}}`. A tier for an absent expert is refused,
+as are missing records for selected W3/W2 experts. Receipt tier counts cover
+kept experts only.
+Optional `mtp` selects compact MTP aggregate rows; absent/null preserves MTP.
+`qwen4.expert_keep` records membership and its canonical SHA-256.
+
+Use the shipped `hipfire ple split` path on the MQ4 source first (or reuse an
+already verified MQ4 split base). Packing that base preserves its
+`hipfire_ple_rows` marker unchanged and never adds PLE rows. This binds the
+pruned base to the same shared `.ple-q4`/`.ple-q8` row identity, independent of
+its new base size/index hash. The split command verifies the Q8 source rows;
+do not copy a marker from an unrelated model.
+
+```sh
+hipfire ple split "$SOURCE_MQ4" --out "$SOURCE_BASE_MQ4" --keep-original
+qwen4_i4_slabs --source "$SOURCE_BASE_MQ4" \
+  --alloc "$ALLOC" --point "$POINT" --records-w3 "$W3_RECORDS" \
+  --expert-keep "$KEEP_JSON" --out "$CODER_BASE" \
+  --receipt "$RECEIPT" --threads 8
+qwen4_slab_admit_check "$CODER_BASE"
+```
+
+Install the verified shared row files under the runtime aliases
+`$CODER_BASE.ple-q4` / `$CODER_BASE.ple-q8` (links to the shared files, not copies).
+They must have the same Q8 source-row digest and geometry as the split marker.
+Add `--size-only` to the pack command to print exact container bytes and
+kept-only routed/non-expert payload totals without writing output or receipt;
+use identical source, records paths, allocation, and keep file for packing.
+The checker verifies membership SHA, table counts, exclusion of absent expert
+tensors, all W3/W2 payloads, and the production CPU admission refusal.
+
 The CPU loader builds an O(index entries) `expert_slab_table::ExpertSlabTable`
 from the actual spans: 48 × 512 gate/up-down pairs first, canonical names and
 order, frozen shapes/qtype pairs/group sizes/byte sizes, contiguous aligned
