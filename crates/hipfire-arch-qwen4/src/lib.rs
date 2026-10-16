@@ -18,6 +18,8 @@ pub mod cache_quality;
 pub mod chunk_dump;
 pub mod config;
 pub mod ep;
+pub mod expert_keep;
+pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 pub mod expert_residency;
 /// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
 pub mod expert_hotset;
