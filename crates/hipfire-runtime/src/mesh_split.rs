@@ -722,12 +722,9 @@ impl<'a> Walk<'a> {
             else {
                 continue;
             };
-            let Some((_, devices)) = self
-                .plan
-                .state
-                .iter()
-                .find(|(entry, _)| entry.layer == layer && state_matches(&entry.kind, class))
-            else {
+            let Some((_, devices)) = self.plan.state.iter().find(|(entry, _)| {
+                entry.layer() == Some(layer) && state_matches(&entry.kind, class)
+            }) else {
                 return Err(SplitError::UnknownState { resource });
             };
             if *devices != self.groups[stage] {
@@ -1270,6 +1267,7 @@ pub fn split_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh_placement::BandPlacement;
     use crate::weight_manifest::{
         plan_manifest, FusedQkvLayout, PinTarget, PlacementHint, StateEntry, WeightEntry,
     };
@@ -1411,7 +1409,17 @@ mod tests {
         }
 
         fn plan(&self, mesh: &DeviceMesh, n_layers: usize) -> ManifestPlan {
-            plan_manifest(&self.ws, &self.st, mesh, n_layers).unwrap()
+            let placement = BandPlacement::uniform(mesh, n_layers).unwrap();
+            self.plan_with(mesh, n_layers, &placement)
+        }
+
+        fn plan_with(
+            &self,
+            mesh: &DeviceMesh,
+            n_layers: usize,
+            placement: &BandPlacement,
+        ) -> ManifestPlan {
+            plan_manifest(&self.ws, &self.st, mesh, n_layers, placement).unwrap()
         }
     }
 
@@ -1972,6 +1980,32 @@ mod tests {
         assert_eq!(
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::PlacementMismatch { op }
+        );
+    }
+
+    #[test]
+    fn layer_stage_follows_custom_band_counts() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let mut b = B::new();
+        let x = b.act(4);
+        // Layer-1 weight: stage 0 under uniform [2,2], stage 1 under [1,3].
+        let w = b.weight("w", 1, vec![8, 4], ShardPolicy::Replicate);
+        let y = b.act(8);
+        let op = b.project(Some(0), w, x, y);
+        let custom = BandPlacement::from_counts(&mesh, 4, &[1, 3]).unwrap();
+        let plan = b.plan_with(&mesh, 4, &custom);
+        assert_eq!(
+            plan.band_xfers,
+            vec![(0, CollectiveHint::BandXfer { src: 0, dst: 1 })]
+        );
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::PlacementMismatch { op }
+        );
+        let uniform = b.plan(&mesh, 4);
+        assert_ne!(
+            split_program(&b.g, &uniform, &mesh).err(),
+            Some(SplitError::PlacementMismatch { op })
         );
     }
 

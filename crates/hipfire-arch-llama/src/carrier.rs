@@ -14,6 +14,7 @@ use hipfire_runtime::llama::{
     LlamaConfig, LlamaWeights, WeightTensor,
 };
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::mesh_placement::BandPlacement;
 use hipfire_runtime::model_source::ModelSource as ModelSourceTrait;
 use hipfire_runtime::weight_backend::hfq_weight_dtype;
 use hipfire_runtime::weight_manifest::{plan_manifest, ManifestPlan, WeightEntry};
@@ -162,7 +163,9 @@ fn plan_single(
     let mesh = DeviceMesh::single().map_err(|error| format!("llama: device mesh: {error}"))?;
     let manifest = Llama::weight_manifest_for_hfq(config, has_separate_lm_head);
     let state = Llama::state_manifest(config);
-    let plan = plan_manifest(&manifest, &state, &mesh, config.n_layers)
+    let placement = BandPlacement::uniform(&mesh, config.n_layers)
+        .map_err(|e| format!("llama: band placement failed: {e}"))?;
+    let plan = plan_manifest(&manifest, &state, &mesh, config.n_layers, &placement)
         .map_err(|e| format!("llama: manifest planning failed: {e}"))?;
     Ok((mesh, plan))
 }
@@ -1231,6 +1234,7 @@ mod tests {
             vision_mode: "auto".to_string(),
             cask,
             pp: 1,
+            pp_layer_counts: None,
             spec: SpecLoadCfg::default(),
             gpu,
             gemma4_drafter_path: None,
@@ -1296,22 +1300,26 @@ mod tests {
         use hipfire_runtime::weight_manifest::{placement_devices, PinTarget, PlacementHint};
         let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)])
             .expect("two-stage pipeline mesh construction cannot overflow");
-        let manifest = Llama::weight_manifest(&config());
+        let mut config = config();
+        config.n_layers = 2; // Both PP stages must own a nonempty trunk band.
+        let placement = BandPlacement::uniform(&mesh, config.n_layers)
+            .expect("uniform placement over the two-stage mesh");
+        let manifest = Llama::weight_manifest(&config);
         let devices = |name: &str| {
             let entry = manifest
                 .iter()
                 .find(|entry| entry.name == name && entry.layer.is_none())
                 .expect("model-scope entry exists");
-            placement_devices(entry, &mesh, config().n_layers)
+            placement_devices(entry, &mesh, &placement)
         };
         assert_eq!(devices("token_embd"), vec![0]);
         assert_eq!(devices("output_norm"), vec![1]);
         assert_eq!(devices("lm_head"), vec![1]);
-        let tied = Llama::weight_manifest_for_hfq(&config(), false);
+        let tied = Llama::weight_manifest_for_hfq(&config, false);
         let head = tied.last().expect("manifest has lm_head");
         assert_eq!(head.placement, PlacementHint::Pin(PinTarget::Output));
         assert_eq!(
-            placement_devices(head, &mesh, config().n_layers),
+            placement_devices(head, &mesh, &placement),
             vec![1],
             "tying lm_head must not move it to stage 0"
         );

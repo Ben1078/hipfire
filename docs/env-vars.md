@@ -1853,7 +1853,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PP_GATE_MODEL` | scripts/pp-gate.sh | harness |
 | `HIPFIRE_PP_GATE_REQUIRE_SYSFS` | scripts/pp-gate.sh | harness |
 | `HIPFIRE_PP_GATE_TEST_NO_SYSFS` | scripts/pp-gate.sh | harness |
-| `HIPFIRE_PP_LAYERS` | crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_PP_LAYERS` | crates/hipfire-loader/src/admission.rs | developer |
 | `HIPFIRE_PP_PARITY_MODEL` | crates/hipfire-arch-qwen35/tests/pp_parity.rs | harness |
 | `HIPFIRE_PP_PFLASH` | crates/hipfire-daemon/src/main.rs | deprecated |
 | `HIPFIRE_PP_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |

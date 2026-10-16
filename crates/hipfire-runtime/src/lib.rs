@@ -59,6 +59,7 @@ pub mod llama_spec;
 pub mod lloyd_lut;
 pub mod loader_api;
 pub mod loop_guard;
+pub mod mesh_placement;
 pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;

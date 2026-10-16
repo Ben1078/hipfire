@@ -2767,29 +2767,15 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-    let mut gpus = match hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Some(spec) => {
-            let counts: Result<Vec<usize>, _> =
-                spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
-            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
-            if counts.len() != pp {
-                return Err(format!(
-                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
-                    counts.len(),
-                    pp
-                ));
-            }
-            let sum: usize = counts.iter().sum();
-            if sum != config.n_layers {
-                return Err(format!(
-                    "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
-                    sum, config.n_layers
-                ));
-            }
-            hipfire_runtime::multi_gpu::Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+    // Band counts were normalized once at admission (`BandPlacement`, sum and
+    // length validated against this config's layer count); explicit counts
+    // skip the uniform free-VRAM delta gate exactly as the old
+    // `HIPFIRE_PP_LAYERS` escape hatch did. The environment is not read here.
+    let mut gpus = match ctx.pp_layer_counts {
+        Some(counts) => {
+            debug_assert_eq!(counts.len(), pp);
+            debug_assert_eq!(counts.iter().sum::<usize>(), config.n_layers);
+            hipfire_runtime::multi_gpu::Gpus::init_layers(counts).map_err(|e| format!("{e}"))?
         }
         None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
             .map_err(|e| format!("{e}"))?,

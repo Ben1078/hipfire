@@ -17,6 +17,7 @@
 //! assembling typed weights, and therefore removes the cell from the store's
 //! cleanup set.
 use crate::device_mesh::{DeviceMesh, MeshEpoch};
+use crate::mesh_placement::BandPlacement;
 use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
 use crate::tp_shard::ExpertAssign;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
@@ -1148,9 +1149,15 @@ where
             ),
         });
     }
+    let placement = BandPlacement::uniform(mesh, n_layers).map_err(|reason| FulfillError {
+        name: "<manifest>".to_string(),
+        layer: None,
+        device: 0,
+        reason,
+    })?;
     let mut store = WeightStore::with_origin(origin);
     for entry in weights {
-        let devices = placement_devices(entry, mesh, n_layers);
+        let devices = placement_devices(entry, mesh, &placement);
         if devices.as_slice() != [0] {
             let error = FulfillError {
                 name: entry.name.clone(),
@@ -1587,9 +1594,15 @@ where
         });
     }
 
+    let placement = BandPlacement::uniform(mesh, n_layers).map_err(|reason| FulfillError {
+        name: "<manifest>".to_string(),
+        layer: None,
+        device: 0,
+        reason,
+    })?;
     let mut store = WeightStore::with_origin(origin);
     for entry in weights {
-        let devices = placement_devices(entry, mesh, n_layers);
+        let devices = placement_devices(entry, mesh, &placement);
         if devices.as_slice() != [0] {
             return Err(rollback_fulfill_error(
                 store,
@@ -2308,7 +2321,8 @@ mod tests {
         // The target guard is pure and can be checked without constructing a
         // Gpu; the closure would be unreachable on this path.
         assert!(target_error(&mesh).is_some());
-        assert_eq!(placement_devices(&entry, &mesh, 1), vec![0]);
+        let placement = BandPlacement::uniform(&mesh, 1).unwrap();
+        assert_eq!(placement_devices(&entry, &mesh, &placement), vec![0]);
     }
 
     #[test]

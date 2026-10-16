@@ -17,6 +17,7 @@ use hipfire_dispatch::pipeline::step_graph::{
     OpDecl, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule, StepGraph, StepGraphError,
 };
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+use hipfire_runtime::mesh_placement::BandPlacement;
 use hipfire_runtime::mesh_split::{split_program, SplitError, SplitPlan};
 use hipfire_runtime::weight_manifest::{plan_manifest, ManifestPlan, ShardPolicy, WeightEntry};
 use rdna_compute::DType;
@@ -142,7 +143,10 @@ fn expect_plan(
     mesh: &DeviceMesh,
     n_layers: usize,
 ) -> ManifestPlan {
-    plan_manifest(entries, &[], mesh, n_layers).expect("manifest plans on its own mesh")
+    let placement =
+        BandPlacement::uniform(mesh, n_layers).expect("uniform placement on its own mesh");
+    plan_manifest(entries, &[], mesh, n_layers, &placement)
+        .expect("manifest plans on its own mesh")
 }
 
 #[test]

@@ -7,6 +7,7 @@
 
 use crate::device_mesh::{DeviceMesh, DimKind};
 use crate::llama::{EmbeddingFormat, WeightTensor};
+use crate::mesh_placement::BandPlacement;
 use crate::multi_gpu::Gpus;
 use crate::offload::{ExpertResidency, LayerResidency, Placement, WeightResidency};
 use hip_bridge::HipResult;
@@ -42,39 +43,37 @@ impl Layout {
         }
     }
 
-    /// Build the canonical stage/rank-0 view from an admitted mesh. The
-    /// manifest planner owns the full stage grid; this legacy loader view
-    /// selects rank zero for each layer so existing orchestrators continue to
-    /// have one deterministic device index until their typed mesh path lands.
+    /// Build the canonical stage/rank-0 view from an admitted mesh and the
+    /// band placement that owns layer -> stage. The manifest planner owns the
+    /// full stage grid; this legacy loader view selects rank zero for each
+    /// layer so existing orchestrators continue to have one deterministic
+    /// device index until their typed mesh path lands.
     ///
+    /// The placement's epoch and PP degree are validated against `mesh`
+    /// before any assignment; a stale or mismatched placement is refused.
     /// Coordinates derive from the mesh itself on an admitted mesh, so the
-    /// fallible coordinate lookups cannot fail here.
-    pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> Self {
-        let mut output_coord = mesh
-            .coord_of(0)
-            .expect("device-mesh coordinate 0 exists on an admitted mesh");
-        if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
-            output_coord[index] = mesh.size_of(DimKind::Pp).saturating_sub(1);
-        }
+    /// fallible coordinate lookups cannot fail after that.
+    pub fn from_mesh(mesh: &DeviceMesh, placement: &BandPlacement) -> Result<Self, String> {
+        let n_layers = placement.n_trunk_layers;
+        placement.validate_for(mesh, n_layers)?;
+        let stage_device = |stage: usize| {
+            let mut coord = mesh
+                .coord_of(0)
+                .expect("device-mesh coordinate 0 exists on an admitted mesh");
+            if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
+                coord[index] = stage;
+            }
+            mesh.device_of(&coord)
+                .expect("stage coordinate is in bounds on an admitted mesh")
+        };
         let layer_to_device = (0..n_layers)
-            .map(|layer| {
-                let mut coord = mesh
-                    .coord_of(0)
-                    .expect("device-mesh coordinate 0 exists on an admitted mesh");
-                if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
-                    coord[index] = mesh.stage_for_layer(layer, n_layers);
-                }
-                mesh.device_of(&coord)
-                    .expect("stage coordinate is in bounds on an admitted mesh")
-            })
+            .map(|layer| stage_device(placement.stage_of_layer(layer)))
             .collect();
-        Self {
-            output_device: mesh
-                .device_of(&output_coord)
-                .expect("output stage coordinate is in bounds on an admitted mesh"),
+        Ok(Self {
+            output_device: stage_device(placement.stages().saturating_sub(1)),
             layer_to_device,
             placement: Placement::all_device(n_layers),
-        }
+        })
     }
 
     /// Validate the pure layout before any source preparation or GPU upload.
@@ -522,7 +521,8 @@ mod tests {
     fn mesh_layout_selects_stage_rank_zero_without_io() {
         let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Tp, 2)])
             .expect("small test mesh construction cannot overflow");
-        let layout = Layout::from_mesh(&mesh, 4);
+        let placement = BandPlacement::uniform(&mesh, 4).unwrap();
+        let layout = Layout::from_mesh(&mesh, &placement).unwrap();
         assert_eq!(layout.output_device(), 2);
         assert_eq!(
             (0..4)
@@ -531,6 +531,32 @@ mod tests {
             vec![0, 0, 2, 2]
         );
         assert!(layout.validate(mesh.n_devices(), 4).is_ok());
+    }
+
+    #[test]
+    fn mesh_layout_follows_custom_counts_and_refuses_stale_epoch() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3)])
+            .expect("small test mesh construction cannot overflow");
+        let custom = BandPlacement::from_counts(&mesh, 6, &[1, 2, 3]).unwrap();
+        let layout = Layout::from_mesh(&mesh, &custom).unwrap();
+        assert_eq!(layout.output_device(), 2);
+        assert_eq!(
+            (0..6)
+                .map(|layer| layout.device_for_layer(layer))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 1, 2, 2, 2]
+        );
+        let uniform = Layout::from_mesh(&mesh, &BandPlacement::uniform(&mesh, 6).unwrap()).unwrap();
+        assert_eq!(
+            (0..6)
+                .map(|layer| uniform.device_for_layer(layer))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 1, 2, 2]
+        );
+        let newer = DeviceMesh::rect(&[(DimKind::Pp, 3)])
+            .expect("small test mesh construction cannot overflow");
+        let error = Layout::from_mesh(&newer, &custom).err().unwrap();
+        assert!(error.contains("mesh epoch"), "{error}");
     }
 
     #[test]

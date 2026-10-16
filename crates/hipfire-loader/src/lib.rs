@@ -3233,6 +3233,7 @@ pub fn load_admitted_with_gemma4_drafter(
         carrier,
         vision_path,
         vision_mode,
+        pp_layer_counts,
         ..
     } = admission;
     let carrier =
@@ -3293,6 +3294,7 @@ pub fn load_admitted_with_gemma4_drafter(
         state_quant_override,
         cask,
         pp,
+        pp_layer_counts: pp_layer_counts.as_deref(),
         spec,
         gpu,
         gemma4_drafter_path,
