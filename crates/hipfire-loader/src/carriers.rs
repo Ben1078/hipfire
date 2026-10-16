@@ -2758,10 +2758,17 @@ fn load_qwen4_rank_scoped(
             ));
         }
     }
-    // The CPU splice arms inside `attach_forward` (`memory.offload_exec=cpu`
-    // over host-placed routed experts), so the loaded placement is only
-    // known here; the native-MTP admission above is unchanged by it.
-    if bundle.has_cpu_deferred_experts() {
+    // The CPU splice (D1) and the hot-set tier split (D2) arm inside
+    // `attach_forward` (`memory.offload_exec=cpu`, any arch the hot set applies
+    // on), so the loaded placement is only known here; the native-MTP
+    // admission above is unchanged by it.
+    let split_layers = bundle.split_layers().len();
+    if split_layers > 0 {
+        eprintln!(
+            "  qwen4 routed experts: CPU tier split armed on {split_layers} hot-set layers (offload_exec=cpu): decode and <=4-row verify run hot-set-cold experts on the CPU; wider prefill stays on PCIe"
+        );
+    }
+    if bundle.has_cpu_deferred_experts() && split_layers == 0 {
         eprintln!(
             "  qwen4 routed experts: CPU splice armed (offload_exec=cpu): decode and <=4-row verify run host-placed experts on the CPU; wider prefill stays on PCIe"
         );

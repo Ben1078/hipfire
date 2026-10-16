@@ -10,9 +10,10 @@
 //! plus the hot-set plan and tier owners): the
 //! sidecar's ranking fills `--hot-budget-mib` of device experts, every other trunk expert
 //! lives in the pinned host tier, and `attach_forward` arms the split per layer
-//! (`Qwen4Bundle::split_layers`). Arming needs `HIPFIRE_OFFLOAD_EXEC=cpu`; on gfx1100 the
-//! hot set is opt-in through an explicit sidecar path (`--hotset` or
-//! `HIPFIRE_QWEN4_EXPERT_HOTSET`).
+//! (`Qwen4Bundle::split_layers`). Arming needs `HIPFIRE_OFFLOAD_EXEC=cpu`; the hot
+//! set comes from an explicit sidecar path (`--hotset` or
+//! `HIPFIRE_QWEN4_EXPERT_HOTSET`) on any arch (gfx1100 included), and gfx1201 also
+//! takes the default sibling sidecar.
 //!
 //! Every comparison is SAME-INPUT: the split executor captures, inside the real forward
 //! call of one layer, the exact rotated activation, the original route, the combine

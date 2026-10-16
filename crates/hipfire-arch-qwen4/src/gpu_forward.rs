@@ -482,6 +482,24 @@ fn qwen4_expert_stage_min_rows(arch: &str, chunk_rows: usize) -> (usize, StageMi
     )
 }
 
+/// Whether long-prefill expert staging would stage a window of at most
+/// [`hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS`] rows: staging on and
+/// `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` forced to the cap or below. The
+/// default threshold is `min(2048, prefill chunk)` (hundreds of rows at
+/// least), so only the forced value can reach a narrow window. A staged forward
+/// swaps the layer's pointer tables for the stage's, which the CPU tier split's
+/// masked route does not cover, so the split refuses to arm (one log line)
+/// instead of failing each narrow call.
+fn expert_stage_takes_narrow_windows(
+    arch: &str,
+    stage_on: bool,
+    min_rows_env: Option<&str>,
+) -> bool {
+    stage_on
+        && resolve_expert_stage_min_rows(arch, usize::MAX, min_rows_env).0
+            <= hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS
+}
+
 /// Which rows of a batched Qwen4 prefill write language-model logits.
 ///
 /// `All` is the public chunk/capture contract.  `Final` keeps the complete
@@ -1164,9 +1182,9 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// Opt-in routed CPU splice, only for whole host-mapped trunk aggregates.
     pub(crate) cpu_deferred_experts: bool,
     cpu_expert_owners: Option<cpu_splice::CpuExpertOwners>,
-    /// D2 tier split (`memory.offload_exec=cpu` over an explicit gfx1100 hot
-    /// set): the COLD experts' retained CPU spans. Never set together with
-    /// `cpu_deferred_experts` (distinct numerical mode).
+    /// D2 tier split (`memory.offload_exec=cpu` over an expert hot set, any
+    /// arch the loader admitted one on): the COLD experts' retained CPU spans.
+    /// Never set together with `cpu_deferred_experts` (distinct numerical mode).
     cpu_tier_owners: Option<cpu_splice::CpuTierOwners>,
     /// The layer's preallocated split executor (masked route + slot storage),
     /// released through `free_gpu` only.
@@ -2939,15 +2957,19 @@ impl Qwen4MoeLayerRuntime {
         // D2 tier split: its own admission, distinct from the whole-layer D1
         // splice above (which never arms on a tier layer). Only
         // `memory.offload_exec=cpu` requests it (passback keeps D1 behaviour).
+        // It has no arch gate: it arms on any tier plan the loader admitted
+        // (`expert_hotset::hotset_arch_admits`: default sidecar on gfx1201
+        // only, an explicit sidecar path on any arch), and every route it has
+        // no masked ids or cold-slot installation for is refused below with
+        // one line.
         let split_admission = cpu_splice::CpuSplitAdmission {
             enabled: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
                 && !hipfire_dispatch::cpu_exec::passback_enabled()
                 && allow_tiers
                 && layer_label < config.num_hidden_layers
                 && kept_ids.is_none(),
-            opt_in_arch: gpu.arch == crate::expert_hotset::HOTSET_OPT_IN_ARCH,
             tier: tier_layer.is_some(),
-            explicit_hotset: tier_layer
+            bound_hotset: tier_layer
                 .as_ref()
                 .is_some_and(|view| view.lease().hotset_sidecar_sha256().is_some()),
             host_experts: tier_layer.as_ref().map_or(0, |view| {
@@ -2965,7 +2987,17 @@ impl Qwen4MoeLayerRuntime {
             slab: false,
             awq: cpu_admission.awq,
             fp8: fp8_tables.is_some(),
+            narrow_stage: expert_stage_takes_narrow_windows(
+                &gpu.arch,
+                hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_ENV, gpu.arch == "gfx1201"),
+                hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
         };
+        if let Some(refusal) = split_admission.refusal() {
+            cpu_splice::log_split_refusal_once(refusal, &gpu.arch);
+        }
         let cpu_tier_owners = split_admission
             .armed()
             .then_some(tier_layer.as_ref())
@@ -6492,8 +6524,13 @@ impl Qwen4GpuForward {
                 );
             }
             if hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled() {
+                let slab_layers = moe
+                    .iter()
+                    .flatten()
+                    .filter(|layer| layer.slab.is_some())
+                    .count();
                 eprintln!(
-                    "  [moe-cpu-expert] qwen4: {cpu_layers}/{} trunk layers armed for CPU routed FFN (armed layers use eager HIP for decode and <=4-row verify; wide prefill keeps PCIe); EP, slab, AWQ, unsupported dtypes and resident layers keep the GPU path; expert-tier/hot-set layers use the separate gfx1100 tier split (see [moe-cpu-split])",
+                    "  [moe-cpu-expert] qwen4: {cpu_layers}/{} trunk layers armed for CPU routed FFN (armed layers use eager HIP for decode and <=4-row verify; wide prefill keeps PCIe); {slab_layers} expert-slab layers keep the slab GPU route (it has no masked route or cold-slot installation); EP, AWQ, unsupported dtypes and resident layers keep the GPU path; expert-tier/hot-set layers use the separate hot-set tier split (see [moe-cpu-split])",
                     moe_count
                 );
             }
@@ -10749,6 +10786,25 @@ mod tests {
             resolve("gfx1100", chunk("gfx1100", Some("1100")), None),
             (1024, Default)
         );
+    }
+
+    #[test]
+    fn only_a_forced_stage_threshold_reaches_a_narrow_window() {
+        use super::expert_stage_takes_narrow_windows as narrow;
+        for arch in ["gfx1100", "gfx1201"] {
+            // Default thresholds (min(2048, chunk) or 2048) never stage <= 4 rows.
+            assert!(!narrow(arch, true, None), "{arch}");
+            assert!(!narrow(arch, true, Some("512")), "{arch}");
+            assert!(!narrow(arch, true, Some("5")), "{arch}");
+            // Below 2 or unparsable keeps the default threshold.
+            assert!(!narrow(arch, true, Some("1")), "{arch}");
+            assert!(!narrow(arch, true, Some("x")), "{arch}");
+            // A forced threshold at or below the 4-row cap does, when staging is on.
+            for rows in ["2", "3", "4"] {
+                assert!(narrow(arch, true, Some(rows)), "{arch} {rows}");
+                assert!(!narrow(arch, false, Some(rows)), "{arch} {rows} stage off");
+            }
+        }
     }
 
     #[test]
