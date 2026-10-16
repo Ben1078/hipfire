@@ -14,6 +14,13 @@
 //! [`CpuSpliceAdmission`] is the pure arming decision: the splice runs only for
 //! host-mapped, supported layers with no EP / slab / tier / AWQ route that
 //! owns the weights differently.
+//!
+//! [`CpuSplitAdmission`] is the same decision for the D2 hot-set tier split. Both
+//! are architecture-generic: neither has an arch input. D2 arms on any tier plan
+//! the loader admitted (default sibling sidecar on gfx1201 only, an explicit
+//! `HIPFIRE_QWEN4_EXPERT_HOTSET` path on any arch; see
+//! `expert_hotset::hotset_arch_admits`) and refuses, with one log line per
+//! reason, every route that has no masked ids or cold-slot installation.
 
 use super::*;
 
@@ -194,25 +201,21 @@ impl CpuExpertOwners {
     }
 }
 
-/// Whether the D2 tier split (`memory.offload_exec=cpu` over an explicit
-/// gfx1100 expert hot set) may arm for one layer. Distinct from
-/// [`CpuSpliceAdmission`]: the whole-layer D1 splice never arms on a tier
-/// layer, and this mode never sets the layer's `cpu_deferred_experts` flag.
-/// Every field is an input; [`Self::armed`] is the single decision.
+/// Whether the D2 tier split (`memory.offload_exec=cpu` over an expert hot
+/// set) may arm for one layer. Distinct from [`CpuSpliceAdmission`]: the
+/// whole-layer D1 splice never arms on a tier layer, and this mode never sets
+/// the layer's `cpu_deferred_experts` flag. Every field is an input;
+/// [`Self::refusal`] is the single decision and [`Self::armed`] its yes/no.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CpuSplitAdmission {
     /// `memory.offload_exec=cpu` selected the CPU expert route.
     pub enabled: bool,
-    /// The device is the explicit-hotset opt-in arch (`gfx1100`). A tier plan
-    /// exists there only from an explicit `HIPFIRE_QWEN4_EXPERT_HOTSET`
-    /// sidecar, never from the default sibling sidecar.
-    pub opt_in_arch: bool,
     /// The layer is governed by a per-expert tier plan (the hot set).
     pub tier: bool,
-    /// The tier plan came from an explicit `HIPFIRE_QWEN4_EXPERT_HOTSET`
-    /// sidecar: the loader bound that sidecar's SHA-256 to the lease before
-    /// attach. A custom tier plan without a bound sidecar never arms.
-    pub explicit_hotset: bool,
+    /// The tier plan came from a hot-set sidecar: the loader bound that
+    /// sidecar's SHA-256 to the lease before attach. A custom tier plan
+    /// without a bound sidecar never arms.
+    pub bound_hotset: bool,
     /// How many of the layer's experts are host-mapped (cold). Zero leaves
     /// nothing for the CPU to do.
     pub host_experts: usize,
@@ -228,22 +231,108 @@ pub(super) struct CpuSplitAdmission {
     pub awq: bool,
     /// Stock FP8 blocks.
     pub fp8: bool,
+    /// Long-prefill expert staging would take a window of at most
+    /// [`hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS`] rows
+    /// (`HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` forced that low): a staged
+    /// table is a different pointer set than the masked route's, so the split
+    /// would be refused per call instead of served.
+    pub narrow_stage: bool,
+}
+
+/// Why the D2 split does not arm on a layer. The first three are the normal
+/// shape of a layer outside the mode (never logged); every other reason is a
+/// route the split has no masked-route or cold-slot installation for, logged
+/// once per process by [`log_split_refusal_once`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitRefusal {
+    NotRequested,
+    NotTier,
+    NoColdExperts,
+    UnboundHotset,
+    NotFlashNextMq4,
+    ExpertParallel,
+    Slab,
+    Awq,
+    Fp8,
+    NarrowStage,
+}
+
+impl SplitRefusal {
+    /// A layer outside the mode, not a refused route.
+    pub(super) fn is_silent(self) -> bool {
+        matches!(self, Self::NotRequested | Self::NotTier | Self::NoColdExperts)
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotRequested => "the CPU tier split is not requested",
+            Self::NotTier => "the layer is not governed by a hot-set tier plan",
+            Self::NoColdExperts => "the layer has no host-mapped expert",
+            Self::UnboundHotset => "the tier plan is not backed by a bound hot-set sidecar",
+            Self::NotFlashNextMq4 => {
+                "the layer is not uniform Flash-Next QT44 gate/up + QT53 down"
+            }
+            Self::ExpertParallel => "expert-parallel layers have no masked route",
+            Self::Slab => "expert-slab layers have no masked route or cold-slot installation",
+            Self::Awq => "AWQ layers carry scales the CPU arithmetic would ignore",
+            Self::Fp8 => "stock-FP8 layers have no masked route or cold-slot installation",
+            Self::NarrowStage => {
+                "HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS makes long-prefill staging take windows of \
+                 at most 4 rows, and a staged expert table has no masked route"
+            }
+        }
+    }
 }
 
 impl CpuSplitAdmission {
-    pub(super) fn armed(&self) -> bool {
-        self.enabled
-            && self.opt_in_arch
-            && self.tier
-            && self.explicit_hotset
-            && self.host_experts != 0
-            && self.flash_next
-            && self.uniform_qt44_qt53
-            && !self.ep
-            && !self.slab
-            && !self.awq
-            && !self.fp8
+    /// The first reason the split does not arm, `None` when it arms.
+    pub(super) fn refusal(&self) -> Option<SplitRefusal> {
+        let checks = [
+            (!self.enabled, SplitRefusal::NotRequested),
+            (!self.tier, SplitRefusal::NotTier),
+            (self.host_experts == 0, SplitRefusal::NoColdExperts),
+            (!self.bound_hotset, SplitRefusal::UnboundHotset),
+            (
+                !self.flash_next || !self.uniform_qt44_qt53,
+                SplitRefusal::NotFlashNextMq4,
+            ),
+            (self.ep, SplitRefusal::ExpertParallel),
+            (self.slab, SplitRefusal::Slab),
+            (self.awq, SplitRefusal::Awq),
+            (self.fp8, SplitRefusal::Fp8),
+            (self.narrow_stage, SplitRefusal::NarrowStage),
+        ];
+        checks
+            .into_iter()
+            .find_map(|(refused, reason)| refused.then_some(reason))
     }
+
+    pub(super) fn armed(&self) -> bool {
+        self.refusal().is_none()
+    }
+}
+
+/// Log a refused (non-silent) split route exactly once per process and reason,
+/// so a 48-layer hot set reports one line, not 48. Silent reasons never log.
+pub(super) fn log_split_refusal_once(refusal: SplitRefusal, arch: &str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if refusal.is_silent() {
+        return;
+    }
+    let bit = 1u32 << (refusal as u32);
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        eprintln!("{}", split_refusal_line(refusal, arch));
+    }
+}
+
+/// The one log line of a refused split route.
+fn split_refusal_line(refusal: SplitRefusal, arch: &str) -> String {
+    format!(
+        "  [moe-cpu-split] qwen4: not armed on {arch}: {}; the affected hot-set layers keep the \
+         PCIe mapped-expert read",
+        refusal.reason()
+    )
 }
 
 /// Validated byte ranges of one cold expert inside the host owner.
@@ -751,9 +840,8 @@ mod tests {
     fn split_admission() -> CpuSplitAdmission {
         CpuSplitAdmission {
             enabled: true,
-            opt_in_arch: true,
             tier: true,
-            explicit_hotset: true,
+            bound_hotset: true,
             host_experts: 100,
             flash_next: true,
             uniform_qt44_qt53: true,
@@ -761,33 +849,138 @@ mod tests {
             slab: false,
             awq: false,
             fp8: false,
+            narrow_stage: false,
+        }
+    }
+
+    /// The layer admission of an `offload_exec=cpu` load on `arch` whose hot
+    /// set came from the default sibling sidecar (`explicit_path = false`) or
+    /// an explicit `HIPFIRE_QWEN4_EXPERT_HOTSET` path. The loader builds a tier
+    /// plan (and binds its sidecar) only where `hotset_arch_admits` held; the
+    /// layer has no arch input of its own.
+    fn split_on(arch: &str, explicit_path: bool) -> CpuSplitAdmission {
+        let loaded = crate::expert_hotset::hotset_arch_admits(arch, explicit_path);
+        CpuSplitAdmission {
+            tier: loaded,
+            bound_hotset: loaded,
+            ..split_admission()
         }
     }
 
     #[test]
-    fn split_admission_arms_only_the_explicit_gfx1100_tier_shape() {
+    fn split_arming_truth_table_any_arch() {
+        // (arch, explicit hot-set path, armed)
+        for (arch, explicit_path, armed) in [
+            // The default sibling sidecar builds a plan on gfx1201 only.
+            ("gfx1201", false, true),
+            ("gfx1100", false, false),
+            ("gfx1151", false, false),
+            ("gfx1200", false, false),
+            ("gfx942", false, false),
+            // An explicit path arms on any arch whose plan the loader admitted.
+            ("gfx1201", true, true),
+            ("gfx1100", true, true),
+            ("gfx1151", true, true),
+            ("gfx1200", true, true),
+            ("gfx942", true, true),
+        ] {
+            assert_eq!(
+                split_on(arch, explicit_path).armed(),
+                armed,
+                "{arch} explicit={explicit_path}"
+            );
+        }
+        // The not-armed rows are "no tier plan", never an arch refusal.
+        assert_eq!(split_on("gfx1100", false).refusal(), Some(SplitRefusal::NotTier));
+        // Without `memory.offload_exec=cpu` nothing arms on any arch.
+        for arch in ["gfx1100", "gfx1201", "gfx1151"] {
+            let mut a = split_on(arch, true);
+            a.enabled = false;
+            assert_eq!(a.refusal(), Some(SplitRefusal::NotRequested), "{arch}");
+        }
+    }
+
+    #[test]
+    fn split_admission_arms_only_the_bound_uniform_tier_shape() {
         assert!(split_admission().armed());
-        let refusals: [(&str, fn(&mut CpuSplitAdmission)); 10] = [
-            ("disabled", |a| a.enabled = false),
-            ("other arch", |a| a.opt_in_arch = false),
-            ("no tier", |a| a.tier = false),
-            ("custom tier, no bound sidecar", |a| a.explicit_hotset = false),
-            ("no cold experts", |a| a.host_experts = 0),
-            ("not flash-next", |a| a.flash_next = false),
-            ("mixed codec", |a| a.uniform_qt44_qt53 = false),
-            ("ep", |a| a.ep = true),
-            ("awq", |a| a.awq = true),
-            ("fp8", |a| a.fp8 = true),
+        assert_eq!(split_admission().refusal(), None);
+        let refusals: [(&str, SplitRefusal, fn(&mut CpuSplitAdmission)); 11] = [
+            ("disabled", SplitRefusal::NotRequested, |a| a.enabled = false),
+            ("no tier", SplitRefusal::NotTier, |a| a.tier = false),
+            (
+                "custom tier, no bound sidecar",
+                SplitRefusal::UnboundHotset,
+                |a| a.bound_hotset = false,
+            ),
+            ("no cold experts", SplitRefusal::NoColdExperts, |a| a.host_experts = 0),
+            ("not flash-next", SplitRefusal::NotFlashNextMq4, |a| a.flash_next = false),
+            ("mixed codec", SplitRefusal::NotFlashNextMq4, |a| {
+                a.uniform_qt44_qt53 = false
+            }),
+            ("ep", SplitRefusal::ExpertParallel, |a| a.ep = true),
+            ("slab", SplitRefusal::Slab, |a| a.slab = true),
+            ("awq", SplitRefusal::Awq, |a| a.awq = true),
+            ("fp8", SplitRefusal::Fp8, |a| a.fp8 = true),
+            ("staged narrow window", SplitRefusal::NarrowStage, |a| {
+                a.narrow_stage = true
+            }),
         ];
-        for (name, mutate) in refusals {
+        for (name, reason, mutate) in refusals {
             let mut a = split_admission();
             mutate(&mut a);
             assert!(!a.armed(), "{name}");
+            assert_eq!(a.refusal(), Some(reason), "{name}");
         }
-        let mut slab = split_admission();
-        slab.slab = true;
-        assert!(!slab.armed(), "slab");
         assert!(!CpuSplitAdmission::default().armed());
+    }
+
+    #[test]
+    fn split_refusals_log_one_line_only_for_unsupported_routes() {
+        // A layer outside the mode, or with nothing cold, is not a refused
+        // route: no line.
+        for reason in [
+            SplitRefusal::NotRequested,
+            SplitRefusal::NotTier,
+            SplitRefusal::NoColdExperts,
+        ] {
+            assert!(reason.is_silent(), "{reason:?}");
+        }
+        for reason in [
+            SplitRefusal::UnboundHotset,
+            SplitRefusal::NotFlashNextMq4,
+            SplitRefusal::ExpertParallel,
+            SplitRefusal::Slab,
+            SplitRefusal::Awq,
+            SplitRefusal::Fp8,
+            SplitRefusal::NarrowStage,
+        ] {
+            assert!(!reason.is_silent(), "{reason:?}");
+            let line = split_refusal_line(reason, "gfx1201");
+            assert!(!line.contains('\n'), "{line}");
+            assert!(
+                line.starts_with("  [moe-cpu-split] qwen4: not armed on gfx1201: "),
+                "{line}"
+            );
+            assert!(line.ends_with("keep the PCIe mapped-expert read"), "{line}");
+        }
+        // One bit per reason: the once-per-process latch cannot alias.
+        let mut bits = 0u32;
+        for reason in [
+            SplitRefusal::NotRequested,
+            SplitRefusal::NotTier,
+            SplitRefusal::NoColdExperts,
+            SplitRefusal::UnboundHotset,
+            SplitRefusal::NotFlashNextMq4,
+            SplitRefusal::ExpertParallel,
+            SplitRefusal::Slab,
+            SplitRefusal::Awq,
+            SplitRefusal::Fp8,
+            SplitRefusal::NarrowStage,
+        ] {
+            let bit = 1u32 << (reason as u32);
+            assert_eq!(bits & bit, 0, "{reason:?}");
+            bits |= bit;
+        }
     }
 
     #[test]
