@@ -18,13 +18,12 @@ Timing uses `q8`/`q8` KV on both architectures because `bench_qwen35_mq4` only b
 caches (no fp8). All arms in a timing comparison share the identical cache setting, and the manifest
 records it. Quality keeps the pinned R9700 fp8/q8 setting.
 
-## Build (main agent; not run by this ticket)
+## Build
 
-Run in `/home/kaden/qcal/release-0.4.3/a4-fused-ladder`, after the selector change has landed:
+Run in `/home/kaden/qcal/release-0.4.3/a4-fused-ladder`:
 
 ```
-ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CARGO_BUILD_JOBS=8 cargo build --release -p hipfire-runtime --example eval_hipfire
-ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CARGO_BUILD_JOBS=8 cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
+ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CARGO_BUILD_JOBS=8 cargo build --release --features deltanet -p hipfire-runtime --example eval_hipfire --example bench_qwen35_mq4
 ```
 
 Binaries: `target/release/examples/eval_hipfire`, `target/release/examples/bench_qwen35_mq4`
@@ -41,7 +40,7 @@ The model sha256 and both reference sha256 are checked first (model/reference mi
 (WT2 `ff88c499...2841`, code24 `9b061631...910e`); use it for the unset control and for `explicit2`.
 
 ```
-fabric-run.sh --class correct --card <r9700 card> --mem-gb 24 --max-secs 600 --wait-secs 14400 --priority P1 \
+fabric-run.sh --class correct --card <r9700 card> --mem-gb 24 --max-secs 600 --wait-secs 14400 --priority P0 \
   --owner A4LadderStudy -- python3 experiments/a4-ladder/runner.py quality --arch r9700 \
   --arm control=@unset --validate-pin --model <canonical .mq4-xts> \
   --bin target/release/examples/eval_hipfire --out <runs>/quality/control
@@ -95,16 +94,17 @@ involved. Prefill-code facts the harness relies on (read from `bench_qwen35_mq4.
   `--prefill-runs` must be >= 3. The atlas last-sample value is cross-checked against the last run
   line.
 - `--warmup 0` removes the decode warmup tokens; `--gen 0` makes the bench return right after the
-  prefill (after its post-prefill DPM warm-up, if enabled). The bench never frees replaced KV caches,
-  so device memory grows slightly per run (visible in the memory receipt).
+  prefill (after its post-prefill DPM warm-up, if enabled). The bench retains replaced KV caches.
+  Measured R9700 total peak VRAM is 15.89 GiB at pp512 and 24.85 GiB at pp8192
+  with three samples/process; declare 28 GiB for pp8192 (including Halo UMA admission).
 - `HIPFIRE_PREFILL_REUSE_PBS` is unset, as in the bench default; `--env KEY=VALUE` adds extra
   child environment to every arm (recorded in the manifest).
 
 ```
-fabric-run.sh --class timing --card <card> --mem-gb 24 --max-secs 1800 --wait-secs 14400 --priority P1 \
+fabric-run.sh --class timing --card <card> --mem-gb 28 --max-secs 1800 --wait-secs 14400 --priority P1 \
   --owner A4LadderStudy -- python3 experiments/a4-ladder/runner.py timing --arch r9700 \
-  --arm control=@unset --arm explicit2=2 --arm fused8=<v8> --arm compact=<vc> \
-  --model <canonical .mq4-xts> --bin target/release/examples/bench_qwen35_mq4 --out <runs>/timing/r9700
+  --arm control=@unset --arm fused8=8 --lengths 8192 --blocks 2 \
+  --model <canonical .mq4-xts> --bin target/release/examples/bench_qwen35_mq4 --out <runs>/timing/r9700-c8-pp8192
 ```
 
 Model sha256 is not recomputed inside the hold by default (it costs about a minute of the 1800 s):
