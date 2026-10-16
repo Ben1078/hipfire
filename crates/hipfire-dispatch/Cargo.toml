@@ -11,6 +11,10 @@ hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 smallvec = "1.15.2"
 
+[dev-dependencies]
+# Worker-count determinism tests build their own pools.
+rayon.workspace = true
+
 [features]
 default = []
 test-utils = []
