@@ -251,6 +251,11 @@ pub fn production_fail_closed_rollback(
     slot: Option<&mut dyn SpecTarget>,
     spec: Option<&mut dyn Speculator>,
 ) -> RollbackEpilogue {
+    if slot.is_none() && spec.is_none() {
+        if let Some(epilogue) = qwen4_pp_rollback(m) {
+            return epilogue;
+        }
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
@@ -297,6 +302,43 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+fn qwen4_pp_owns_reset(pp: usize, active_qwen4_mesh: bool) -> bool {
+    pp > 1 && active_qwen4_mesh
+}
+
+/// Qwen4's band adapter resets every model GPU through the `LoadedModel`
+/// hardware owner. Its all-band reset is already drained; neither a daemon
+/// root reset nor the legacy Qwen3.5 DN reset applies to that route.
+fn qwen4_pp_rollback(m: &mut LoadedModel) -> Option<RollbackEpilogue> {
+    if !qwen4_pp_owns_reset(
+        m.pp,
+        m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active()),
+    ) {
+        return None;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    m.asst_turn_cache.clear();
+    let unexpected_spec = m.speculator.is_some()
+        || !m.prefill_checkpoints.is_empty()
+        || !m.dflash_checkpoints.is_empty();
+    let result = match m.qwen4_mesh_mut() {
+        Some((bundle, gpus)) => bundle.pp_reset(gpus).map_err(|error| error.to_string()),
+        None => Err("qwen4 topology.pp reset is missing its admitted Gpus owner".into()),
+    };
+    let context = match result {
+        Err(error) => Some(error.to_string()),
+        Ok(()) if unexpected_spec => {
+            Some("qwen4 topology.pp reset found speculative state excluded by admission".into())
+        }
+        Ok(()) => None,
+    };
+    Some(RollbackEpilogue {
+        rolled_back: context.is_none(),
+        context,
+    })
+}
+
 /// Pipeline-parallel production fail-closed rollback (G4.7).
 ///
 /// Extends [`production_fail_closed_rollback`] — host cursors, asst-turn
@@ -320,6 +362,9 @@ pub fn production_pp_fail_closed_rollback(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> RollbackEpilogue {
+    if let Some(epilogue) = qwen4_pp_rollback(m) {
+        return epilogue;
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     let single = fail_closed_reset_target_and_spec(m, gpu, None, None);
@@ -383,6 +428,9 @@ pub fn reset_mesh_request_state(
     m: &mut LoadedModel,
     gpu: Option<&mut rdna_compute::Gpu>,
 ) -> RollbackEpilogue {
+    if let Some(epilogue) = qwen4_pp_rollback(m) {
+        return epilogue;
+    }
     if m.pp > 1 {
         return match gpu {
             Some(gpu) => production_pp_fail_closed_rollback(m, gpu),
@@ -2017,6 +2065,15 @@ pub fn token_logprob_fields(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen4_pp_reset_dispatch_excludes_legacy_and_single() {
+        assert!(super::qwen4_pp_owns_reset(2, true));
+        assert!(super::qwen4_pp_owns_reset(8, true));
+        assert!(!super::qwen4_pp_owns_reset(1, true));
+        assert!(!super::qwen4_pp_owns_reset(2, false));
+        assert!(!super::qwen4_pp_owns_reset(1, false));
+    }
+
     use super::{
         fit_max_tokens, latch_request_think_cap, spec_ctx_request_fits, FitMaxTokensGuard,
         FIT_MAX_TOKENS_MARGIN,

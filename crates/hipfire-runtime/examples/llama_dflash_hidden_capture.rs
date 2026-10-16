@@ -51,6 +51,8 @@ fn main() {
         cask: &cask,
         pp: 1,
         pp_layer_counts: None,
+        admitted_mesh: None,
+        band_placement: None,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
         gemma4_drafter_path: None,

@@ -9,6 +9,8 @@
 //! lowering and execution; this module only supplies family-owned typed data
 //! and the source-bound MoE sealer inputs.
 
+use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig};
+use crate::weights::Qwen4BandScope;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
@@ -16,11 +18,16 @@ use hipfire_dispatch::families::moe::{
     MoeSharedDtypes, MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
+use hipfire_dispatch::pipeline::step_graph::{
+    OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule, StepGraph,
+    StepGraphError,
+};
 use hipfire_dispatch::pipeline::{
     execute_final_hyper as execute_shared_final_hyper, project_weight, seal_decode, seal_prefill,
     BoundMoeExperts, ExpertBindingCache, ExpertTable, HyperReadOp,
 };
 use hipfire_dispatch::types::DispatchError;
+use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 #[inline]
@@ -1164,6 +1171,461 @@ fn build_moe_prefill<'a>(
         ep_layer_idx: moe.layer_idx,
         ep_tile_exchange: moe.tile_exchange,
     })
+}
+
+/// The HC streams: the only resource live across trunk layer boundaries, hence
+/// the operand of every pipeline `BandXfer`. Always the first declared
+/// resource of [`qwen4_step_graph_with_output`].
+pub const QWEN4_STREAMS_RESOURCE: ResourceId = ResourceId(0);
+
+fn step_graph_error(error: StepGraphError) -> String {
+    format!("Qwen4 step graph: {error}")
+}
+
+/// [`qwen4_step_graph_with_output`] for a forward that computes logits but no
+/// top-1 rows.
+pub fn qwen4_step_graph(config: &Qwen4Config, route: MeshRoute) -> Result<StepGraph, String> {
+    qwen4_step_graph_with_output(config, route, true, false)
+}
+
+/// Pure declaration of the trunk program `forward_chunk_scoped` builds: one
+/// [`OpDecl`] per `Step` it emits per layer (the op kind is the `OpKind` of
+/// that `Step`), the input op (token embedding plus HC stream init: `Embed`)
+/// and, when `head`, the head ops the builder runs after the trunk (final HC
+/// read `HyperRead`, LM head `Project`, and with `top1` the `Argmax` of the
+/// requested rows). `top1` requires `head`, as in the builder.
+///
+/// Every op carries `layer: Some(_)` so its pipeline stage never depends on
+/// issue order: the input op is attributed to layer 0 and the head ops to the
+/// last layer, hence the input pin is the band owning layer 0 and the output
+/// pin the band owning the last layer. The wide-hidden capture is not an op
+/// (refused under PP). The graph is the same for every [`MeshRoute`]; row
+/// counts are not part of it (shapes are per row).
+///
+/// Per layer, in order: `GroupedDepthwise` (PLE layer only), `HyperRead`,
+/// `GatedDeltaNet` | `IndexedAttention`, `HyperWrite`, `HyperRead`, `Clear`
+/// (MoE only), `Moe` | `DenseFfn`, `HyperWrite`.
+///
+/// Only [`QWEN4_STREAMS_RESOURCE`] is written in one layer and read in the
+/// next. Scratch activations are written before they are read within one
+/// layer, and the PLE rows are a host-fed input read only at the PLE layer
+/// (input band). The graph declares no weight and no state resources.
+pub fn qwen4_step_graph_with_output(
+    config: &Qwen4Config,
+    _route: MeshRoute,
+    head: bool,
+    top1: bool,
+) -> Result<StepGraph, String> {
+    let layers = config.num_hidden_layers;
+    if layers == 0 || config.layer_types.len() != layers {
+        return Err(format!(
+            "Qwen4 step graph: {layers} layers with {} layer types",
+            config.layer_types.len()
+        ));
+    }
+    if top1 && !head {
+        return Err("Qwen4 step graph: top-1 rows require the LM head".to_string());
+    }
+    let ple_layer = config.ple.as_ref().map(|ple| ple.layer);
+    if ple_layer.is_some_and(|layer| layer >= layers) {
+        return Err("Qwen4 step graph: PLE layer is outside the trunk".to_string());
+    }
+    let moe = matches!(config.ffn, Qwen4FfnConfig::Moe { .. });
+    let mut graph = StepGraph::new();
+    let mut resource = |class: ResourceClass, shape: &[usize]| {
+        graph
+            .add_resource(ResourceDecl {
+                class,
+                shape: shape.to_vec(),
+                alias: None,
+            })
+            .map_err(step_graph_error)
+    };
+    let streams = resource(
+        ResourceClass::Activation,
+        &[config.hc_count, config.hidden_size],
+    )?;
+    debug_assert_eq!(streams, QWEN4_STREAMS_RESOURCE);
+    let tokens = resource(ResourceClass::Input, &[1])?;
+    let mixed = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    let attention_output = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    let ffn_output = resource(ResourceClass::Activation, &[config.hidden_size])?;
+    let ple_rows = match config.ple.as_ref() {
+        Some(ple) => Some(resource(
+            ResourceClass::Input,
+            &[ple.head_count * ple.row_width],
+        )?),
+        None => None,
+    };
+    let logits = resource(ResourceClass::Output, &[config.vocab_size])?;
+    let top1_rows = resource(ResourceClass::Output, &[1])?;
+
+    let mut ops: Vec<OpDecl> = Vec::new();
+    let mut op = |kind: OpKind,
+                  layer: usize,
+                  rule: SplitRule,
+                  reads: &[ResourceId],
+                  writes: &[ResourceId]| {
+        ops.push(OpDecl {
+            kind,
+            layer: Some(layer),
+            rule,
+            reads: reads.to_vec(),
+            writes: writes.to_vec(),
+        });
+    };
+    op(OpKind::Embed, 0, SplitRule::Opaque, &[tokens], &[streams]);
+    for (layer, kind) in config.layer_types.iter().copied().enumerate() {
+        if let (Some(index), Some(rows)) = (ple_layer, ple_rows) {
+            if index == layer {
+                op(
+                    OpKind::GroupedDepthwise,
+                    layer,
+                    SplitRule::Opaque,
+                    &[streams, rows],
+                    &[streams],
+                );
+            }
+        }
+        op(
+            OpKind::HyperRead,
+            layer,
+            SplitRule::RowComplete,
+            &[streams],
+            &[mixed],
+        );
+        op(
+            match kind {
+                LayerType::LinearAttention => OpKind::GatedDeltaNet,
+                LayerType::FullAttention => OpKind::IndexedAttention,
+            },
+            layer,
+            SplitRule::Opaque,
+            &[mixed],
+            &[attention_output],
+        );
+        op(
+            OpKind::HyperWrite,
+            layer,
+            SplitRule::RowComplete,
+            &[streams, attention_output],
+            &[streams],
+        );
+        op(
+            OpKind::HyperRead,
+            layer,
+            SplitRule::RowComplete,
+            &[streams],
+            &[mixed],
+        );
+        if moe {
+            op(
+                OpKind::Clear,
+                layer,
+                SplitRule::Pointwise,
+                &[],
+                &[ffn_output],
+            );
+            op(
+                OpKind::Moe,
+                layer,
+                SplitRule::Opaque,
+                &[mixed],
+                &[ffn_output],
+            );
+        } else {
+            op(
+                OpKind::DenseFfn,
+                layer,
+                SplitRule::Opaque,
+                &[mixed],
+                &[ffn_output],
+            );
+        }
+        op(
+            OpKind::HyperWrite,
+            layer,
+            SplitRule::RowComplete,
+            &[streams, ffn_output],
+            &[streams],
+        );
+    }
+    if head {
+        let last = layers - 1;
+        op(
+            OpKind::HyperRead,
+            last,
+            SplitRule::RowComplete,
+            &[streams],
+            &[mixed],
+        );
+        op(
+            OpKind::Project,
+            last,
+            SplitRule::Opaque,
+            &[mixed],
+            &[logits],
+        );
+        if top1 {
+            op(
+                OpKind::Argmax,
+                last,
+                SplitRule::RowComplete,
+                &[logits],
+                &[top1_rows],
+            );
+        }
+    }
+    for decl in ops {
+        graph.add_op(decl).map_err(step_graph_error)?;
+    }
+    Ok(graph)
+}
+
+/// Ops of `graph` (a [`qwen4_step_graph_with_output`] graph) that a rank owning
+/// `scope` runs, in issue order: every op attributed to a layer of the band.
+/// The input op (layer 0) is therefore only on the input band and the head ops
+/// (last layer) only on the output band.
+pub fn qwen4_rank_op_ids(graph: &StepGraph, scope: &Qwen4BandScope) -> Vec<OpId> {
+    graph
+        .ops()
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.layer.is_some_and(|layer| scope.band.contains(&layer)))
+        .map(|(index, _)| OpId(index as u32))
+        .collect()
+}
+
+#[cfg(test)]
+mod step_graph_tests {
+    use super::*;
+    use crate::config::compact_test_config;
+    use crate::weights::Qwen4Manifest;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+    use hipfire_runtime::mesh_placement::BandPlacement;
+    use hipfire_runtime::mesh_split::{split_program, CollectiveKind, RankItem, SplitPlan};
+    use hipfire_runtime::weight_manifest::plan_manifest;
+
+    fn expected_kinds(config: &Qwen4Config, head: bool, top1: bool) -> Vec<(OpKind, usize)> {
+        let moe = matches!(config.ffn, Qwen4FfnConfig::Moe { .. });
+        let mut out = vec![(OpKind::Embed, 0)];
+        for (layer, kind) in config.layer_types.iter().copied().enumerate() {
+            if config.ple.as_ref().is_some_and(|ple| ple.layer == layer) {
+                out.push((OpKind::GroupedDepthwise, layer));
+            }
+            out.push((OpKind::HyperRead, layer));
+            out.push((
+                match kind {
+                    LayerType::LinearAttention => OpKind::GatedDeltaNet,
+                    LayerType::FullAttention => OpKind::IndexedAttention,
+                },
+                layer,
+            ));
+            out.push((OpKind::HyperWrite, layer));
+            out.push((OpKind::HyperRead, layer));
+            if moe {
+                out.push((OpKind::Clear, layer));
+                out.push((OpKind::Moe, layer));
+            } else {
+                out.push((OpKind::DenseFfn, layer));
+            }
+            out.push((OpKind::HyperWrite, layer));
+        }
+        let last = config.num_hidden_layers - 1;
+        if head {
+            out.push((OpKind::HyperRead, last));
+            out.push((OpKind::Project, last));
+        }
+        if top1 {
+            out.push((OpKind::Argmax, last));
+        }
+        out
+    }
+
+    fn kinds(graph: &StepGraph) -> Vec<(OpKind, usize)> {
+        graph
+            .ops()
+            .iter()
+            .map(|op| (op.kind, op.layer.expect("every op is layer-attributed")))
+            .collect()
+    }
+
+    fn split(
+        config: &Qwen4Config,
+        counts: &[usize],
+        head: bool,
+        top1: bool,
+    ) -> (StepGraph, SplitPlan, BandPlacement) {
+        let graph = qwen4_step_graph_with_output(config, MeshRoute::Prefill, head, top1).unwrap();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+        let placement = BandPlacement::from_counts(&mesh, config.num_hidden_layers, counts)
+            .unwrap()
+            .with_first_band_min(2)
+            .unwrap();
+        // The real declaration authority: the Qwen4 manifest's weights and
+        // state (PLE conv state pinned to the input stage).
+        let manifest = Qwen4Manifest::build(config).unwrap();
+        let plan = plan_manifest(
+            &manifest.weights,
+            &manifest.state,
+            &mesh,
+            config.num_hidden_layers,
+            &placement,
+        )
+        .unwrap();
+        let split = split_program(&graph, &plan, &mesh).unwrap();
+        (graph, split, placement)
+    }
+
+    #[test]
+    fn graph_matches_the_trunk_builder_step_order() {
+        let config = compact_test_config();
+        for (head, top1) in [(true, false), (true, true), (false, false)] {
+            let graph =
+                qwen4_step_graph_with_output(&config, MeshRoute::Decode, head, top1).unwrap();
+            assert_eq!(kinds(&graph), expected_kinds(&config, head, top1));
+            // Identical for every route.
+            for route in [MeshRoute::Prefill, MeshRoute::Verify] {
+                assert_eq!(
+                    qwen4_step_graph_with_output(&config, route, head, top1).unwrap(),
+                    graph
+                );
+            }
+        }
+        assert_eq!(
+            qwen4_step_graph(&config, MeshRoute::Decode).unwrap(),
+            qwen4_step_graph_with_output(&config, MeshRoute::Decode, true, false).unwrap()
+        );
+        assert!(qwen4_step_graph_with_output(&config, MeshRoute::Decode, false, true).is_err());
+        let graph = qwen4_step_graph(&config, MeshRoute::Decode).unwrap();
+        assert_eq!(
+            graph.resources()[QWEN4_STREAMS_RESOURCE.0 as usize].class,
+            ResourceClass::Activation
+        );
+    }
+
+    #[test]
+    fn dense_and_no_ple_variants_follow_the_config() {
+        let mut config = compact_test_config();
+        config.ffn = Qwen4FfnConfig::Dense {
+            intermediate_size: 1024,
+        };
+        config.ple = None;
+        let graph = qwen4_step_graph(&config, MeshRoute::Decode).unwrap();
+        assert_eq!(kinds(&graph), expected_kinds(&config, true, false));
+        assert!(graph.ops().iter().all(|op| !matches!(
+            op.kind,
+            OpKind::GroupedDepthwise | OpKind::Clear | OpKind::Moe
+        )));
+    }
+
+    #[test]
+    fn bad_config_is_refused() {
+        let mut config = compact_test_config();
+        config.layer_types.pop();
+        assert!(qwen4_step_graph(&config, MeshRoute::Decode).is_err());
+    }
+
+    fn assert_split(counts: &[usize], head: bool, top1: bool) {
+        let config = compact_test_config();
+        assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
+        let (graph, plan, placement) = split(&config, counts, head, top1);
+        let stages = counts.len();
+        assert_eq!(plan.ranks.len(), stages);
+
+        // Every op runs on exactly one band: the one owning its layer (input
+        // op on band 0, head ops on the output band).
+        let mut owner = vec![None; graph.ops().len()];
+        for rank in &plan.ranks {
+            for item in &rank.items {
+                if let RankItem::Op(op) = item {
+                    assert!(
+                        owner[op.0 as usize].replace(rank.device).is_none(),
+                        "op {} placed twice",
+                        op.0
+                    );
+                }
+            }
+        }
+        for (index, decl) in graph.ops().iter().enumerate() {
+            let stage = placement.stage_of_layer(decl.layer.unwrap());
+            assert_eq!(owner[index], Some(stage), "op {index} {:?}", decl.kind);
+        }
+        assert_eq!(owner[0], Some(0), "input op on the input band");
+        assert_eq!(
+            owner[graph.ops().len() - 1],
+            Some(stages - 1),
+            "last op on the output band"
+        );
+
+        // Exactly one BandXfer of the streams per edge, nothing else.
+        assert_eq!(plan.collectives.len(), stages - 1);
+        for (edge, collective) in plan.collectives.iter().enumerate() {
+            assert_eq!(
+                collective.kind,
+                CollectiveKind::BandXfer {
+                    src: edge,
+                    dst: edge + 1
+                }
+            );
+            assert_eq!(collective.operand, QWEN4_STREAMS_RESOURCE);
+            assert_eq!(collective.group, vec![edge, edge + 1]);
+            let producer = &graph.ops()[collective.producer.0 as usize];
+            assert_eq!(producer.kind, OpKind::HyperWrite);
+            assert_eq!(producer.layer, Some(placement.band(edge).end - 1));
+        }
+
+        // Rank programs: receive, run the band's ops, publish.
+        for rank in &plan.ranks {
+            let stage = rank.device;
+            let scope = Qwen4BandScope {
+                band: placement.band(stage),
+                input: stage == 0,
+                output: stage + 1 == stages,
+            };
+            let ops: Vec<OpId> = rank
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RankItem::Op(op) => Some(*op),
+                    RankItem::Collective(_) => None,
+                })
+                .collect();
+            assert_eq!(ops, qwen4_rank_op_ids(&graph, &scope), "stage {stage}");
+            let collectives: Vec<usize> = rank
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches!(item, RankItem::Collective(_)))
+                .map(|(position, _)| position)
+                .collect();
+            let expected = usize::from(stage > 0) + usize::from(stage + 1 < stages);
+            assert_eq!(collectives.len(), expected, "stage {stage}");
+            if stage > 0 {
+                assert_eq!(collectives[0], 0, "receive precedes the band's ops");
+            }
+            if stage + 1 < stages {
+                assert_eq!(
+                    *collectives.last().unwrap(),
+                    rank.items.len() - 1,
+                    "publish follows the band's ops"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pp2_even_split_places_every_op_once_with_one_streams_edge() {
+        assert_split(&[24, 24], true, true);
+        assert_split(&[24, 24], false, false);
+    }
+
+    #[test]
+    fn pp6_uneven_split_places_every_op_once_with_streams_edges() {
+        assert_split(&[9, 8, 8, 8, 8, 7], true, true);
+        assert_split(&[9, 8, 8, 8, 8, 7], true, false);
+        assert_split(&[9, 8, 8, 8, 8, 7], false, false);
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,10 @@
 //! mutation.
 
 use crate::Carrier;
+pub use hipfire_arch_qwen4::admission::{
+    qwen4_pp_band_budget, qwen4_pp_edge_max_bytes, Qwen4PpBudgetInputs, Qwen4PpRankFit,
+    QWEN4_PP_RESERVE_BYTES,
+};
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
@@ -236,6 +240,17 @@ pub(crate) fn qwen4_native_mtp(
     tp: usize,
     ep: usize,
 ) -> Result<bool, String> {
+    if pp > 1 {
+        // Native MTP is refused under pipeline parallelism: `auto` stays AR
+        // (the head is never loaded), an explicit request is refused.
+        return match spec.mtp {
+            Some(true) => Err(qwen4_pp_unsupported(
+                pp,
+                "native MTP (speculation.mtp = on)",
+            )),
+            _ => Ok(false),
+        };
+    }
     if ep > 1 {
         return Ok(spec.mtp == Some(true));
     }
@@ -463,8 +478,14 @@ pub fn qwen4_request_admission(
     }
     if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
-            "qwen4: only pp=1, tp=1 with expert-parallel ep in 1..=8 is admitted (pp={}, tp={}, ep={})",
+            "qwen4: only pp=1, tp=1 with expert-parallel ep in 1..=8, or tp=1, ep=1 with pipeline-parallel pp in 2..=8 is admitted (pp={}, tp={}, ep={})",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
+        ));
+    }
+    if effective_mesh.pp > 1 && native_mtp {
+        return Err(qwen4_pp_unsupported(
+            effective_mesh.pp,
+            "native MTP (speculation.mtp = on)",
         ));
     }
     Ok(())
@@ -920,6 +941,21 @@ pub fn admit_qwen4_source(
     let host_mapped_experts = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
         .map_err(|error| format!("qwen4: {error}"))?
         .is_some();
+    if effective_mesh.pp > 1 {
+        let pp = effective_mesh.pp;
+        if host_mapped_experts {
+            return Err(qwen4_pp_unsupported(
+                pp,
+                "host-mapped routed experts (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS)",
+            ));
+        }
+        if matches!(
+            receipt.recipe(),
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+        ) {
+            return Err(qwen4_pp_unsupported(pp, "expert-slab artifacts"));
+        }
+    }
     hipfire_arch_qwen4::admission::admit_recipe_on_device(
         receipt.recipe(),
         gpu_arch,
@@ -1802,6 +1838,238 @@ pub fn normalize_pp_bands(
     })
 }
 
+/// Developer variable selecting how pipeline edges move bytes:
+/// `auto` (default), `peer` or `host`.
+pub const MESH_TRANSPORT_ENV: &str = "HIPFIRE_MESH_TRANSPORT";
+
+/// Numerical-policy identity of the admitted Qwen4 PP route: every band edge
+/// executes the cut-safe Single schedule (no fusion state across a cut).
+pub const QWEN4_PP_NUMERICAL_POLICY: &str = "qwen4-pp-cut-safe-v1";
+
+/// The one refusal sentence of every feature the Qwen4 PP route does not run.
+pub(crate) fn qwen4_pp_unsupported(pp: usize, what: &str) -> String {
+    format!(
+        "qwen4: pipeline parallelism (topology.pp = {pp}) does not support {what}; drop the option or set topology.pp = 1"
+    )
+}
+
+/// Parse [`MESH_TRANSPORT_ENV`] (`None`/empty = `auto`).
+pub fn parse_mesh_transport(raw: Option<&str>) -> Result<EdgeTransportPolicy, String> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(EdgeTransportPolicy::Auto),
+        Some("peer") => Ok(EdgeTransportPolicy::Peer),
+        Some("host") => Ok(EdgeTransportPolicy::Host),
+        Some(other) => Err(format!(
+            "{MESH_TRANSPORT_ENV}={other:?} is not one of auto, peer, host"
+        )),
+    }
+}
+
+/// Features the Qwen4 PP route does not run, refused from the load options
+/// before any source, device or cache work. `pp <= 1` never refuses.
+pub(crate) fn qwen4_pp_option_refusal(
+    pp: usize,
+    draft_path: Option<&str>,
+    options: &SourceAdmissionOptions,
+) -> Result<(), String> {
+    if pp <= 1 {
+        return Ok(());
+    }
+    let spec = options.spec;
+    let unsupported = [
+        (spec.mtp == Some(true), "native MTP (speculation.mtp = on)"),
+        (draft_path.is_some() || spec.dflash == Some(true), "DFlash"),
+        (spec.dspark == Some(true), "DSpark"),
+        (spec.ngram_draft == Some(true), "n-gram drafting"),
+        (crate::carriers::qwen4_ddtree_requested(spec), "DDTree"),
+        (options.kv_adaptive, "adaptive KV"),
+        (options.eagle_drafter, "an EAGLE drafter"),
+        (options.cask, "CASK"),
+        (options.pflash, "PFlash"),
+        (
+            options.expert_count_override,
+            "an experts-per-token override",
+        ),
+        (options.non_single_compute, "a non-Single compute placement"),
+    ];
+    match unsupported.iter().find(|(requested, _)| *requested) {
+        Some((_, what)) => Err(qwen4_pp_unsupported(pp, what)),
+        None => Ok(()),
+    }
+}
+
+/// Explicit environment/config requests the Qwen4 PP route does not run:
+/// host-mapped band layers, the expert hotset, expert staging, session
+/// snapshots (turn snapshots, the session-cache disk tier) and the NPU trunk
+/// (`npu` is the already resolved mode for the rank architecture). Unset
+/// values are accepted: the PP route never enables any of them, and attaches no
+/// session cache whatever `memory.session_cache_bytes` holds. `pp <= 1` never
+/// refuses.
+pub(crate) fn qwen4_pp_env_refusal(
+    pp: usize,
+    env: &dyn Fn(&str) -> Option<String>,
+    npu: hipfire_arch_qwen4::npu_trunk::NpuTrunkMode,
+    session_cache_disk_bytes: u64,
+) -> Result<(), String> {
+    use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
+    if pp <= 1 {
+        return Ok(());
+    }
+    let hotset = hipfire_arch_qwen4::expert_hotset::HOTSET_ENV;
+    let vram_layers = hipfire_arch_qwen4::expert_residency::EXPERT_VRAM_LAYERS_ENV;
+    let stage = hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV;
+    let turns = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
+    let unsupported = [
+        (
+            env(vram_layers).is_some(),
+            format!("host-mapped routed experts ({vram_layers})"),
+        ),
+        (
+            env(hotset).is_some_and(|value| value != "0"),
+            format!("the expert hotset ({hotset}; set 0)"),
+        ),
+        (
+            env(stage).as_deref() == Some("1"),
+            format!("expert staging ({stage})"),
+        ),
+        (
+            env(turns).as_deref() == Some("1"),
+            format!("session snapshots ({turns})"),
+        ),
+        (
+            session_cache_disk_bytes > 0,
+            "the session cache disk tier (memory.session_cache_disk_bytes; set 0)".to_string(),
+        ),
+        (
+            matches!(npu, NpuTrunkMode::On | NpuTrunkMode::Emulate),
+            format!("the NPU trunk (fusions.npu_trunk = {})", npu.as_str()),
+        ),
+    ];
+    match unsupported.iter().find(|(requested, _)| *requested) {
+        Some((_, what)) => Err(qwen4_pp_unsupported(pp, what)),
+        None => Ok(()),
+    }
+}
+
+/// The admitted ranks of a Qwen4 PP mesh: known PCI identity on every rank,
+/// one homogeneous gfx1100 or gfx1201, and the output owner (last logical
+/// rank = the daemon's device 0) agreeing with the daemon's architecture.
+pub(crate) fn qwen4_pp_rank_refusal(
+    pp: usize,
+    ranks: &[AdmittedRank],
+    gpu_arch: &str,
+) -> Result<(), String> {
+    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {pp})");
+    let Some(first) = ranks.first() else {
+        return Err(format!("{prefix} needs at least one rank"));
+    };
+    for rank in ranks {
+        if rank.pci_bus_id.is_none() {
+            return Err(format!(
+                "{prefix} needs a known PCI identity for every rank; rank {} (device {}) has none (KFD topology unreadable)",
+                rank.logical, rank.device_ordinal
+            ));
+        }
+        if !qwen4_ep_arch_admitted(&rank.arch) {
+            return Err(format!(
+                "{prefix} requires gfx1100 or gfx1201 on every rank; rank {} is {}",
+                rank.logical, rank.arch
+            ));
+        }
+        if rank.arch != first.arch {
+            return Err(format!(
+                "{prefix} requires the same architecture on every rank; rank 0 is {}, rank {} is {}",
+                first.arch, rank.logical, rank.arch
+            ));
+        }
+    }
+    if first.arch != gpu_arch {
+        return Err(format!(
+            "{prefix} requires every rank to match the primary device; ranks are {}, device 0 is {gpu_arch}",
+            first.arch
+        ));
+    }
+    Ok(())
+}
+
+/// The admitted Qwen4 PP mesh and bands. Pure: no HIP, no peer probing, no
+/// allocation. `visible` is the HIP-order device identity; ranks bind
+/// `OutputCardLast` (the primary device owns the output band). Transport per
+/// directed edge comes from `policy` and `qualified_peer` (logical rank ids,
+/// pre-side-effect byte-qualification evidence: there is none in production,
+/// so `auto` resolves to host-mapped and a forced `peer` refuses). Bands come
+/// from `requested_layers` (`HIPFIRE_PP_LAYERS`) or the uniform split, with
+/// the PLE layer pinned to the first band (`with_first_band_min(2)`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_qwen4_pp_mesh(
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    n_layers: usize,
+    visible: &[AdmittedRank],
+    gpu_arch: &str,
+    emulated: bool,
+    policy: EdgeTransportPolicy,
+    qualified_peer: &dyn Fn(usize, usize) -> bool,
+    requested_layers: Option<&str>,
+) -> Result<(AdmittedMesh, PpBands), String> {
+    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {pp})");
+    let stages = hipfire_arch_qwen4::EffectiveMesh::PP_MIN_DEGREE
+        ..=hipfire_arch_qwen4::EffectiveMesh::PP_MAX_DEGREE;
+    if !stages.contains(&pp) || tp != 1 || ep != 1 {
+        return Err(format!(
+            "{prefix} is admitted for 2..=8 stages with tp = ep = 1 (tp={tp}, ep={ep})"
+        ));
+    }
+    if emulated {
+        return Err(format!(
+            "{prefix} owns physical devices; HIPFIRE_EMULATE_GPUS aliasing is not admitted"
+        ));
+    }
+    if visible.len() < pp {
+        return Err(format!(
+            "{prefix} needs {pp} visible devices, {} visible (hardware.devices / HIPFIRE_DEVICES)",
+            visible.len()
+        ));
+    }
+    let ordered = pp_rank_order(&visible[..pp]).map_err(|e| format!("{prefix}: {e}"))?;
+    qwen4_pp_rank_refusal(pp, &ordered, gpu_arch)?;
+    let shape = normalize_mesh_shape(pp, 1, 1).map_err(|e| format!("{prefix}: {e}"))?;
+    let mesh = admit_mesh(
+        shape,
+        "qwen4",
+        QWEN4_PP_NUMERICAL_POLICY,
+        visible,
+        RankBinding::OutputCardLast,
+        Some(EdgeAdmission {
+            policy,
+            qualified_peer,
+        }),
+    )
+    .map_err(|e| {
+        if policy == EdgeTransportPolicy::Peer {
+            format!(
+                "{prefix}: Peer edges for Qwen4 PP need an admission-time qualification step ({MESH_TRANSPORT_ENV}=peer refused: {e}); no byte-qualification evidence exists before side effects (qualifying enables peer access); use auto or host"
+            )
+        } else {
+            format!("{prefix}: {e}")
+        }
+    })?;
+    let bands = normalize_pp_bands(&mesh.mesh, n_layers, requested_layers)
+        .map_err(|e| format!("{prefix}: {e}"))?;
+    let placement = bands
+        .placement
+        .with_first_band_min(2)
+        .map_err(|e| format!("{prefix}: {e} (the PLE layer lives in the first band)"))?;
+    Ok((
+        mesh,
+        PpBands {
+            placement,
+            explicit_counts: bands.explicit_counts,
+        },
+    ))
+}
+
 /// Read-only source admission: open the source, classify `arch_id` + vision,
 /// decide the effective topology, and refuse every unsupported/contradictory
 /// combination — without touching GPU state, VMM, or any prior model.
@@ -1925,6 +2193,7 @@ pub fn admit_source_with_options(
     };
     let mut qwen35_ep_experts = None;
     let mut qwen4_sequence = None;
+    let mut qwen4_pp: Option<(AdmittedMesh, PpBands)> = None;
     let mesh_shape: DeviceMesh;
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
@@ -1946,6 +2215,7 @@ pub fn admit_source_with_options(
         let spec_mtp = options.spec.mtp;
         let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
         crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
+        qwen4_pp_option_refusal(pp, draft_path, &options)?;
         carrier.admit_options(draft_path, options)?;
         if let Some(refusal) = qwen4_ep_geometry_refusal(
             ep,
@@ -1956,6 +2226,17 @@ pub fn admit_source_with_options(
             hipfire_runtime::config::get().emulate_gpus.is_some(),
         ) {
             return Err(refusal);
+        }
+        if pp > 1 {
+            let npu = hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()
+                .map_err(|error| format!("qwen4: {error}"))?
+                .resolve(gpu_arch);
+            qwen4_pp_env_refusal(
+                pp,
+                &|name| hipfire_config::developer_var(name).ok(),
+                npu,
+                hipfire_config::memory::session_cache_disk_bytes(),
+            )?;
         }
         // The PLE rows source is chosen here, before the resident model is
         // torn down: a refusal (missing sidecar, binding mismatch) leaves the
@@ -1980,6 +2261,30 @@ pub fn admit_source_with_options(
         )?;
         // Only an admitted (hence well-formed) mesh reaches here.
         mesh_shape = shape?;
+        if pp > 1 {
+            let policy = parse_mesh_transport(
+                hipfire_config::developer_var(MESH_TRANSPORT_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(|error| {
+                format!("qwen4: pipeline parallelism (topology.pp = {pp}): {error}")
+            })?;
+            // No pre-side-effect byte-qualification evidence exists: `auto`
+            // resolves to host-mapped edges, a forced `peer` refuses.
+            qwen4_pp = Some(admit_qwen4_pp_mesh(
+                pp,
+                tp,
+                ep,
+                admitted.config.num_hidden_layers,
+                &visible_device_ranks(gpu_arch, pp),
+                gpu_arch,
+                hipfire_runtime::config::get().emulate_gpus.is_some(),
+                policy,
+                &|_, _| false,
+                pp_layers_request().as_deref(),
+            )?);
+        }
         // Native positions, or the YaRN-extended `factor x original` context.
         let positions = admitted.config.context_limit();
         if max_seq > positions {
@@ -1995,7 +2300,12 @@ pub fn admit_source_with_options(
             model_ctx,
             hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
         );
-        (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
+        let topology = if pp > 1 {
+            EffectiveTopology::Pipeline(pp)
+        } else {
+            EffectiveTopology::Single
+        };
+        (topology, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
         // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
@@ -2400,32 +2710,43 @@ pub fn admit_source_with_options(
     // One admitted mesh. Visible-device identity (HIP ordinal + PCI id + arch)
     // is bound here once; placement and carriers consume it and never reread
     // the raw pp/tp/ep request. Existing routes keep their rank order and
-    // transports (`RankBinding::Visible`/`Emulated`, no edge decisions).
-    let shape = mesh_shape;
-    let binding = if hipfire_runtime::config::get().emulate_gpus.is_some() {
-        RankBinding::Emulated
-    } else {
-        RankBinding::Visible
-    };
-    let visible = visible_device_ranks(gpu_arch, shape.n_devices());
-    let family = carrier.map_or_else(|| format!("arch{arch_id}"), |c| c.name().to_string());
-    let mesh = admit_mesh(
-        shape,
-        &family,
-        LEGACY_NUMERICAL_POLICY,
-        &visible,
-        binding,
-        None,
-    )?;
-    // Qwen3.5 pipeline bands: `HIPFIRE_PP_LAYERS` is read here, once, after
-    // every other admission verdict, and normalized through `BandPlacement`.
-    let (pp_bands, pp_layer_counts) = if matches!(topology, EffectiveTopology::Pipeline(_)) {
-        let n_layers = qwen_n_layers
-            .ok_or_else(|| "qwen35 pipeline admission: layer count unavailable".to_string())?;
-        let bands = normalize_pp_bands(&mesh.mesh, n_layers, pp_layers_request().as_deref())?;
-        (Some(bands.placement), bands.explicit_counts)
-    } else {
-        (None, None)
+    // transports (`RankBinding::Visible`/`Emulated`, no edge decisions); the
+    // Qwen4 PP route arrives with its mesh and bands already admitted.
+    let (mesh, pp_bands, pp_layer_counts) = match qwen4_pp {
+        Some((mesh, bands)) => (mesh, Some(bands.placement), bands.explicit_counts),
+        None => {
+            let shape = mesh_shape;
+            let binding = if hipfire_runtime::config::get().emulate_gpus.is_some() {
+                RankBinding::Emulated
+            } else {
+                RankBinding::Visible
+            };
+            let visible = visible_device_ranks(gpu_arch, shape.n_devices());
+            let family = carrier.map_or_else(|| format!("arch{arch_id}"), |c| c.name().to_string());
+            let mesh = admit_mesh(
+                shape,
+                &family,
+                LEGACY_NUMERICAL_POLICY,
+                &visible,
+                binding,
+                None,
+            )?;
+            // Qwen3.5 pipeline bands: `HIPFIRE_PP_LAYERS` is read here, once,
+            // after every other admission verdict, and normalized through
+            // `BandPlacement`.
+            let (pp_bands, pp_layer_counts) = if matches!(topology, EffectiveTopology::Pipeline(_))
+            {
+                let n_layers = qwen_n_layers.ok_or_else(|| {
+                    "qwen35 pipeline admission: layer count unavailable".to_string()
+                })?;
+                let bands =
+                    normalize_pp_bands(&mesh.mesh, n_layers, pp_layers_request().as_deref())?;
+                (Some(bands.placement), bands.explicit_counts)
+            } else {
+                (None, None)
+            };
+            (mesh, pp_bands, pp_layer_counts)
+        }
     };
     Ok(SourceAdmission {
         source,
@@ -3003,9 +3324,19 @@ mod tests {
         }
         assert_eq!(admit(1, 1, 1, true), Ok(()));
         for ep in [0, 9, 16] {
-            assert!(admit(1, 1, ep, false).unwrap_err().contains("ep in 1..=8"), "ep {ep}");
+            assert!(
+                admit(1, 1, ep, false).unwrap_err().contains("ep in 1..=8"),
+                "ep {ep}"
+            );
         }
-        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4)] {
+        for pp in 2..=8 {
+            assert_eq!(admit(pp, 1, 1, false), Ok(()), "pp {pp}");
+            assert!(
+                admit(pp, 1, 1, true).unwrap_err().contains("topology.pp"),
+                "pp {pp}"
+            );
+        }
+        for (pp, tp, ep) in [(1, 2, 1), (2, 1, 2), (1, 2, 4), (2, 2, 1), (9, 1, 1)] {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
         }
         for ep in 2..=8 {
@@ -3015,22 +3346,43 @@ mod tests {
 
     #[test]
     fn qwen4_ep_geometry_refusal_names_the_missing_requirement() {
-        assert_eq!(qwen4_ep_geometry_refusal(1, 1, 1, "gfx1030", Some(1), false), None);
-        assert_eq!(qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4), false), None);
-        assert_eq!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(6), false), None);
-        assert_eq!(qwen4_ep_geometry_refusal(8, 1, 1, "gfx1100", Some(8), false), None);
-        assert_eq!(qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None, false), None);
+        assert_eq!(
+            qwen4_ep_geometry_refusal(1, 1, 1, "gfx1030", Some(1), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(6), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(8, 1, 1, "gfx1100", Some(8), false),
+            None
+        );
+        assert_eq!(
+            qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None, false),
+            None
+        );
         let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1151", Some(4), false).unwrap();
         assert!(
             arch.contains("gfx1100 or gfx1201") && arch.contains("expert parallelism"),
             "{arch}"
         );
         let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2), false).unwrap();
-        assert!(count.contains("4 visible devices") && count.contains("2 visible"), "{count}");
+        assert!(
+            count.contains("4 visible devices") && count.contains("2 visible"),
+            "{count}"
+        );
         assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2), false).is_some());
         assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2), false).is_some());
         // Emulation needs one physical device, not one per rank.
-        assert_eq!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(1), true), None);
+        assert_eq!(
+            qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(1), true),
+            None
+        );
         assert!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(0), true).is_some());
         assert!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1030", Some(1), true).is_some());
     }
@@ -3041,13 +3393,22 @@ mod tests {
         assert_eq!(qwen4_ep_rank_devices(4, 4, false), Ok(vec![0, 1, 2, 3]));
         assert_eq!(qwen4_ep_rank_devices(2, 8, false), Ok(vec![0, 1]));
         let short = qwen4_ep_rank_devices(6, 4, false).unwrap_err();
-        assert!(short.contains("6 visible devices") && short.contains("4 visible"), "{short}");
+        assert!(
+            short.contains("6 visible devices") && short.contains("4 visible"),
+            "{short}"
+        );
         // Emulation: rank r -> physical device r % count.
         assert_eq!(qwen4_ep_rank_devices(2, 1, true), Ok(vec![0, 0]));
         assert_eq!(qwen4_ep_rank_devices(3, 1, true), Ok(vec![0, 0, 0]));
         assert_eq!(qwen4_ep_rank_devices(6, 1, true), Ok(vec![0; 6]));
-        assert_eq!(qwen4_ep_rank_devices(6, 4, true), Ok(vec![0, 1, 2, 3, 0, 1]));
-        assert_eq!(qwen4_ep_rank_devices(8, 4, true), Ok(vec![0, 1, 2, 3, 0, 1, 2, 3]));
+        assert_eq!(
+            qwen4_ep_rank_devices(6, 4, true),
+            Ok(vec![0, 1, 2, 3, 0, 1])
+        );
+        assert_eq!(
+            qwen4_ep_rank_devices(8, 4, true),
+            Ok(vec![0, 1, 2, 3, 0, 1, 2, 3])
+        );
         assert!(qwen4_ep_rank_devices(6, 0, true).is_err());
     }
 
@@ -3419,7 +3780,7 @@ mod tests {
         assert!(qwen4_request_admission(single, InputModality::Image, true).is_err());
         assert!(qwen4_request_admission(single, InputModality::Video, true).is_err());
         assert!(qwen4_request_admission(
-            hipfire_arch_qwen4::EffectiveMesh::new(2, 1, 1),
+            hipfire_arch_qwen4::EffectiveMesh::new(1, 2, 1),
             InputModality::Text,
             true
         )
@@ -4967,6 +5328,587 @@ mod tests {
                 ..halo
             };
             assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_admission_tests {
+    use super::*;
+    use hipfire_arch_qwen4::npu_trunk::NpuTrunkMode;
+    use hipfire_runtime::mesh_placement::EdgeTransport;
+
+    fn rank(ordinal: i32, pci: Option<&str>, arch: &str) -> AdmittedRank {
+        AdmittedRank {
+            logical: ordinal as usize,
+            device_ordinal: ordinal,
+            pci_bus_id: pci.map(str::to_string),
+            arch: arch.to_string(),
+        }
+    }
+
+    fn visible(n: i32, arch: &str) -> Vec<AdmittedRank> {
+        (0..n)
+            .map(|i| rank(i, Some(&format!("0000:{:02x}:00.0", i + 3)), arch))
+            .collect()
+    }
+
+    fn mesh(
+        pp: usize,
+        visible: &[AdmittedRank],
+        policy: EdgeTransportPolicy,
+        peer: bool,
+        layers: Option<&str>,
+    ) -> Result<(AdmittedMesh, PpBands), String> {
+        admit_qwen4_pp_mesh(
+            pp,
+            1,
+            1,
+            48,
+            visible,
+            "gfx1100",
+            false,
+            policy,
+            &move |_, _| peer,
+            layers,
+        )
+    }
+
+    #[test]
+    fn transport_variable_truth_table() {
+        assert_eq!(parse_mesh_transport(None), Ok(EdgeTransportPolicy::Auto));
+        assert_eq!(
+            parse_mesh_transport(Some("")),
+            Ok(EdgeTransportPolicy::Auto)
+        );
+        assert_eq!(
+            parse_mesh_transport(Some("auto")),
+            Ok(EdgeTransportPolicy::Auto)
+        );
+        assert_eq!(
+            parse_mesh_transport(Some(" peer ")),
+            Ok(EdgeTransportPolicy::Peer)
+        );
+        assert_eq!(
+            parse_mesh_transport(Some("host")),
+            Ok(EdgeTransportPolicy::Host)
+        );
+        for bad in ["Peer", "p2p", "1", "host,peer"] {
+            let error = parse_mesh_transport(Some(bad)).unwrap_err();
+            assert!(error.contains(MESH_TRANSPORT_ENV), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepted_cell_binds_output_card_last_and_pins_the_ple_band() {
+        for (pp, arch) in [(2usize, "gfx1100"), (6, "gfx1100"), (8, "gfx1100")] {
+            let vis = visible(pp as i32, arch);
+            let (mesh, bands) = mesh(pp, &vis, EdgeTransportPolicy::Auto, false, None).unwrap();
+            assert_eq!(mesh.family, "qwen4");
+            assert_eq!(mesh.numerical_policy, QWEN4_PP_NUMERICAL_POLICY);
+            // Logical stage s < S-1 runs on visible device s+1; the last stage
+            // (the output band) on visible device 0, PCI identity attached.
+            for stage in 0..pp {
+                let expected = (stage as i32 + 1) % pp as i32;
+                assert_eq!(mesh.ranks[stage].logical, stage);
+                assert_eq!(mesh.ranks[stage].device_ordinal, expected);
+                assert_eq!(
+                    mesh.ranks[stage].pci_bus_id.as_deref(),
+                    Some(format!("0000:{:02x}:00.0", expected + 3).as_str())
+                );
+            }
+            assert_eq!(mesh.ranks[pp - 1].device_ordinal, 0);
+            assert_eq!(mesh.edges.len(), pp - 1);
+            assert!(bands.explicit_counts.is_none());
+            let placement = &bands.placement;
+            assert_eq!(placement.stages(), pp);
+            assert!(placement.band(0).len() >= 2);
+            let counts: Vec<usize> = (0..pp).map(|s| placement.band(s).len()).collect();
+            assert_eq!(counts.iter().sum::<usize>(), 48);
+        }
+        // gfx1201 is the other admitted architecture.
+        let vis = visible(4, "gfx1201");
+        assert!(admit_qwen4_pp_mesh(
+            4,
+            1,
+            1,
+            48,
+            &vis,
+            "gfx1201",
+            false,
+            EdgeTransportPolicy::Auto,
+            &|_, _| false,
+            None
+        )
+        .is_ok());
+        // PP6 uniform split is 8 layers per stage (48 / 6).
+        let vis = visible(6, "gfx1100");
+        let (_, bands) = mesh(6, &vis, EdgeTransportPolicy::Auto, false, None).unwrap();
+        assert_eq!(bands.placement.band(0), 0..8);
+        // Only visible devices beyond the stage count are ignored.
+        let vis = visible(8, "gfx1100");
+        let (mesh8, _) = mesh(4, &vis, EdgeTransportPolicy::Auto, false, None).unwrap();
+        assert_eq!(mesh8.ranks.len(), 4);
+        assert_eq!(mesh8.ranks[3].device_ordinal, 0);
+    }
+
+    #[test]
+    fn generic_counts_come_from_the_pp_layers_request() {
+        let vis = visible(6, "gfx1100");
+        let (_, bands) = mesh(
+            6,
+            &vis,
+            EdgeTransportPolicy::Auto,
+            false,
+            Some("9,8,8,8,8,7"),
+        )
+        .unwrap();
+        assert_eq!(bands.explicit_counts, Some(vec![9, 8, 8, 8, 8, 7]));
+        assert_eq!(bands.placement.band(0), 0..9);
+        assert_eq!(bands.placement.band(5), 41..48);
+        let vis2 = visible(2, "gfx1100");
+        let (_, bands) = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some("2,46")).unwrap();
+        assert_eq!(bands.placement.band(0), 0..2);
+        // A first band under 2 layers cuts the PLE layer off the input band.
+        for spec in ["1,47", "0,48"] {
+            let error = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some(spec)).unwrap_err();
+            assert!(error.contains("topology.pp = 2"), "{spec}: {error}");
+        }
+        let error = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some("1,47")).unwrap_err();
+        assert!(error.contains("at least 2"), "{error}");
+        // Count mismatches and wrong sums keep the generic verdicts.
+        for spec in ["24", "24,24,0", "20,20", "a,b"] {
+            let error = mesh(2, &vis2, EdgeTransportPolicy::Auto, false, Some(spec)).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains("HIPFIRE_PP_LAYERS"),
+                "{spec}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_policy_decides_each_directed_edge_with_no_fallback() {
+        let vis = visible(4, "gfx1100");
+        let transports = |policy, peer| {
+            mesh(4, &vis, policy, peer, None)
+                .map(|(mesh, _)| mesh.edges.iter().map(|e| e.transport).collect::<Vec<_>>())
+        };
+        // No byte-qualification evidence: auto is host-mapped.
+        assert_eq!(
+            transports(EdgeTransportPolicy::Auto, false).unwrap(),
+            vec![EdgeTransport::HostMapped; 3]
+        );
+        assert_eq!(
+            transports(EdgeTransportPolicy::Host, true).unwrap(),
+            vec![EdgeTransport::HostMapped; 3]
+        );
+        // With evidence auto and peer pick peer.
+        assert_eq!(
+            transports(EdgeTransportPolicy::Auto, true).unwrap(),
+            vec![EdgeTransport::Peer; 3]
+        );
+        assert_eq!(
+            transports(EdgeTransportPolicy::Peer, true).unwrap(),
+            vec![EdgeTransport::Peer; 3]
+        );
+        // A forced peer without evidence refuses, naming topology.pp and the variable.
+        let error = transports(EdgeTransportPolicy::Peer, false).unwrap_err();
+        assert!(
+            error.contains("topology.pp = 4")
+                && error.contains(MESH_TRANSPORT_ENV)
+                && error
+                    .contains("Peer edges for Qwen4 PP need an admission-time qualification step"),
+            "{error}"
+        );
+        // Edge ids are logical stage pairs.
+        let (mesh, _) = mesh(4, &vis, EdgeTransportPolicy::Host, false, None).unwrap();
+        let pairs: Vec<_> = mesh.edges.iter().map(|e| (e.src, e.dst)).collect();
+        assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn every_mesh_refusal_names_topology_pp_before_side_effects() {
+        let vis = visible(6, "gfx1100");
+        let admit = |pp, tp, ep, v: &[AdmittedRank], arch: &str, emulated| {
+            admit_qwen4_pp_mesh(
+                pp,
+                tp,
+                ep,
+                48,
+                v,
+                arch,
+                emulated,
+                EdgeTransportPolicy::Auto,
+                &|_, _| false,
+                None,
+            )
+            .map(|_| ())
+        };
+        assert!(admit(2, 1, 1, &vis, "gfx1100", false).is_ok());
+        let mut refusals = vec![
+            admit(1, 1, 1, &vis, "gfx1100", false),
+            admit(9, 1, 1, &visible(9, "gfx1100"), "gfx1100", false),
+            admit(2, 2, 1, &vis, "gfx1100", false),
+            admit(2, 1, 2, &vis, "gfx1100", false),
+            admit(2, 1, 1, &vis, "gfx1100", true),
+            admit(7, 1, 1, &vis, "gfx1100", false),
+        ];
+        // Unknown PCI identity on any rank.
+        let mut unknown = vis.clone();
+        unknown[3].pci_bus_id = None;
+        refusals.push(admit(6, 1, 1, &unknown, "gfx1100", false));
+        // Mixed architectures; unadmitted architecture; daemon mismatch.
+        let mut mixed = vis.clone();
+        mixed[2].arch = "gfx1201".to_string();
+        refusals.push(admit(6, 1, 1, &mixed, "gfx1100", false));
+        refusals.push(admit(6, 1, 1, &visible(6, "gfx1151"), "gfx1151", false));
+        refusals.push(admit(6, 1, 1, &visible(6, "gfx1030"), "gfx1030", false));
+        refusals.push(admit(6, 1, 1, &vis, "gfx1201", false));
+        // Duplicate PCI identity / ordinal.
+        let mut dup = vis.clone();
+        dup[4].pci_bus_id = dup[1].pci_bus_id.clone();
+        refusals.push(admit(6, 1, 1, &dup, "gfx1100", false));
+        let mut dup_ordinal = vis.clone();
+        dup_ordinal[4].device_ordinal = 1;
+        refusals.push(admit(6, 1, 1, &dup_ordinal, "gfx1100", false));
+        for refusal in refusals {
+            let error = refusal.unwrap_err();
+            assert!(error.contains("topology.pp"), "{error}");
+        }
+        let error = admit(2, 1, 1, &vis[..1], "gfx1100", false).unwrap_err();
+        assert!(error.contains("needs 2 visible devices"), "{error}");
+        let mut unknown = vis.clone();
+        unknown[1].pci_bus_id = None;
+        let error = admit(2, 1, 1, &unknown, "gfx1100", false).unwrap_err();
+        assert!(error.contains("PCI identity"), "{error}");
+    }
+
+    fn options_with(f: impl FnOnce(&mut SourceAdmissionOptions)) -> SourceAdmissionOptions {
+        let mut options = SourceAdmissionOptions::default();
+        f(&mut options);
+        options
+    }
+
+    #[test]
+    fn unsupported_load_options_are_refused_under_pp_only() {
+        let cases: Vec<(&str, Option<&str>, SourceAdmissionOptions)> = vec![
+            (
+                "native MTP",
+                None,
+                options_with(|o| o.spec.mtp = Some(true)),
+            ),
+            (
+                "DFlash",
+                Some("draft.hfq"),
+                SourceAdmissionOptions::default(),
+            ),
+            ("DFlash", None, options_with(|o| o.spec.dflash = Some(true))),
+            ("DSpark", None, options_with(|o| o.spec.dspark = Some(true))),
+            (
+                "n-gram drafting",
+                None,
+                options_with(|o| o.spec.ngram_draft = Some(true)),
+            ),
+            (
+                "DDTree",
+                None,
+                options_with(|o| o.spec.ddtree_budget = Some(1)),
+            ),
+            ("adaptive KV", None, options_with(|o| o.kv_adaptive = true)),
+            ("EAGLE", None, options_with(|o| o.eagle_drafter = true)),
+            ("CASK", None, options_with(|o| o.cask = true)),
+            ("PFlash", None, options_with(|o| o.pflash = true)),
+            (
+                "experts-per-token",
+                None,
+                options_with(|o| o.expert_count_override = true),
+            ),
+            (
+                "compute placement",
+                None,
+                options_with(|o| o.non_single_compute = true),
+            ),
+        ];
+        assert_eq!(
+            qwen4_pp_option_refusal(2, None, &SourceAdmissionOptions::default()),
+            Ok(())
+        );
+        for (name, draft, options) in cases {
+            let error = qwen4_pp_option_refusal(2, draft, &options).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains(name),
+                "{name}: {error}"
+            );
+            // Single and EP never see the PP refusal.
+            assert_eq!(
+                qwen4_pp_option_refusal(1, draft, &options),
+                Ok(()),
+                "{name}"
+            );
+        }
+        // Explicit `off` values are accepted.
+        let off = options_with(|o| {
+            o.spec.mtp = Some(false);
+            o.spec.dflash = Some(false);
+            o.spec.dspark = Some(false);
+            o.spec.ngram_draft = Some(false);
+        });
+        assert_eq!(qwen4_pp_option_refusal(8, None, &off), Ok(()));
+    }
+
+    #[test]
+    fn native_mtp_is_ar_under_pp_and_an_explicit_request_refuses() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        for pp in [2usize, 6, 8] {
+            for arch in ["gfx1100", "gfx1201"] {
+                assert_eq!(
+                    qwen4_native_mtp(with(None), arch, "m/fn.mq4", pp, 1, 1),
+                    Ok(false)
+                );
+                assert_eq!(
+                    qwen4_native_mtp(with(Some(false)), arch, "m/fn.mq4", pp, 1, 1),
+                    Ok(false)
+                );
+                let error =
+                    qwen4_native_mtp(with(Some(true)), arch, "m/fn.mq4", pp, 1, 1).unwrap_err();
+                assert!(error.contains(&format!("topology.pp = {pp}")), "{error}");
+            }
+        }
+        // Single is unchanged.
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", "m/qwen3.8-flash-next.mq4", 1, 1, 1),
+            Ok(true)
+        );
+        // The request boundary refuses MTP on a PP mesh independently.
+        let pp2 = hipfire_arch_qwen4::EffectiveMesh::new(2, 1, 1);
+        assert!(qwen4_request_admission(pp2, InputModality::Text, false).is_ok());
+        let error = qwen4_request_admission(pp2, InputModality::Text, true).unwrap_err();
+        assert!(error.contains("topology.pp = 2"), "{error}");
+        for (pp, tp, ep) in [(2, 2, 1), (2, 1, 2), (9, 1, 1)] {
+            let mesh = hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep);
+            assert!(qwen4_request_admission(mesh, InputModality::Text, false).is_err());
+        }
+    }
+
+    #[test]
+    fn environment_requests_the_pp_route_cannot_run_are_refused() {
+        let none = |_: &str| -> Option<String> { None };
+        let ok = |env: &dyn Fn(&str) -> Option<String>, npu, disk| {
+            qwen4_pp_env_refusal(2, env, npu, disk)
+        };
+        assert_eq!(ok(&none, NpuTrunkMode::Off, 0), Ok(()));
+        assert_eq!(ok(&none, NpuTrunkMode::Auto, 0), Ok(()));
+        let set = |name: &'static str, value: &'static str| {
+            move |query: &str| (query == name).then(|| value.to_string())
+        };
+        let refused: Vec<(&str, Result<(), String>)> = vec![
+            (
+                "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
+                ok(
+                    &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "auto"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
+                ok(
+                    &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "0"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                "HIPFIRE_QWEN4_EXPERT_HOTSET",
+                ok(
+                    &set("HIPFIRE_QWEN4_EXPERT_HOTSET", "/tmp/x"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
+                ok(
+                    &set(hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV, "1"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            (
+                "HIPFIRE_QWEN4_TURN_SNAPSHOTS",
+                ok(
+                    &set("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "1"),
+                    NpuTrunkMode::Off,
+                    0,
+                ),
+            ),
+            ("session_cache_disk_bytes", ok(&none, NpuTrunkMode::Off, 1)),
+            ("fusions.npu_trunk = on", ok(&none, NpuTrunkMode::On, 0)),
+            (
+                "fusions.npu_trunk = emulate",
+                ok(&none, NpuTrunkMode::Emulate, 0),
+            ),
+        ];
+        for (name, result) in refused {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains(name),
+                "{name}: {error}"
+            );
+        }
+        // Explicit off values are accepted (hotset 0, stage 0, snapshots 0).
+        for (name, value) in [
+            ("HIPFIRE_QWEN4_EXPERT_HOTSET", "0"),
+            (hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV, "0"),
+            ("HIPFIRE_QWEN4_TURN_SNAPSHOTS", "0"),
+        ] {
+            assert_eq!(
+                ok(&set(name, value), NpuTrunkMode::Off, 0),
+                Ok(()),
+                "{name}"
+            );
+        }
+        // Single is never refused.
+        assert_eq!(
+            qwen4_pp_env_refusal(
+                1,
+                &set("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "auto"),
+                NpuTrunkMode::On,
+                9
+            ),
+            Ok(())
+        );
+    }
+
+    mod source_order {
+        use super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        fn probe(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-qwen4-pp-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            write_hfqm_package_mem(
+                &path,
+                QWEN4_ARCH_ID,
+                "{}",
+                &[HfqMemTensor {
+                    name: "model.embed_tokens.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                }],
+            )
+            .unwrap();
+            path
+        }
+
+        fn admit(
+            path: &std::path::Path,
+            tp: usize,
+            pp: usize,
+            options: SourceAdmissionOptions,
+        ) -> Result<(), String> {
+            admit_source_with_options(
+                path.to_str().unwrap(),
+                tp,
+                pp,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1100",
+                None,
+                "auto",
+                None,
+                2048,
+                KvBackendHints::without_device(),
+                options,
+            )
+            .map(|_| ())
+        }
+
+        #[test]
+        fn pp_refusals_fire_before_the_source_is_inspected() {
+            let path = probe("order");
+            let defaults = SpecLoadCfg {
+                dflash: Some(false),
+                dspark: Some(false),
+                ngram_draft: Some(false),
+                ddtree_budget: Some(0),
+                ddtree_topk: Some(4),
+                mtp: Some(false),
+                ..SpecLoadCfg::default()
+            };
+            // Admitted options reach the (invalid) source's own validation.
+            let error = admit(
+                &path,
+                1,
+                2,
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("config admission failed"), "{error}");
+            // Every refusal precedes it and names topology.pp.
+            for options in [
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        mtp: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    cask: true,
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    pflash: true,
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        ngram_draft: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+            ] {
+                let error = admit(&path, 1, 2, options).unwrap_err();
+                assert!(
+                    error.contains("topology.pp = 2") && !error.contains("config admission failed"),
+                    "{error}"
+                );
+            }
+            // tp with pp is refused at the request boundary, before the source.
+            let error = admit(
+                &path,
+                2,
+                2,
+                SourceAdmissionOptions {
+                    spec: defaults,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("pipeline-parallel pp in 2..=8")
+                    && !error.contains("config admission failed"),
+                "{error}"
+            );
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
         }
     }
 }

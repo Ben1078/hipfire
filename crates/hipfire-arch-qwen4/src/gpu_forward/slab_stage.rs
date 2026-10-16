@@ -251,7 +251,7 @@ impl Qwen4ExpertStage {
     pub(super) fn new_slab(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
-        moe: &[Qwen4MoeLayerRuntime],
+        moe: &[Option<Qwen4MoeLayerRuntime>],
         first_host: usize,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let off = |reason: &str| {
@@ -264,16 +264,27 @@ impl Qwen4ExpertStage {
         if bundle.weights.ep_placement().is_some() {
             return off("slab arenas have no EP route");
         }
-        if !moe[first_host..].iter().all(RoutedExpertWeights::host_mapped) {
+        if !moe[first_host..]
+            .iter()
+            .all(|layer| layer.as_ref().is_some_and(RoutedExpertWeights::host_mapped))
+        {
             return off("host-mapped slab layers are not a suffix");
         }
         let config = &bundle.config;
         let mut sources = Vec::with_capacity(moe.len() - first_host);
-        for (layer, runtime) in moe.iter().enumerate().skip(first_host) {
+        for (layer, runtime) in moe
+            .iter()
+            .enumerate()
+            .skip(first_host)
+            .filter_map(|(layer, runtime)| runtime.as_ref().map(|runtime| (layer, runtime)))
+        {
             let Some(slab) = runtime.slab.as_ref() else {
                 return off("a host layer is not a slab arena");
             };
-            let arena_ref = bundle.weights.layer_refs[layer]
+            let arena_ref = bundle
+                .weights
+                .layer(layer)
+                .ok_or_else(|| invalid("slab stage layer is not owned"))?
                 .ffn
                 .moe()
                 .and_then(|weights| weights.expert_arena.as_ref())
@@ -287,11 +298,15 @@ impl Qwen4ExpertStage {
             }
             // Host-mapped allocations carry a zeroed tail pad past `len()`
             // (`HOST_TAIL_PAD_BYTES`, 1 MiB >= `ARENA_TAIL_PAD_BYTES`).
-            sources.push((host.as_ptr() as usize, slab.arena_bytes + ARENA_TAIL_PAD_BYTES));
+            sources.push((
+                host.as_ptr() as usize,
+                slab.arena_bytes + ARENA_TAIL_PAD_BYTES,
+            ));
         }
         let Some(stage_bytes) = stage_buffer_bytes(
             moe[first_host..]
                 .iter()
+                .flatten()
                 .filter_map(|runtime| runtime.slab.as_ref().map(|slab| slab.arena_bytes)),
         ) else {
             return off("no slab host layers");
@@ -346,15 +361,33 @@ impl Qwen4ExpertStage {
                 );
             }
             stage.mirrors.extend(buffers);
-            for (layer, runtime) in moe.iter().enumerate().skip(first_host) {
+            for (layer, runtime) in moe
+                .iter()
+                .enumerate()
+                .skip(first_host)
+                .filter_map(|(layer, runtime)| runtime.as_ref().map(|runtime| (layer, runtime)))
+            {
                 let slab = runtime.slab.as_ref().expect("checked above");
                 let stage_base = stage.mirrors[layer % 2].buf.as_ptr() as usize;
-                for entries in [&runtime.expert_gate_up_entries, &runtime.expert_down_entries] {
-                    let table = rebase_stage_entries(entries, slab.arena_base, slab.arena_bytes, stage_base)
-                        .map_err(|reason| invalid(format!("layer {layer} slab stage table: {reason}")))?;
+                for entries in [
+                    &runtime.expert_gate_up_entries,
+                    &runtime.expert_down_entries,
+                ] {
+                    let table = rebase_stage_entries(
+                        entries,
+                        slab.arena_base,
+                        slab.arena_bytes,
+                        stage_base,
+                    )
+                    .map_err(|reason| {
+                        invalid(format!("layer {layer} slab stage table: {reason}"))
+                    })?;
                     let tensor = gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?;
                     stage.tables.push(tensor);
-                    gpu.memcpy_htod_auto(&stage.tables.last().expect("table just allocated").buf, &table)?;
+                    gpu.memcpy_htod_auto(
+                        &stage.tables.last().expect("table just allocated").buf,
+                        &table,
+                    )?;
                 }
             }
             Ok::<(), Qwen4GpuForwardError>(())
@@ -380,7 +413,7 @@ impl Qwen4ExpertStage {
     fn new_tier(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
-        moe: &[Qwen4MoeLayerRuntime],
+        moe: &[Option<Qwen4MoeLayerRuntime>],
         first_host: usize,
         lease: &ExpertTierLease,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
@@ -403,6 +436,10 @@ impl Qwen4ExpertStage {
         let mut slots = Vec::with_capacity(moe.len());
         let mut layouts: Vec<(usize, TierStageLayout)> = Vec::new();
         for (layer, runtime) in moe.iter().enumerate() {
+            let Some(runtime) = runtime.as_ref() else {
+                slots.push(None);
+                continue;
+            };
             let view = lease
                 .layer(layer)
                 .ok_or_else(|| invalid(format!("tier stage: layer {layer} has no tier view")))?;
@@ -680,7 +717,7 @@ impl Qwen4ExpertStage {
     pub(super) fn slab_after_moe(
         &self,
         gpu: &Gpu,
-        moe: &[Qwen4MoeLayerRuntime],
+        moe: &[Option<Qwen4MoeLayerRuntime>],
         layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
         if let Some(tier) = self.slab.as_ref().and_then(|meta| meta.tier.as_ref()) {
@@ -692,11 +729,14 @@ impl Qwen4ExpertStage {
                 None => Ok(()),
             };
         }
-        if !moe[layer].host_mapped() {
+        if !moe[layer]
+            .as_ref()
+            .is_some_and(RoutedExpertWeights::host_mapped)
+        {
             return Ok(());
         }
         match moe.get(layer + 2) {
-            Some(next) if next.host_mapped() => self.slab_enqueue(gpu, layer + 2),
+            Some(Some(next)) if next.host_mapped() => self.slab_enqueue(gpu, layer + 2),
             _ => Ok(()),
         }
     }

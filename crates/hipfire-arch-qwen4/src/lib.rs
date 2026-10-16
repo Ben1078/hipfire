@@ -37,6 +37,7 @@ pub mod gpu_forward_lanes;
 pub mod kv_backend;
 pub mod lane;
 pub mod lane_exec;
+pub mod mesh_bindings;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
 pub mod mtp_spec;

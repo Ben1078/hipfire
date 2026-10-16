@@ -696,7 +696,12 @@ fn layer_program(
             program.push((LaneOp::PleConv, StageName::PleConv));
         }
         program.push((LaneOp::HcRead { layer, mlp: false }, StageName::HcRead));
-        match bundle.weights.layer_refs[layer].kind {
+        match bundle
+            .weights
+            .layer(layer)
+            .ok_or_else(|| invalid(format!("lane layer {layer} is not owned")))?
+            .kind
+        {
             LayerType::LinearAttention => {
                 for (phase, stage) in mixer_phases(StageName::GdnInProj, StageName::GdnOutProj) {
                     program.push((LaneOp::Gdn { layer, slot: gdn_slot, phase }, stage));
@@ -812,6 +817,11 @@ fn forward_lanes_scoped(
     if fwd.ep_placement().is_some() {
         return Err(invalid(
             "lane steps do not run under expert parallelism (EP forwards are one-row decode and chunk forwards only)",
+        ));
+    }
+    if *bundle.weights.band_scope() != crate::weights::Qwen4BandScope::single(&bundle.config) {
+        return Err(invalid(
+            "lane steps do not run on a pipeline-parallel band (topology.pp refuses lanes)",
         ));
     }
     // Lanes are the Flash-Next route: the stage policy, row sharing and
@@ -1069,8 +1079,10 @@ fn forward_lanes_scoped(
                 ple_head_count * ple_row_width,
             )?);
         }
-        let seg_scratch: Vec<Qwen4LayerScratch<'_>> =
-            views.iter().map(|view| view.layer_scratch(scratch)).collect();
+        let seg_scratch: Vec<Qwen4LayerScratch<'_>> = views
+            .iter()
+            .map(|view| view.layer_scratch(scratch))
+            .collect();
 
         // Per-layer weight descriptions, one set per distinct row count in
         // `seg_desc_rows` (AR: one set; decode copies bind for every
@@ -1081,15 +1093,19 @@ fn forward_lanes_scoped(
                 desc_rows.push(rows);
             }
         }
-        let mut desc_sets: Vec<Vec<Qwen4LayerDescription<'_>>> = Vec::with_capacity(desc_rows.len());
+        let mut desc_sets: Vec<Vec<Qwen4LayerDescription<'_>>> =
+            Vec::with_capacity(desc_rows.len());
         for &rows in &desc_rows {
             let mut descs: Vec<Qwen4LayerDescription<'_>> =
                 Vec::with_capacity(config.num_hidden_layers);
             for layer_index in 0..config.num_hidden_layers {
                 descs.push(layer_desc(
                     &bundle.weights,
-                    &bundle.weights.layer_refs[layer_index],
-                    fwd.moe.get(layer_index),
+                    bundle
+                        .weights
+                        .layer(layer_index)
+                        .ok_or_else(|| invalid(format!("lane layer {layer_index} is not owned")))?,
+                    fwd.moe.get(layer_index).and_then(Option::as_ref),
                     config,
                     &fwd.decode_q8,
                     rows,
@@ -1102,13 +1118,23 @@ fn forward_lanes_scoped(
             .iter()
             .map(|rows| desc_rows.iter().position(|k| k == rows).unwrap_or(0))
             .collect();
-        let ple_weights = bundle.weights.layer_refs[ple_layer]
+        let ple_weights = bundle
+            .weights
+            .layer(ple_layer)
+            .ok_or_else(|| invalid("lane PLE layer is not owned"))?
             .ple
             .as_ref()
             .ok_or_else(|| invalid("PLE weights missing"))?;
         let ple_w = ple_desc(&bundle.weights, ple_weights)?;
         let ple_rows_f16_at = |gpu: &Gpu, rows: usize| {
-            qwen4_ple_rows_f16(gpu, bf16_state, dims.hc_count, config.hidden_size, &ple_w, rows)
+            qwen4_ple_rows_f16(
+                gpu,
+                bf16_state,
+                dims.hc_count,
+                config.hidden_size,
+                &ple_w,
+                rows,
+            )
         };
         let ple_rows_f16 = if prefill {
             // One value for the whole wave (the PLE conv runs per lane on the

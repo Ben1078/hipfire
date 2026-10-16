@@ -189,6 +189,8 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         cask: &cask,
         pp: 1,
         pp_layer_counts: None,
+        admitted_mesh: None,
+        band_placement: None,
         spec: SpecLoadCfg::default(),
         gpu,
         gemma4_drafter_path: None,

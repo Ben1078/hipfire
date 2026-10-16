@@ -1400,11 +1400,12 @@ impl Qwen4Manifest {
             }
         }
         // PLE is injected at its declared layer and retains its depthwise
-        // convolution history.  StateKind has no family-local name; the
-        // architecture state owner keeps this entry distinct by type.  A
+        // convolution history, owned by the input band (the PLE layer is
+        // admitted only inside band 0), so it is declared as input-pinned
+        // state rather than a second Conv entry of that trunk layer.  A
         // profile without PLE declares no PLE state.
-        if let Some(ple) = ple {
-            state.push(StateEntry::new(StateKind::Conv, ple.layer));
+        if ple.is_some() {
+            state.push(StateEntry::pinned(StateKind::Conv, PinTarget::Embed));
         }
         if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = &recipe {
             apply_expert_arenas(&mut weights, arenas)?;
@@ -4749,7 +4750,7 @@ mod tests {
                 state.push(StateEntry::new(StateKind::Conv, layer));
             }
         }
-        state.push(StateEntry::new(StateKind::Conv, 1));
+        state.push(StateEntry::pinned(StateKind::Conv, PinTarget::Embed));
         assert_eq!(manifest.state, state);
         assert_eq!(manifest.state.len(), 85);
         let metadata_base = "model.language_model.layers.1.ple.ple_embedding";

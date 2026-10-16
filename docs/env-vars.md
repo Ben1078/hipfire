@@ -411,7 +411,8 @@ harness exports pending their cleanup.
 | `HIPFIRE_EP_PEER_ALLREDUCE=1` | Explicit peer all-reduce selector for logical EP batched prefill/tick proofs; do not set it to `0`. |
 | `HIPFIRE_TP_PEER_DIRECT` / `HIPFIRE_TP_PEER_ALTERNATING` / `HIPFIRE_TP_FULL_GRAPH` | Developer-only dense-TP2 residual reduction controls; every route computes the same rank-ordered `x + (p0 + p1)`. `HIPFIRE_TP_PEER_DIRECT=0` replaces the default symmetric direct-peer read with the rooted fold. `HIPFIRE_TP_PEER_ALTERNATING` and `HIPFIRE_TP_FULL_GRAPH` are tri-state (`1` forces on, `0` forces off, unset takes the default); **both default on for an exact gfx1201 pair and off everywhere else**, so `HIPFIRE_TP_FULL_GRAPH=0` is the gfx1201 kill switch. `HIPFIRE_TP_PEER_ALTERNATING` uses the fact that the attention and FFN partials live in different buffers: each reduction waits only on the peer's producer event, without the consumer-complete reverse wait; unset follows `HIPFIRE_TP_FULL_GRAPH`, and `=0` also disables the whole-token graph. `HIPFIRE_TP_FULL_GRAPH` admits an exact homogeneous gfx1100 pair or an exact homogeneous gfx1201 pair (TP=2, peer access, AR decode; mixed or other arches are not admitted) and captures each rank's whole decode token as one hipGraph, with device-resident signal barriers and a host-mapped coherent payload exchange; enabling it turns on the alternating protocol unless that is set to `0`. See [multi-gpu.md](multi-gpu.md#dense-tp2-reduction-protocol-developer). |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
-| `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
+| `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel. `HIPFIRE_PP_LAYERS=a,b,…` gives per-stage trunk layer counts in logical stage order (sum = trunk layers; Flash-Next/Qwen4 also needs the first stage ≥ 2 layers, the PLE layer). |
+| `HIPFIRE_MESH_TRANSPORT` | **Developer-only.** How the admitted pipeline mesh moves each band edge's HC streams: `auto` (default), `peer` or `host`; read once at admission, only for Flash-Next (Qwen4) `topology.pp` 2..=8. The decision is per directed edge and made before any allocation or peer enable; there is no runtime fallback. `host` uses two pinned host banks per edge and never enables peer access. `peer` needs pre-side-effect byte-qualification evidence for every edge; none exists yet, so `peer` is refused at admission naming `topology.pp`, and `auto` resolves to host-mapped edges. Any other value is refused. |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
 | `HIPFIRE_SLOTS_PAGED` / `HIPFIRE_SLOTS_PAGED_PAGES` | Multi-slot engine: `1`/`on`/`true` selects the paged KV pool instead of fixed per-slot slabs (implied by `serve.prefix_cache`); `_PAGES` overrides the physical page count (clamped to ≥ 1). |
 | `HIPFIRE_VL_SEQUENTIAL` | Multi-slot engine: `1`/`on`/`true` forces the legacy one-image-at-a-time VL prefill. Refused together with the paged pool. |
@@ -729,7 +730,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1632
+**Count:** 1633
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1620,6 +1621,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MEMSET_DUMP` | crates/hip-bridge/src/ffi.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_MEM_CAP` | scripts/run-bounded.sh, scripts/serve_concurrency_gate.sh | harness |
 | `HIPFIRE_MEM_MARGIN_GIB` | scripts/run-bounded.sh | harness |
+| `HIPFIRE_MESH_TRANSPORT` | crates/hipfire-loader/src/admission.rs | developer |
 | `HIPFIRE_META_MAX` | scripts/ddtree_meta_sweep.sh | harness |
 | `HIPFIRE_META_RUNS` | scripts/ddtree_meta_sweep.sh | harness |
 | `HIPFIRE_MINIMAX_BATCH_PREFILL` | crates/hipfire-generate/src/dense.rs | developer |

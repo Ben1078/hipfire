@@ -162,6 +162,13 @@ pub struct LoadCtx<'a> {
     /// `SourceAdmission::pp_layer_counts`; carriers must never reread the
     /// environment. `None` = carrier-default balanced placement.
     pub pp_layer_counts: Option<&'a [usize]>,
+    /// Admitted PP mesh (physical rank identity and edge transports) for a
+    /// carrier with a mesh-executor PP route (Qwen4 `topology.pp`). Populated
+    /// solely from `SourceAdmission::mesh` when `pp > 1`; `None` otherwise.
+    pub admitted_mesh: Option<&'a crate::mesh_placement::AdmittedMesh>,
+    /// Admitted band placement matching `admitted_mesh` (from
+    /// `SourceAdmission::pp_bands`). `None` outside a mesh-executor PP load.
+    pub band_placement: Option<&'a crate::mesh_placement::BandPlacement>,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
     /// Gemma4 EAGLE drafter path (arch 22 `gemma4_unified_assistant`), separate

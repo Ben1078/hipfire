@@ -1734,7 +1734,12 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // penalized sampled request keeps the MTP route. A penalized
             // greedy request, adaptive KV, or a force-AR switch keeps the
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
-            let spec_ok = i.has_speculator
+            // Pipeline parallelism (`pp > 1`) is hidden inside the Qwen4
+            // bundle: it never takes the Qwen3.5-only `PipelineParallel`
+            // route, and it runs AR only (native MTP is refused at admission,
+            // and no speculator can demote it onto a spec route).
+            let spec_ok = i.pp <= 1
+                && i.has_speculator
                 && i.speculator_is_mtp
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
                 && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor))
@@ -6823,5 +6828,94 @@ mod route_scope_tests {
         clear_generation_route();
         clear_terminal_control();
         set_active_attempt_id(0);
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_route_tests {
+    use super::*;
+
+    fn inputs(arch_id: u32, pp: usize) -> GenerationRouteInputs {
+        GenerationRouteInputs {
+            arch_id,
+            ep: false,
+            dense_tp: false,
+            pp,
+            has_speculator: false,
+            speculator_is_mtp: false,
+            deepseek4_spec_requested: false,
+            ngram_can_sample: false,
+            temp: 0.0,
+            user_explicit_sampling: false,
+            min_p: None,
+            nonneutral_penalties: false,
+            force_ar_chat: false,
+            temp_spec_env_off: false,
+            fast_sample_on: false,
+            supports_temp_swor: false,
+            supports_chain_nucleus_verify: false,
+            kv_adaptive: false,
+        }
+    }
+
+    #[test]
+    fn qwen4_pipeline_parallel_stays_on_the_qwen4_ar_route() {
+        for pp in 1..=8 {
+            for temp in [0.0f32, 0.7] {
+                let mut i = inputs(16, pp);
+                i.temp = temp;
+                assert_eq!(
+                    select_generation_route(&i),
+                    GenerationRoute::Qwen4Ar,
+                    "pp {pp}"
+                );
+                // Penalties, explicit sampling and chain verify flags never
+                // reach the Qwen3.5 mesh route.
+                i.nonneutral_penalties = true;
+                i.user_explicit_sampling = true;
+                i.supports_chain_nucleus_verify = true;
+                assert_eq!(
+                    select_generation_route(&i),
+                    GenerationRoute::Qwen4Ar,
+                    "pp {pp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qwen4_mtp_spec_route_is_single_device_only() {
+        let mut single = inputs(16, 1);
+        single.has_speculator = true;
+        single.speculator_is_mtp = true;
+        assert_eq!(select_generation_route(&single), GenerationRoute::Qwen4Spec);
+        for pp in 2..=8 {
+            let mut i = single;
+            i.pp = pp;
+            assert_eq!(
+                select_generation_route(&i),
+                GenerationRoute::Qwen4Ar,
+                "pp {pp}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_qwen35_pipeline_parallel_takes_the_mesh_route() {
+        for arch_id in [5u32, 6] {
+            assert_eq!(
+                select_generation_route(&inputs(arch_id, 2)),
+                GenerationRoute::PipelineParallel
+            );
+        }
+        // Single, and every other arch short-circuit, is unchanged.
+        assert_eq!(
+            select_generation_route(&inputs(16, 1)),
+            GenerationRoute::Qwen4Ar
+        );
+        assert_ne!(
+            select_generation_route(&inputs(16, 6)),
+            GenerationRoute::PipelineParallel
+        );
     }
 }

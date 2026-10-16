@@ -9633,14 +9633,21 @@ pub fn generate_qwen4_ar(
             // single-token continuation only (docs/REDLINE.md §3). The Qwen4
             // forward declares that boundary itself and owns the whole
             // per-forward retained-body lifecycle (arm, route, close, prepare).
-            model
-                .qwen4_mut()
-                .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())
-                .and_then(|bundle| {
-                    bundle
-                        .prefill_final(device, tokens, reused, logits)
-                        .map_err(|error| error.to_string())
-                })
+            let (bundle, gpus) = qwen4_bundle_and_mesh(model)
+                .ok_or_else(|| "qwen4 AR bundle disappeared before prefill".to_string())?;
+            // Pipeline parallelism: the bundle hides the mesh; `LoadedModel`
+            // owns the `Gpus` (the daemon `device` is never a model GPU).
+            if bundle.pp_mesh_active() {
+                let gpus = gpus.ok_or_else(|| {
+                    "qwen4 pipeline-parallel model has no Gpus before prefill".to_string()
+                })?;
+                return bundle
+                    .pp_prefill_final(gpus, tokens, reused, logits)
+                    .map_err(|error| error.to_string());
+            }
+            bundle
+                .prefill_final(device, tokens, reused, logits)
+                .map_err(|error| error.to_string())
         },
         |model, device, token, logits| {
             let penalize = token.is_none() && decode_penalizes;
@@ -9648,9 +9655,21 @@ pub fn generate_qwen4_ar(
                 penalty_table.reset(&penalty_cfg);
                 penalty_table.push_row(&model.conversation_tokens, &penalty_cfg, vocab_size);
             }
-            let bundle = model
-                .qwen4_mut()
+            let (bundle, gpus) = qwen4_bundle_and_mesh(model)
                 .ok_or_else(|| "qwen4 AR bundle disappeared during decode".to_string())?;
+            if bundle.pp_mesh_active() {
+                let gpus = gpus.ok_or_else(|| {
+                    "qwen4 pipeline-parallel model has no Gpus during decode".to_string()
+                })?;
+                if penalize {
+                    bundle
+                        .pp_apply_penalty_table(gpus, logits, &penalty_table)
+                        .map_err(|error| error.to_string())?;
+                }
+                return bundle
+                    .pp_forward_token_or_argmax(gpus, token, logits)
+                    .map_err(|error| error.to_string());
+            }
             if penalize {
                 bundle
                     .apply_penalty_table(device, logits, &penalty_table)
@@ -9662,4 +9681,19 @@ pub fn generate_qwen4_ar(
         },
         commit_qwen4_session,
     );
+}
+
+/// Disjoint borrows of the Qwen4 bundle and the model's PP `Gpus` (`Some` only
+/// for a pipeline-parallel load), so a mesh forward can run the bundle against
+/// the `Gpus` without a second owner.
+fn qwen4_bundle_and_mesh(
+    model: &mut LoadedModel,
+) -> Option<(
+    &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+)> {
+    let bundle = model.state.as_deref_mut().and_then(|state| {
+        (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    })?;
+    Some((bundle, model.pp_gpus.as_mut()))
 }

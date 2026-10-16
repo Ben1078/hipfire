@@ -1215,6 +1215,20 @@ impl LoadedModel {
         })
     }
 
+    /// The Qwen4 PP root bundle and its generic `Gpus` as disjoint borrows
+    /// (`state` and `pp_gpus` are separate fields), for generation closures
+    /// that need both at once. `None` unless this is a Qwen4 bundle whose
+    /// `pp_gpus` is present.
+    pub fn qwen4_mesh_mut(
+        &mut self,
+    ) -> Option<(&mut hipfire_arch_qwen4::bundle::Qwen4Bundle, &mut Gpus)> {
+        let bundle = self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        })?;
+        let gpus = self.pp_gpus.as_mut()?;
+        Some((bundle, gpus))
+    }
+
     pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
         self.state
             .as_deref()
@@ -3208,6 +3222,8 @@ pub fn load_admitted_with_gemma4_drafter(
         vision_path,
         vision_mode,
         pp_layer_counts,
+        mesh,
+        pp_bands,
         ..
     } = admission;
     let carrier =
@@ -3268,6 +3284,8 @@ pub fn load_admitted_with_gemma4_drafter(
         cask,
         pp,
         pp_layer_counts: pp_layer_counts.as_deref(),
+        admitted_mesh: pp_bands.as_ref().map(|_| &mesh),
+        band_placement: pp_bands.as_ref(),
         spec,
         gpu,
         gemma4_drafter_path,
@@ -4962,6 +4980,81 @@ pub fn ensure_vmm_ready_for_load(gpu: &mut rdna_compute::Gpu) -> Result<(), Stri
 
 // ─── Unload ───────────────────────────────────────────────────────────
 
+/// True when `m` is a Qwen4 mesh-executor PP load: the bundle holds the band
+/// bundles and plans while `pp_gpus` is the sole hardware owner (`Gpus` is
+/// `!Send`, so it cannot live inside the `Send` bundle); `m.pp` keeps the
+/// admitted PP degree and `pp_dn_la_to_device` stays `None`.
+fn qwen4_pp_mesh_owner(m: &LoadedModel) -> bool {
+    m.state.as_ref().is_some_and(|state| {
+        (state.as_ref() as &dyn Any)
+            .downcast_ref::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+            .is_some_and(|bundle| bundle.pp_mesh_active())
+    })
+}
+
+/// What unload reports when the Qwen4 PP teardown failed: the bundle's mesh
+/// teardown drains every epoch and edge before freeing anything, and a failed
+/// drain keeps all resources (devices, bands, edges) alive and unreclaimed.
+fn qwen4_pp_quarantine_report(error: &str) -> String {
+    format!(
+        "qwen4 topology.pp unload failed ({error}); mesh resources quarantined until process restart"
+    )
+}
+
+/// Unload a Qwen4 mesh-executor PP model. `Qwen4Bundle::pp_free_gpu` drains
+/// epochs and edges first and then frees every band on its own device; a
+/// failed teardown quarantines: the bundle leaks the root and bands, and the
+/// `Gpus` and the rest of the model are leaked here, never freed under
+/// possibly in-flight work. Unload reports the failure.
+fn unload_qwen4_pp(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    if let Some(spec) = m.speculator.take() {
+        spec.free(gpu);
+    }
+    if let Some(ev) = m.eviction.take() {
+        ev.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.prefill_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.dflash_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    let Some(mut gpus) = m.pp_gpus.take() else {
+        std::mem::forget(m);
+        return Err(qwen4_pp_quarantine_report("the PP model carries no Gpus"));
+    };
+    let bundle =
+        match m.state.take().map(|state| {
+            (state as Box<dyn Any>).downcast::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }) {
+            Some(Ok(bundle)) => bundle,
+            other => {
+                std::mem::forget(other);
+                std::mem::forget(gpus);
+                std::mem::forget(m);
+                return Err(qwen4_pp_quarantine_report(
+                    "model state is not a Qwen4 bundle",
+                ));
+            }
+        };
+    if let Err(error) = hipfire_arch_qwen4::bundle::Qwen4Bundle::pp_free_gpu(*bundle, &mut gpus) {
+        std::mem::forget(gpus);
+        std::mem::forget(m);
+        return Err(qwen4_pp_quarantine_report(&error.to_string()));
+    }
+    for device in gpus.devices.iter_mut() {
+        let _ = device.bind_thread();
+        device.invalidate_weight_caches();
+        device.invalidate_graph_state();
+        device.drain_pool();
+    }
+    drop(gpus);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    gpu.ensure_vmm_cleaned().map_err(|e| e.to_string())
+}
+
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     // The next load (or none) starts lazy; a sealed route never outlives its model.
     if let Err(e) = gpu.abort_route_kernel_load() {
@@ -5216,6 +5309,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         }
         return Ok(());
         // `gpus` drops here, tearing down comms + devices.
+    }
+    // Qwen4 mesh-executor PP: the root bundle owns the `Gpus` (`pp_gpus` is
+    // `None`), so it must leave before the legacy Qwen3.5 `m.pp > 1` arm.
+    if qwen4_pp_mesh_owner(&m) {
+        return unload_qwen4_pp(m, gpu);
     }
     if m.pp > 1 {
         if let Some(b) = m.qwen35_mut() {

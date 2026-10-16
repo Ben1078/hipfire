@@ -550,7 +550,7 @@ const QWEN4_DDTREE_DEFAULT_TOPK: usize = 4;
 /// request. The CLI resolves schema defaults before serializing load params,
 /// so an ordinary AR load arrives as `Some(0)`/`Some(4)` rather than `None`.
 /// A non-default top-K remains unsupported even when the budget is zero.
-const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
+pub(crate) const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
     match (spec.ddtree_budget, spec.ddtree_topk) {
         (Some(budget), _) if budget != QWEN4_DDTREE_DEFAULT_BUDGET => true,
         (_, Some(topk)) if topk != QWEN4_DDTREE_DEFAULT_TOPK => true,
@@ -602,8 +602,10 @@ impl Carrier for Qwen4Carrier {
                 "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
             );
         }
-        if pp != 1 {
-            return Err("qwen4: only Single topology is admitted".into());
+        if pp == 0 || pp > QWEN4_PP_MAX {
+            return Err(format!(
+                "qwen4: topology.pp = {pp} is outside the admitted 1..={QWEN4_PP_MAX}"
+            ));
         }
         Ok(())
     }
@@ -678,6 +680,11 @@ impl Carrier for Qwen4Carrier {
             ctx.pp,
             ctx.kv_backend,
         )?;
+        // Pipeline-parallel (topology.pp 2..=8): the mesh-executor route. The
+        // Single and expert-parallel paths below are untouched.
+        if ctx.pp > 1 {
+            return load_qwen4_pp_model(src, ctx);
+        }
         // Admission resolved the QSA context storage (automatic: VMM where
         // `qwen4_vmm_refusal` is clear); the device must still agree.
         let backend = hipfire_arch_qwen4::Qwen4KvBackend::from(ctx.kv_backend);
@@ -1499,6 +1506,27 @@ pub fn load_qwen4_rank(
     session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
 ) -> Result<Qwen4RankLoad, String> {
+    load_qwen4_rank_scoped(gpu, ep, shared, expert_vram_layers, session, src, None)
+}
+
+/// [`load_qwen4_rank`] for one pipeline band (`band == Some`) or the whole
+/// model (`None`, the unchanged Single / expert-parallel load). A band loads
+/// only its [`Qwen4BandScope`]: the admitted artifact is projected through
+/// `Qwen4HfqmArtifact::for_band`, the manifest fulfills only the band's
+/// resources on `gpu`, and the bundle is assembled with
+/// `assemble_band_with_ple_rows`. Every routed expert of the band is
+/// resident (no host-mapped layers, hot set, MTP head, session cache or
+/// automatic context), and the forward scratch plan is the one chosen from
+/// the full manifest so every band agrees.
+fn load_qwen4_rank_scoped(
+    gpu: &mut rdna_compute::Gpu,
+    ep: Option<hipfire_arch_qwen4::weights::Qwen4EpPlacement>,
+    shared: &Qwen4RankShared,
+    expert_vram_layers: Option<usize>,
+    session: Option<Qwen4SessionSeed<'_>>,
+    src: ModelSource,
+    band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
+) -> Result<Qwen4RankLoad, String> {
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
     let max_k = shared.max_k;
@@ -1513,6 +1541,23 @@ pub fn load_qwen4_rank(
         }
     }
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
+    if band.is_some()
+        && (ep.is_some()
+            || expert_vram_layers.is_some()
+            || session.is_some()
+            || shared.native_mtp
+            || shared.sequence.is_some()
+            || gpu.is_uma())
+    {
+        return Err(
+            "qwen4: a topology.pp band load admits no expert parallelism, MTP head, session \
+             cache, automatic context or unified memory"
+                .into(),
+        );
+    }
+    // Only the input band owns PLE rows; the other bands neither report nor
+    // prewarm them.
+    let ple_owner = band.map_or(true, |scope| scope.input);
     let mut ctx = RankCtx {
         gpu,
         path: shared.path.as_str(),
@@ -1543,6 +1588,27 @@ pub fn load_qwen4_rank(
     // run would otherwise fail after the weights were fulfilled.
     hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
         .map_err(|error| format!("qwen4: {error}"))?;
+    // A band's forward scratch plan is chosen once, from the full manifest,
+    // so every band attaches the same plan (a band-scoped manifest would
+    // miss the PLE entries the selector inspects).
+    let full_scratch_mode = match band {
+        Some(_) => Some(
+            hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+                ctx.gpu,
+                &hfq,
+                &receipt.config,
+                &receipt.manifest,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let receipt = match band {
+        Some(scope) => receipt
+            .for_band(scope, 0)
+            .map_err(|error| format!("qwen4: topology.pp band projection failed: {error}"))?,
+        None => receipt,
+    };
     // The trunk overlay sidecar (`<model>.trunk-overlay`): bound to this
     // base while it is open, applied by `attach_forward`.  Only a bad
     // `HIPFIRE_QWEN4_TRUNK_OVERLAY` value fails the load.
@@ -1552,16 +1618,23 @@ pub fn load_qwen4_rank(
         &ctx.gpu.arch,
         &receipt.config,
     )?;
+    if band.is_some() && trunk_overlay.is_some() {
+        return Err("qwen4: topology.pp does not admit a trunk overlay sidecar".into());
+    }
     // The profile is known: the head-free MTP and developer-PLE refusals
     // happen here, before any allocation (source admission applies the
     // same checks).
     let requested_native_mtp = native_mtp;
-    native_mtp = crate::admission::qwen4_native_mtp_for_head(
-        native_mtp,
-        ctx.spec.mtp,
-        receipt.config.mtp.is_some(),
-        receipt.config.profile.id(),
-    )?;
+    native_mtp = if band.is_some() {
+        false
+    } else {
+        crate::admission::qwen4_native_mtp_for_head(
+            native_mtp,
+            ctx.spec.mtp,
+            receipt.config.mtp.is_some(),
+            receipt.config.profile.id(),
+        )?
+    };
     if requested_native_mtp && !native_mtp {
         eprintln!(
             "  qwen4 native MTP: off (profile {} has no MTP head)",
@@ -1609,43 +1682,46 @@ pub fn load_qwen4_rank(
             )
         }
     };
-    match &choice {
-        Some(choice) => {
-            eprintln!(
-                "  qwen4 ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
-                choice.format.name(),
-                match &choice.origin {
-                    hipfire_runtime::ple_sidecar::PleRowsOrigin::Embedded => {
-                        "embedded model file".to_string()
-                    }
-                    hipfire_runtime::ple_sidecar::PleRowsOrigin::Sidecar(path) => {
-                        path.display().to_string()
-                    }
-                },
-                if rank_table.is_some() { "rank" } else { "row" },
-                rows_total as f64 / 1e9
-            );
-            if let Some(note) = &choice.note {
-                eprintln!("  qwen4 ple rows: {note}");
+    if ple_owner {
+        match &choice {
+            Some(choice) => {
+                eprintln!(
+                    "  qwen4 ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
+                    choice.format.name(),
+                    match &choice.origin {
+                        hipfire_runtime::ple_sidecar::PleRowsOrigin::Embedded => {
+                            "embedded model file".to_string()
+                        }
+                        hipfire_runtime::ple_sidecar::PleRowsOrigin::Sidecar(path) => {
+                            path.display().to_string()
+                        }
+                    },
+                    if rank_table.is_some() { "rank" } else { "row" },
+                    rows_total as f64 / 1e9
+                );
+                if let Some(note) = &choice.note {
+                    eprintln!("  qwen4 ple rows: {note}");
+                }
             }
+            None => match &receipt.ple_rows {
+                hipfire_arch_qwen4::Qwen4PleRows::Absent => eprintln!(
+                    "  qwen4 ple rows: none (profile {} declares no PLE)",
+                    receipt.config.profile.id()
+                ),
+                _ => eprintln!(
+                    "  qwen4 ple rows: embedded developer rows ({rows_encoding}, {:.3} MB)",
+                    rows_total as f64 / 1e6
+                ),
+            },
         }
-        None => match &receipt.ple_rows {
-            hipfire_arch_qwen4::Qwen4PleRows::Absent => eprintln!(
-                "  qwen4 ple rows: none (profile {} declares no PLE)",
-                receipt.config.profile.id()
-            ),
-            _ => eprintln!(
-                "  qwen4 ple rows: embedded developer rows ({rows_encoding}, {:.3} MB)",
-                rows_total as f64 / 1e6
-            ),
-        },
     }
     // The row-order q4 sidecar's data section, for the post-ready
     // page-cache prewarm (when no hot store attaches).
     let q4_prewarm = hfq
         .ple_rows()
         .filter(|rows| {
-            rows.encoding() == hipfire_runtime::external_rows::RowEncoding::Q4Lm
+            ple_owner
+                && rows.encoding() == hipfire_runtime::external_rows::RowEncoding::Q4Lm
                 && rows.order() == hipfire_runtime::ple_hot_pack::PackOrder::Row
         })
         .map(|rows| {
@@ -1714,10 +1790,13 @@ pub fn load_qwen4_rank(
     // payload while the mapping is still readable and before any
     // placement input: `auto` charges exactly the plan `attach_forward`
     // allocates below.
-    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-        ctx.gpu, &hfq, &config, &manifest,
-    )
-    .map_err(|error| error.to_string())?;
+    let scratch_mode = match full_scratch_mode {
+        Some(mode) => mode,
+        None => hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+            ctx.gpu, &hfq, &config, &manifest,
+        )
+        .map_err(|error| error.to_string())?,
+    };
     if scratch_mode != hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full {
         eprintln!("  qwen4 forward scratch: {scratch_mode:?} plan (symmetric routed experts proven from the payload)");
     }
@@ -1854,63 +1933,96 @@ pub fn load_qwen4_rank(
     // binding, source/manifest eligibility, host limits, plan and a fresh
     // free-VRAM check. A refusal here leaves whole-layer placement untouched.
     let mut hotset_host_bytes = 0;
-    let (hotset, hotset_plan) = if let Some(path) = hotset_path.as_deref() {
+    let (hotset, hotset_plan) = if let Some(path) =
+        hotset_path.as_deref().filter(|_| band.is_none())
+    {
         let prepare = || -> Result<_, String> {
             let base = hotsets::HotsetBase::from_hfq(&hfq)?;
             let sidecar = hotsets::HotsetSidecar::load_bound(
-                path, config.num_hidden_layers, config.num_experts,
-                config.num_experts_per_tok, &base,
-            ).map_err(|skip| skip.to_string())?;
-            manifest.check_expert_tiers().map_err(|error| error.to_string())?;
-            let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
-                &hfq, &config, &manifest,
-            )?;
+                path,
+                config.num_hidden_layers,
+                config.num_experts,
+                config.num_experts_per_tok,
+                &base,
+            )
+            .map_err(|skip| skip.to_string())?;
+            manifest
+                .check_expert_tiers()
+                .map_err(|error| error.to_string())?;
+            let slabs =
+                hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(&hfq, &config, &manifest)?;
             let (free, non_expert, _, reserve, mtp_bytes, gather_bytes) = auto_inputs()?;
             let reserve_note = reserve.describe();
             let reserve = reserve.bytes();
-            let total = hotsets::require_budget(
-                residency::expert_hotset_budget(free, non_expert, reserve),
-            ).map_err(|skip| skip.to_string())?;
+            let total =
+                hotsets::require_budget(residency::expert_hotset_budget(free, non_expert, reserve))
+                    .map_err(|skip| skip.to_string())?;
             // Retain the existing fixed point: host-tier stage buffers can
             // grow as a smaller budget moves more experts off device.
             let stage_enabled = residency::expert_stage_enabled(&ctx.gpu.arch);
             let mut stage = 0u64;
             let (plan, budget) = loop {
                 let budget = hotsets::require_budget(total.checked_sub(stage).ok_or_else(|| {
-                    format!("{} MiB budget cannot hold {} MiB of long-prefill stage buffers", total / MIB, stage / MIB)
-                })).map_err(|skip| skip.to_string())?;
+                    format!(
+                        "{} MiB budget cannot hold {} MiB of long-prefill stage buffers",
+                        total / MIB,
+                        stage / MIB
+                    )
+                }))
+                .map_err(|skip| skip.to_string())?;
                 let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
-                    &slabs, sidecar.rank(), budget,
-                ).map_err(|error| error.to_string())?;
+                    &slabs,
+                    sidecar.rank(),
+                    budget,
+                )
+                .map_err(|error| error.to_string())?;
                 hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
-                let need = if stage_enabled { residency::expert_tier_stage_bytes(&plan) } else { 0 };
+                let need = if stage_enabled {
+                    residency::expert_tier_stage_bytes(&plan)
+                } else {
+                    0
+                };
                 if need <= stage {
                     break (plan, budget);
                 }
                 stage = need;
             };
-            plan.check_executable(&ctx.gpu.arch).map_err(|error| error.to_string())?;
-            let host_bytes = plan.owner_bytes(
-                hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped,
-            ).checked_add(residency::hotset_host_mapped_bytes(
-                &manifest.weights, bytes_of, config.num_hidden_layers,
-            )?).ok_or("host byte accounting overflow")?;
+            plan.check_executable(&ctx.gpu.arch)
+                .map_err(|error| error.to_string())?;
+            let host_bytes = plan
+                .owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
+                .checked_add(residency::hotset_host_mapped_bytes(
+                    &manifest.weights,
+                    bytes_of,
+                    config.num_hidden_layers,
+                )?)
+                .ok_or("host byte accounting overflow")?;
             residency::check_host_ram(
-                host_bytes, rdna_compute::kv_slots::mem_available_bytes(),
+                host_bytes,
+                rdna_compute::kv_slots::mem_available_bytes(),
                 residency::ttm_pool_estimate(),
             )?;
             residency::check_gtt_cap(host_bytes, residency::gtt_budget())?;
             // Re-query before either placement branch changes WeightEntries
             // or tier conversion removes aggregate tensors. A shortfall can
             // still take the ordinary whole-layer path without undoing work.
-            let (latest_free, _) = ctx.gpu.device_mem_info()
+            let (latest_free, _) = ctx
+                .gpu
+                .device_mem_info()
                 .map_err(|error| format!("memory re-query before materialize: {error}"))?;
             let latest_budget = hotsets::require_budget(
-                residency::expert_hotset_budget(latest_free as u64, non_expert, reserve)
-                    .and_then(|bytes| bytes.checked_sub(stage)
-                        .ok_or_else(|| "no budget after long-prefill stage buffers".to_string())),
-            ).map_err(|skip| skip.to_string())?;
-            if plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::Device) > latest_budget {
+                residency::expert_hotset_budget(latest_free as u64, non_expert, reserve).and_then(
+                    |bytes| {
+                        bytes
+                            .checked_sub(stage)
+                            .ok_or_else(|| "no budget after long-prefill stage buffers".to_string())
+                    },
+                ),
+            )
+            .map_err(|skip| skip.to_string())?;
+            if plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::Device)
+                > latest_budget
+            {
                 return Err(format!(
                     "free VRAM dropped to {} MiB before materialize; planned device experts exceed the remaining {} MiB budget",
                     latest_free as u64 / MIB, latest_budget / MIB,
@@ -1954,7 +2066,18 @@ pub fn load_qwen4_rank(
     // reaches the global OOM killer.
     let mut measured = None;
     let mut unset_note = String::new();
-    let placement = if hotset_plan.is_some() {
+    let placement = if band.is_some() {
+        // A pipeline band keeps every routed expert resident: host-mapped
+        // band layers need their own residency cell, and capacity was
+        // admitted against the band census before any allocation.
+        if explicit.is_some() {
+            return Err(format!(
+                "qwen4: topology.pp does not admit {} (host-mapped expert layers)",
+                residency::EXPERT_VRAM_LAYERS_ENV
+            ));
+        }
+        None
+    } else if hotset_plan.is_some() {
         None
     } else if let Some(layers) = expert_vram_layers {
         // The split an expert-parallel load agreed on (minimum over
@@ -2381,7 +2504,10 @@ pub fn load_qwen4_rank(
     )
     .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
     drop(weights_role);
-    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_ple_rows(
+    let scope = band
+        .cloned()
+        .unwrap_or_else(|| hipfire_arch_qwen4::weights::Qwen4BandScope::single(&config));
+    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_band_with_ple_rows(
             config,
             &recipe,
             transaction,
@@ -2393,6 +2519,7 @@ pub fn load_qwen4_rank(
             state_format,
             backend,
             expert_tiers,
+            &scope,
         )
         .map_err(|error| match backend {
             hipfire_arch_qwen4::Qwen4KvBackend::Legacy => format!(
@@ -2435,6 +2562,24 @@ pub fn load_qwen4_rank(
         let _ = bundle.free_gpu(ctx.gpu);
         return Err(format!("qwen4: forward setup failed: {detail}"));
     }
+    if let Some(scope) = band {
+        // `attach_forward` searches smaller chunk rungs when the largest does
+        // not fit; a band never shrinks the canonical chunk on its own.
+        let canonical = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+            &ctx.gpu.arch,
+            ctx.max_seq,
+        );
+        if bundle.spec_chunk_rows() != Some(canonical) {
+            let got = bundle.spec_chunk_rows();
+            let _ = bundle.free_gpu(ctx.gpu);
+            return Err(format!(
+                "qwen4: topology.pp band {:?} allocated chunk rows {got:?} but the canonical \
+                 chunk is {canonical}; the rank's free VRAM cannot hold it and a band never \
+                 shrinks the canonical chunk",
+                scope.band
+            ));
+        }
+    }
     if native_mtp {
         if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
@@ -2471,7 +2616,7 @@ pub fn load_qwen4_rank(
     // an explicit one must fit whole. The session cache is not charged:
     // its snapshots yield to context growth. A discrete GPU keeps its
     // requested context unchecked, as before.
-    let admission = ctx.sequence.is_some().then(
+    let admission = (ctx.sequence.is_some() && band.is_none()).then(
         || -> Result<crate::admission::Qwen4MemoryAdmission, String> {
             let mtp_request = if native_mtp {
                 let config = &bundle.config;
@@ -2669,6 +2814,12 @@ pub fn load_qwen4_rank(
                 return Err(format!("qwen4: QSA context census failed: {detail}"));
             }
         }
+    if let Some(scope) = band {
+        eprintln!(
+            "qwen4 PP band layers {:?} (input {}, output {}): loaded on device {} (max_seq {max_seq})",
+            scope.band, scope.input, scope.output, ctx.gpu.device_id,
+        );
+    }
     if let Some(placement) = ep {
         eprintln!(
             "qwen4 EP rank {}/{}: loaded on device {} ({} routed experts of {} per stack, native MTP {}, max_seq {max_seq})",
@@ -2687,6 +2838,460 @@ pub fn load_qwen4_rank(
         max_k,
         max_seq,
         card_cap,
+    })
+}
+
+// ─── Qwen4 pipeline-parallel (topology.pp) load ──────────────────────
+
+/// Largest pipeline degree the Qwen4 mesh executor admits.
+const QWEN4_PP_MAX: usize = 8;
+
+/// Structural re-check of the admitted PP mesh at load, before any device is
+/// touched (admission already refused anything else; this keeps the carrier
+/// from loading against a mesh it was not admitted for): `pp` in 2..=8 with
+/// `tp = ep = 1`, one rank per band in logical order, a known PCI identity on
+/// every rank, homogeneous gfx1100 or gfx1201, and the daemon's own device
+/// (the owner of generation buffers) equal to the output rank.
+pub(crate) fn qwen4_pp_mesh_refusal(
+    admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
+    placement: &hipfire_runtime::mesh_placement::BandPlacement,
+    pp: usize,
+    daemon_device: i32,
+    daemon_arch: &str,
+) -> Result<(), String> {
+    use hipfire_runtime::device_mesh::DimKind;
+    if !(2..=QWEN4_PP_MAX).contains(&pp) {
+        return Err(format!(
+            "qwen4: topology.pp = {pp} is outside the admitted 2..={QWEN4_PP_MAX}"
+        ));
+    }
+    let mesh = &admitted.mesh;
+    if mesh.size_of(DimKind::Pp) != pp
+        || mesh.size_of(DimKind::Tp) != 1
+        || mesh.size_of(DimKind::Ep) != 1
+        || mesh.n_devices() != pp
+        || admitted.ranks.len() != pp
+        || placement.stages() != pp
+    {
+        return Err(format!(
+            "qwen4: topology.pp admits pipeline parallelism with tp = ep = 1 only; the admitted \
+             mesh, ranks and band placement disagree about pp = {pp}"
+        ));
+    }
+    placement
+        .validate_for(mesh, placement.n_trunk_layers)
+        .map_err(|error| format!("qwen4: topology.pp band placement: {error}"))?;
+    for (index, rank) in admitted.ranks.iter().enumerate() {
+        if rank.logical != index {
+            return Err(format!(
+                "qwen4: topology.pp rank {index} carries logical id {}",
+                rank.logical
+            ));
+        }
+        if rank.pci_bus_id.is_none() {
+            return Err(format!(
+                "qwen4: topology.pp rank {index} (device {}) has no known PCI identity",
+                rank.device_ordinal
+            ));
+        }
+        if rank.arch != daemon_arch || !matches!(rank.arch.as_str(), "gfx1100" | "gfx1201") {
+            return Err(format!(
+                "qwen4: topology.pp admits homogeneous gfx1100 or gfx1201 ranks only; rank \
+                 {index} is {} while the output device is {daemon_arch}",
+                rank.arch
+            ));
+        }
+    }
+    let output = admitted
+        .ranks
+        .last()
+        .ok_or("qwen4: topology.pp mesh has no ranks")?;
+    if output.device_ordinal != daemon_device {
+        return Err(format!(
+            "qwen4: topology.pp output rank is device {} but the daemon's generation device is \
+             {daemon_device}; generation buffers must live on the output card",
+            output.device_ordinal
+        ));
+    }
+    Ok(())
+}
+
+/// Bring up one `Gpu` per admitted rank without enabling peer access:
+/// `Gpus::init_layers` constructs the devices (arch and bind preflight, no
+/// VRAM-delta gate) in the process's device order; they are then permuted to
+/// the admitted logical rank order (output card last) and the retained mesh
+/// is replaced by the admitted one, so `devices[r]` is exactly logical rank
+/// `r`. A device the admitted ranks do not name refuses before any model
+/// allocation.
+fn init_qwen4_pp_gpus(
+    admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
+    placement: &hipfire_runtime::mesh_placement::BandPlacement,
+) -> Result<hipfire_runtime::multi_gpu::Gpus, String> {
+    // Read-only structural validation before any `Gpu` is constructed.
+    let ordinals: std::collections::BTreeSet<i32> = admitted
+        .ranks
+        .iter()
+        .map(|rank| rank.device_ordinal)
+        .collect();
+    if admitted.ranks.len() != placement.stages()
+        || ordinals.len() != admitted.ranks.len()
+        || ordinals.iter().any(|ordinal| *ordinal < 0)
+    {
+        return Err(
+            "qwen4: topology.pp admitted ranks must be one distinct, non-negative device per band"
+                .into(),
+        );
+    }
+    let counts: Vec<usize> = (0..placement.stages())
+        .map(|stage| placement.band(stage).len())
+        .collect();
+    let mut gpus = hipfire_runtime::multi_gpu::Gpus::init_layers(&counts)
+        .map_err(|error| format!("qwen4: topology.pp device initialization failed: {error}"))?;
+    let mut pool: Vec<Option<rdna_compute::Gpu>> = std::mem::take(&mut gpus.devices)
+        .into_iter()
+        .map(Some)
+        .collect();
+    let mut ordered = Vec::with_capacity(pool.len());
+    for rank in &admitted.ranks {
+        let slot = pool.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|device| device.device_id == rank.device_ordinal)
+        });
+        match slot.and_then(Option::take) {
+            Some(device) => ordered.push(device),
+            None => {
+                return Err(format!(
+                    "qwen4: topology.pp rank {} names device {}, which the process did not open \
+                     for {} pipeline ranks",
+                    rank.logical,
+                    rank.device_ordinal,
+                    admitted.ranks.len()
+                ));
+            }
+        }
+    }
+    gpus.devices = ordered;
+    gpus.mesh = admitted.mesh.clone();
+    Ok(gpus)
+}
+
+/// Unwind a failed PP load: drain the edge leases first (nothing was
+/// submitted, so this only retires the transport), then free every loaded
+/// band on its own device. A failed drain leaks the bands and the devices
+/// (quarantine): nothing is freed under possibly in-flight work.
+fn abort_qwen4_pp_load(
+    mut gpus: hipfire_runtime::multi_gpu::Gpus,
+    bands: Vec<hipfire_arch_qwen4::bundle::Qwen4Bundle>,
+    error: String,
+) -> String {
+    if let Err(drain) = gpus.drain_mesh_edges() {
+        std::mem::forget(bands);
+        std::mem::forget(gpus);
+        return format!(
+            "{error}; mesh edge drain failed ({drain}): resources quarantined until process restart"
+        );
+    }
+    let mut cleanup = Vec::new();
+    for (rank, band) in bands.into_iter().enumerate() {
+        if let Err(free) = band.free_gpu(&mut gpus.devices[rank]) {
+            cleanup.push(format!("rank {rank}: {free}"));
+        }
+    }
+    if cleanup.is_empty() {
+        error
+    } else {
+        format!("{error}; cleanup also failed: {}", cleanup.join("; "))
+    }
+}
+
+/// Load every band of one Qwen4 PP model and return the root (output-band)
+/// bundle, which owns the generic `Gpus`, the other band bundles and the
+/// placement ([`Qwen4Bundle::attach_pp_mesh`]); the daemon's `gpu` is the
+/// output card and keeps only generation-owned buffers.
+///
+/// Order: structural mesh re-check, device bring-up (no peer enable), the
+/// per-rank capacity census against each rank's free VRAM (refuses naming
+/// `topology.pp` before any allocation), edge provisioning sized to the
+/// largest canonical chunk's HC streams, then one band-scoped load per rank
+/// (stage 0 on the admitted source, the rest on a fresh source each).
+fn load_qwen4_pp_bundle(
+    daemon: &mut rdna_compute::Gpu,
+    admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
+    placement: &hipfire_runtime::mesh_placement::BandPlacement,
+    shared: &Qwen4RankShared,
+    src: ModelSource,
+) -> Result<
+    (
+        hipfire_arch_qwen4::bundle::Qwen4Bundle,
+        hipfire_runtime::multi_gpu::Gpus,
+    ),
+    String,
+> {
+    use hipfire_arch_qwen4 as q4;
+    let stages = placement.stages();
+    qwen4_pp_mesh_refusal(admitted, placement, stages, daemon.device_id, &daemon.arch)?;
+    if daemon.is_uma() {
+        return Err("qwen4: topology.pp needs discrete GPUs".into());
+    }
+    if shared.native_mtp || shared.sequence.is_some() {
+        return Err("qwen4: topology.pp admits no native MTP head and no automatic context".into());
+    }
+    // Per-rank free VRAM from the daemon's runtime (no `Gpus`, no allocation):
+    // every artifact and capacity refusal below happens before any device
+    // beyond the daemon's own is brought up.
+    daemon
+        .emu_refuse_multi_device("qwen4 topology.pp")
+        .map_err(|error| format!("qwen4: {error}"))?;
+    let mut free_per_rank = Vec::with_capacity(stages);
+    for rank in &admitted.ranks {
+        let (free, _) = daemon
+            .device_mem_info_for(rank.device_ordinal)
+            .map_err(|error| {
+                format!(
+                    "qwen4: topology.pp rank {} (device {}) memory query: {error}",
+                    rank.logical, rank.device_ordinal
+                )
+            })?;
+        free_per_rank.push(free as u64);
+    }
+    let (scopes, edge_bytes, chunk_rows) = {
+        let ModelSource::Hfq(hfq) = &src else {
+            return Err(
+                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+            );
+        };
+        let receipt = q4::admit_hfqm_artifact_on(hfq, Some(&daemon.arch))
+            .map_err(|error| error.to_string())?;
+        q4::bundle::admit_executable_profile(&receipt.config)
+            .map_err(|error| format!("qwen4: {error}"))?;
+        let config = receipt.config.clone();
+        let scopes = (0..stages)
+            .map(|stage| q4::weights::Qwen4BandScope::from_placement(&config, placement, stage))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("qwen4: topology.pp: {error}"))?;
+        let state_format = q4::resolve_state_format(
+            &shared.kv_mode,
+            shared.state_quant.as_deref().unwrap_or(""),
+            daemon,
+            &config,
+        )?;
+        let scratch_mode =
+            q4::artifact::source_forward_scratch_mode(daemon, hfq, &config, &receipt.manifest)
+                .map_err(|error| error.to_string())?;
+        let chunk_rows =
+            q4::gpu_forward::qwen4_prefill_chunk_requested(&daemon.arch, shared.max_seq);
+        let context = q4::Qwen4ContextCommit::new(
+            shared.backend,
+            shared.max_seq,
+            shared.max_seq,
+            shared.vmm_granularity,
+        );
+        // The gathered QSA prefill attention's workspace is committed with
+        // the context; every rank charges it (the headroom is the rest).
+        let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            daemon,
+            state_format.qsa,
+            state_format.qsa_f16_arena,
+        )
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                config.num_key_value_heads,
+                context.tokens,
+            )
+            // Every rank is a fresh model `Gpu` that owns no daemon scratch:
+            // charge the full gathered workspace per rank.
+            .map(|bytes| bytes as u64)
+            .ok_or("qwen4: QSA gather scratch size overflows".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+        let reserve_bytes = crate::admission::QWEN4_MEMORY_HEADROOM_BYTES
+            .checked_add(gather)
+            .ok_or("qwen4: topology.pp reserve overflows")?;
+        let recipe = receipt.recipe().clone();
+        let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+            crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
+                hfq.tensor_data(&entry.name)
+                    .map(|(_, bytes)| bytes.len() as u64)
+            })
+        };
+        let fits =
+            crate::admission::qwen4_pp_band_budget(&crate::admission::Qwen4PpBudgetInputs {
+                config: &config,
+                placement,
+                weights: &receipt.manifest.weights,
+                bytes_of: &bytes_of,
+                format: state_format,
+                context: &context,
+                chunk_rows,
+                mode: scratch_mode,
+                free_per_rank: &free_per_rank,
+                reserve_bytes,
+            })?;
+        for fit in &fits {
+            eprintln!(
+                "  qwen4 PP rank {}: layers {:?} need {} MiB of {} MiB free",
+                fit.stage,
+                fit.band,
+                fit.required >> 20,
+                fit.free >> 20
+            );
+        }
+        let edge_bytes = crate::admission::qwen4_pp_edge_max_bytes(&config, chunk_rows)?;
+        (scopes, edge_bytes, chunk_rows)
+    };
+    let mut gpus = init_qwen4_pp_gpus(admitted, placement)?;
+    gpus.provision_mesh_edges(admitted, placement, edge_bytes)
+        .map_err(|error| format!("qwen4: topology.pp edge provisioning failed: {error}"))?;
+    let mut bands: Vec<q4::bundle::Qwen4Bundle> = Vec::with_capacity(stages);
+    let mut admitted_source = Some(src);
+    for stage in 0..stages {
+        let source = match admitted_source.take() {
+            Some(source) => Ok(source),
+            None => open_qwen4_rank_source(shared, &gpus.devices[stage].arch),
+        };
+        let loaded = source.and_then(|source| {
+            load_qwen4_rank_scoped(
+                &mut gpus.devices[stage],
+                None,
+                shared,
+                None,
+                None,
+                source,
+                Some(&scopes[stage]),
+            )
+        });
+        match loaded {
+            Ok(load) => bands.push(load.bundle),
+            Err(error) => {
+                return Err(abort_qwen4_pp_load(
+                    gpus,
+                    bands,
+                    format!("qwen4: topology.pp band {stage} of {stages} failed to load: {error}"),
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "qwen4 PP plan: {stages} bands {:?} on devices {:?}, edge payload up to {} MiB ({chunk_rows} canonical rows)",
+        (0..stages).map(|stage| placement.band(stage)).collect::<Vec<_>>(),
+        admitted.ranks.iter().map(|rank| rank.device_ordinal).collect::<Vec<_>>(),
+        edge_bytes >> 20,
+    );
+    let mut root = bands.pop().expect("a PP load has at least two bands");
+    match root.attach_pp_mesh(&mut gpus, bands, placement.clone()) {
+        Ok(()) => Ok((root, gpus)),
+        Err(error) => {
+            // The holder is installed before validation, so the root's own
+            // teardown drains the epochs and edges and frees every band. A
+            // failed drain quarantines: the root and bands were leaked by the
+            // bundle, and the devices are leaked here.
+            let detail = error.to_string();
+            Err(match root.pp_free_gpu(&mut gpus) {
+                Ok(()) => format!("qwen4: topology.pp mesh attach failed: {detail}"),
+                Err(free) => {
+                    std::mem::forget(gpus);
+                    format!(
+                        "qwen4: topology.pp mesh attach failed: {detail}; teardown also failed \
+                         ({free}): resources quarantined until process restart"
+                    )
+                }
+            })
+        }
+    }
+}
+
+/// The `Qwen4Carrier` load of a `topology.pp` 2..=8 model: the same
+/// pre-allocation option and device refusals as the Single load, then the
+/// mesh-executor bundle. `LoadedModel.pp` is the admitted degree and
+/// `pp_gpus` holds the generic `Gpus` (the sole hardware owner, `!Send`, so
+/// it cannot live in the `Send` bundle); `pp_dn_la_to_device` stays `None`.
+fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+    let pp = ctx.pp;
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::from(ctx.kv_backend);
+    if backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm {
+        if let Some(reason) = hipfire_arch_qwen4::qwen4_vmm_refusal(
+            &ctx.gpu.arch,
+            ctx.gpu.vmm_recommended_granularity().is_ok(),
+        ) {
+            return Err(format!(
+                "qwen4: KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy"
+            ));
+        }
+    }
+    let vmm_granularity = match backend {
+        hipfire_arch_qwen4::Qwen4KvBackend::Vmm => ctx
+            .gpu
+            .vmm_recommended_granularity()
+            .map_err(|error| format!("qwen4: VMM granularity: {error}"))?,
+        hipfire_arch_qwen4::Qwen4KvBackend::Legacy => 1,
+    };
+    if ctx.max_seq == 0 || ctx.max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
+        return Err(format!(
+            "qwen4: max_seq {} is outside the admitted context range 1..={}",
+            ctx.max_seq,
+            hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
+        ));
+    }
+    let ep = hipfire_config::topology::qwen4_ep()?;
+    if ep > 1 {
+        return Err(format!(
+            "qwen4: topology.pp = {pp} cannot combine with expert parallelism (topology.ep = {ep})"
+        ));
+    }
+    let options = crate::admission::SourceAdmissionOptions {
+        spec: ctx.spec,
+        kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(ctx.kv_adaptive_override),
+        eagle_drafter: ctx.gemma4_drafter_path.is_some(),
+        cask: ctx.cask.sidecar.is_some(),
+        state_quant: ctx.state_quant_override.is_some(),
+        non_single_compute: !matches!(
+            &ctx.deepseek4_compute_placement,
+            hipfire_config::Deepseek4ComputePlacement::Single
+        ),
+        expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
+        pflash: false,
+    };
+    crate::admission::qwen4_pp_option_refusal(pp, ctx.draft_path, &options)?;
+    Qwen4Carrier.admit_options(ctx.draft_path, options)?;
+    let (Some(admitted), Some(placement)) = (ctx.admitted_mesh, ctx.band_placement) else {
+        return Err(format!(
+            "qwen4: topology.pp = {pp} needs the admitted mesh and band placement from source \
+             admission"
+        ));
+    };
+    if ctx.sequence.is_some() {
+        return Err(
+            "qwen4: topology.pp has no automatic context sizing; set memory.max_seq".into(),
+        );
+    }
+    let meta = resolve_source_meta(&src, ctx.path)?;
+    let shared = Qwen4RankShared {
+        path: ctx.path.to_string(),
+        max_seq: ctx.max_seq,
+        sequence: None,
+        backend,
+        vmm_granularity,
+        kv_mode: kv_mode_from_ctx(ctx),
+        state_quant: ctx.state_quant_override.map(str::to_string),
+        spec: ctx.spec,
+        native_mtp: false,
+        max_k: 1,
+    };
+    let (bundle, gpus) = load_qwen4_pp_bundle(ctx.gpu, admitted, placement, &shared, src)?;
+    let max_seq = ctx.max_seq;
+    Ok(LoadedModel {
+        state: Some(Box::new(bundle)),
+        pp,
+        pp_gpus: Some(gpus),
+        ..LoadedModel::skeleton(
+            meta.arch_id,
+            meta.tokenizer,
+            max_seq,
+            max_seq,
+            ctx.path.to_string(),
+            meta.chat_template,
+        )
     })
 }
 
@@ -5958,5 +6563,81 @@ mod qwen4_ple_load_fill_tests {
         // Never more than the table/pack/sidecar holds, and 0 when off.
         assert_eq!(ple_resident_bytes(40 * GIB, 14 * GIB, 27 * GIB), 27 * GIB);
         assert_eq!(ple_resident_bytes(0, 0, 27 * GIB), 0);
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_load_tests {
+    use super::qwen4_pp_mesh_refusal;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+    use hipfire_runtime::mesh_placement::{AdmittedMesh, AdmittedRank, BandPlacement};
+
+    /// The admitted cell for `pp` ranks in output-card-last order: logical
+    /// `s < pp - 1` is visible device `s + 1`, the output rank is device 0.
+    fn cell(pp: usize, arch: &str) -> (AdmittedMesh, BandPlacement) {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, pp)]).unwrap();
+        let placement = BandPlacement::uniform(&mesh, 48).unwrap();
+        let ranks = (0..pp)
+            .map(|logical| AdmittedRank {
+                logical,
+                device_ordinal: ((logical + 1) % pp) as i32,
+                pci_bus_id: Some(format!("0000:0{logical}:00.0")),
+                arch: arch.to_string(),
+            })
+            .collect();
+        let admitted = AdmittedMesh {
+            mesh,
+            ranks,
+            edges: Vec::new(),
+            family: "qwen4".to_string(),
+            numerical_policy: "test".to_string(),
+        };
+        (admitted, placement)
+    }
+
+    #[test]
+    fn accepted_cells_are_homogeneous_gfx1100_or_gfx1201_with_the_output_card_as_daemon() {
+        for arch in ["gfx1100", "gfx1201"] {
+            for pp in [2, 3, 6, 8] {
+                let (admitted, placement) = cell(pp, arch);
+                assert_eq!(
+                    qwen4_pp_mesh_refusal(&admitted, &placement, pp, 0, arch),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_refusal_names_topology_pp_before_any_device_is_touched() {
+        let refuses = |admitted: &AdmittedMesh, placement: &BandPlacement, pp, device, arch| {
+            let error = qwen4_pp_mesh_refusal(admitted, placement, pp, device, arch)
+                .expect_err("this cell must refuse");
+            assert!(error.contains("topology.pp"), "{error}");
+        };
+        let (admitted, placement) = cell(2, "gfx1100");
+        // The daemon's generation device must be the output rank.
+        refuses(&admitted, &placement, 2, 1, "gfx1100");
+        // Mixed or unsupported architectures.
+        refuses(&admitted, &placement, 2, 0, "gfx1201");
+        let (other, other_placement) = cell(2, "gfx90a");
+        refuses(&other, &other_placement, 2, 0, "gfx90a");
+        let (mut mixed, mixed_placement) = cell(3, "gfx1100");
+        mixed.ranks[1].arch = "gfx1201".to_string();
+        refuses(&mixed, &mixed_placement, 3, 0, "gfx1100");
+        // Unknown PCI identity.
+        let (mut anonymous, anonymous_placement) = cell(2, "gfx1100");
+        anonymous.ranks[0].pci_bus_id = None;
+        refuses(&anonymous, &anonymous_placement, 2, 0, "gfx1100");
+        // Degrees outside 2..=8 and a placement of another degree.
+        refuses(&admitted, &placement, 1, 0, "gfx1100");
+        let (nine, nine_placement) = cell(9, "gfx1100");
+        refuses(&nine, &nine_placement, 9, 0, "gfx1100");
+        let (_, three) = cell(3, "gfx1100");
+        refuses(&admitted, &three, 2, 0, "gfx1100");
+        // Logical ids must follow the rank order.
+        let (mut shuffled, shuffled_placement) = cell(2, "gfx1100");
+        shuffled.ranks[0].logical = 1;
+        refuses(&shuffled, &shuffled_placement, 2, 0, "gfx1100");
     }
 }

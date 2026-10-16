@@ -154,10 +154,27 @@ impl EffectiveMesh {
     /// uneven splits (512 over 6 ranks = 86/86/85/85/85/85) are admitted.
     pub const EP_MAX_DEGREE: usize = 8;
 
-    /// The meshes Qwen4 admits: no pipeline or tensor parallelism, expert
-    /// parallelism of 1..=8 ranks.
+    /// Smallest and largest pipeline-parallel degree Qwen4 admits
+    /// (`topology.pp`): contiguous layer bands over homogeneous cards with
+    /// tp = ep = 1.
+    pub const PP_MIN_DEGREE: usize = 2;
+    pub const PP_MAX_DEGREE: usize = 8;
+
+    /// A pure pipeline-parallel mesh in the admitted degree range.
+    pub const fn is_pipeline(self) -> bool {
+        self.pp >= Self::PP_MIN_DEGREE
+            && self.pp <= Self::PP_MAX_DEGREE
+            && self.tp == 1
+            && self.ep == 1
+    }
+
+    /// The meshes Qwen4 admits: Single, expert parallelism of 1..=8 ranks
+    /// with no pipeline or tensor parallelism, or a pure pipeline-parallel
+    /// mesh of [`Self::PP_MIN_DEGREE`]..=[`Self::PP_MAX_DEGREE`] stages
+    /// (tp = ep = 1; PP never composes with EP or TP).
     pub const fn is_qwen4_admitted(self) -> bool {
-        self.pp == 1 && self.tp == 1 && self.ep >= 1 && self.ep <= Self::EP_MAX_DEGREE
+        (self.pp == 1 && self.tp == 1 && self.ep >= 1 && self.ep <= Self::EP_MAX_DEGREE)
+            || self.is_pipeline()
     }
 }
 
@@ -561,6 +578,11 @@ pub enum AdmissionError {
     UnsupportedModality(InputModality),
     UnsupportedCapability(Qwen4Capability),
     NonSingleMesh(EffectiveMesh),
+    /// A feature the pipeline-parallel (`topology.pp`) route does not run.
+    PipelineUnsupported {
+        pp: usize,
+        feature: &'static str,
+    },
     UnsupportedFormat(Qwen4ArtifactFormat),
     WrongGeometry {
         component: &'static str,
@@ -603,8 +625,12 @@ impl fmt::Display for AdmissionError {
             }
             Self::NonSingleMesh(mesh) => write!(
                 f,
-                "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in 1..=8 is admitted (pp={}, tp={}, ep={})",
+                "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in 1..=8, or tp=1, ep=1 with pipeline-parallel pp in 2..=8 is admitted (pp={}, tp={}, ep={})",
                 mesh.pp, mesh.tp, mesh.ep
+            ),
+            Self::PipelineUnsupported { pp, feature } => write!(
+                f,
+                "qwen4 admission: pipeline parallelism (topology.pp = {pp}) does not support {feature}"
             ),
             Self::UnsupportedFormat(format) => {
                 write!(f, "qwen4 admission: unsupported artifact format {format:?}")
@@ -696,6 +722,12 @@ impl Qwen4Admission {
         }
         if !request.effective_mesh.is_qwen4_admitted() {
             return Err(AdmissionError::NonSingleMesh(request.effective_mesh));
+        }
+        if request.effective_mesh.pp > 1 && request.native_mtp {
+            return Err(AdmissionError::PipelineUnsupported {
+                pp: request.effective_mesh.pp,
+                feature: "native MTP",
+            });
         }
         if !request.artifact.format.is_hfqm() {
             return Err(AdmissionError::UnsupportedFormat(
@@ -817,6 +849,140 @@ pub enum QuantAdmissionError {
         expected: QuantFormat,
         got: QuantFormat,
     },
+}
+
+/// Free device bytes a pipeline-parallel rank keeps beyond its band census:
+/// the first long request's other lazy allocations, kernel-cache warmup and
+/// VMM page rounding (the loader's single-device headroom, 2 GiB).
+pub const QWEN4_PP_RESERVE_BYTES: u64 = 2 << 30;
+
+/// Inputs of [`qwen4_pp_band_budget`]. Everything is a value the loader has
+/// before its first allocation: the manifest's entries, payload sizes from the
+/// open artifact, the resolved state format, context and scratch mode, and
+/// each rank's measured free VRAM.
+pub struct Qwen4PpBudgetInputs<'a> {
+    pub config: &'a Qwen4Config,
+    /// The admitted placement (`BandPlacement::with_first_band_min(2)`).
+    pub placement: &'a hipfire_runtime::mesh_placement::BandPlacement,
+    /// `manifest.weights`; `mtp.*` entries are ignored (MTP is refused under
+    /// PP, so the output band's MTP and head reserves are 0).
+    pub weights: &'a [hipfire_runtime::weight_manifest::WeightEntry],
+    pub bytes_of: &'a dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    pub format: crate::Qwen4StateFormat,
+    /// The actual backend with the whole admitted context mapped.
+    pub context: &'a crate::Qwen4ContextCommit,
+    pub chunk_rows: usize,
+    pub mode: crate::gpu_forward::Qwen4ForwardScratchMode,
+    /// Free VRAM by LOGICAL rank (`AdmittedMesh::ranks` order).
+    pub free_per_rank: &'a [u64],
+    pub reserve_bytes: u64,
+}
+
+/// One rank's admitted budget line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4PpRankFit {
+    pub stage: usize,
+    pub band: std::ops::Range<usize>,
+    /// Weights + F16 shadows + QSA context + state + forward scratch + reserve.
+    pub required: u64,
+    pub free: u64,
+}
+
+/// Per-rank band budget from the S5 band census: every rank's required bytes
+/// must fit its free VRAM (no host-mapped band layers). Pure; refuses before
+/// any allocation, naming `topology.pp`, every failing rank and its shortfall.
+pub fn qwen4_pp_band_budget(i: &Qwen4PpBudgetInputs<'_>) -> Result<Vec<Qwen4PpRankFit>, String> {
+    use crate::weights::Qwen4BandScope;
+    let stages = i.placement.stages();
+    let prefix = format!("qwen4: pipeline parallelism (topology.pp = {stages})");
+    if i.free_per_rank.len() != stages {
+        return Err(format!(
+            "{prefix}: {} free-VRAM readings for {stages} ranks",
+            i.free_per_rank.len()
+        ));
+    }
+    let weights: Vec<_> = i
+        .weights
+        .iter()
+        .filter(|entry| !entry.name.starts_with("mtp."))
+        .cloned()
+        .collect();
+    let overflow = || format!("{prefix}: band budget overflows");
+    let mut fits = Vec::with_capacity(stages);
+    let mut failures = Vec::new();
+    for stage in 0..stages {
+        let scope = Qwen4BandScope::from_placement(i.config, i.placement, stage)
+            .map_err(|error| format!("{prefix}: {error}"))?;
+        let census = crate::expert_residency::band_census(
+            i.config,
+            &weights,
+            |entry| (i.bytes_of)(entry),
+            &scope,
+            i.format,
+            i.context,
+            i.chunk_rows,
+            i.mode,
+        )
+        .map_err(|error| format!("{prefix}: rank {stage}: {error}"))?;
+        let weight_bytes = census
+            .weight_bytes()
+            .map_err(|e| format!("{prefix}: {e}"))?;
+        let required = [
+            census.f16_shadow_bytes,
+            census.state.qsa_context,
+            census.state.state,
+            census.state.forward,
+            i.reserve_bytes,
+        ]
+        .into_iter()
+        .try_fold(weight_bytes, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(overflow)?;
+        let free = i.free_per_rank[stage];
+        if required > free {
+            failures.push(format!(
+                "rank {stage} (layers {}..{}) needs {required} bytes ({weight_bytes} weights + {} F16 shadows + {} QSA context + {} state + {} forward scratch + {} reserve) but {free} bytes are free (short by {})",
+                scope.band.start,
+                scope.band.end,
+                census.f16_shadow_bytes,
+                census.state.qsa_context,
+                census.state.state,
+                census.state.forward,
+                i.reserve_bytes,
+                required - free
+            ));
+        }
+        fits.push(Qwen4PpRankFit {
+            stage,
+            band: scope.band,
+            required,
+            free,
+        });
+    }
+    if failures.is_empty() {
+        Ok(fits)
+    } else {
+        Err(format!(
+            "{prefix}: band does not fit device memory: {}; rebalance HIPFIRE_PP_LAYERS or lower memory.max_seq (host-mapped band layers are not admitted)",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Largest streams payload of one band edge at `chunk_rows` canonical rows:
+/// `rows * hc_count * hidden * 4` (the F32 worst case; BF16 halves it), the
+/// `max_bytes` for `Gpus::provision_mesh_edges`.
+pub fn qwen4_pp_edge_max_bytes(config: &Qwen4Config, chunk_rows: usize) -> Result<usize, String> {
+    if chunk_rows == 0 {
+        return Err("qwen4: pipeline-parallel edge payload for zero rows".to_string());
+    }
+    chunk_rows
+        .checked_mul(config.hc_count)
+        .and_then(|bytes| bytes.checked_mul(config.hidden_size))
+        .and_then(|bytes| bytes.checked_mul(std::mem::size_of::<f32>()))
+        .filter(|bytes| bytes % 16 == 0)
+        .ok_or_else(|| {
+            format!("qwen4: pipeline-parallel edge payload for {chunk_rows} rows is not a 16-byte multiple or overflows")
+        })
 }
 
 #[cfg(test)]
@@ -997,7 +1163,13 @@ mod tests {
         for ep in 1..=8 {
             let mesh = EffectiveMesh::new(1, 1, ep);
             assert!(mesh.is_qwen4_admitted());
-            assert_eq!(admit(mesh, false).expect("ep AR admitted").effective_mesh.ep, ep);
+            assert_eq!(
+                admit(mesh, false)
+                    .expect("ep AR admitted")
+                    .effective_mesh
+                    .ep,
+                ep
+            );
         }
         assert!(EffectiveMesh::single().is_single());
         assert!(!EffectiveMesh::new(1, 1, 2).is_single());
@@ -1008,13 +1180,46 @@ mod tests {
                 Err(AdmissionError::NonSingleMesh(_))
             ));
         }
-        // pp / tp stay refused at every ep.
-        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4), (4, 1, 4), (1, 2, 6)] {
+        // tp stays refused at every pp/ep, and pp never composes with ep.
+        for (pp, tp, ep) in [
+            (1, 2, 1),
+            (2, 1, 2),
+            (1, 2, 4),
+            (4, 1, 4),
+            (1, 2, 6),
+            (2, 2, 1),
+            (9, 1, 1),
+            (0, 1, 1),
+        ] {
             assert!(matches!(
                 admit(EffectiveMesh::new(pp, tp, ep), false),
                 Err(AdmissionError::NonSingleMesh(_))
             ));
         }
+        // Pure pipeline parallelism is admitted for AR at pp 2..=8 only.
+        for pp in 2..=8 {
+            let mesh = EffectiveMesh::new(pp, 1, 1);
+            assert!(mesh.is_qwen4_admitted() && mesh.is_pipeline() && !mesh.is_single());
+            let admitted = admit(mesh, false).expect("PP AR admitted");
+            assert_eq!(admitted.effective_mesh.pp, pp);
+            assert!(!admitted.native_mtp);
+            assert_eq!(
+                admit(mesh, true),
+                Err(AdmissionError::PipelineUnsupported {
+                    pp,
+                    feature: "native MTP"
+                })
+            );
+        }
+        assert!(!EffectiveMesh::single().is_pipeline());
+        assert!(!EffectiveMesh::new(1, 1, 4).is_pipeline());
+        let message = admit(EffectiveMesh::new(3, 1, 1), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("topology.pp = 3") && message.contains("native MTP"),
+            "{message}"
+        );
         // Native MTP is admitted on every admitted mesh: under EP the drafter
         // is replicated on every rank.
         assert!(admit(EffectiveMesh::single(), true).is_ok());
@@ -1161,5 +1366,127 @@ mod tests {
         };
         let caps = admit_recipe_on_device(&packed, "gfx1201", single, true, true).unwrap();
         assert!(!caps.fp8_experts && caps.native_mtp);
+    }
+
+    mod pp_budget {
+        use super::*;
+        use crate::gpu_forward::Qwen4ForwardScratchMode::Full;
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        use hipfire_runtime::mesh_placement::BandPlacement;
+        use hipfire_runtime::weight_manifest::WeightEntry;
+        use rdna_compute::tensor_ops::QsaKvFormat;
+
+        fn bytes_of(entry: &WeightEntry) -> Option<u64> {
+            Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)
+        }
+
+        fn placement(counts: &[usize]) -> BandPlacement {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+            BandPlacement::from_counts(&mesh, 48, counts).unwrap()
+        }
+
+        fn budget(
+            config: &Qwen4Config,
+            weights: &[WeightEntry],
+            placement: &BandPlacement,
+            free: &[u64],
+        ) -> Result<Vec<Qwen4PpRankFit>, String> {
+            let context = crate::Qwen4ContextCommit::legacy(1024);
+            qwen4_pp_band_budget(&Qwen4PpBudgetInputs {
+                config,
+                placement,
+                weights,
+                bytes_of: &bytes_of,
+                format: crate::Qwen4StateFormat {
+                    qsa: QsaKvFormat::Fp8,
+                    gdn: crate::GdnStateFormat::Q8,
+                    qsa_f16_arena: false,
+                    qsa_pooled_bf16: false,
+                },
+                context: &context,
+                chunk_rows: 256,
+                mode: Full,
+                free_per_rank: free,
+                reserve_bytes: QWEN4_PP_RESERVE_BYTES,
+            })
+        }
+
+        #[test]
+        fn every_rank_must_fit_its_own_census() {
+            let config = crate::config::compact_test_config();
+            let manifest = crate::weights::Qwen4Manifest::build(&config).unwrap();
+            let placement = placement(&[9, 8, 8, 8, 8, 7]);
+            let fits = budget(&config, &manifest.weights, &placement, &[u64::MAX; 6]).unwrap();
+            assert_eq!(fits.len(), 6);
+            assert_eq!(fits[0].band, 0..9);
+            assert_eq!(fits[5].band, 41..48);
+            assert!(fits.iter().all(|fit| fit.required > QWEN4_PP_RESERVE_BYTES));
+            // Exactly enough fits; one byte short on one rank refuses, naming
+            // topology.pp and that rank only.
+            let exact: Vec<u64> = fits.iter().map(|fit| fit.required).collect();
+            assert!(budget(&config, &manifest.weights, &placement, &exact).is_ok());
+            let mut short = exact.clone();
+            short[3] -= 1;
+            let error = budget(&config, &manifest.weights, &placement, &short).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 6")
+                    && error.contains("rank 3 (layers 25..33)")
+                    && error.contains("short by 1")
+                    && !error.contains("rank 2")
+                    && !error.contains("rank 4"),
+                "{error}"
+            );
+            // The reading count must match the rank count.
+            let error = budget(&config, &manifest.weights, &placement, &exact[..5]).unwrap_err();
+            assert!(error.contains("topology.pp = 6"), "{error}");
+        }
+
+        #[test]
+        fn mtp_entries_never_charge_a_pipeline_rank() {
+            let config = crate::config::compact_test_config();
+            let manifest = crate::weights::Qwen4Manifest::build(&config).unwrap();
+            assert!(manifest.weights.iter().any(|e| e.name.starts_with("mtp.")));
+            let without: Vec<WeightEntry> = manifest
+                .weights
+                .iter()
+                .filter(|e| !e.name.starts_with("mtp."))
+                .cloned()
+                .collect();
+            let placement = placement(&[24, 24]);
+            assert_eq!(
+                budget(&config, &manifest.weights, &placement, &[u64::MAX; 2]),
+                budget(&config, &without, &placement, &[u64::MAX; 2]),
+            );
+        }
+
+        #[test]
+        fn a_band_without_the_ple_layer_is_refused_before_any_census() {
+            let config = crate::config::compact_test_config();
+            let manifest = crate::weights::Qwen4Manifest::build(&config).unwrap();
+            // `with_first_band_min(2)` already refuses this split; the budget
+            // refuses it independently.
+            assert!(placement(&[1, 47]).with_first_band_min(2).is_err());
+            let error = budget(
+                &config,
+                &manifest.weights,
+                &placement(&[1, 47]),
+                &[u64::MAX; 2],
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("topology.pp = 2") && error.contains("PLE"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn edge_payload_matches_the_frozen_chunk_sizes() {
+            let config = crate::config::compact_test_config();
+            assert_eq!(qwen4_pp_edge_max_bytes(&config, 1), Ok(40_960));
+            assert_eq!(qwen4_pp_edge_max_bytes(&config, 1536), Ok(62_914_560));
+            assert_eq!(qwen4_pp_edge_max_bytes(&config, 4096), Ok(167_772_160));
+            assert!(qwen4_pp_edge_max_bytes(&config, 0).is_err());
+            assert!(qwen4_pp_edge_max_bytes(&config, usize::MAX).is_err());
+        }
     }
 }

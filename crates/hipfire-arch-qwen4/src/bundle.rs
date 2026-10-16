@@ -50,7 +50,18 @@ use std::time::Duration;
 mod session_pair;
 pub(crate) use session_pair::PairSessionStage;
 
+#[path = "bundle/pp.rs"]
+mod pp;
+use hipfire_runtime::multi_gpu::executor::MeshRoute;
+use pp::Qwen4PpMesh;
+
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn pp_owner_required() -> BundleError {
+    BundleError::Forward(
+        "qwen4 topology.pp requires the admitted Gpus owner; use the mesh entry point".into(),
+    )
+}
 
 /// Architecture-private owner for the fulfilled manifest census.
 ///
@@ -196,6 +207,9 @@ pub struct Qwen4Bundle {
     /// daemon-facing call is replicated on the peer ranks. `None` = single
     /// device (the default; no behaviour change).
     pub(crate) ep: Option<Box<Qwen4EpMesh>>,
+    /// Band state and generic execution plans. This bundle is the output band;
+    /// callers borrow the sole hardware owner, `LoadedModel::pp_gpus`.
+    pub(crate) pp: Option<Box<Qwen4PpMesh>>,
     /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
@@ -281,6 +295,9 @@ pub fn session_snapshot_bytes(
 
 impl SessionState for Qwen4Bundle {
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
+        if self.pp.is_some() {
+            return None;
+        }
         let chunk = self.spec_chunk_rows()?;
         if route == SessionRoute::Mtp && self.mtp.is_none() {
             return None;
@@ -328,6 +345,9 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String> {
+        if self.pp.is_some() {
+            return Err("session snapshots are not supported under qwen4 topology.pp yet".into());
+        }
         self.quiesce_ple().map_err(|e| e.to_string())?;
         let mtp = match route {
             SessionRoute::Ar => None,
@@ -373,6 +393,9 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<StateLayout<'_>, String> {
+        if self.pp.is_some() {
+            return Err("session restore is not supported under qwen4 topology.pp yet".into());
+        }
         self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
         let (target_meta, mtp_meta) = meta
             .split_at_checked(self.state.session_meta_bytes())
@@ -401,6 +424,9 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String> {
+        if self.pp.is_some() {
+            return Err("session restore is not supported under qwen4 topology.pp yet".into());
+        }
         let (target_meta, mtp_meta) = meta
             .split_at_checked(self.state.session_meta_bytes())
             .ok_or("qwen4 session snapshot shape mismatch")?;
@@ -523,7 +549,7 @@ impl Qwen4Bundle {
     pub fn assemble_with_ple_rows(
         config: Qwen4Config,
         recipe: &Qwen4TierRecipe,
-        mut transaction: WeightLoadTransaction,
+        transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
         max_seq_len: usize,
@@ -533,18 +559,72 @@ impl Qwen4Bundle {
         backend: Qwen4KvBackend,
         expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
     ) -> Result<Self, BundleError> {
-        let ple_inputs = match admit_ple_inputs(&config, metadata.into(), ple_source) {
+        let scope = crate::weights::Qwen4BandScope::single(&config);
+        Self::assemble_band_with_ple_rows(
+            config,
+            recipe,
+            transaction,
+            placements,
+            gpu,
+            max_seq_len,
+            metadata,
+            ple_source,
+            state_format,
+            backend,
+            expert_tiers,
+            &scope,
+        )
+    }
+
+    /// Assemble precisely one admitted pipeline band, including only its
+    /// pinned PLE/input resources and band-local mutable state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_band_with_ple_rows(
+        config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        mut transaction: WeightLoadTransaction,
+        placements: &[Qwen4Placement],
+        gpu: &mut Gpu,
+        max_seq_len: usize,
+        metadata: impl Into<Option<PleHashMetadata>>,
+        ple_source: Qwen4PleRows,
+        state_format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+        scope: &crate::weights::Qwen4BandScope,
+    ) -> Result<Self, BundleError> {
+        if let Err(error) = scope.validate(&config) {
+            return Err(cleanup_transaction(
+                BundleError::Forward(error),
+                transaction.rollback(gpu),
+            ));
+        }
+        let metadata = metadata.into();
+        let ple_inputs = if scope.input {
+            admit_ple_inputs(&config, metadata, ple_source)
+        } else if metadata.is_none() && matches!(ple_source, Qwen4PleRows::Absent) {
+            Ok(None)
+        } else {
+            Err(BundleError::Forward(
+                "qwen4 topology.pp: only the input band owns PLE rows and metadata".into(),
+            ))
+        };
+        let ple_inputs = match ple_inputs {
             Ok(inputs) => inputs,
             Err(error) => {
                 return Err(cleanup_transaction(error, transaction.rollback(gpu)));
             }
         };
-        let scope = crate::weights::Qwen4BandScope::single(&config);
         let assembled = match expert_tiers {
             Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
-                &mut transaction, &config, recipe, placements, &scope, lease,
+                &mut transaction,
+                &config,
+                recipe,
+                placements,
+                scope,
+                lease,
             ),
-            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, &scope),
+            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, scope),
         };
         let weights = match assembled {
             Ok(weights) => weights,
@@ -590,24 +670,30 @@ impl Qwen4Bundle {
             }
             _ => None,
         };
-        let mut state =
-            match Qwen4State::new_with_backend(gpu, &config, max_seq_len, state_format, backend) {
-                Ok(state) => state,
-                Err(error) => {
-                    // `unload` consumes the reader and joins its worker even on a
-                    // quiesce error, so source descriptors cannot outlive failure.
-                    if let Some(ple) = ple {
-                        let _ = ple.rows.unload();
-                    }
-                    let weight_result = weights.free_gpu(gpu);
-                    let cleanup = transaction.rollback(gpu);
-                    return Err(cleanup_bundle_failure(
-                        BundleError::State(error),
-                        weight_result,
-                        cleanup,
-                    ));
+        let mut state = match Qwen4State::new_with_backend_scoped(
+            gpu,
+            &config,
+            max_seq_len,
+            state_format,
+            backend,
+            scope,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                // `unload` consumes the reader and joins its worker even on a
+                // quiesce error, so source descriptors cannot outlive failure.
+                if let Some(ple) = ple {
+                    let _ = ple.rows.unload();
                 }
-            };
+                let weight_result = weights.free_gpu(gpu);
+                let cleanup = transaction.rollback(gpu);
+                return Err(cleanup_bundle_failure(
+                    BundleError::State(error),
+                    weight_result,
+                    cleanup,
+                ));
+            }
+        };
         state.bind_transaction_generation(transaction.inventory_len() as u64);
         Ok(Self {
             config,
@@ -638,6 +724,7 @@ impl Qwen4Bundle {
             state_format,
             lanes: None,
             ep: None,
+            pp: None,
             trunk_overlay: None,
             npu_model_index: None,
         })
@@ -1875,6 +1962,9 @@ impl Qwen4Bundle {
         if table.is_noop() {
             return Ok(());
         }
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_apply_penalty_table(gpu, logits, table);
         }
@@ -2312,6 +2402,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_token(gpu, token, logits, top1);
         }
@@ -2334,6 +2427,9 @@ impl Qwen4Bundle {
         token: Option<u32>,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_token_or_argmax(gpu, token, logits);
         }
@@ -2357,6 +2453,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_chunk(gpu, tokens, logits, top1, false);
         }
@@ -2384,6 +2483,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_chunk(gpu, tokens, logits, top1, true);
         }
@@ -2416,6 +2518,9 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         self.ep_refuse("silent chunk forward outside a replicated call")?;
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
@@ -2467,6 +2572,9 @@ impl Qwen4Bundle {
 
     /// Reset every owner for a cold prefill.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
@@ -2490,6 +2598,9 @@ impl Qwen4Bundle {
     /// Device bytes the QSA context arenas commit now, `(target, MTP head)`:
     /// mapped pages of VMM owners, full allocations of legacy ones.
     pub fn qsa_context_committed_bytes(&self, gpu: &Gpu) -> Result<(usize, usize), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         let target = self
             .state
             .mapped_context_bytes(gpu)
@@ -2570,7 +2681,7 @@ impl Qwen4Bundle {
         remaining_new_tokens: usize,
         max_draft_rows: usize,
     ) {
-        if self.ep.is_some() {
+        if self.ep.is_some() || self.pp.is_some() {
             return;
         }
         let Some(target) = decode_map_ahead_tokens(
@@ -2807,6 +2918,9 @@ impl Qwen4Bundle {
         reused: usize,
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_prefill_final(gpu, prompt, reused, logits);
         }
@@ -3416,6 +3530,10 @@ impl Qwen4Bundle {
     /// leases/page-cache resources, free mutable GPU state, free finalized
     /// resident weights, then drain the attached transaction/census.
     pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            std::mem::forget(self);
+            return Err(pp_owner_required());
+        }
         // Peers drain and free first: their gather events and P2P reads end
         // before rank 0's buffers go.
         let ep_result = self.ep_close(gpu);

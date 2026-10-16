@@ -26,7 +26,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
     let mut ple_rows_f16 = false;
         for layer_index in 0..config.num_hidden_layers {
             let begin = steps.len();
-            let layer = &bundle.weights.layer_refs[layer_index];
+            let layer = bundle.weights.layer(layer_index).ok_or_else(|| invalid(format!("NPU trunk layer {layer_index} is not owned")))?;
             if ple_layer_index == Some(layer_index) {
                 let ple_weights = layer
                     .ple
@@ -81,7 +81,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
 
             let layer_moe = match ep {
                 Some(ep) if route_n > 1 => ep.moe_full.get(layer_index),
-                _ => owner.moe.get(layer_index),
+                _ => owner.moe.get(layer_index).and_then(Option::as_ref),
             };
             let mut description = layer_desc(
                 &bundle.weights,

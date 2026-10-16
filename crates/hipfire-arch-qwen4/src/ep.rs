@@ -1644,6 +1644,11 @@ impl Qwen4Bundle {
     /// snapshots) instead of running it on rank 0 alone and stalling the gather
     /// barrier.
     pub(crate) fn ep_refuse(&self, what: &str) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(BundleError::Forward(format!(
+                "{what} is not supported under qwen4 topology.pp yet"
+            )));
+        }
         if self.ep.is_some() {
             return Err(BundleError::Forward(format!(
                 "{what} is unsupported under qwen4 EP"
