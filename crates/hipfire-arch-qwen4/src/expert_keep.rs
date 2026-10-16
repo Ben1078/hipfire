@@ -58,7 +58,11 @@ impl ExpertKeep {
         if integer(v, "n_layers")? != layers.len() { return Err("coder keep n_layers mismatch".into()) }
         let counts: Vec<usize> = serde_json::from_value(v.get("counts").cloned().ok_or("missing coder counts")?).map_err(|e| format!("coder counts: {e}"))?;
         if counts != layers.iter().map(Vec::len).collect::<Vec<_>>() { return Err("coder keep counts mismatch".into()) }
-        let keep = Self::new(integer(v, "n_experts")?, layers, None, 1)?;
+        let mtp: Option<Vec<u16>> = match v.get("mtp") {
+            None | Some(Value::Null) => None,
+            Some(m) => Some(serde_json::from_value(m.clone()).map_err(|e| format!("coder keep mtp: {e}"))?),
+        };
+        let keep = Self::new(integer(v, "n_experts")?, layers, mtp, 1)?;
         if integer(v, "total")? != keep.total_kept() { return Err("coder keep total mismatch".into()) }
         Ok(keep)
     }
@@ -119,6 +123,16 @@ mod tests {
         assert!(ExpertKeep::from_coder_keep_file(&v).is_err());
         v["counts"] = json!([2,3]);
         v["total"] = json!(6);
+        assert!(ExpertKeep::from_coder_keep_file(&v).is_err());
+    }
+
+    #[test]
+    fn coder_keep_parses_optional_mtp() {
+        let mut v = json!({"schema":"hipfire.coder.keep.v1", "n_layers":1,"n_experts":512,"keep":[[0,3]],"counts":[2],"total":2,"mtp":null});
+        assert_eq!(ExpertKeep::from_coder_keep_file(&v).unwrap().mtp_kept(), None);
+        v["mtp"] = json!([1, 4, 7]);
+        assert_eq!(ExpertKeep::from_coder_keep_file(&v).unwrap().mtp_kept(), Some(&[1u16, 4, 7][..]));
+        v["mtp"] = json!([7, 1]);
         assert!(ExpertKeep::from_coder_keep_file(&v).is_err());
     }
 }
