@@ -39,6 +39,36 @@ pub const EXPERT_VRAM_LAYERS_ENV: &str = hip_bridge::QWEN4_EXPERT_VRAM_LAYERS_EN
 /// context, a different chunk and native MTP take; a shorter context keeps it.
 pub const AUTO_VRAM_RESERVE_BYTES: u64 = 6656 << 20;
 
+/// Device memory the HIP runtime holds on an exact gfx1201 beyond every
+/// allocation the load and the forward make: code objects, HSA queues and
+/// their context-save areas, kernel scratch and the ROCr pools. Measured on an
+/// R9700 as the device-wide sysfs `mem_info_vram_used` minus every live
+/// allocation `rocprofv3 --memory-allocation-trace` reports, beyond the
+/// 57 MiB idle baseline:
+/// - pruned W3-slab pack fully resident, compact scratch, 1024-row chunk:
+///   929 MiB after load, 1,330 MiB at the peak of a 32K-token request
+///   (receipt `slab-scratch-notes/rcpt/h1-proof-run1/p1024`);
+/// - shipped `mq3-xts` with 30 routed layers in pinned host RAM, full scratch,
+///   1024-row chunk: 974 MiB after load, 1,373 MiB at the peak (receipt
+///   `slab-scratch-notes/rcpt/h2a-run2/c1024`). The same load at 4096 and
+///   8192 rows (no trace; the traced allocations rebased by the census
+///   difference) peaks at about 1,380 and 1,383 MiB, at 256 rows at about
+///   956 MiB.
+///
+/// The growth after load appears only once a request runs at least 512 rows.
+/// The constant is the largest peak rounded up to 1,408 MiB.
+/// The historical floor's stale F32 context used to cover it; with the floor
+/// retired on this route the census carries it as [`ReserveCensus::runtime`].
+pub const QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES: u64 = 1408 << 20;
+
+/// The measured HIP runtime overhead the census charges: only where it was
+/// measured, an exact gfx1201 discrete (not unified-memory) single-device
+/// load. `None` elsewhere, where the historical floor still applies.
+pub fn runtime_overhead_bytes(arch: &str, unified_memory: bool, ranks: usize) -> Option<u64> {
+    (arch == "gfx1201" && !unified_memory && ranks == 1)
+        .then_some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES)
+}
+
 /// Context [`AUTO_VRAM_RESERVE_BYTES`] was measured at (`hipfire run`'s
 /// legacy-KV `max_seq`).
 pub const AUTO_VRAM_RESERVE_MAX_SEQ: usize = 32768;
@@ -354,6 +384,8 @@ pub struct ReserveCensus {
     pub qsa_selector: u64,
     pub mtp: u64,
     pub gather: u64,
+    /// The HIP runtime's own device memory ([`runtime_overhead_bytes`]).
+    pub runtime: u64,
 }
 
 impl ReserveCensus {
@@ -367,6 +399,7 @@ impl ReserveCensus {
             ("QSA selector", self.qsa_selector),
             ("native MTP", self.mtp),
             ("QSA gather", self.gather),
+            ("HIP runtime", self.runtime),
         ]
         .into_iter()
         .chain(self.workspace.iter().copied())
@@ -1293,45 +1326,60 @@ fn f16_shadow_bytes_owned(
 /// The reserve `auto` keeps free: the larger of the historical measured
 /// formula (`historical`, [`auto_vram_reserve`], the floor, no longer
 /// evidence of what a long context takes) and the bottom-up
-/// [`ReserveCensus`]. The whole-layer stage buffers and safety margin
-/// ([`PlacementCharges`]) are added on top of [`Self::bytes`].
+/// [`ReserveCensus`]; where the census carries the measured HIP runtime
+/// overhead ([`runtime_overhead_bytes`]) the floor is retired
+/// (`historical` is `None`) and the census alone is the reserve. The
+/// whole-layer stage buffers and safety margin ([`PlacementCharges`]) are
+/// added on top of [`Self::bytes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AutoReserve {
-    pub historical: u64,
+    pub historical: Option<u64>,
     pub census: ReserveCensus,
     pub census_total: u64,
 }
 
 impl AutoReserve {
-    pub fn new(historical: u64, census: ReserveCensus) -> Result<Self, String> {
+    pub fn new(historical: Option<u64>, census: ReserveCensus) -> Result<Self, String> {
         let census_total = census.total()?;
         Ok(Self { historical, census, census_total })
     }
 
-    /// The bytes `auto` reserves: `max(historical, census)`.
+    /// The bytes `auto` reserves: `max(historical, census)`, or the census
+    /// alone once the floor is retired.
     pub fn bytes(&self) -> u64 {
-        self.historical.max(self.census_total)
+        match self.historical {
+            Some(historical) => historical.max(self.census_total),
+            None => self.census_total,
+        }
     }
 
     /// Which formula set [`Self::bytes`].
     pub fn winner(&self) -> &'static str {
-        if self.census_total > self.historical {
-            "census"
-        } else {
-            "historical floor"
+        match self.historical {
+            None => "census (historical floor retired)",
+            Some(historical) if self.census_total > historical => "census",
+            Some(_) => "historical floor",
         }
     }
 
     /// The reserve and its parts for the placement log, every census term.
     pub fn describe(&self) -> String {
-        format!(
-            "{} MiB = max({} MiB historical floor, {} MiB census [{}]): {} wins",
-            self.bytes() >> 20,
-            self.historical >> 20,
-            self.census_total >> 20,
-            self.census.describe(),
-            self.winner()
-        )
+        match self.historical {
+            Some(historical) => format!(
+                "{} MiB = max({} MiB historical floor, {} MiB census [{}]): {} wins",
+                self.bytes() >> 20,
+                historical >> 20,
+                self.census_total >> 20,
+                self.census.describe(),
+                self.winner()
+            ),
+            None => format!(
+                "{} MiB = census [{}] (historical floor retired: the census carries the \
+                 measured HIP runtime overhead)",
+                self.bytes() >> 20,
+                self.census.describe()
+            ),
+        }
     }
 }
 
@@ -2207,6 +2255,7 @@ mod tests {
             qsa_selector,
             mtp: 0,
             gather: 0,
+            runtime: 0,
         }
     }
 
@@ -2243,13 +2292,22 @@ mod tests {
     }
 
     /// The full-context census of the target profile on a VMM discrete card
-    /// at `max_seq` (native MTP off), every term from its owning query.
-    fn real_census(config: &Qwen4Config, max_seq: usize) -> ReserveCensus {
+    /// at `max_seq` (native MTP off), every term from its owning query, for a
+    /// prefill `chunk` of rows, the forward `mode` it allocates and a
+    /// `runtime` overhead term. The F16 shadows are charged only at chunks of
+    /// at least [`rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`] rows, as
+    /// the loader does.
+    fn census_at(
+        config: &Qwen4Config,
+        max_seq: usize,
+        chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        runtime: u64,
+    ) -> ReserveCensus {
         let format = target_state_format();
-        let chunk = crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201");
         let context =
             crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, max_seq, 2 << 20);
-        let state = state_census(config, format, &context, chunk, Full).unwrap();
+        let state = state_census(config, format, &context, chunk, mode).unwrap();
         let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
             hidden_size: config.hidden_size,
             moe_intermediate_size: config.moe_intermediate_size,
@@ -2261,11 +2319,16 @@ mod tests {
             routed_i4: true,
             include_short_tails: true,
         };
+        let f16_shadows = if chunk >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+            f16_shadow_bytes(&target_f16_manifest(), config.num_hidden_layers).unwrap()
+        } else {
+            0
+        };
         ReserveCensus {
             qsa_context: state.qsa_context,
             state: state.state,
             forward: state.forward,
-            f16_shadows: f16_shadow_bytes(&target_f16_manifest(), config.num_hidden_layers).unwrap(),
+            f16_shadows,
             workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap(),
             qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_capacity_bytes() as u64,
             mtp: 0,
@@ -2274,7 +2337,14 @@ mod tests {
                 max_seq,
             )
             .unwrap() as u64,
+            runtime,
         }
+    }
+
+    /// The full-context census at the default 4096-row chunk, `Full` forward,
+    /// no runtime term: what the census was before the runtime overhead.
+    fn real_census(config: &Qwen4Config, max_seq: usize) -> ReserveCensus {
+        census_at(config, max_seq, crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"), Full, 0)
     }
 
     /// Placement of the reproduction card with the real census: the layers
@@ -2288,7 +2358,7 @@ mod tests {
         historical: u64,
         census: ReserveCensus,
     ) -> (usize, usize, usize, AutoReserve, PlacementCharges) {
-        let reserve = AutoReserve::new(historical, census).unwrap();
+        let reserve = AutoReserve::new(Some(historical), census).unwrap();
         let charges = PlacementCharges::new(layer, true).unwrap();
         let unfixed = auto_vram_layers(free, non_expert, layer, 49, historical);
         let floor_charged = auto_vram_layers(
@@ -2377,6 +2447,126 @@ mod tests {
         assert!(reserve.describe().contains("QSA context"));
     }
 
+    #[test]
+    fn runtime_overhead_is_charged_only_on_exact_discrete_single_device_gfx1201() {
+        assert_eq!(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES, 1408 << 20);
+        assert_eq!(
+            runtime_overhead_bytes("gfx1201", false, 1),
+            Some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES)
+        );
+        assert_eq!(runtime_overhead_bytes("gfx1201", true, 1), None);
+        assert_eq!(runtime_overhead_bytes("gfx1201", false, 2), None);
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx12010", ""] {
+            assert_eq!(runtime_overhead_bytes(arch, false, 1), None, "{arch}");
+        }
+    }
+
+    #[test]
+    fn a_retired_floor_makes_the_census_the_reserve_and_says_so() {
+        let census = ReserveCensus { runtime: 1344 << 20, ..census_with(1 << 30, 1 << 30, 1 << 30, 0, 0) };
+        let retired = AutoReserve::new(None, census).unwrap();
+        assert_eq!(retired.bytes(), retired.census_total);
+        assert_eq!(retired.winner(), "census (historical floor retired)");
+        let text = retired.describe();
+        assert!(text.contains("HIP runtime 1344 MiB"), "{text}");
+        assert!(
+            text.contains("(historical floor retired: the census carries the measured HIP runtime overhead)"),
+            "{text}"
+        );
+        // Even a census below what a floor would have been is not raised.
+        let huge_floor = AutoReserve::new(Some(retired.census_total * 2), census).unwrap();
+        assert_eq!(huge_floor.bytes(), retired.census_total * 2);
+        assert_eq!(huge_floor.winner(), "historical floor");
+    }
+
+    /// The shipped mq3-xts R9700 card (free 32550 MiB, non-expert 5115 MiB,
+    /// 1060 MiB per slab layer, 49 MoE layers, VMM fp8 / Q8 state, 4096-row
+    /// chunk, slab stage + margin): the layers `auto` keeps resident today
+    /// (historical floor, `Full` forward, no runtime term) and with the
+    /// census carrying the HIP runtime overhead on the compact forward.
+    fn shipped_r9700_layers(max_seq: usize) -> (usize, usize) {
+        let (free, non_expert, layer) = (32550u64 << 20, 5115u64 << 20, 1060u64 << 20);
+        let config = crate::config::compact_test_config();
+        let format = target_state_format();
+        let chunk = 4096;
+        let charges = PlacementCharges::new(layer, true).unwrap();
+        // The loader's historical floor: legacy-forced context, `Full`.
+        let context = crate::Qwen4ContextCommit::for_expert_reserve(
+            crate::Qwen4KvBackend::Vmm,
+            false,
+            max_seq,
+            chunk,
+            2 << 20,
+        );
+        let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+            config.num_key_value_heads,
+            context.tokens,
+        )
+        .unwrap() as u64;
+        let historical = auto_vram_reserve(
+            &config, &context, chunk, Full, format.layout(), None, Some(gather),
+        )
+        .unwrap();
+        let today = AutoReserve::new(Some(historical), census_at(&config, max_seq, chunk, Full, 0))
+            .unwrap();
+        let new = AutoReserve::new(
+            None,
+            census_at(&config, max_seq, chunk, FnSymGfx1201, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES),
+        )
+        .unwrap();
+        let layers = |reserve: &AutoReserve| {
+            auto_placement_layers(free, non_expert, layer, 49, reserve.bytes(), &charges).unwrap()
+        };
+        (layers(&today), layers(&new))
+    }
+
+    #[test]
+    fn shipped_r9700_keeps_more_layers_with_the_compact_census_and_retired_floor() {
+        let (today_8k, new_8k) = shipped_r9700_layers(8192);
+        let (today_32k, new_32k) = shipped_r9700_layers(32768);
+        assert_eq!((today_8k, today_32k), (15, 15));
+        assert_eq!((new_8k, new_32k), (18, 17));
+    }
+
+    #[test]
+    fn pruned_w3_slab_pack_fits_fully_resident_at_32k_only_with_a_small_compact_chunk() {
+        // 29,556,669,976 device bytes (non-expert + routed experts), free
+        // 32550 MiB: margin only, no stage (fully resident has no host layer).
+        let (free, non_expert, total) = (32550u64 << 20, 5115u64 << 20, 29_556_669_976u64);
+        let config = crate::config::compact_test_config();
+        let charges = PlacementCharges::new(1060 << 20, false).unwrap();
+        let fits = |chunk: usize| {
+            let census = census_at(
+                &config, 32768, chunk, FnSymGfx1201, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+            );
+            let reserve = AutoReserve::new(None, census).unwrap();
+            fits_fully_resident(
+                free,
+                non_expert,
+                total - non_expert,
+                charges.reserve(reserve.bytes()).unwrap(),
+            )
+        };
+        assert!(fits(256));
+        assert!(!fits(1024));
+    }
+
+    #[test]
+    fn the_compact_1024_census_covers_the_measured_peak_beyond_weights() {
+        let config = crate::config::compact_test_config();
+        let census = census_at(
+            &config, 32768, 1024, FnSymGfx1201, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+        );
+        // 4,141 MiB: the measured peak beyond the weights at this config.
+        assert!(census.total().unwrap() >= 4141 << 20);
+        assert_eq!(census.total().unwrap() >> 20, 4237);
+        // For the record: the `Full` 8192-row chunk at 32K with the runtime.
+        let full = census_at(
+            &config, 32768, 8192, Full, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+        );
+        assert_eq!(full.total().unwrap() >> 20, 12302);
+    }
+
     /// The shipped Strix Halo (gfx1151, unified memory) admission: VMM QSA
     /// F32 K/V, Q8 GDN, BF16 pooled mirror on, F16 arena off, no MTP,
     /// 8192-row chunk, `max_seq` 16384, free 118,441 MiB (XTS) / 118,415 MiB
@@ -2436,8 +2626,9 @@ mod tests {
             qsa_selector: 0,
             mtp: 0,
             gather: gather(full.tokens),
+            runtime: 0,
         };
-        let reserve = AutoReserve::new(historical, census).unwrap();
+        let reserve = AutoReserve::new(Some(historical), census).unwrap();
         // Both Halo artifacts fit fully resident under whichever formula wins
         // (exact non-expert bytes 5,364,055,296 = 5,115.6 MiB).
         assert_eq!(reserve.census_total >> 20, 9854, "{}", reserve.describe());
@@ -2461,7 +2652,7 @@ mod tests {
             83_894_272,
         );
         let total = (2000 + 1000 + 5000) * (1u64 << 20) + 1_298_923_520 + 153_256_072 + 83_894_272;
-        let reserve = AutoReserve::new(historical, census).unwrap();
+        let reserve = AutoReserve::new(Some(historical), census).unwrap();
         assert_eq!(reserve.census_total, total);
         assert!(total > historical);
         assert_eq!(reserve.bytes(), total);
@@ -2480,7 +2671,7 @@ mod tests {
             qsa_context: u64::MAX,
             ..census_with(0, 0, 0, 0, 0)
         };
-        assert!(AutoReserve::new(0, overflowing).is_err());
+        assert!(AutoReserve::new(Some(0), overflowing).is_err());
     }
 
     #[test]

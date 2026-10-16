@@ -1235,7 +1235,9 @@ pub fn attach_qwen4_ep_peers(
 /// load: the replicated non-expert bytes, one MoE layer's routed-expert bytes
 /// on this rank, the `auto` reserve ([`residency::AutoReserve`]: the larger
 /// of the historical measured formula and a bottom-up census of the first
-/// full-context request, itemised) and its native MTP and QSA gather parts,
+/// full-context request, itemised; the census alone where it carries the
+/// measured HIP runtime overhead, [`residency::runtime_overhead_bytes`]) and
+/// its native MTP and QSA gather parts,
 /// returned too. The one place this is computed, for the load and for
 /// [`qwen4_ep_vram_layers`].
 #[allow(clippy::too_many_arguments)]
@@ -1336,16 +1338,26 @@ fn qwen4_placement_inputs(
     };
     let mtp_bytes = mtp_for(&context)?;
     let gather_bytes = gather_for(&context)?;
-    let historical = residency::auto_vram_reserve(
-        config,
-        &context,
-        chunk_rows,
-        scratch_mode,
-        state_format.layout(),
-        mtp_bytes,
-        gather_bytes,
-    )
-    .map_err(|error| format!("qwen4: {error}"))?;
+    // The measured HIP runtime overhead (exact gfx1201, discrete,
+    // single-device): the census then carries it and the historical floor,
+    // whose stale F32 context used to cover it, is retired.
+    let runtime = residency::runtime_overhead_bytes(&gpu.arch, use_ranges, ranks);
+    let historical = if runtime.is_some() {
+        None
+    } else {
+        Some(
+            residency::auto_vram_reserve(
+                config,
+                &context,
+                chunk_rows,
+                scratch_mode,
+                state_format.layout(),
+                mtp_bytes,
+                gather_bytes,
+            )
+            .map_err(|error| format!("qwen4: {error}"))?,
+        )
+    };
     // The bottom-up census at the full admitted context.
     let state = residency::state_census(
         config,
@@ -1358,7 +1370,13 @@ fn qwen4_placement_inputs(
     // Lazy F16 weight shadows of the BF16 owners the long-prefill F16 WMMA
     // arms read (exact gfx1201): the cold bound from the manifest, not the
     // warm cache.
-    let f16_shadows = if gpu.qwen4_f16_wmma_gfx1201() {
+    // The F16 WMMA arms run only at `route_rows >= 512`
+    // (`gemm.rs` `qwen4_f16_wmma_applies`); no forward has more rows than the
+    // chunk and gfx1201 has no canonical-row routing scope, so a smaller chunk
+    // never creates a shadow.
+    let f16_shadows = if gpu.qwen4_f16_wmma_gfx1201()
+        && chunk_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+    {
         residency::f16_shadow_bytes(weights, config.num_hidden_layers)
             .map_err(|error| format!("qwen4: {error}"))?
     } else {
@@ -1417,6 +1435,7 @@ fn qwen4_placement_inputs(
         ) as u64,
         mtp: mtp_for(&census_context)?.unwrap_or(0),
         gather: gather_for(&census_context)?.unwrap_or(0),
+        runtime: runtime.unwrap_or(0),
     };
     let reserve = residency::AutoReserve::new(historical, census)
         .map_err(|error| format!("qwen4: {error}"))?;
