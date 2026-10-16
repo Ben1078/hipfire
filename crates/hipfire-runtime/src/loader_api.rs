@@ -157,6 +157,11 @@ pub struct LoadCtx<'a> {
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,
     pub pp: usize,
+    /// Admission-only explicit pipeline layer counts (one entry per rank,
+    /// summing to the model layer count). Populated solely from
+    /// `SourceAdmission::pp_layer_counts`; carriers must never reread the
+    /// environment. `None` = carrier-default balanced placement.
+    pub pp_layer_counts: Option<&'a [usize]>,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
     /// Gemma4 EAGLE drafter path (arch 22 `gemma4_unified_assistant`), separate

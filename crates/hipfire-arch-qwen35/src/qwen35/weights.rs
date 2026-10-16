@@ -790,7 +790,9 @@ pub(crate) fn build_expert_binding(
             // The ordinary manifest + expert planners: ownership, local slots,
             // and the collective schedule come from the sealed plan, never
             // from a hand-built expert map.
-            let manifest_plan = plan_manifest(&manifest, &[], mesh, n_layers)
+            let placement = hipfire_runtime::mesh_placement::BandPlacement::uniform(mesh, n_layers)
+                .map_err(|error| HipError::new(0, &error))?;
+            let manifest_plan = plan_manifest(&manifest, &[], mesh, n_layers, &placement)
                 .map_err(|error| HipError::new(0, &error))?;
             let mut plans = plan_expert_execution(
                 &manifest,

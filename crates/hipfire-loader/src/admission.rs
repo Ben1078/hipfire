@@ -14,9 +14,14 @@
 use crate::Carrier;
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
+use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{KvMode, VMode};
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
+use hipfire_runtime::mesh_placement::{
+    pp_rank_order, resolve_edge_transports, AdmittedMesh, AdmittedRank, BandPlacement,
+    EdgeTransportPolicy,
+};
 fn qwen4_vision_tensor_name(name: &str) -> bool {
     [
         "model.visual.",
@@ -976,6 +981,20 @@ pub struct SourceAdmission {
     /// alone cannot distinguish "off" (never probe a sibling) from "auto with
     /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
     pub vision_mode: String,
+    /// The one admitted mesh: topology, physical identity of every logical
+    /// rank (HIP ordinal + PCI id + arch), per-edge transports and
+    /// numerical-policy identity. Normalized here exactly once; no later
+    /// stage rereads the raw pp/tp/ep request.
+    pub mesh: AdmittedMesh,
+    /// Pipeline band placement (`Some` only for the pp>1 Qwen3.5 load). Built
+    /// from the single `BandPlacement` authority at admission.
+    pub pp_bands: Option<BandPlacement>,
+    /// Explicit per-stage layer counts, read from `HIPFIRE_PP_LAYERS` once at
+    /// admission and normalized through `BandPlacement::from_counts`. `None`
+    /// = the historical uniform split (`Gpus::init_uniform`, which keeps its
+    /// free-VRAM delta gate); `Some` = `Gpus::init_layers`. Carriers consume
+    /// this value and never reread the environment.
+    pub pp_layer_counts: Option<Vec<usize>>,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -1529,6 +1548,260 @@ fn tp_geometry_refusal(tp: usize, n_devices: Option<usize>) -> Option<String> {
     None
 }
 
+/// Numerical-policy identity of every route that has not declared its own.
+pub const LEGACY_NUMERICAL_POLICY: &str = "legacy";
+
+/// Normalize raw parallel degrees into the one rectangular [`DeviceMesh`].
+/// Size-one axes are dropped (`pp=tp=ep=1` is the empty single-device mesh).
+/// Zero degrees and cardinality overflow are refused here instead of being
+/// clamped to one by `DeviceMesh::rect`.
+pub fn normalize_mesh_shape(pp: usize, tp: usize, ep: usize) -> Result<DeviceMesh, String> {
+    if pp == 0 || tp == 0 || ep == 0 {
+        return Err(format!(
+            "mesh degree is zero (pp={pp}, tp={tp}, ep={ep}); every parallel degree must be >= 1"
+        ));
+    }
+    let axes: Vec<(DimKind, usize)> = [(DimKind::Pp, pp), (DimKind::Tp, tp), (DimKind::Ep, ep)]
+        .into_iter()
+        .filter(|&(_, size)| size > 1)
+        .collect();
+    DeviceMesh::rect(&axes).map_err(|e| format!("mesh shape pp={pp}, tp={tp}, ep={ep}: {e}"))
+}
+
+/// Physical identity of the visible devices in HIP logical order, from the
+/// KFD topology records the visibility resolver already produced. The HIP
+/// ordinal is the position (HIP always sees `0..N-1` inside the ROCr-filtered
+/// set); the PCI id is what survives remapping.
+pub fn visible_ranks(devices: &[hipfire_config::devices::GpuDevice]) -> Vec<AdmittedRank> {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(logical, device)| AdmittedRank {
+            logical,
+            device_ordinal: logical as i32,
+            pci_bus_id: Some(device.bdf.to_string()),
+            arch: device.arch.clone(),
+        })
+        .collect()
+}
+
+/// The visible devices admission binds ranks to. Uses the KFD identity when
+/// it covers `needed` ranks (read-only sysfs; no HIP init, no context, no
+/// allocation). Otherwise (no readable topology, e.g. CPU-only unit tests,
+/// WSL2/ROCDXG) ranks carry no PCI identity and the daemon's device arch:
+/// per-device architectures are verified against real devices at load.
+fn visible_device_ranks(gpu_arch: &str, needed: usize) -> Vec<AdmittedRank> {
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        if devices.len() >= needed {
+            return visible_ranks(&devices);
+        }
+    }
+    let count = visible_device_count().unwrap_or(needed).max(1);
+    (0..count)
+        .map(|logical| AdmittedRank {
+            logical,
+            device_ordinal: logical as i32,
+            pci_bus_id: None,
+            arch: gpu_arch.to_string(),
+        })
+        .collect()
+}
+
+/// How logical ranks bind to the visible devices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RankBinding {
+    /// Logical rank `r` runs on visible device `r`: every route that existed
+    /// before the admitted mesh (Qwen3.5 PP/EP/TP, Qwen4 EP, Single).
+    Visible,
+    /// `HIPFIRE_EMULATE_GPUS`: rank `r` aliases onto visible device
+    /// `r % visible` (the `multi_gpu::alias_ids` rule); ranks may share a card.
+    Emulated,
+    /// The admitted generic PP route: the first visible device (the primary,
+    /// output-owning card) is the LAST logical stage, so logical stages stay
+    /// in increasing layer order. Pure pipeline meshes only.
+    OutputCardLast,
+}
+
+/// Per-edge transport admission for routes that provision edges.
+pub struct EdgeAdmission<'a> {
+    pub policy: EdgeTransportPolicy,
+    /// Whether a peer read from logical rank `src` to logical rank `dst` was
+    /// byte-qualified. Pure: admission never probes peer access.
+    pub qualified_peer: &'a dyn Fn(usize, usize) -> bool,
+}
+
+/// Directed PP edges `(src, dst)` as logical rank (flat mesh device) ids: every
+/// device sends to the device with the same TP/EP coordinates one PP stage on.
+fn pp_edges(mesh: &DeviceMesh) -> Result<Vec<(usize, usize)>, String> {
+    let Some(axis) = mesh.axes().iter().position(|a| a.kind == DimKind::Pp) else {
+        return Ok(Vec::new());
+    };
+    let stages = mesh.axes()[axis].size;
+    let mut edges = Vec::new();
+    for dev in 0..mesh.n_devices() {
+        let mut coord = mesh.coord_of(dev).map_err(|e| e.to_string())?;
+        if coord[axis] + 1 < stages {
+            coord[axis] += 1;
+            edges.push((dev, mesh.device_of(&coord).map_err(|e| e.to_string())?));
+        }
+    }
+    Ok(edges)
+}
+
+/// Refuse an enumeration with a negative or repeated ordinal or a repeated PCI id.
+fn validate_distinct_visible(visible: &[AdmittedRank]) -> Result<(), String> {
+    let mut ordinals = std::collections::HashSet::new();
+    let mut pci_ids = std::collections::HashSet::new();
+    for rank in visible {
+        if rank.device_ordinal < 0 || !ordinals.insert(rank.device_ordinal) {
+            return Err("visible devices contain an invalid or duplicate ordinal".to_string());
+        }
+        if let Some(pci) = &rank.pci_bus_id {
+            if !pci_ids.insert(pci.as_str()) {
+                return Err("visible devices contain a duplicate PCI identity".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bind a normalized mesh shape to physical devices: the single admission
+/// value. Pure: no HIP, no peer probing, no allocation of device resources.
+/// `edges: None` keeps the route's existing transports (every pre-admitted-mesh
+/// route); `Some` records one transport decision per directed PP edge.
+pub fn admit_mesh(
+    shape: DeviceMesh,
+    family: &str,
+    numerical_policy: &str,
+    visible: &[AdmittedRank],
+    binding: RankBinding,
+    edges: Option<EdgeAdmission<'_>>,
+) -> Result<AdmittedMesh, String> {
+    let needed = shape.n_devices();
+    validate_distinct_visible(visible)?;
+    let too_few = || {
+        format!(
+            "mesh needs {needed} visible devices, {} visible",
+            visible.len()
+        )
+    };
+    let ranks: Vec<AdmittedRank> = match binding {
+        RankBinding::Visible => {
+            if visible.len() < needed {
+                return Err(too_few());
+            }
+            visible[..needed]
+                .iter()
+                .enumerate()
+                .map(|(logical, rank)| AdmittedRank {
+                    logical,
+                    ..rank.clone()
+                })
+                .collect()
+        }
+        RankBinding::Emulated => {
+            if visible.is_empty() {
+                return Err(too_few());
+            }
+            (0..needed)
+                .map(|logical| AdmittedRank {
+                    logical,
+                    ..visible[logical % visible.len()].clone()
+                })
+                .collect()
+        }
+        RankBinding::OutputCardLast => {
+            if shape.size_of(DimKind::Tp) != 1 || shape.size_of(DimKind::Ep) != 1 {
+                return Err(
+                    "output-card-last rank order is defined for pure pipeline meshes only"
+                        .to_string(),
+                );
+            }
+            if visible.len() < needed {
+                return Err(too_few());
+            }
+            pp_rank_order(&visible[..needed])?
+        }
+    };
+    let edges = match edges {
+        None => Vec::new(),
+        Some(edge) => {
+            resolve_edge_transports(edge.policy, edge.qualified_peer, &pp_edges(&shape)?)?
+        }
+    };
+    Ok(AdmittedMesh {
+        mesh: shape,
+        ranks,
+        edges,
+        family: family.to_string(),
+        numerical_policy: numerical_policy.to_string(),
+    })
+}
+
+/// Generic per-stage layer counts (`HIPFIRE_PP_LAYERS`), read once at
+/// admission. Empty is unset.
+fn pp_layers_request() -> Option<String> {
+    hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Normalized pipeline bands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PpBands {
+    pub placement: BandPlacement,
+    /// Counts the operator declared; `None` for the uniform default.
+    pub explicit_counts: Option<Vec<usize>>,
+}
+
+/// Normalize the pipeline split once. `requested` is the raw
+/// `HIPFIRE_PP_LAYERS` text (`None` = unset/empty). Counts are in logical
+/// stage order and must sum to the trunk layer count. Every legacy load-time
+/// verdict keeps its exact text; they now fire before any teardown.
+pub fn normalize_pp_bands(
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    requested: Option<&str>,
+) -> Result<PpBands, String> {
+    let pp = mesh.size_of(DimKind::Pp);
+    let Some(spec) = requested else {
+        if n_layers < pp {
+            return Err(format!(
+                "HipError(0): init_uniform: n_layers ({n_layers}) < n_devices ({pp}) — each device must own at least one layer (hipError=0)"
+            ));
+        }
+        return Ok(PpBands {
+            placement: BandPlacement::uniform(mesh, n_layers)?,
+            explicit_counts: None,
+        });
+    };
+    let counts: Result<Vec<usize>, _> =
+        spec.split(',').map(|s| s.trim().parse::<usize>()).collect();
+    let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+    if counts.len() != pp {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+            counts.len(),
+            pp
+        ));
+    }
+    let sum = counts.iter().fold(0usize, |acc, &c| acc.saturating_add(c));
+    if sum != n_layers {
+        return Err(format!(
+            "HIPFIRE_PP_LAYERS sum={sum} != n_layers={n_layers}"
+        ));
+    }
+    if counts.contains(&0) {
+        return Err(
+            "HipError(0): init_layers: each device must own ≥1 layer (hipError=0)".to_string(),
+        );
+    }
+    Ok(PpBands {
+        placement: BandPlacement::from_counts(mesh, n_layers, &counts)?,
+        explicit_counts: Some(counts),
+    })
+}
+
 /// Read-only source admission: open the source, classify `arch_id` + vision,
 /// decide the effective topology, and refuse every unsupported/contradictory
 /// combination — without touching GPU state, VMM, or any prior model.
@@ -1652,6 +1925,7 @@ pub fn admit_source_with_options(
     };
     let mut qwen35_ep_experts = None;
     let mut qwen4_sequence = None;
+    let mesh_shape: DeviceMesh;
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
@@ -1688,14 +1962,24 @@ pub fn admit_source_with_options(
         // loaded model in place; nothing is derived on this path.  The
         // attached sidecar travels with `source` to the carrier.
         resolve_qwen4_ple_rows(&mut source, path, gpu_arch)?;
+        // The one mesh normalization: Qwen4's EffectiveMesh is derived from it.
+        // A malformed request (zero degree / overflow) keeps its raw degrees so
+        // Qwen4's own refusal text is unchanged.
+        let shape = normalize_mesh_shape(pp, tp, ep);
+        let effective_mesh = match &shape {
+            Ok(mesh) => hipfire_arch_qwen4::EffectiveMesh::from_device_mesh(mesh),
+            Err(_) => hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep),
+        };
         let admitted = admit_qwen4_source(
             &source,
-            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep),
+            effective_mesh,
             InputModality::Text,
             native_mtp,
             spec_mtp,
             gpu_arch,
         )?;
+        // Only an admitted (hence well-formed) mesh reaches here.
+        mesh_shape = shape?;
         // Native positions, or the YaRN-extended `factor x original` context.
         let positions = admitted.config.context_limit();
         if max_seq > positions {
@@ -1763,6 +2047,12 @@ pub fn admit_source_with_options(
                 return Err(refusal);
             }
         }
+        let moe = matches!(arch_id, 9 | 10) || qwen35_num_experts.is_some_and(|n| n > 0);
+        mesh_shape = if moe {
+            normalize_mesh_shape(1, 1, tp)?
+        } else {
+            normalize_mesh_shape(1, tp, 1)?
+        };
         (EffectiveTopology::Expert(tp), None)
     } else {
         // Single / pipeline-parallel via the carrier registry.
@@ -1784,6 +2074,7 @@ pub fn admit_source_with_options(
         } else {
             EffectiveTopology::Single
         };
+        mesh_shape = normalize_mesh_shape(pp, 1, 1)?;
         (topology, Some(carrier))
     };
     // Partial GPU offload: fail closed where the arch is dispatched, before any
@@ -1957,6 +2248,7 @@ pub fn admit_source_with_options(
             "--kv-k/--kv-v are Qwen-only (arch_id={arch_id}); use --kv-mode for this model"
         ));
     }
+    let mut qwen_n_layers: Option<usize> = None;
     if matches!(arch_id, 1 | 5 | 6) {
         use hipfire_runtime::kv_mode::{self, KvMode};
         let policy = if arch_id == 1 {
@@ -1985,6 +2277,7 @@ pub fn admit_source_with_options(
         } else {
             None
         };
+        qwen_n_layers = qwen_cfg.as_ref().map(|cfg| cfg.n_layers);
         let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
         let native_eligible = qwen_cfg.as_ref().is_some_and(|cfg| {
             kv_mode::qwen35_native_eligible(
@@ -2104,6 +2397,36 @@ pub fn admit_source_with_options(
         }
     }
 
+    // One admitted mesh. Visible-device identity (HIP ordinal + PCI id + arch)
+    // is bound here once; placement and carriers consume it and never reread
+    // the raw pp/tp/ep request. Existing routes keep their rank order and
+    // transports (`RankBinding::Visible`/`Emulated`, no edge decisions).
+    let shape = mesh_shape;
+    let binding = if hipfire_runtime::config::get().emulate_gpus.is_some() {
+        RankBinding::Emulated
+    } else {
+        RankBinding::Visible
+    };
+    let visible = visible_device_ranks(gpu_arch, shape.n_devices());
+    let family = carrier.map_or_else(|| format!("arch{arch_id}"), |c| c.name().to_string());
+    let mesh = admit_mesh(
+        shape,
+        &family,
+        LEGACY_NUMERICAL_POLICY,
+        &visible,
+        binding,
+        None,
+    )?;
+    // Qwen3.5 pipeline bands: `HIPFIRE_PP_LAYERS` is read here, once, after
+    // every other admission verdict, and normalized through `BandPlacement`.
+    let (pp_bands, pp_layer_counts) = if matches!(topology, EffectiveTopology::Pipeline(_)) {
+        let n_layers = qwen_n_layers
+            .ok_or_else(|| "qwen35 pipeline admission: layer count unavailable".to_string())?;
+        let bands = normalize_pp_bands(&mesh.mesh, n_layers, pp_layers_request().as_deref())?;
+        (Some(bands.placement), bands.explicit_counts)
+    } else {
+        (None, None)
+    };
     Ok(SourceAdmission {
         source,
         arch_id,
@@ -2121,12 +2444,269 @@ pub fn admit_source_with_options(
         carrier,
         vision_path,
         vision_mode: vision_mode.to_string(),
+        mesh,
+        pp_bands,
+        pp_layer_counts,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod mesh_normalization {
+        use super::*;
+        use hipfire_runtime::mesh_placement::EdgeTransport;
+
+        fn rank(ordinal: i32, pci: Option<&str>) -> AdmittedRank {
+            AdmittedRank {
+                logical: ordinal as usize,
+                device_ordinal: ordinal,
+                pci_bus_id: pci.map(str::to_string),
+                arch: "gfx1100".to_string(),
+            }
+        }
+
+        fn six() -> Vec<AdmittedRank> {
+            (0..6)
+                .map(|i| rank(i, Some(&format!("0000:{:02x}:00.0", i + 3))))
+                .collect()
+        }
+
+        fn admit(
+            pp: usize,
+            tp: usize,
+            ep: usize,
+            visible: &[AdmittedRank],
+            binding: RankBinding,
+        ) -> Result<AdmittedMesh, String> {
+            admit_mesh(
+                normalize_mesh_shape(pp, tp, ep)?,
+                "test",
+                LEGACY_NUMERICAL_POLICY,
+                visible,
+                binding,
+                None,
+            )
+        }
+
+        #[test]
+        fn single_is_the_identity_mesh() {
+            let mesh = admit(1, 1, 1, &six(), RankBinding::Visible).unwrap();
+            assert!(mesh.mesh.axes().is_empty());
+            assert_eq!(mesh.mesh.n_devices(), 1);
+            assert_eq!(mesh.ranks, vec![rank(0, Some("0000:03:00.0"))]);
+            assert!(mesh.edges.is_empty());
+            assert_eq!(mesh.numerical_policy, LEGACY_NUMERICAL_POLICY);
+        }
+
+        #[test]
+        fn zero_degree_and_overflow_are_refused_not_clamped() {
+            for (pp, tp, ep) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+                let err = normalize_mesh_shape(pp, tp, ep).unwrap_err();
+                assert!(err.contains("mesh degree is zero"), "{err}");
+            }
+            assert!(normalize_mesh_shape(usize::MAX, 2, 1).is_err());
+        }
+
+        #[test]
+        fn rectangular_shapes_drop_size_one_axes() {
+            let mesh = normalize_mesh_shape(2, 3, 1).unwrap();
+            assert_eq!(mesh.n_devices(), 6);
+            assert_eq!(mesh.size_of(DimKind::Pp), 2);
+            assert_eq!(mesh.size_of(DimKind::Tp), 3);
+            assert_eq!(mesh.axes().len(), 2);
+            let ep = normalize_mesh_shape(1, 1, 4).unwrap();
+            assert_eq!(ep.size_of(DimKind::Ep), 4);
+            assert_eq!(ep.axes().len(), 1);
+        }
+
+        #[test]
+        fn visible_binding_keeps_rank_order_and_identity() {
+            let mesh = admit(2, 1, 1, &six(), RankBinding::Visible).unwrap();
+            let ordinals: Vec<_> = mesh.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [0, 1]);
+            assert_eq!(mesh.ranks[1].pci_bus_id.as_deref(), Some("0000:04:00.0"));
+            assert_eq!(mesh.ranks[1].logical, 1);
+        }
+
+        #[test]
+        fn pp6_output_card_last_rotates_complete_identity_records() {
+            let mesh = admit(6, 1, 1, &six(), RankBinding::OutputCardLast).unwrap();
+            let ordinals: Vec<_> = mesh.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [1, 2, 3, 4, 5, 0]);
+            let logical: Vec<_> = mesh.ranks.iter().map(|r| r.logical).collect();
+            assert_eq!(logical, [0, 1, 2, 3, 4, 5]);
+            assert_eq!(mesh.ranks[5].pci_bus_id.as_deref(), Some("0000:03:00.0"));
+            assert_eq!(mesh.ranks[0].pci_bus_id.as_deref(), Some("0000:04:00.0"));
+            // Only the first `needed` visible devices participate.
+            let pp2 = admit(2, 1, 1, &six(), RankBinding::OutputCardLast).unwrap();
+            let ordinals: Vec<_> = pp2.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [1, 0]);
+        }
+
+        #[test]
+        fn output_card_last_is_pure_pipeline_only() {
+            let err = admit(2, 2, 1, &six(), RankBinding::OutputCardLast).unwrap_err();
+            assert!(err.contains("pure pipeline"), "{err}");
+        }
+
+        #[test]
+        fn too_few_duplicate_or_negative_devices_refuse() {
+            let two = six()[..2].to_vec();
+            assert!(admit(3, 1, 1, &two, RankBinding::Visible)
+                .unwrap_err()
+                .contains("needs 3 visible devices, 2 visible"));
+            let dup_ordinal = vec![rank(0, None), rank(0, None)];
+            assert!(admit(2, 1, 1, &dup_ordinal, RankBinding::Visible)
+                .unwrap_err()
+                .contains("duplicate ordinal"));
+            let dup_pci = vec![rank(0, Some("0000:03:00.0")), rank(1, Some("0000:03:00.0"))];
+            assert!(admit(2, 1, 1, &dup_pci, RankBinding::Visible)
+                .unwrap_err()
+                .contains("duplicate PCI"));
+            let negative = vec![rank(-1, None), rank(1, None)];
+            assert!(admit(2, 1, 1, &negative, RankBinding::Visible).is_err());
+            assert!(admit(1, 1, 1, &[], RankBinding::Visible).is_err());
+        }
+
+        #[test]
+        fn emulation_aliases_ranks_onto_the_visible_devices() {
+            let two = six()[..2].to_vec();
+            let mesh = admit(1, 1, 4, &two, RankBinding::Emulated).unwrap();
+            let ordinals: Vec<_> = mesh.ranks.iter().map(|r| r.device_ordinal).collect();
+            assert_eq!(ordinals, [0, 1, 0, 1]);
+            let logical: Vec<_> = mesh.ranks.iter().map(|r| r.logical).collect();
+            assert_eq!(logical, [0, 1, 2, 3]);
+            assert!(admit(1, 1, 2, &[], RankBinding::Emulated).is_err());
+        }
+
+        #[test]
+        fn edges_follow_pp_adjacency_and_the_policy() {
+            let shape = || normalize_mesh_shape(3, 1, 1).unwrap();
+            let all_peer = |_: usize, _: usize| true;
+            let only_first = |src: usize, dst: usize| (src, dst) == (0, 1);
+            let go = |policy, qualified: &dyn Fn(usize, usize) -> bool| {
+                admit_mesh(
+                    shape(),
+                    "test",
+                    "p",
+                    &six(),
+                    RankBinding::Visible,
+                    Some(EdgeAdmission {
+                        policy,
+                        qualified_peer: qualified,
+                    }),
+                )
+            };
+            let host = go(EdgeTransportPolicy::Host, &all_peer).unwrap();
+            assert_eq!(
+                host.edges
+                    .iter()
+                    .map(|e| (e.src, e.dst))
+                    .collect::<Vec<_>>(),
+                [(0, 1), (1, 2)]
+            );
+            assert!(host
+                .edges
+                .iter()
+                .all(|e| e.transport == EdgeTransport::HostMapped));
+            let auto = go(EdgeTransportPolicy::Auto, &only_first).unwrap();
+            assert_eq!(auto.edges[0].transport, EdgeTransport::Peer);
+            assert_eq!(auto.edges[1].transport, EdgeTransport::HostMapped);
+            assert!(go(EdgeTransportPolicy::Peer, &only_first).is_err());
+            assert!(go(EdgeTransportPolicy::Peer, &all_peer).is_ok());
+        }
+
+        #[test]
+        fn composed_pp_tp_edges_keep_tp_coordinates() {
+            // [pp, tp] row-major: device = pp * 2 + tp.
+            let mesh = normalize_mesh_shape(2, 2, 1).unwrap();
+            assert_eq!(pp_edges(&mesh).unwrap(), [(0, 2), (1, 3)]);
+            assert!(pp_edges(&normalize_mesh_shape(1, 1, 4).unwrap())
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn visible_ranks_carry_physical_pci_identity() {
+            use hipfire_config::devices::{GpuDevice, PciBdf};
+            let devices = [GpuDevice {
+                index: 4,
+                rocr_index: 2,
+                node: 7,
+                arch: "gfx1201".to_string(),
+                unique_id: None,
+                bdf: PciBdf {
+                    domain: 0,
+                    bus: 0x44,
+                    device: 0,
+                    function: 0,
+                },
+            }];
+            let ranks = visible_ranks(&devices);
+            assert_eq!(ranks.len(), 1);
+            assert_eq!(ranks[0].device_ordinal, 0);
+            assert_eq!(ranks[0].pci_bus_id.as_deref(), Some("0000:44:00.0"));
+            assert_eq!(ranks[0].arch, "gfx1201");
+        }
+
+        fn pp_mesh(pp: usize) -> DeviceMesh {
+            normalize_mesh_shape(pp, 1, 1).unwrap()
+        }
+
+        fn counts(bands: &PpBands) -> Vec<usize> {
+            (0..bands.placement.stages())
+                .map(|s| bands.placement.band(s).len())
+                .collect()
+        }
+
+        #[test]
+        fn unset_pp_layers_is_the_historical_uniform_split() {
+            let bands = normalize_pp_bands(&pp_mesh(3), 10, None).unwrap();
+            assert_eq!(bands.explicit_counts, None);
+            assert_eq!(counts(&bands), [4, 3, 3]);
+            assert_eq!(
+                normalize_pp_bands(&pp_mesh(3), 2, None).unwrap_err(),
+                "HipError(0): init_uniform: n_layers (2) < n_devices (3) — each device must own at least one layer (hipError=0)"
+            );
+        }
+
+        #[test]
+        fn explicit_pp_layers_normalize_through_the_band_placement() {
+            let mesh = pp_mesh(6);
+            let bands = normalize_pp_bands(&mesh, 48, Some("9,8,8,8,8,7")).unwrap();
+            assert_eq!(bands.explicit_counts, Some(vec![9, 8, 8, 8, 8, 7]));
+            assert_eq!(bands.placement.band(0), 0..9);
+            assert_eq!(bands.placement.band(5), 41..48);
+            assert_eq!(bands.placement.stage_of_layer(9), 1);
+            bands.placement.validate_for(&mesh, 48).unwrap();
+            // Stale placement: another mesh (new epoch) is refused.
+            assert!(bands.placement.validate_for(&pp_mesh(6), 48).is_err());
+            let spaced = normalize_pp_bands(&pp_mesh(2), 32, Some("16, 16")).unwrap();
+            assert_eq!(counts(&spaced), [16, 16]);
+            // The first-band PLE minimum is enforced on the placement value.
+            assert!(bands.placement.clone().with_first_band_min(9).is_ok());
+            assert!(bands.placement.with_first_band_min(10).is_err());
+        }
+
+        #[test]
+        fn pp_layers_refusals_keep_their_exact_text() {
+            let mesh = pp_mesh(2);
+            let err = |spec| normalize_pp_bands(&mesh, 32, Some(spec)).unwrap_err();
+            assert!(err("a,b").starts_with("HIPFIRE_PP_LAYERS parse: "));
+            assert_eq!(err("32"), "HIPFIRE_PP_LAYERS has 1 entries, expected pp=2");
+            assert_eq!(err("16,15"), "HIPFIRE_PP_LAYERS sum=31 != n_layers=32");
+            assert_eq!(
+                err("0,32"),
+                "HipError(0): init_layers: each device must own ≥1 layer (hipError=0)"
+            );
+            assert_eq!(
+                err("18446744073709551615,2"),
+                "HIPFIRE_PP_LAYERS sum=18446744073709551615 != n_layers=32"
+            );
+        }
+    }
 
     /// The load path never derives a missing q4 sidecar: a `q4` request with
     /// the q4 rows absent from the selected path and its canonical target is

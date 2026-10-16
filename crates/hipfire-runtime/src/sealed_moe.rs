@@ -1753,8 +1753,11 @@ pub fn plan_single_expert_execution(
         ));
     }
     let mesh = DeviceMesh::single().map_err(|error| format!("single expert mesh: {error}"))?;
-    let manifest_plan = crate::weight_manifest::plan_manifest(manifest, &[], &mesh, n_layers)
+    let placement = crate::mesh_placement::BandPlacement::uniform(&mesh, n_layers)
         .map_err(|error| format!("single expert manifest planning: {error}"))?;
+    let manifest_plan =
+        crate::weight_manifest::plan_manifest(manifest, &[], &mesh, n_layers, &placement)
+            .map_err(|error| format!("single expert manifest planning: {error}"))?;
     let mut plans = plan_expert_execution(
         manifest,
         &manifest_plan,
@@ -2021,8 +2024,11 @@ pub fn repartition_expert_execution_plan(
         }
     };
     let n_layers = layer.map(|layer| layer + 1).unwrap_or(1);
-    let manifest_plan = crate::weight_manifest::plan_manifest(&manifest, &[], mesh, n_layers)
+    let placement = crate::mesh_placement::BandPlacement::uniform(mesh, n_layers)
         .map_err(|error| format!("repartition manifest planning: {error}"))?;
+    let manifest_plan =
+        crate::weight_manifest::plan_manifest(&manifest, &[], mesh, n_layers, &placement)
+            .map_err(|error| format!("repartition manifest planning: {error}"))?;
     let spec = ExpertGroupSpec {
         group: base.group.clone(),
         layer,
@@ -2321,6 +2327,12 @@ mod tests {
     use crate::device_mesh::DimKind;
     use crate::weight_manifest::{ExpertProjectionResources, PlacementHint, ShardPolicy};
 
+    /// Plan a one-layer manifest under the uniform placement of `mesh`.
+    fn plan_one_layer(manifest: &[WeightEntry], mesh: &DeviceMesh) -> ManifestPlan {
+        let placement = crate::mesh_placement::BandPlacement::uniform(mesh, 1).unwrap();
+        crate::weight_manifest::plan_manifest(manifest, &[], mesh, 1, &placement).unwrap()
+    }
+
     fn ep_fixture() -> (
         Vec<WeightEntry>,
         ManifestPlan,
@@ -2339,7 +2351,7 @@ mod tests {
             WeightEntry::layer("up", 0, vec![4, 2, 2], DType::F32, expert_policy.clone()),
             WeightEntry::layer("down", 0, vec![4, 2, 2], DType::F32, expert_policy),
         ];
-        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let plan = plan_one_layer(&manifest, &mesh);
         let resources = ExpertResourceRequirements {
             experts: vec![
                 ExpertProjectionResources {
@@ -2510,7 +2522,7 @@ mod tests {
         sources.extend(second_sources);
         specs = vec![first, second];
 
-        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let plan = plan_one_layer(&manifest, &mesh);
         let planned =
             plan_expert_execution(&manifest, &plan, &specs, &sources, &mesh, &physical).unwrap();
         assert_eq!(planned.len(), 2);
@@ -2666,7 +2678,7 @@ mod tests {
                 "natural",
             )
         };
-        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let plan = plan_one_layer(&manifest, &mesh);
         (
             manifest,
             plan,
@@ -3003,7 +3015,7 @@ mod tests {
                 "natural",
             )
         };
-        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let plan = plan_one_layer(&manifest, &mesh);
         (
             manifest,
             plan,
@@ -3154,8 +3166,7 @@ mod tests {
     fn one_axis_moe_plan_rejects_non_degenerate_cross_axis_mesh() {
         let (manifest, _, specs, sources, _) = ep_fixture();
         let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2), (DimKind::Tp, 2)]).unwrap();
-        let manifest_plan =
-            crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let manifest_plan = plan_one_layer(&manifest, &mesh);
         let error = plan_expert_execution(
             &manifest,
             &manifest_plan,
@@ -3169,8 +3180,7 @@ mod tests {
 
         let (manifest, _, specs, sources, _) = tp_fixture();
         let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2), (DimKind::Tp, 2)]).unwrap();
-        let manifest_plan =
-            crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let manifest_plan = plan_one_layer(&manifest, &mesh);
         let error = plan_expert_execution(
             &manifest,
             &manifest_plan,
@@ -3349,8 +3359,7 @@ mod tests {
                 "natural",
             ),
         ];
-        let manifest_plan =
-            crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let manifest_plan = plan_one_layer(&manifest, &mesh);
         let plans =
             plan_expert_execution(&manifest, &manifest_plan, &[spec], &sources, &mesh, &[9])
                 .unwrap();
@@ -3415,7 +3424,7 @@ mod tests {
             ),
             WeightEntry::layer("down", 0, vec![n_experts, 2, 2], DType::F32, expert_policy),
         ];
-        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let plan = plan_one_layer(&manifest, &mesh);
         let resources = ExpertResourceRequirements {
             experts: vec![
                 ExpertProjectionResources {
@@ -3520,7 +3529,7 @@ mod tests {
                 ShardPolicy::Replicate,
             ),
         ];
-        let plan = crate::weight_manifest::plan_manifest(&manifest, &[], &mesh, 1).unwrap();
+        let plan = plan_one_layer(&manifest, &mesh);
         let resources = ExpertResourceRequirements {
             experts: vec![
                 ExpertProjectionResources {

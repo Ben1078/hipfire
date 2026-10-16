@@ -17,6 +17,7 @@
 //! family-local reductions.
 
 use crate::device_mesh::{CollectiveHint, DeviceMesh, DimKind};
+use crate::mesh_placement::BandPlacement;
 use crate::tp_shard::ExpertAssign;
 use rdna_compute::DType;
 use std::collections::HashSet;
@@ -37,7 +38,7 @@ pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
 }
 
 /// Non-layer placement targets resolved from mesh stage coordinates.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PinTarget {
     /// Token embedding, pinned to pipeline stage zero.
     Embed,
@@ -325,15 +326,47 @@ pub enum StateKind {
     Conv,
 }
 
+/// Ownership scope of one state declaration: an absolute trunk layer, or an
+/// auxiliary resource pinned to the input/output stage (for example MTP head
+/// state, which is not trunk layer N).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StateScope {
+    /// State owned by the band containing this absolute trunk layer.
+    Layer(usize),
+    /// State owned by the stage a [`PinTarget`] resolves to: `Embed` is stage
+    /// zero and `Output` is the last stage.
+    Pin(PinTarget),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StateEntry {
     pub kind: StateKind,
-    pub layer: usize,
+    pub scope: StateScope,
 }
 
 impl StateEntry {
+    /// Per-layer state owned by the band containing `layer`.
     pub fn new(kind: StateKind, layer: usize) -> Self {
-        Self { kind, layer }
+        Self {
+            kind,
+            scope: StateScope::Layer(layer),
+        }
+    }
+
+    /// Auxiliary state pinned to the stage `target` resolves to.
+    pub fn pinned(kind: StateKind, target: PinTarget) -> Self {
+        Self {
+            kind,
+            scope: StateScope::Pin(target),
+        }
+    }
+
+    /// Absolute trunk layer for a layer-scoped entry.
+    pub fn layer(&self) -> Option<usize> {
+        match self.scope {
+            StateScope::Layer(layer) => Some(layer),
+            StateScope::Pin(_) => None,
+        }
     }
 }
 
@@ -377,17 +410,16 @@ pub struct ManifestPlan {
     pub mesh_epoch: crate::device_mesh::MeshEpoch,
 }
 
-fn base_coord_for(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
-    let stage = match (entry.placement, &entry.policy, entry.layer) {
-        (PlacementHint::Pin(PinTarget::Embed), _, _)
-        | (PlacementHint::Policy, ShardPolicy::Pin(PinTarget::Embed), _) => 0,
-        (PlacementHint::Pin(PinTarget::Output), _, _)
-        | (PlacementHint::Policy, ShardPolicy::Pin(PinTarget::Output), _) => {
-            mesh.size_of(DimKind::Pp).saturating_sub(1)
-        }
-        (PlacementHint::Policy, _, Some(layer)) => mesh.stage_for_layer(layer, n_layers),
-        (PlacementHint::Policy, _, None) => 0,
-    };
+/// Stage a pin target resolves to under `placement`.
+fn pin_stage(target: PinTarget, placement: &BandPlacement) -> usize {
+    match target {
+        PinTarget::Embed => 0,
+        PinTarget::Output => placement.stages().saturating_sub(1),
+    }
+}
+
+/// Mesh coordinate of `stage` (all non-PP axes at index zero).
+fn stage_coord(mesh: &DeviceMesh, stage: usize) -> Vec<usize> {
     let mut coord = mesh
         .coord_of(0)
         .expect("device-mesh coordinate 0 exists on an admitted mesh");
@@ -397,9 +429,23 @@ fn base_coord_for(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Ve
     coord
 }
 
+fn base_coord_for(entry: &WeightEntry, mesh: &DeviceMesh, placement: &BandPlacement) -> Vec<usize> {
+    let stage = match (entry.placement, &entry.policy, entry.layer) {
+        (PlacementHint::Pin(target), _, _) => pin_stage(target, placement),
+        (PlacementHint::Policy, ShardPolicy::Pin(target), _) => pin_stage(*target, placement),
+        (PlacementHint::Policy, _, Some(layer)) => placement.stage_of_layer(layer),
+        (PlacementHint::Policy, _, None) => 0,
+    };
+    stage_coord(mesh, stage)
+}
+
 /// Compute global placement without touching a source, GPU, or allocator.
-pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize) -> Vec<usize> {
-    let coord = base_coord_for(entry, mesh, n_layers);
+pub fn placement_devices(
+    entry: &WeightEntry,
+    mesh: &DeviceMesh,
+    placement: &BandPlacement,
+) -> Vec<usize> {
+    let coord = base_coord_for(entry, mesh, placement);
     match &entry.policy {
         ShardPolicy::Pin(_) | ShardPolicy::Tied { .. } => {
             vec![mesh
@@ -686,28 +732,41 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
     Ok(())
 }
 
-/// Compile declarations against a mesh.
+/// Compile declarations against a mesh and one band placement. Weights, state
+/// and band transfers all derive from `placement`; the placement's mesh epoch
+/// and trunk-layer count are validated against `mesh` and `n_layers` before
+/// any planning.
 pub fn plan_manifest(
     weights: &[WeightEntry],
     state: &[StateEntry],
     mesh: &DeviceMesh,
     n_layers: usize,
+    placement: &BandPlacement,
 ) -> Result<ManifestPlan, String> {
+    placement.validate_for(mesh, n_layers)?;
     validate_weight_layers(weights, n_layers)?;
     validate_manifest(weights, mesh)?;
     let mut state_ids = HashSet::new();
     for entry in state {
-        if entry.layer >= n_layers {
-            return Err(format!(
-                "state {:?} layer {} outside n_layers={n_layers}",
-                entry.kind, entry.layer
-            ));
+        if let StateScope::Layer(layer) = entry.scope {
+            if layer >= n_layers {
+                return Err(format!(
+                    "state {:?} layer {} outside n_layers={n_layers}",
+                    entry.kind, layer
+                ));
+            }
         }
-        if !state_ids.insert((&entry.kind, entry.layer)) {
-            return Err(format!(
-                "duplicate state declaration {:?}[layer {}]",
-                entry.kind, entry.layer
-            ));
+        if !state_ids.insert((&entry.kind, entry.scope)) {
+            return Err(match entry.scope {
+                StateScope::Layer(layer) => format!(
+                    "duplicate state declaration {:?}[layer {}]",
+                    entry.kind, layer
+                ),
+                StateScope::Pin(target) => format!(
+                    "duplicate state declaration {:?}[pin {:?}]",
+                    entry.kind, target
+                ),
+            });
         }
     }
     let schedule = collective_schedule(weights);
@@ -720,7 +779,7 @@ pub fn plan_manifest(
         .map(|entry| WeightPlacement {
             name: entry.name.clone(),
             layer: entry.layer,
-            devices: placement_devices(entry, mesh, n_layers),
+            devices: placement_devices(entry, mesh, placement),
             policy: entry.policy.clone(),
             logical_shape: entry.logical_shape.clone(),
         })
@@ -728,25 +787,23 @@ pub fn plan_manifest(
     let state_placements = state
         .iter()
         .map(|entry| {
-            let mut coord = mesh
-                .coord_of(0)
-                .expect("device-mesh coordinate 0 exists on an admitted mesh");
-            let stage = mesh.stage_for_layer(entry.layer, n_layers);
-            if let Some(index) = mesh.axes().iter().position(|axis| axis.kind == DimKind::Pp) {
-                coord[index] = stage;
-            }
-            (
-                entry.clone(),
-                mesh.stage_devices(&coord)
+            let devices = match entry.scope {
+                StateScope::Layer(layer) => mesh
+                    .stage_devices(&stage_coord(mesh, placement.stage_of_layer(layer)))
                     .expect("state stage devices resolve on an admitted mesh"),
-            )
+                // Pinned state follows PinTarget weight semantics: one
+                // endpoint owner (base TP/EP coordinates zero), not the
+                // whole stage.
+                StateScope::Pin(target) => vec![mesh
+                    .device_of(&stage_coord(mesh, pin_stage(target, placement)))
+                    .expect("pinned state device coordinate is in bounds")],
+            };
+            (entry.clone(), devices)
         })
         .collect();
-    let band_xfers = (0..n_layers)
-        .filter_map(|layer| {
-            mesh.band_xfer_after(layer, n_layers)
-                .map(|hint| (layer, hint))
-        })
+    let band_xfers = placement
+        .boundaries()
+        .map(|(layer, src, dst)| (layer, CollectiveHint::BandXfer { src, dst }))
         .collect();
     Ok(ManifestPlan {
         weights: weight_placements,
@@ -1174,13 +1231,15 @@ mod tests {
             ShardPolicy::Pin(PinTarget::Embed),
         );
         let row = layer_entry("wo", 2, ShardPolicy::RowShard { axis: 1 });
-        assert_eq!(placement_devices(&embed, &mesh, 4), vec![0]);
-        assert_eq!(placement_devices(&row, &mesh, 4), vec![2, 3]);
+        let placement = BandPlacement::uniform(&mesh, 4).unwrap();
+        assert_eq!(placement_devices(&embed, &mesh, &placement), vec![0]);
+        assert_eq!(placement_devices(&row, &mesh, &placement), vec![2, 3]);
         let plan = plan_manifest(
             &[layer_entry("wo", 0, ShardPolicy::RowShard { axis: 1 }), row],
             &[],
             &mesh,
             4,
+            &placement,
         )
         .unwrap();
         assert_eq!(plan.layer_collectives.len(), 2);
@@ -1188,6 +1247,135 @@ mod tests {
             plan.band_xfers,
             vec![(1, CollectiveHint::BandXfer { src: 0, dst: 1 })]
         );
+    }
+
+    #[test]
+    fn uniform_placement_matches_historical_uniform_banding() {
+        // 7 layers over 3 stages: the first stage takes the remainder.
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3)])
+            .expect("small test mesh construction cannot overflow");
+        let placement = BandPlacement::uniform(&mesh, 7).unwrap();
+        assert_eq!(
+            (0..7)
+                .map(|l| placement.stage_of_layer(l))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 1, 1, 2, 2]
+        );
+        let explicit = BandPlacement::from_counts(&mesh, 7, &[3, 2, 2]).unwrap();
+        assert_eq!(placement, explicit);
+        let weights: Vec<_> = (0..7)
+            .map(|l| layer_entry("w", l, ShardPolicy::Replicate))
+            .collect();
+        let plan = plan_manifest(&weights, &[], &mesh, 7, &placement).unwrap();
+        assert_eq!(
+            plan.weights
+                .iter()
+                .map(|w| w.devices.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![0],
+                vec![0],
+                vec![0],
+                vec![1],
+                vec![1],
+                vec![2],
+                vec![2]
+            ]
+        );
+        assert_eq!(
+            plan.band_xfers,
+            vec![
+                (2, CollectiveHint::BandXfer { src: 0, dst: 1 }),
+                (4, CollectiveHint::BandXfer { src: 1, dst: 2 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_counts_drive_weights_state_and_band_transfers() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3)])
+            .expect("small test mesh construction cannot overflow");
+        let placement = BandPlacement::from_counts(&mesh, 7, &[1, 4, 2]).unwrap();
+        let weights: Vec<_> = (0..7)
+            .map(|l| layer_entry("w", l, ShardPolicy::Replicate))
+            .collect();
+        let state: Vec<_> = (0..7)
+            .map(|l| StateEntry::new(StateKind::Recurrent, l))
+            .collect();
+        let plan = plan_manifest(&weights, &state, &mesh, 7, &placement).unwrap();
+        let expected_stage = [0usize, 1, 1, 1, 1, 2, 2];
+        for (layer, &stage) in expected_stage.iter().enumerate() {
+            assert_eq!(
+                plan.weights[layer].devices,
+                vec![stage],
+                "weight layer {layer}"
+            );
+            assert_eq!(plan.state[layer].1, vec![stage], "state layer {layer}");
+            assert_eq!(
+                placement_devices(&weights[layer], &mesh, &placement),
+                vec![stage]
+            );
+        }
+        assert_eq!(
+            plan.band_xfers,
+            vec![
+                (0, CollectiveHint::BandXfer { src: 0, dst: 1 }),
+                (4, CollectiveHint::BandXfer { src: 1, dst: 2 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_state_resolves_embed_to_first_and_output_to_last_stage() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3), (DimKind::Tp, 2)])
+            .expect("small test mesh construction cannot overflow");
+        let placement = BandPlacement::from_counts(&mesh, 6, &[1, 2, 3]).unwrap();
+        let state = vec![
+            StateEntry::pinned(StateKind::Recurrent, PinTarget::Embed),
+            StateEntry::pinned(StateKind::Recurrent, PinTarget::Output),
+            StateEntry::pinned(StateKind::Conv, PinTarget::Output),
+            StateEntry::new(StateKind::Recurrent, 1),
+        ];
+        assert_eq!(state[3].scope, StateScope::Layer(1));
+        assert_eq!(state[3].layer(), Some(1));
+        assert_eq!(state[0].layer(), None);
+        let plan = plan_manifest(&[], &state, &mesh, 6, &placement).unwrap();
+        // Pins are single endpoint owners (TP coordinate zero), unlike the
+        // stage-wide Layer scope below.
+        assert_eq!(plan.state[0].1, vec![0]);
+        assert_eq!(plan.state[1].1, vec![4]);
+        assert_eq!(plan.state[2].1, vec![4]);
+        assert_eq!(plan.state[3].1, vec![2, 3]);
+
+        let duplicate = vec![
+            StateEntry::pinned(StateKind::Conv, PinTarget::Output),
+            StateEntry::pinned(StateKind::Conv, PinTarget::Output),
+        ];
+        let error = plan_manifest(&[], &duplicate, &mesh, 6, &placement).unwrap_err();
+        assert!(error.contains("duplicate state declaration"), "{error}");
+        // A pinned and a layer-scoped declaration of one kind are distinct.
+        let mut scopes = HashSet::new();
+        assert!(scopes.insert(StateScope::Layer(0)));
+        assert!(scopes.insert(StateScope::Pin(PinTarget::Embed)));
+        assert!(!scopes.insert(StateScope::Layer(0)));
+    }
+
+    #[test]
+    fn planning_rejects_stale_epoch_and_mismatched_layer_count_before_planning() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)])
+            .expect("small test mesh construction cannot overflow");
+        let placement = BandPlacement::uniform(&mesh, 4).unwrap();
+        let newer = DeviceMesh::rect(&[(DimKind::Pp, 2)])
+            .expect("small test mesh construction cannot overflow");
+        assert_ne!(mesh.epoch(), newer.epoch());
+        let stale = plan_manifest(&[], &[], &newer, 4, &placement).unwrap_err();
+        assert!(stale.contains("mesh epoch"), "{stale}");
+        // Fails on the placement, not on an invalid declaration that follows.
+        let invalid = layer_entry("w", 99, ShardPolicy::Replicate);
+        let stale = plan_manifest(&[invalid], &[], &newer, 4, &placement).unwrap_err();
+        assert!(stale.contains("mesh epoch"), "{stale}");
+        let wrong_count = plan_manifest(&[], &[], &mesh, 5, &placement).unwrap_err();
+        assert!(wrong_count.contains("trunk layers"), "{wrong_count}");
     }
 
     #[test]
@@ -1343,10 +1531,11 @@ mod tests {
     #[test]
     fn planning_rejects_weight_layer_at_n_layers_and_accepts_last_layer() {
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let placement = BandPlacement::uniform(&mesh, 3).unwrap();
         let valid = layer_entry("w", 2, ShardPolicy::Replicate);
-        assert!(plan_manifest(&[valid], &[], &mesh, 3).is_ok());
+        assert!(plan_manifest(&[valid], &[], &mesh, 3, &placement).is_ok());
         let out_of_range = layer_entry("w", 3, ShardPolicy::Replicate);
-        let error = plan_manifest(&[out_of_range], &[], &mesh, 3).unwrap_err();
+        let error = plan_manifest(&[out_of_range], &[], &mesh, 3, &placement).unwrap_err();
         assert!(error.contains("outside n_layers=3"));
     }
 
@@ -1456,9 +1645,10 @@ mod tests {
             }
         );
         let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        let placement = BandPlacement::uniform(&mesh, 1).unwrap();
         assert_eq!(
-            placement_devices(&resident.clone().external_rows(6, 3), &mesh, 1),
-            placement_devices(&resident, &mesh, 1),
+            placement_devices(&resident.clone().external_rows(6, 3), &mesh, &placement),
+            placement_devices(&resident, &mesh, &placement),
             "residency must not change placement"
         );
     }

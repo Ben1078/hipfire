@@ -61,6 +61,7 @@ fn main() {
         state_quant_override: None,
         cask: &cask,
         pp: 1,
+        pp_layer_counts: None,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
         gemma4_drafter_path: None,

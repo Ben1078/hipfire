@@ -273,39 +273,6 @@ impl DeviceMesh {
         Ok(out)
     }
 
-    /// Return the pipeline stage containing `layer` under a uniform banding.
-    ///
-    /// The first `n_layers % pp_size` stages receive one extra layer. A mesh
-    /// without a PP axis has one stage. Valid layer indexes always map to a
-    /// non-empty stage; an out-of-range index is clamped to the final stage.
-    pub fn stage_for_layer(&self, layer: usize, n_layers: usize) -> usize {
-        let stages = self.size_of(DimKind::Pp);
-        if stages <= 1 || n_layers == 0 {
-            return 0;
-        }
-        let base = n_layers / stages;
-        let remainder = n_layers % stages;
-        let mut start = 0;
-        for stage in 0..stages {
-            let count = base + usize::from(stage < remainder);
-            if layer < start + count {
-                return stage;
-            }
-            start += count;
-        }
-        stages - 1
-    }
-
-    /// Return a point-to-point hint when the next layer crosses a PP band.
-    pub fn band_xfer_after(&self, layer: usize, n_layers: usize) -> Option<CollectiveHint> {
-        if n_layers == 0 || layer >= n_layers.saturating_sub(1) {
-            return None;
-        }
-        let src = self.stage_for_layer(layer, n_layers);
-        let dst = self.stage_for_layer(layer + 1, n_layers);
-        (src != dst).then_some(CollectiveHint::BandXfer { src, dst })
-    }
-
     /// Expand the PP stage in `coord` to its global device IDs.
     ///
     /// For a mesh without PP, all devices belong to the sole stage. For a
@@ -421,8 +388,9 @@ mod tests {
         assert_eq!(mesh.device_of(&[]).unwrap(), 0);
         assert_eq!(mesh.group_along(DimKind::Tp, &[]).unwrap(), vec![0]);
         assert_eq!(mesh.group_along(DimKind::Ep, &[]).unwrap(), vec![0]);
-        assert_eq!(mesh.stage_for_layer(0, 32), 0);
-        assert_eq!(mesh.band_xfer_after(0, 32), None);
+        let placement = crate::mesh_placement::BandPlacement::uniform(&mesh, 32).unwrap();
+        assert_eq!(placement.stage_of_layer(0), 0);
+        assert_eq!(placement.boundaries().next(), None);
         assert_eq!(mesh.stage_devices(&[]).unwrap(), vec![0]);
     }
 
@@ -441,21 +409,17 @@ mod tests {
     #[test]
     fn pp_bands_and_boundary_hints_are_uniform() {
         let mesh = DeviceMesh::rect(&[(DimKind::Pp, 3)]).unwrap();
+        let placement = crate::mesh_placement::BandPlacement::uniform(&mesh, 6).unwrap();
         assert_eq!(
             (0..6)
-                .map(|l| mesh.stage_for_layer(l, 6))
+                .map(|l| placement.stage_of_layer(l))
                 .collect::<Vec<_>>(),
             vec![0, 0, 1, 1, 2, 2]
         );
         assert_eq!(
-            mesh.band_xfer_after(1, 6),
-            Some(CollectiveHint::BandXfer { src: 0, dst: 1 })
+            placement.boundaries().collect::<Vec<_>>(),
+            vec![(1, 0, 1), (3, 1, 2)]
         );
-        assert_eq!(
-            mesh.band_xfer_after(3, 6),
-            Some(CollectiveHint::BandXfer { src: 1, dst: 2 })
-        );
-        assert_eq!(mesh.band_xfer_after(5, 6), None);
         assert_eq!(mesh.stage_devices(&[1]).unwrap(), vec![1]);
     }
 

@@ -132,6 +132,19 @@ impl EffectiveMesh {
         Self { pp, tp, ep }
     }
 
+    /// The degrees of an already-normalized `DeviceMesh`: the loader's single
+    /// mesh normalization is the only source of an admitted `EffectiveMesh`,
+    /// so a request's raw pp/tp/ep are never reinterpreted a second time.
+    /// An absent axis is degree 1.
+    pub fn from_device_mesh(mesh: &hipfire_runtime::device_mesh::DeviceMesh) -> Self {
+        use hipfire_runtime::device_mesh::DimKind;
+        Self::new(
+            mesh.size_of(DimKind::Pp),
+            mesh.size_of(DimKind::Tp),
+            mesh.size_of(DimKind::Ep),
+        )
+    }
+
     pub const fn is_single(self) -> bool {
         self.pp == 1 && self.tp == 1 && self.ep == 1
     }
@@ -950,6 +963,24 @@ mod tests {
         assert_eq!(geometry.conv_dtype, QuantFormat::BF16);
         assert_eq!(geometry.metadata_dtype, QuantFormat::I64);
         geometry.validate().expect("manifest recipe");
+    }
+
+    #[test]
+    fn effective_mesh_is_derived_from_the_normalized_device_mesh() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let single = DeviceMesh::single().expect("single mesh");
+        assert_eq!(
+            EffectiveMesh::from_device_mesh(&single),
+            EffectiveMesh::single()
+        );
+        let ep = DeviceMesh::rect(&[(DimKind::Ep, 6)]).expect("ep mesh");
+        let derived = EffectiveMesh::from_device_mesh(&ep);
+        assert_eq!(derived, EffectiveMesh::new(1, 1, 6));
+        assert!(derived.is_qwen4_admitted());
+        let pp = DeviceMesh::rect(&[(DimKind::Pp, 2), (DimKind::Ep, 2)]).expect("pp mesh");
+        let derived = EffectiveMesh::from_device_mesh(&pp);
+        assert_eq!(derived, EffectiveMesh::new(2, 1, 2));
+        assert!(!derived.is_qwen4_admitted());
     }
 
     #[test]

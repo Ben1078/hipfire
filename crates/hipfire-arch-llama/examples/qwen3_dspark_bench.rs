@@ -170,6 +170,7 @@ fn main() -> Result<(), String> {
         qwen_default_q8: true,
         cask: &cask,
         pp: 1,
+        pp_layer_counts: None,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
         gemma4_drafter_path: None,

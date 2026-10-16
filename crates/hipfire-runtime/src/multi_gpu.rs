@@ -4128,10 +4128,12 @@ mod tests {
                 let mesh = DeviceMesh::rect(&[(DimKind::Pp, n_devices)])
                     .expect("small pp mesh must construct");
                 let split = uniform_split_counts(n_devices, n_layers);
+                let placement = crate::mesh_placement::BandPlacement::uniform(&mesh, n_layers)
+                    .expect("uniform placement over a small pp mesh");
                 assert_eq!(split.len(), n_devices);
                 for layer in 0..n_layers {
                     assert_eq!(
-                        mesh.stage_for_layer(layer, n_layers),
+                        placement.stage_of_layer(layer),
                         stage_implied_by_split(&split, layer),
                         "layer {layer} of {n_layers} over {n_devices} devices"
                     );
