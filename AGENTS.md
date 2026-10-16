@@ -779,7 +779,9 @@ Caveats that are part of the fixture, not trivia:
   row per draft, stop at the first rejection) when no depth pays.
   A same-request AR floor guards the default route: the request's first
   window is one ordinary target-only token, timed (a sampled draw included)
-  as the AR price and followed by one head append; up to three speculative
+  as the AR price and followed by one head append (the drafter's first such
+  token pays the decode route's one-time kernel binds, so it prices nothing
+  and the next window calibrates again); up to three speculative
   probe windows then run under the table-ordered route. A batched depth is
   priced by the depth (cap) it was routed at: the cap's decayed mean window
   time over the agreement-predicted tokens of its windows' drafted-depth mix,
