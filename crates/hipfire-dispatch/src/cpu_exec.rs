@@ -57,7 +57,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use hipfire_cpu::epilogue::{residual_add, silu_mul};
 use hipfire_cpu::gemv::gemv;
-use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, CpuQuant};
+use hipfire_cpu::quant::{divide_by_awq_scale, rotate_x, rotate_x_128_v2, CpuQuant, InputRotation};
 
 use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{GemvInput, Step};
@@ -363,9 +363,9 @@ static MOE_SHAPES: LazyLock<Mutex<BTreeMap<(u8, usize, usize, usize, usize, bool
 /// the format.
 ///
 /// Invariant, pinned by `cpu_quant_rotation_agrees_with_plan`: for every dtype
-/// here, [`CpuQuant::is_fwht_g256`] agrees with [`dtype_rotation_plan`], so the
-/// seam and the launcher cannot disagree about whether a `Raw` activation
-/// arrives rotated.
+/// here, [`CpuQuant::input_rotation`] agrees with [`dtype_rotation_plan`]
+/// (FWHT-256 <-> `FwhtG256`, FWHT-128 <-> `FwhtG128`), so the seam and the
+/// launcher cannot disagree about whether a `Raw` activation arrives rotated.
 
 /// Every `DType` [`cpu_quant_for`] maps to `Some`: the declaration for
 /// consumers and tests (both `cpu_quant_for` pins iterate this). The match in
@@ -386,6 +386,7 @@ pub const CPU_EXECUTED_DTYPES: &[DType] = &[
     DType::MQ2G256Lloyd,
     DType::MQ2G256LloydU,
     DType::MQ4G256Lloyd,
+    DType::MQ4G128V2,
     DType::MFP4G32E8,
     DType::HFQ6G256,
     DType::HFQ4G256,
@@ -419,6 +420,7 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
         DType::MQ2G256Lloyd => Some(CpuQuant::Mq2G256Lloyd),
         DType::MQ2G256LloydU => Some(CpuQuant::Mq2G256LloydU),
         DType::MQ4G256Lloyd => Some(CpuQuant::Mq4G256Lloyd),
+        DType::MQ4G128V2 => Some(CpuQuant::Mq4G128V2),
         DType::MFP4G32E8 => Some(CpuQuant::Mfp4G32E8),
         DType::HFQ6G256 => Some(CpuQuant::Hfq6G256),
         DType::HFQ4G256 => Some(CpuQuant::Hfq4G256),
@@ -434,6 +436,19 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
         DType::F32 => Some(CpuQuant::F32),
         DType::BF16 => Some(CpuQuant::Bf16),
         _ => None,
+    }
+}
+
+/// Whether a `Raw` input of this dtype is rotated by the launcher — i.e. the
+/// CPU path must rotate it itself: `FwhtG256` (every FWHT-256 format) or, for
+/// the one CPU-executed FWHT-128 format (qt 53), `FwhtG128`.
+pub(crate) fn raw_input_is_rotated(dtype: DType) -> bool {
+    match dtype_rotation_plan(dtype) {
+        RotationPlan::FwhtG256 => true,
+        RotationPlan::FwhtG128 => {
+            cpu_quant_for(dtype).is_some_and(|q| q.input_rotation() == InputRotation::FwhtG128V2)
+        }
+        _ => false,
     }
 }
 
@@ -573,7 +588,10 @@ pub(crate) fn prepare_activation(
             let scale = download_f32(gpu, scale, w.k)?;
             divide_by_awq_scale(&mut host, &scale);
         }
-        rotate_x(&mut host);
+        match cpu_quant_for(w.dtype).map(CpuQuant::input_rotation) {
+            Some(InputRotation::FwhtG128V2) => rotate_x_128_v2(&mut host),
+            _ => rotate_x(&mut host),
+        }
     }
     Ok((host, t0.elapsed().as_nanos() as u64))
 }
@@ -693,7 +711,7 @@ pub fn run_host_mapped_gemv_residual(
     // unrotated activation (the SiLU output), so it rotates when the dtype says
     // the weights were encoded post-rotation — the same rule `run_step` derives
     // from a `Raw` input.
-    let rotate_input = dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
+    let rotate_input = raw_input_is_rotated(w.dtype);
     let plan = CpuStep {
         w,
         x,
@@ -799,6 +817,22 @@ fn expert_id(raw: f32) -> usize {
     (raw.to_bits() as i32) as u16 as usize
 }
 
+/// BF16 round-to-nearest-even of a finite `f32`, returned widened to `f32`;
+/// non-finite values pass through unchanged. Integer-bit arithmetic identical to
+/// the GPU `rt` helpers (`router_bf16_rt`, `rot128_bf16_rt`): add `0x7fff` plus
+/// the kept LSB, then truncate the low 16 bits. Signed zero and the sign of
+/// every finite value are preserved; a finite value that rounds past the BF16
+/// maximum carries into the exponent and becomes ±Inf, as on the GPU.
+#[inline]
+fn bf16_rt(x: f32) -> f32 {
+    if !x.is_finite() {
+        return x;
+    }
+    let bits = x.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    f32::from_bits(rounded & 0xffff_0000)
+}
+
 /// `gate_up` extent of one expert: `row_bytes * 2 * mi`, checked.
 fn expert_gu_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
     hipfire_cpu::gemv::row_bytes(q, dim)
@@ -839,10 +873,25 @@ const MOE_STACK_SLOTS: usize = 256;
 /// front, may be asked for the same id more than once, and must be a pure
 /// function of the id.
 ///
+/// `bf16_round_trip` selects the GPU BF16 storage boundaries of the grouped
+/// QT44/QT53 decode route instead of plain f32 arithmetic. `false` is the
+/// original arithmetic, byte for byte. `true` applies
+/// `rt` = BF16 round-to-nearest-even (non-finite passes through) at exactly
+/// these points: each gathered gate and up value before SiLU; the activated
+/// hidden `rt(silu(rt g) * rt u)` before the FWHT (the rotated down input stays
+/// f32); and the combine, which starts every row at `rt(residual)` and then adds
+/// that row's selected experts in ASCENDING EXPERT ID (equal ids: lower rank
+/// first — not routing-rank order), each step
+/// `acc = rt(acc + rt(rt(down) * rt(weight)))`. The gate/up and down GEMVs stay
+/// f32 with the CPU kernels' own summation order, which intentionally differs
+/// from the GPU's reduction tree.
+///
 /// Fail-closed by construction: an unknown expert id, unavailable host bytes, an
 /// undecodable dtype, an AWQ sidecar (a bare `gemv` would ignore the per-expert
 /// scale), graph capture / replay recording (a CPU step is a host sync point), a
-/// `dim`/`mi` that is not a multiple of 256, or short scratch are all errors,
+/// `dim` that is not a multiple of 256, an `mi` that is not a multiple of 128 (or
+/// of the selected down format's group width: 256 for FWHT-256 formats, 128 for
+/// the QT53 `Mq4G128V2` down), or short scratch are all errors,
 /// never silent zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_cpu_experts<'a>(
@@ -856,6 +905,7 @@ pub fn moe_cpu_experts<'a>(
     topk_weights: &GpuTensor,
     residual: &GpuTensor,
     awq: bool,
+    bf16_round_trip: bool,
     resolve: impl Fn(usize) -> Result<CpuMoeExpert<'a>, DispatchError>,
 ) -> Result<(), DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
@@ -873,9 +923,9 @@ pub fn moe_cpu_experts<'a>(
             "moe cpu expert splice: rows and top_k must be non-zero",
         ));
     }
-    if dim % 256 != 0 || mi % 256 != 0 {
+    if dim % 256 != 0 || mi % 128 != 0 {
         return Err(cpu_err(&format!(
-            "moe cpu expert splice: dim={dim} mi={mi} must be multiples of 256"
+            "moe cpu expert splice: dim={dim} must be a multiple of 256 and mi={mi} of 128"
         )));
     }
     let slots = rows
@@ -980,7 +1030,18 @@ pub fn moe_cpu_experts<'a>(
                 timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
             }
             moe_cpu_experts_host(
-                dim, mi, rows, top_k, experts, x, ti, tw, acc, &mut scratch, &mut timing,
+                dim,
+                mi,
+                rows,
+                top_k,
+                experts,
+                x,
+                ti,
+                tw,
+                acc,
+                &mut scratch,
+                &mut timing,
+                bf16_round_trip,
             )?;
             let t_h2d = Instant::now();
             upload_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
@@ -1033,6 +1094,7 @@ fn moe_cpu_experts_host(
     residual_acc: &mut [f32],
     scratch: &mut MoeScratch,
     timing: &mut MoeStepTiming,
+    bf16_round_trip: bool,
 ) -> Result<(), DispatchError> {
     let slots = rows * top_k;
     if experts.len() != slots {
@@ -1055,6 +1117,11 @@ fn moe_cpu_experts_host(
     scratch.slot_group.resize(slots, 0);
     for s in 0..slots {
         let e = &experts[s];
+        if dim % e.gate_up_quant.group_elems() != 0 || mi % e.down_quant.group_elems() != 0 {
+            return Err(cpu_err(&format!(
+                "moe cpu expert splice: dim={dim} / mi={mi} not a multiple of the expert's gate_up / down group width"
+            )));
+        }
         let gu_need = expert_gu_bytes(e.gate_up_quant, dim, mi)?;
         let dn_need = expert_down_bytes(e.down_quant, dim, mi)?;
         if e.gate_up.len() < gu_need {
@@ -1145,21 +1212,33 @@ fn moe_cpu_experts_host(
             let n = group_n(&scratch.group_start, gi);
             let base = scratch.group_off[gi];
             let first = scratch.order[scratch.group_start[gi] as usize] as usize;
-            let rotate = experts[first].down_quant.is_fwht_g256();
+            let down_rotation = experts[first].down_quant.input_rotation();
+            let rotate = down_rotation != InputRotation::None;
             for si in 0..n {
                 let s = scratch.order[scratch.group_start[gi] as usize + si] as usize;
                 let t_gather = Instant::now();
                 for (r, g) in gather.iter_mut().enumerate() {
-                    *g = gu[base + r * n + si];
+                    let v = gu[base + r * n + si];
+                    *g = if bf16_round_trip { bf16_rt(v) } else { v };
                 }
                 gather_ns += t_gather.elapsed().as_nanos() as u64;
                 let hid = &mut hidden[s * mi..(s + 1) * mi];
                 let t_silu = Instant::now();
                 silu_mul(gather, hid);
+                if bf16_round_trip {
+                    // The activated hidden is stored BF16 before the FWHT; the
+                    // rotated output below stays f32.
+                    for h in hid.iter_mut() {
+                        *h = bf16_rt(*h);
+                    }
+                }
                 silu_ns += t_silu.elapsed().as_nanos() as u64;
                 if rotate {
                     let t_fwht = Instant::now();
-                    rotate_x(hid);
+                    match down_rotation {
+                        InputRotation::FwhtG128V2 => rotate_x_128_v2(hid),
+                        _ => rotate_x(hid),
+                    }
                     fwht_ns += t_fwht.elapsed().as_nanos() as u64;
                 }
             }
@@ -1192,16 +1271,56 @@ fn moe_cpu_experts_host(
     let t_combine = Instant::now();
     {
         let dn = &scratch.dn[..dim * slots];
-        for s in 0..slots {
-            let t = s / top_k;
-            let gi = scratch.slot_group[s] as usize;
-            let si = scratch.slot_si[s] as usize;
-            let n = group_n(&scratch.group_start, gi);
-            let base = scratch.group_off[gi];
-            let w = tw[s];
-            let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
-            for (r, a) in accrow.iter_mut().enumerate() {
-                *a += w * dn[base + r * n + si];
+        if bf16_round_trip {
+            // GPU `moe_down_combine_top10_batched` order: each row starts from
+            // rt(residual) and adds its selected ranks in ascending expert id
+            // (ties: lower rank, NOT routing-rank order), each step
+            // acc = rt(acc + rt(rt(down) * rt(weight))). The next rank is the
+            // smallest (expert id, rank) key strictly after the previous one — a
+            // tight O(top_k²) scan that needs no extra buffer.
+            for t in 0..rows {
+                let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
+                for a in accrow.iter_mut() {
+                    *a = bf16_rt(*a);
+                }
+                let mut prev: Option<(usize, usize)> = None;
+                for _ in 0..top_k {
+                    let mut best: Option<(usize, usize)> = None;
+                    for j in 0..top_k {
+                        let key = (expert_id(ti[t * top_k + j]), j);
+                        if prev.map_or(false, |p| key <= p) {
+                            continue;
+                        }
+                        if best.map_or(true, |b| key < b) {
+                            best = Some(key);
+                        }
+                    }
+                    let Some((_, j)) = best else { break };
+                    prev = best;
+                    let s = t * top_k + j;
+                    let gi = scratch.slot_group[s] as usize;
+                    let si = scratch.slot_si[s] as usize;
+                    let n = group_n(&scratch.group_start, gi);
+                    let base = scratch.group_off[gi];
+                    let w = bf16_rt(tw[s]);
+                    for (r, a) in accrow.iter_mut().enumerate() {
+                        let out = bf16_rt(dn[base + r * n + si]);
+                        *a = bf16_rt(*a + bf16_rt(out * w));
+                    }
+                }
+            }
+        } else {
+            for s in 0..slots {
+                let t = s / top_k;
+                let gi = scratch.slot_group[s] as usize;
+                let si = scratch.slot_si[s] as usize;
+                let n = group_n(&scratch.group_start, gi);
+                let base = scratch.group_off[gi];
+                let w = tw[s];
+                let accrow = &mut residual_acc[t * dim..(t + 1) * dim];
+                for (r, a) in accrow.iter_mut().enumerate() {
+                    *a += w * dn[base + r * n + si];
+                }
             }
         }
     }
@@ -1705,8 +1824,7 @@ pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>
     // Mirror `GemvFamily::run_input`: a `Raw` input is rotated by the launcher
     // *and only when* the dtype's plan is `FwhtG256`; a `Prerotated` input is
     // never touched again.
-    let rotate_input = matches!(input, GemvInput::Raw(_))
-        && dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
+    let rotate_input = matches!(input, GemvInput::Raw(_)) && raw_input_is_rotated(w.dtype);
     Some(CpuStep {
         w,
         x: match input {
@@ -2263,6 +2381,17 @@ mod moe_splice_tests {
             o
         };
         match q {
+            CpuQuant::Mq4G256V2 => {
+                // fp16 [s0 z0 s1 z1] = 0.0625, -0.25, 0.5, 0.75.
+                for (i, v) in [0x2c00u16, 0xb400, 0x3800, 0x3a00].iter().enumerate() {
+                    b[2 * i..2 * i + 2].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            CpuQuant::Mq4G128V2 => {
+                // fp16 [scale][zero] = 0.0625, -0.25.
+                b[..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+                b[2..4].copy_from_slice(&0xb400u16.to_le_bytes());
+            }
             CpuQuant::Mq4G256 => b[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
             CpuQuant::Mq6G256 => b[..8].copy_from_slice(&f32x2(0.0078125, -0.125)),
             CpuQuant::Mq3G256Lloyd => {
@@ -2347,6 +2476,7 @@ mod moe_splice_tests {
             &mut acc,
             &mut scratch,
             &mut MoeStepTiming::default(),
+            false,
         )
         .unwrap();
 
@@ -2435,6 +2565,7 @@ mod moe_splice_tests {
             &mut acc,
             &mut scratch,
             &mut MoeStepTiming::default(),
+            false,
         )
         .unwrap();
 
@@ -2488,6 +2619,7 @@ mod moe_splice_tests {
             &mut vec![0.0f32; dim],
             &mut scratch,
             &mut MoeStepTiming::default(),
+            false,
         )
         .expect_err("a short expert span must fail");
         assert!(format!("{err}").contains("span"), "unexpected error: {err}");
@@ -2508,21 +2640,289 @@ mod moe_splice_tests {
         }];
         let mut scratch = MoeScratch::default();
         // rows=2, top_k=1 needs 2 experts; only 1 supplied.
-        assert!(
+        assert!(moe_cpu_experts_host(
+            dim,
+            mi,
+            2,
+            1,
+            &experts,
+            &vec![0.0f32; 2 * dim],
+            &[id_bits(0), id_bits(0)],
+            &[1.0, 1.0],
+            &mut vec![0.0f32; 2 * dim],
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+            false,
+        )
+        .is_err());
+    }
+
+    /// Flash-Next's shape: gate_up in qt 44 (`k = dim`), down in qt 53 with
+    /// `k = mi = 640` — not a multiple of 256, rotated with the 128-wide
+    /// transform. The splice must equal the per-expert reference built from
+    /// `gemv` + `rotate_x_128_v2` bit for bit, and agree with the original-basis
+    /// product (dequantized, inverse-rotated weights · the *unrotated* hidden),
+    /// which a wrong or missing down rotation would not.
+    #[test]
+    fn qt53_down_k640_uses_the_g128_rotation() {
+        assert_eq!(cpu_quant_for(DType::MQ4G128V2), Some(CpuQuant::Mq4G128V2));
+        assert!(CPU_EXECUTED_DTYPES.contains(&DType::MQ4G128V2));
+        let (dim, mi) = (256usize, 640usize);
+        let (rows, top_k, n_exp) = (2usize, 3usize, 3usize);
+        let (gq, dq) = (CpuQuant::Mq4G256V2, CpuQuant::Mq4G128V2);
+        let gu: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(gq, 2 * mi, dim, 500 + e))
+            .collect();
+        let dn: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(dq, dim, mi, 600 + e))
+            .collect();
+        let idx: [usize; 6] = [0, 1, 2, 2, 0, 1];
+        let wts: [f32; 6] = [0.4, 0.35, 0.25, 0.5, 0.3, 0.2];
+        let x = x_of(rows * dim);
+        let seed: Vec<f32> = (0..rows * dim).map(|i| 0.05 * (i % 5) as f32).collect();
+        let ti: Vec<f32> = idx.iter().map(|&e| id_bits(e)).collect();
+        let experts: Vec<CpuMoeExpert> = (0..rows * top_k)
+            .map(|s| CpuMoeExpert {
+                gate_up_quant: gq,
+                gate_up: &gu[idx[s]],
+                down_quant: dq,
+                down: &dn[idx[s]],
+            })
+            .collect();
+        let mut scratch = MoeScratch::default();
+        let mut acc = seed.clone();
+        moe_cpu_experts_host(
+            dim,
+            mi,
+            rows,
+            top_k,
+            &experts,
+            &x,
+            &ti,
+            &wts,
+            &mut acc,
+            &mut scratch,
+            &mut MoeStepTiming::default(),
+            false,
+        )
+        .unwrap();
+
+        let mut reference = seed.clone();
+        let mut original_basis = seed.clone();
+        // Σ |w||h| per element: the f32 rounding scale. The fixture's hidden is
+        // large with heavy cancellation, so the tolerance is relative to this,
+        // not to the (small) result.
+        let mut mag = vec![0.0f64; rows * dim];
+        for t in 0..rows {
+            for j in 0..top_k {
+                let s = t * top_k + j;
+                let e = idx[s];
+                let mut gv = vec![0.0f32; 2 * mi];
+                gemv(gq, &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                let mut hid = vec![0.0f32; mi];
+                silu_mul(&gv, &mut hid);
+                let unrotated = hid.clone();
+                rotate_x_128_v2(&mut hid);
+                let mut dout = vec![0.0f32; dim];
+                gemv(dq, &dn[e], dim, mi, &hid, &mut dout);
+                for (a, v) in reference[t * dim..(t + 1) * dim].iter_mut().zip(dout) {
+                    *a += wts[s] * v;
+                }
+                // Original-basis product: inverse-rotated weights · unrotated hidden.
+                let rb = hipfire_cpu::gemv::row_bytes(dq, mi);
+                for r in 0..dim {
+                    let mut dot = 0.0f64;
+                    let mut abs = 0.0f64;
+                    for g in 0..mi / 128 {
+                        let mut w = [0.0f32; 128];
+                        hipfire_cpu::quant::dequant_group(dq, &dn[e][r * rb + g * 68..], &mut w);
+                        for i in 0..128 {
+                            let term = w[i] as f64 * unrotated[g * 128 + i] as f64;
+                            dot += term;
+                            abs += term.abs();
+                        }
+                    }
+                    original_basis[t * dim + r] += wts[s] * dot as f32;
+                    mag[t * dim + r] += wts[s] as f64 * abs;
+                }
+            }
+        }
+        assert_eq!(acc, reference, "qt53 splice != per-expert gemv reference");
+        for (i, (a, b)) in acc.iter().zip(&original_basis).enumerate() {
+            let tol = 1e-4 * (mag[i] as f32).max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "element {i}: rotated-basis {a} vs original-basis {b} (tol {tol})"
+            );
+        }
+    }
+
+    /// `bf16_rt` is the GPU `rt`: ties-to-even on the dropped 16 bits, sign and
+    /// signed zero preserved, ±Inf and NaN (payload included) passed through, and
+    /// a finite value past the BF16 maximum carries into ±Inf.
+    #[test]
+    fn bf16_rt_rounds_ties_to_even_and_passes_nonfinite() {
+        let rt_bits = |bits: u32| bf16_rt(f32::from_bits(bits)).to_bits();
+        // Exactly half way: even kept mantissa stays, odd kept mantissa rounds up.
+        assert_eq!(rt_bits(0x3f80_8000), 0x3f80_0000);
+        assert_eq!(rt_bits(0x3f81_8000), 0x3f82_0000);
+        // Just below / above half way.
+        assert_eq!(rt_bits(0x3f80_7fff), 0x3f80_0000);
+        assert_eq!(rt_bits(0x3f80_8001), 0x3f81_0000);
+        // Negative mirrors positive (magnitude rounding, sign kept).
+        assert_eq!(rt_bits(0xbf80_8000), 0xbf80_0000);
+        assert_eq!(rt_bits(0xbf81_8000), 0xbf82_0000);
+        assert_eq!(rt_bits(0xbf80_8001), 0xbf81_0000);
+        // Signed zero, and a negative denormal that rounds to -0.
+        assert_eq!(rt_bits(0x0000_0000), 0x0000_0000);
+        assert_eq!(rt_bits(0x8000_0000), 0x8000_0000);
+        assert_eq!(rt_bits(0x8000_0001), 0x8000_0000);
+        // Already-BF16 values are fixed points.
+        assert_eq!(rt_bits(0x4049_0000), 0x4049_0000);
+        // Non-finite: unchanged bit for bit.
+        for bits in [
+            0x7f80_0000u32,
+            0xff80_0000,
+            0x7fc0_0000,
+            0x7f80_0001,
+            0xffc1_2345,
+        ] {
+            assert_eq!(rt_bits(bits), bits);
+        }
+        // Largest finite f32 rounds up into +Inf / -Inf.
+        assert_eq!(bf16_rt(f32::MAX), f32::INFINITY);
+        assert_eq!(bf16_rt(f32::MIN), f32::NEG_INFINITY);
+    }
+
+    /// Scalar reference for the BF16 route: plain `gemv` projections with explicit
+    /// BF16 boundaries — rt(gate), rt(up), rt(activated hidden) before the FWHT,
+    /// the rotated down input left f32, rt(residual) at the start of each row, and
+    /// per step `acc = rt(acc + rt(rt(down) * rt(weight)))`. `rank_order` and
+    /// `round_rotated` switch in the two WRONG variants the real route must not
+    /// match: routing-rank combine order and a BF16 round of the rotated hidden.
+    #[allow(clippy::too_many_arguments)]
+    fn bf16_reference(
+        q: CpuQuant,
+        gu: &[Vec<u8>],
+        dn: &[Vec<u8>],
+        idx: &[usize],
+        wts: &[f32],
+        x: &[f32],
+        seed: &[f32],
+        (dim, mi, rows, top_k): (usize, usize, usize, usize),
+        rank_order: bool,
+        round_rotated: bool,
+    ) -> Vec<f32> {
+        let mut out: Vec<f32> = seed.iter().map(|&v| bf16_rt(v)).collect();
+        for t in 0..rows {
+            let mut order: Vec<usize> = (0..top_k).collect();
+            if !rank_order {
+                order.sort_by_key(|&j| (idx[t * top_k + j], j));
+            }
+            for j in order {
+                let s = t * top_k + j;
+                let e = idx[s];
+                let mut gv = vec![0.0f32; 2 * mi];
+                gemv(q, &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                for g in gv.iter_mut() {
+                    *g = bf16_rt(*g);
+                }
+                let mut hid = vec![0.0f32; mi];
+                silu_mul(&gv, &mut hid);
+                for h in hid.iter_mut() {
+                    *h = bf16_rt(*h);
+                }
+                if q.is_fwht_g256() {
+                    rotate_x(&mut hid);
+                }
+                if round_rotated {
+                    for h in hid.iter_mut() {
+                        *h = bf16_rt(*h);
+                    }
+                }
+                let mut dout = vec![0.0f32; dim];
+                gemv(q, &dn[e], dim, mi, &hid, &mut dout);
+                let w = bf16_rt(wts[s]);
+                for (a, v) in out[t * dim..(t + 1) * dim].iter_mut().zip(dout) {
+                    *a = bf16_rt(*a + bf16_rt(bf16_rt(v) * w));
+                }
+            }
+        }
+        out
+    }
+
+    /// The `bf16_round_trip = true` host path equals the scalar BF16-boundary
+    /// reference bit for bit, on a window whose routing ranks are NOT in expert-id
+    /// order (including a repeated id in one row, which must tie-break by rank).
+    /// The two wrong variants — routing-rank combine order, and rounding the
+    /// rotated hidden — must differ, and the false route must differ from true
+    /// while staying plain f32.
+    #[test]
+    fn bf16_route_matches_scalar_reference_with_expert_id_combine_order() {
+        let (dim, mi) = (256usize, 256usize);
+        let (rows, top_k, n_exp) = (2usize, 3usize, 4usize);
+        let q = CpuQuant::Mq4G256;
+        let gu: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(q, 2 * mi, dim, 700 + e))
+            .collect();
+        let dn: Vec<Vec<u8>> = (0..n_exp)
+            .map(|e| weight_bytes(q, dim, mi, 800 + e))
+            .collect();
+        // Row 0 ranks are 3, 0, 2 (descending/unsorted); row 1 repeats id 2.
+        let idx: [usize; 6] = [3, 0, 2, 2, 2, 1];
+        let wts: [f32; 6] = [0.4, 0.35, 0.25, 0.5, 0.3, 0.2];
+        let x = x_of(rows * dim);
+        // Not BF16-exact, so the initial rt(residual) is observable.
+        let seed: Vec<f32> = (0..rows * dim)
+            .map(|i| 0.1234567 * (i % 7) as f32 + 1.0001)
+            .collect();
+        let ti: Vec<f32> = idx.iter().map(|&e| id_bits(e)).collect();
+        let experts: Vec<CpuMoeExpert> = (0..rows * top_k)
+            .map(|s| CpuMoeExpert {
+                gate_up_quant: q,
+                gate_up: &gu[idx[s]],
+                down_quant: q,
+                down: &dn[idx[s]],
+            })
+            .collect();
+        let run = |bf16: bool| {
+            let mut scratch = MoeScratch::default();
+            let mut acc = seed.clone();
             moe_cpu_experts_host(
                 dim,
                 mi,
-                2,
-                1,
+                rows,
+                top_k,
                 &experts,
-                &vec![0.0f32; 2 * dim],
-                &[id_bits(0), id_bits(0)],
-                &[1.0, 1.0],
-                &mut vec![0.0f32; 2 * dim],
+                &x,
+                &ti,
+                &wts,
+                &mut acc,
                 &mut scratch,
-                &mut MoeStepTiming::default()
+                &mut MoeStepTiming::default(),
+                bf16,
             )
-            .is_err()
+            .unwrap();
+            acc
+        };
+        let geom = (dim, mi, rows, top_k);
+        let reference = bf16_reference(q, &gu, &dn, &idx, &wts, &x, &seed, geom, false, false);
+        let acc = run(true);
+        assert_eq!(
+            acc, reference,
+            "bf16 splice != scalar BF16-boundary reference"
         );
+        assert!(
+            acc.iter().all(|v| bf16_rt(*v) == *v),
+            "every stored element must be BF16-exact"
+        );
+        let rank_order = bf16_reference(q, &gu, &dn, &idx, &wts, &x, &seed, geom, true, false);
+        assert_ne!(acc, rank_order, "fixture is not sensitive to combine order");
+        let round_rotated = bf16_reference(q, &gu, &dn, &idx, &wts, &x, &seed, geom, false, true);
+        assert_ne!(
+            acc, round_rotated,
+            "rotated hidden must not be rounded before the down GEMV"
+        );
+        assert_ne!(run(false), acc, "true and false routes must differ");
     }
 }

@@ -968,7 +968,18 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         })
     };
     moe_cpu_experts(
-        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+        &gpu,
+        dim,
+        mi,
+        N,
+        KTOP,
+        &x,
+        &indices,
+        &weights,
+        &residual,
+        false,
+        false,
+        |e| resolve(&gpu, e),
     )?;
     let got = gpu.download_f32(&residual)?;
     let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
@@ -1001,6 +1012,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         &prefix_idx,
         &prefix_w,
         &prefix_residual,
+        false,
         false,
         |e| resolve(&gpu, e),
     )?;
@@ -1058,15 +1070,28 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         offset += len;
     }
     moe_cpu_experts(
-        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+        &gpu,
+        dim,
+        mi,
+        N,
+        KTOP,
+        &x,
+        &indices,
+        &weights,
+        &residual,
+        false,
+        false,
+        |e| resolve(&gpu, e),
     )?;
     // Exercise an actual same-stream GPU consumer before host readback. The
     // splice returns after enqueue, not after its residual DMA completes.
     gpu.add_inplace_f32(&residual, &delta)?;
-    gpu.hip.stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
+    gpu.hip
+        .stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
     let consumed: Vec<f32> = got.iter().map(|v| v + 0.125).collect();
     assert_eq!(
-        gpu.download_f32(&residual)?, consumed,
+        gpu.download_f32(&residual)?,
+        consumed,
         "GPU consumer overtook the nonblocking-stream CPU return",
     );
     let seed_bytes = unsafe {
@@ -1075,13 +1100,34 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     };
     gpu.hip.memcpy_htod(&residual.buf, seed_bytes)?;
     moe_cpu_experts(
-        &gpu, dim, mi, 1, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+        &gpu,
+        dim,
+        mi,
+        1,
+        KTOP,
+        &x,
+        &indices,
+        &weights,
+        &residual,
+        false,
+        false,
+        |e| resolve(&gpu, e),
     )?;
-    gpu.hip.stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
+    gpu.hip
+        .stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
     let single = gpu.download_f32(&residual)?;
-    assert_eq!(&single[..dim], &got[..dim], "stage reuse changed the committed row");
-    assert_eq!(&single[dim..], &seed[dim..], "splice overwrote spare residual rows");
-    gpu.hip.stream_destroy(gpu.active_stream.take().expect("test stream"))?;
+    assert_eq!(
+        &single[..dim],
+        &got[..dim],
+        "stage reuse changed the committed row"
+    );
+    assert_eq!(
+        &single[dim..],
+        &seed[dim..],
+        "splice overwrote spare residual rows"
+    );
+    gpu.hip
+        .stream_destroy(gpu.active_stream.take().expect("test stream"))?;
     eprintln!("GRADED_CPU_STREAM_REUSE_PARITY PASS (rows 3 -> 2 -> 3 -> 1)");
     Ok(())
 }

@@ -7681,6 +7681,116 @@ mod tests {
         moe_program::lowered_stages(&call)
     }
 
+    /// Stages a CPU-deferred grouped call lowers to (decode or prefill) under a
+    /// recipe with the given `shared_after_combine`; nothing launches.
+    fn deferred_stages(decode: bool, shared_after_combine: bool) -> Vec<MoeStage> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xEA_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let recipe = MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine,
+        };
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        if decode {
+            let scratch = decode_scratch(0xEB_0000);
+            let params = MoeParams {
+                recipe,
+                cpu_deferred_experts: true,
+                ..ep_decode_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    0,
+                    8,
+                    4,
+                    MoeEpMode::None,
+                    None,
+                    false,
+                )
+            };
+            let MoeKernelSelection::Decode(mut selection) = decode_selection(&ctx, &params, route)
+            else {
+                unreachable!("decode_selection returns a decode selection");
+            };
+            selection.cpu_deferred_experts = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Decode(selection),
+                SealedParams::Decode(params),
+            );
+            moe_program::lowered_stages(&call).unwrap()
+        } else {
+            let scratch = prefill_scratch(0xEC_0000);
+            let params = MoePrefillParams {
+                recipe,
+                cpu_deferred_experts: true,
+                ..ep_prefill_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            let MoeKernelSelection::Prefill(mut selection) =
+                prefill_selection(&ctx, &params, route)
+            else {
+                unreachable!("prefill_selection returns a prefill selection");
+            };
+            selection.cpu_deferred_experts = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Prefill(selection),
+                SealedParams::Prefill(params),
+            );
+            moe_program::lowered_stages(&call).unwrap()
+        }
+    }
+
+    #[test]
+    fn cpu_deferred_splice_replaces_the_routed_tail_in_recipe_order() {
+        for decode in [true, false] {
+            for shared_after_combine in [true, false] {
+                let stages = deferred_stages(decode, shared_after_combine);
+                let at = |stage: MoeStage| stages.iter().position(|s| *s == stage);
+                let label = format!("decode={decode} shared_after_combine={shared_after_combine}");
+                assert_eq!(
+                    stages.iter().filter(|s| **s == MoeStage::CpuSplice).count(),
+                    1,
+                    "{label}: {stages:?}"
+                );
+                for omitted in [
+                    MoeStage::Scatter,
+                    MoeStage::GateUp,
+                    MoeStage::Unscatter,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::Combine,
+                ] {
+                    assert!(at(omitted).is_none(), "{label}: {omitted:?} in {stages:?}");
+                }
+                let splice = at(MoeStage::CpuSplice).unwrap();
+                let shared_down = at(MoeStage::SharedDown).expect("shared down stays on the GPU");
+                if shared_after_combine {
+                    // Routed contribution first, then the shared expert, like
+                    // the GPU tail (`Combine` then `SharedDown`).
+                    assert!(splice < shared_down, "{label}: {stages:?}");
+                } else {
+                    assert!(shared_down < splice, "{label}: {stages:?}");
+                }
+                // The route the splice consumes exists before it runs.
+                assert!(at(MoeStage::Route).unwrap() < splice, "{label}: {stages:?}");
+            }
+        }
+    }
+
     #[test]
     fn fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2() {
         for rows in [1, 2, 17, 128, 1536] {

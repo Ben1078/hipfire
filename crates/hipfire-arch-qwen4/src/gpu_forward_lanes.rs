@@ -451,14 +451,17 @@ fn lane_segments(rows: &[usize]) -> Vec<Segment> {
         .collect()
 }
 
-/// Consecutive lanes packed into groups of at most [`LANE_MAX_ROWS`] rows (a
-/// lane wider than that is its own group).
-fn group_segments(rows: &[usize]) -> Vec<Segment> {
+/// Consecutive lanes packed into groups of at most `max_rows` rows (a lane
+/// wider than that is its own group). `max_rows` is [`LANE_MAX_ROWS`], or
+/// the CPU-splice window when a layer's routed experts run on the CPU: a group
+/// wider than that would take the GPU grouped read, a different arithmetic
+/// from the singleton's CPU decode.
+fn group_segments(rows: &[usize], max_rows: usize) -> Vec<Segment> {
     let mut groups: Vec<Segment> = Vec::new();
     let mut begin = 0;
     for (lane, &lane_rows) in rows.iter().enumerate() {
         match groups.last_mut() {
-            Some(group) if group.rows + lane_rows <= LANE_MAX_ROWS => group.rows += lane_rows,
+            Some(group) if group.rows + lane_rows <= max_rows => group.rows += lane_rows,
             _ => groups.push(Segment {
                 begin,
                 rows: lane_rows,
@@ -474,7 +477,7 @@ fn group_segments(rows: &[usize]) -> Vec<Segment> {
 /// row counts runs ([`StageShare::OnceAllRows`] stages launch once per
 /// group).
 pub(crate) fn row_group_count(rows: &[usize]) -> usize {
-    group_segments(rows).len()
+    group_segments(rows, LANE_MAX_ROWS).len()
 }
 
 /// The row views one segment's operations bind: every row-indexed scratch
@@ -865,6 +868,8 @@ fn forward_lanes_scoped(
             bundle.config.profile.id()
         )));
     }
+    fwd.ensure_cpu_splice_eager(gpu)?;
+    let cpu_splice = fwd.has_cpu_deferred_experts();
     policy.validate().map_err(invalid)?;
     if lanes.is_empty() {
         return Err(invalid("a lane step needs at least one lane"));
@@ -896,6 +901,14 @@ fn forward_lanes_scoped(
                 if draft_len == 0 || *rows != draft_len + 1 || *rows > LANE_MAX_ROWS {
                     return Err(invalid(format!(
                         "a verify lane carries 1 + {draft_len} rows within {LANE_MAX_ROWS}, got {rows}"
+                    )));
+                }
+                if cpu_splice && *rows > crate::program::QWEN4_CPU_SPLICE_MAX_ROWS {
+                    return Err(invalid(format!(
+                        "a {rows}-row verify lane exceeds the {}-row CPU routed-expert window; \
+                         wider verify would run the GPU grouped read, not the CPU decode arithmetic \
+                         (set memory.offload_exec=pcie or cap the draft length)",
+                        crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
                     )));
                 }
                 // The singleton's `verify_block` arms the ring for exactly
@@ -1030,7 +1043,14 @@ fn forward_lanes_scoped(
             first_lane: 0,
         }]
     } else {
-        group_segments(&rows)
+        group_segments(
+            &rows,
+            if cpu_splice {
+                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+            } else {
+                LANE_MAX_ROWS
+            },
+        )
     };
     let widest = group_segs.iter().map(|seg| seg.rows).max().unwrap_or(1);
     let bf16_state = if prefill {
@@ -1872,7 +1892,7 @@ mod tests {
             .iter()
             .enumerate()
             .all(|(i, s)| s.begin == i && s.rows == 1 && s.first_lane == i));
-        let groups = group_segments(&rows);
+        let groups = group_segments(&rows, LANE_MAX_ROWS);
         assert_eq!(groups.len(), 2);
         assert_eq!(
             (groups[0].begin, groups[0].rows, groups[0].first_lane),
@@ -1882,9 +1902,18 @@ mod tests {
             (groups[1].begin, groups[1].rows, groups[1].first_lane),
             (8, 3, 8)
         );
-        let wide = group_segments(&[3, 9, 2]);
+        let wide = group_segments(&[3, 9, 2], LANE_MAX_ROWS);
         assert_eq!(wide.len(), 3);
         assert_eq!((wide[1].begin, wide[1].rows), (3, 9));
         assert_eq!((wide[2].begin, wide[2].rows), (12, 2));
+        // An armed CPU-splice step never packs a group past its window.
+        let narrow = group_segments(
+            &[1, 1, 1, 1, 1, 1],
+            crate::program::QWEN4_CPU_SPLICE_MAX_ROWS,
+        );
+        assert_eq!(
+            narrow.iter().map(|seg| seg.rows).collect::<Vec<_>>(),
+            [4, 2]
+        );
     }
 }

@@ -442,6 +442,22 @@ row_dot!(
     "avx2,fma,f16c"
 );
 
+affine_row_dot!(
+    /// qt 53 — `Mq4G128V2`: row-local 128-element groups, 68 B each:
+    /// `[f16 scale][f16 zero]` then 64 B of paired nibbles (the same nibble
+    /// order as qt 13/44). One `(scale, zero)` covers the whole group, so the
+    /// body is [`uniform_group_dot`] over its 16 eight-code chunks with the
+    /// payload at byte 4 — the same decode core as every other 4-bit kernel.
+    mq4g128v2_row_dot,
+    mq4g128v2_group,
+    f16_pair,
+    4,
+    4,
+    128,
+    68,
+    "avx2,fma,f16c"
+);
+
 /// One 256-element `Mq4G256` (qt 13) group: `[f32 scale][f32 zero]` then 128 B
 /// of paired nibbles, element `i` taking the low nibble of byte `i/2` for even
 /// `i` and the high nibble for odd `i`. The activation arrives already

@@ -67,6 +67,7 @@ fn features_for(q: CpuQuant) -> bool {
     match q {
         // Kernels that widen fp16 metadata with `vcvtph2ps`.
         CpuQuant::Mq4G256V2
+        | CpuQuant::Mq4G128V2
         | CpuQuant::Mq6G256V2
         | CpuQuant::Mq5G256V2
         | CpuQuant::Mq2G256V2
@@ -246,6 +247,8 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 
         CpuQuant::Mfp4G32E8 => unsafe { x86::mfp4g32_e8_row_dot(p, k, xp) },
         // V2 family: per-128 fp16 header.
         CpuQuant::Mq4G256V2 => unsafe { x86::mq4g256v2_row_dot(p, k, xp) },
+        // Per-128 fp16 header over a 128-element row-local group.
+        CpuQuant::Mq4G128V2 => unsafe { x86::mq4g128v2_row_dot(p, k, xp) },
         CpuQuant::Mq6G256V2 => unsafe { x86::mq6g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq5G256V2 => unsafe { x86::mq5g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq3G256V2 => unsafe { x86::mq3g256v2_row_dot(p, k, xp) },

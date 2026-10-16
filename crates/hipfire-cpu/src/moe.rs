@@ -21,7 +21,7 @@
 
 use crate::epilogue::silu_mul;
 use crate::gemv::{gemv, row_bytes};
-use crate::quant::{rotate_x, CpuQuant};
+use crate::quant::CpuQuant;
 
 /// The packed expert weight blobs of one MoE layer, laid out as the on-disk
 /// tensor is: every routed expert's rows end to end.
@@ -117,9 +117,7 @@ pub fn run_experts(
         // unrotated dtypes (e.g. `Mq2G256LloydU`), whose down weights live in
         // the natural basis. (CPU-down never caught this: it consumed the
         // GPU's already-rotated `rot_batch`.)
-        if blobs.quant.is_fwht_g256() {
-            rotate_x(&mut hidden);
-        }
+        crate::quant::rotate_input(blobs.quant, &mut hidden);
         gemv(
             blobs.quant,
             &blobs.down[d0..d0 + down_bytes],

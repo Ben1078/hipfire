@@ -1614,9 +1614,11 @@ fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 
 /// Whether path 2's fused unscatter launch also runs the BF16 shared expert
 /// activation: its only reader, a natural-basis shared down, runs after the
-/// combine (so after the unscatter).
+/// combine (so after the unscatter). A CPU-deferred call lowers no unscatter,
+/// so its shared activation always runs in its own stage.
 fn shared_in_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    unscatter_rotates(gpu, p)
+    !p.cpu_deferred_experts
+        && unscatter_rotates(gpu, p)
         && p.recipe.bf16_round_trip()
         && p.recipe.shared_after_combine()
         && p.prelude

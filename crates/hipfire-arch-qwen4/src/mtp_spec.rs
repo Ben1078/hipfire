@@ -335,6 +335,19 @@ impl SpecScratch for Qwen4SpecScratch {
 }
 
 impl Qwen4Bundle {
+    /// Most rows (the seed included) one speculative verify or replay forward
+    /// of this load may take: [`spec_verify_rows_cap`] of the load's CPU
+    /// splice flag, fixed at load.
+    pub(crate) fn spec_verify_rows_cap(&self) -> usize {
+        spec_verify_rows_cap(self.has_cpu_deferred_experts())
+    }
+
+    /// Refuse a `rows`-row speculative verify or replay on an armed CPU
+    /// splice load before any state moves ([`check_spec_verify_rows`]).
+    fn require_spec_verify_rows(&self, rows: usize, what: &str) -> Result<(), String> {
+        check_spec_verify_rows(self.spec_verify_rows_cap(), rows, what)
+    }
+
     /// The verify transaction behind [`SpecTarget::verify_block`]: snapshot,
     /// row-armed forward, restore on error, end-position check. `read_picks`
     /// downloads every row's argmax; `false` leaves the picks on the device
@@ -382,6 +395,7 @@ impl Qwen4Bundle {
                 self.state.max_seq_len
             ));
         }
+        self.require_spec_verify_rows(block.len(), "Qwen4 verify block")?;
         // The verify leaves per-row rollback points, so a rejected suffix is
         // dropped without re-running the accepted rows (armed before the
         // snapshot: the GDN states then need no copy).
@@ -707,6 +721,9 @@ impl SpecTarget for Qwen4Bundle {
         if block.is_empty() {
             return Err("Qwen4 commit_prefix cannot commit an empty block".to_string());
         }
+        // Before the snapshot ticket is consumed: a block wider than the CPU
+        // splice window was never verified, so nothing is restored or replayed.
+        self.require_spec_verify_rows(block.len(), "Qwen4 commit block")?;
         let draft_len = block.len() - 1;
         if accept_len > draft_len {
             return Err(format!(
@@ -3191,6 +3208,14 @@ pub struct Qwen4MtpDrafter {
     /// `copy_lane`, is refreshed at every window entry that has the GPU and
     /// the target.
     row_exact_rows: usize,
+    /// Most rows (the seed included) one speculative verify or replay of the
+    /// target may take ([`Qwen4Bundle::spec_verify_rows_cap`]): the CPU
+    /// splice window on an armed load, unbounded otherwise. Latched from the
+    /// target at every window entry and resource pass
+    /// ([`Self::bind_spec_rows`]); it bounds the proposal capacity, so the
+    /// caller's draft budget, the copy-lane take and every n-gram takeover
+    /// stay inside it.
+    spec_rows_cap: usize,
     request: SpecRequestConfig,
     scratch: Option<Box<dyn SpecScratch>>,
     pending_hidden: Option<GpuTensor>,
@@ -3373,6 +3398,7 @@ impl Qwen4MtpDrafter {
             end_of_turn,
             ngram_config: None,
             row_exact_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+            spec_rows_cap: usize::MAX,
             copy_lane: false,
             ngram: None,
             ngram_copy: None,
@@ -3437,6 +3463,34 @@ impl Qwen4MtpDrafter {
             .ok_or_else(|| "Qwen4MtpDrafter: target is not a Qwen4Bundle".to_string())
     }
 
+    /// Latch this load's speculative verify-row cap from the target (the CPU
+    /// splice flag is fixed at load, so the value never changes under a
+    /// drafter).
+    fn bind_spec_rows(&mut self, target: &mut dyn SpecTarget) -> Result<(), String> {
+        self.spec_rows_cap = Self::bundle(target)?.spec_verify_rows_cap();
+        Ok(())
+    }
+
+    /// Most drafts one window of this load verifies: the row cap less the seed.
+    fn draft_rows_cap(&self) -> usize {
+        self.spec_rows_cap.saturating_sub(1)
+    }
+
+    /// Refuse a plan that would verify more rows than the CPU splice window
+    /// before any device state moves.
+    fn check_plan_rows(&self, plan: &WindowPlan) -> Result<(), String> {
+        let candidates = if self.follower {
+            plan.ngram_candidates.len()
+        } else {
+            self.ngram_candidates.len()
+        };
+        check_spec_verify_rows(
+            self.spec_rows_cap,
+            window_verify_rows(plan.route, plan.ngram_hit, candidates),
+            "Qwen4 native MTP window",
+        )
+    }
+
     fn ensure_resources(
         &mut self,
         gpu: &mut Gpu,
@@ -3446,6 +3500,7 @@ impl Qwen4MtpDrafter {
         if self.copy_lane {
             self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
         }
+        self.bind_spec_rows(target)?;
         let width = {
             let bundle = Self::bundle(target)?;
             bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -3917,7 +3972,7 @@ impl Qwen4MtpDrafter {
     /// no pool configured.
     fn ngram_take_cap(&self) -> usize {
         self.ngram_config.map_or(0, |config| {
-            qwen4_ngram_take_cap(&config, self.row_exact_rows)
+            qwen4_ngram_take_cap(&config, self.row_exact_rows).min(self.draft_rows_cap())
         })
     }
 
@@ -4296,6 +4351,7 @@ impl Qwen4MtpDrafter {
         let start = window.span.start;
         let end = start + replay.len();
         let bundle = Self::bundle(target)?;
+        bundle.require_spec_verify_rows(replay.len(), "Qwen4 terminal repair replay")?;
         bundle
             .restore_retain(gpu, window.target)
             .map_err(|error| format!("Qwen4 terminal repair target restore: {error}"))?;
@@ -4638,6 +4694,14 @@ impl Qwen4MtpDrafter {
         if candidates.is_empty() {
             return Err("Qwen4 MTP takeover has no candidates".to_string());
         }
+        // Before any head or target mutation: a takeover wider than the CPU
+        // splice window is refused here, not mid-verify.
+        self.bind_spec_rows(target)?;
+        check_spec_verify_rows(
+            self.spec_rows_cap,
+            candidates.len() + 1,
+            "Qwen4 n-gram takeover window",
+        )?;
         self.ensure_resources(gpu, target)?;
         {
             let bundle = Self::bundle(target)?;
@@ -6033,6 +6097,10 @@ impl Qwen4MtpDrafter {
         eos: u32,
         plan: &WindowPlan,
     ) -> Result<MtpWindow, String> {
+        // A plan wider than the CPU splice window is refused before any
+        // state moves (an armed load's drafter plans within it already).
+        self.bind_spec_rows(target)?;
+        self.check_plan_rows(plan)?;
         let eos = self.end_of_turn.unwrap_or(eos);
         // The window's penalty history is rebuilt from the tokens emitted so
         // far (the pending seed included); rejected drafts of earlier windows
@@ -6709,6 +6777,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         if self.copy_lane {
             self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
         }
+        self.bind_spec_rows(target)?;
         let mut plan = self.plan_window(emitted, k)?;
         if !ep {
             return self.run_window(gpu, target, position, seed, emitted, eos, &plan);
@@ -6818,7 +6887,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         };
         let replay = terminal_repair_replay(window.span, window_start, window_seed, consumed);
         let bundle = Self::bundle(target)?;
-        let usable = replay.is_some()
+        let usable = replay
+            .as_ref()
+            .is_some_and(|rows| rows.len() <= bundle.spec_verify_rows_cap())
             && bundle.ep_mesh().is_none()
             && bundle.state.position == window.span.end
             && bundle
@@ -6884,14 +6955,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
     }
 
     fn k(&self) -> usize {
-        self.max_k
+        self.max_k.min(self.draft_rows_cap())
     }
 
     /// An armed n-gram pool may offer up to its `n_max` candidates (with the
     /// copy lane: take up to [`qwen4_ngram_take_cap`] candidates, never the
     /// longer proposal it observes); native windows still draft at most K.
+    /// On a CPU splice load no window verifies more than
+    /// [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] rows, so the capacity
+    /// (and with it every caller's draft budget) is at most one fewer.
     fn proposal_capacity(&self) -> usize {
-        if self.copy_lane {
+        let capacity = if self.copy_lane {
             if self.ngram_active {
                 self.max_k.max(self.ngram_take_cap())
             } else {
@@ -6902,7 +6976,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 (true, Some(config)) => self.max_k.max(config.n_max),
                 _ => self.max_k,
             }
-        }
+        };
+        capacity.min(self.draft_rows_cap())
     }
 
     fn ctx_capacity(&self) -> usize {
@@ -7040,6 +7115,51 @@ pub fn qwen4_ngram_mod_config(
 /// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`).
 pub fn qwen4_ngram_take_cap(config: &NgramModConfig, row_exact_rows: usize) -> usize {
     config.n_max.min(row_exact_rows.saturating_sub(1))
+}
+
+/// Most rows (the seed included) one speculative verify or replay forward of
+/// a load may take. An armed CPU splice (`Qwen4Bundle::has_cpu_deferred_experts`)
+/// runs host-placed experts on the CPU only for a decode row or a verify of at
+/// most [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] rows; a wider block would
+/// run the GPU grouped expert read, not the arithmetic of the AR decode it must
+/// match. So an armed load verifies at most that many rows (K <= 3, an n-gram
+/// take <= 3); an unarmed load has no such bound.
+pub(crate) const fn spec_verify_rows_cap(cpu_splice: bool) -> usize {
+    if cpu_splice {
+        crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+    } else {
+        usize::MAX
+    }
+}
+
+/// `Ok` while a `rows`-row speculative forward fits `cap`
+/// ([`spec_verify_rows_cap`]); otherwise the CPU splice refusal, to be
+/// returned before the forward's first state mutation.
+pub(crate) fn check_spec_verify_rows(cap: usize, rows: usize, what: &str) -> Result<(), String> {
+    if rows <= cap {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} of {rows} rows exceeds the {cap}-row CPU routed-expert window; \
+         wider verify would run the GPU grouped read, not the CPU decode arithmetic \
+         (set memory.offload_exec=pcie or cap the draft length at K<={})",
+        cap.saturating_sub(1)
+    ))
+}
+
+/// Rows the widest target forward of a planned window verifies: the seed plus
+/// the native drafts (`depth`; the interleaved route and the AR routes are
+/// single-row steps) or, on an n-gram takeover, the seed plus its candidates.
+fn window_verify_rows(route: WindowRoute, ngram_hit: bool, candidates: usize) -> usize {
+    let native = match route {
+        WindowRoute::Native { depth } => depth + 1,
+        WindowRoute::ArRetired | WindowRoute::ArRouted | WindowRoute::ArCalibrate => 1,
+    };
+    if ngram_hit {
+        native.max(candidates + 1)
+    } else {
+        native
+    }
 }
 
 /// The most drafts any window of a native MTP request on `gpu_arch` verifies
@@ -10494,6 +10614,75 @@ mod tests {
         let short = NgramModConfig { n_max: 5, ..config };
         assert_eq!(qwen4_ngram_take_cap(&short, 32), 5);
         assert_eq!(qwen4_ngram_take_cap(&config, 0), 0);
+    }
+
+    #[test]
+    fn cpu_splice_caps_speculative_verify_rows_at_the_narrow_window() {
+        assert_eq!(spec_verify_rows_cap(false), usize::MAX);
+        assert_eq!(spec_verify_rows_cap(true), 4);
+        assert!(check_spec_verify_rows(4, 4, "block").is_ok());
+        assert!(check_spec_verify_rows(4, 1, "block").is_ok());
+        let error = check_spec_verify_rows(4, 5, "Qwen4 verify block").unwrap_err();
+        assert!(error.contains("5 rows") && error.contains("CPU routed-expert window"));
+        assert!(error.contains("K<=3"), "{error}");
+        assert!(check_spec_verify_rows(usize::MAX, 64, "block").is_ok());
+    }
+
+    #[test]
+    fn window_rows_follow_the_widest_forward_of_the_plan() {
+        assert_eq!(
+            window_verify_rows(WindowRoute::Native { depth: 3 }, false, 0),
+            4
+        );
+        assert_eq!(
+            window_verify_rows(WindowRoute::Native { depth: 0 }, false, 0),
+            1
+        );
+        assert_eq!(window_verify_rows(WindowRoute::ArRouted, false, 0), 1);
+        assert_eq!(window_verify_rows(WindowRoute::ArRetired, true, 3), 4);
+        assert_eq!(
+            window_verify_rows(WindowRoute::Native { depth: 2 }, true, 5),
+            6
+        );
+        assert_eq!(
+            window_verify_rows(WindowRoute::Native { depth: 5 }, true, 2),
+            6
+        );
+    }
+
+    #[test]
+    fn an_armed_cpu_splice_bounds_capacity_k_and_every_plan_to_three_drafts() {
+        // Native windows: K beyond the window is clamped out of the capacity,
+        // so the speculative loop's own budget (`min(capacity, max_emit - 1)`)
+        // never reaches 4 and a direct over-budget call is refused.
+        let mut drafter = Qwen4MtpDrafter::new(6, 4096, None);
+        assert_eq!(MtpDrafter::proposal_capacity(&drafter), 6);
+        drafter.spec_rows_cap = 4;
+        assert_eq!(MtpDrafter::proposal_capacity(&drafter), 3);
+        assert_eq!(MtpDrafter::k(&drafter), 3);
+        assert_eq!(plan_of(&mut drafter, 3, None).k, 3);
+        let error = plan_window_budget_error(&mut drafter, 4);
+        assert!(error.contains("exceeds the proposal capacity 3"), "{error}");
+        // An unarmed load keeps the head's full K.
+        drafter.spec_rows_cap = usize::MAX;
+        assert_eq!(MtpDrafter::proposal_capacity(&drafter), 6);
+    }
+
+    #[test]
+    fn an_armed_cpu_splice_caps_the_ngram_sources_at_three_candidates() {
+        // The non-copy takeover offers up to n_max candidates.
+        let mut drafter = armed_ngram_drafter(1, 8);
+        assert!(MtpDrafter::proposal_capacity(&drafter) >= 8);
+        drafter.spec_rows_cap = 4;
+        assert_eq!(MtpDrafter::proposal_capacity(&drafter), 3);
+        // The copy lane's take cap is one below the row-exact rows, and no
+        // more than one below the splice window either way.
+        let mut copy = armed_copy_drafter(1, 63);
+        copy.row_exact_rows = 32;
+        assert_eq!(copy.ngram_take_cap(), 31);
+        copy.spec_rows_cap = 4;
+        assert_eq!(copy.ngram_take_cap(), 3);
+        assert_eq!(MtpDrafter::proposal_capacity(&copy), 3);
     }
 
     #[test]

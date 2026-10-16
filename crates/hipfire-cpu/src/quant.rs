@@ -97,6 +97,12 @@ pub enum CpuQuant {
     Mq3G256V2,
     /// qt 50 — FWHT-rotated 2-bit, per-128 fp16 scale/zero, 72 B / 256.
     Mq2G256V2,
+    /// qt 53 — FWHT-128-rotated 4-bit, row-local `ceil(k/128)` groups of 68 B:
+    /// `[f16 scale][f16 zero][64 B nibbles]`, byte `i` = `q[2i] | q[2i+1] << 4`,
+    /// `w = scale*q + zero`. The Flash-Next routed-expert down projection
+    /// (`DType::MQ4G128V2`). Its activation rotation is the 128-wide
+    /// [`rotate_x_128_v2`], not the 256-wide [`rotate_x`].
+    Mq4G128V2,
     /// qt 40 — TQ2G128 ternary: fp16 `d` + 32 B of 2-bit codes, `(code-1)*d`,
     /// no rotation, 34 B / 128.
     Tq2G128,
@@ -116,6 +122,19 @@ pub enum CpuQuant {
     /// qt 34 — FWHT-256 E8 lattice weights: one 16 B row header,
     /// then eight 17 B blocks per 256 values.
     Mfp4G32E8,
+}
+
+/// Which forward rotation a format's activation needs before the stored codes
+/// are dotted against it (see the module docs of [`crate::gemv`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputRotation {
+    /// Natural basis: `x` is used as is.
+    None,
+    /// Blockwise FWHT-256, seeds 42/1042: [`rotate_x`].
+    FwhtG256,
+    /// Blockwise FWHT-128 with a zero-filled tail, seeds 43/1043:
+    /// [`rotate_x_128_v2`] (qt 53).
+    FwhtG128V2,
 }
 
 impl CpuQuant {
@@ -148,6 +167,7 @@ impl CpuQuant {
             49 => Some(Self::Mq3G256V2),
             50 => Some(Self::Mq2G256V2),
             51 => Some(Self::Mq2G256LloydU),
+            53 => Some(Self::Mq4G128V2),
             13 => Some(Self::Mq4G256),
             15 => Some(Self::Mq6G256),
             17 => Some(Self::Mq3G256),
@@ -163,7 +183,12 @@ impl CpuQuant {
             Self::Q8F16 => 32,
             // The three G128 formats: TQ2/BQ1 are flat element formats with a
             // 128-element block, and the HFQ G128 pair packs 128 weights.
-            Self::Hfq4G128 | Self::Hfq3G128 | Self::Hfq2G128 | Self::Tq2G128 | Self::Bq1G128 => 128,
+            Self::Hfq4G128
+            | Self::Hfq3G128
+            | Self::Hfq2G128
+            | Self::Tq2G128
+            | Self::Bq1G128
+            | Self::Mq4G128V2 => 128,
             _ => 256,
         }
     }
@@ -187,6 +212,7 @@ impl CpuQuant {
             Self::Hfq2G128 => 40,
             Self::Tq2G128 => 34,
             Self::Bq1G128 => 18,
+            Self::Mq4G128V2 => 68,
             Self::Q8F16 => 34,
             Self::F16 | Self::Bf16 => 512,
             Self::F32 => 1024,
@@ -232,6 +258,36 @@ impl CpuQuant {
         // the HFQ/TQ2/BQ1 formats (encoded in the natural basis), and MQ8 (whose
         // activation contract is `RotationPlan::Mq8Internal`, an int8-quantized
         // variant this crate does not implement — see the coverage note).
+    }
+
+    /// Whether the format's weights are stored FWHT-128-rotated (qt 53
+    /// `Mq4G128V2`), i.e. its activation needs [`rotate_x_128_v2`]. Disjoint
+    /// from [`Self::is_fwht_g256`].
+    pub fn is_fwht_g128(self) -> bool {
+        matches!(self, Self::Mq4G128V2)
+    }
+
+    /// The forward activation rotation this format's codes are dotted against.
+    /// Agrees with [`Self::is_fwht_g256`] / [`Self::is_fwht_g128`].
+    pub fn input_rotation(self) -> InputRotation {
+        if self.is_fwht_g256() {
+            InputRotation::FwhtG256
+        } else if self.is_fwht_g128() {
+            InputRotation::FwhtG128V2
+        } else {
+            InputRotation::None
+        }
+    }
+
+    /// The `k` granularity the GEMV entry points accept for this format: the
+    /// 128-element-group formats take any multiple of 128 (Flash-Next's down
+    /// projection is `k = 640`), everything else needs a multiple of 256.
+    pub fn k_multiple(self) -> usize {
+        if self.group_elems() == 128 {
+            128
+        } else {
+            256
+        }
     }
 }
 
@@ -328,6 +384,93 @@ pub fn rotate_x(x: &mut [f32]) {
         for i in 0..FWHT_N {
             group[i] *= scale * signs2()[i];
         }
+    }
+}
+
+/// Forward FWHT-128 sign tables of the qt 53 activation rotation: the seeds
+/// 43 / 1043 that `Gpu::ensure_mq_signs_128` uploads and the `MQ4G128V2`
+/// encoder bakes into the weights.
+const FWHT128_N: usize = 128;
+const FWHT128_SEED1: u32 = 43;
+const FWHT128_SEED2: u32 = 1043;
+/// `1/sqrt(128)` as the `f32` literal `mq_rotate_x_128_v2.hip` uses.
+const FWHT128_SCALE: f32 = 0.0883883476;
+
+static SIGNS128_1: LazyLock<[f32; FWHT128_N]> = LazyLock::new(|| {
+    fwht_signs(FWHT128_SEED1, FWHT128_N)
+        .try_into()
+        .expect("gapless 128")
+});
+static SIGNS128_2: LazyLock<[f32; FWHT128_N]> = LazyLock::new(|| {
+    fwht_signs(FWHT128_SEED2, FWHT128_N)
+        .try_into()
+        .expect("gapless 128")
+});
+
+/// In-place radix-2 Hadamard butterfly over 128 elements, unnormalized.
+fn butterfly128(group: &mut [f32; FWHT128_N]) {
+    let mut stride = 1;
+    while stride < FWHT128_N {
+        let mut j = 0;
+        while j < FWHT128_N {
+            for k in 0..stride {
+                let a = group[j + k];
+                let b = group[j + k + stride];
+                group[j + k] = a + b;
+                group[j + k + stride] = a - b;
+            }
+            j += stride * 2;
+        }
+        stride <<= 1;
+    }
+}
+
+/// Inverse FWHT-128 of one qt 53 group: pre-scale by `signs2`, butterfly,
+/// post-scale by `1/sqrt(128) * signs1` — the mirror of [`rotate_x_128_v2`]'s
+/// per-group transform, the same way [`fwht256_inplace`] mirrors [`rotate_x`].
+pub fn fwht128_inplace(group: &mut [f32; FWHT128_N], signs1: &[f32], signs2: &[f32]) {
+    for i in 0..FWHT128_N {
+        group[i] *= signs2[i];
+    }
+    butterfly128(group);
+    for i in 0..FWHT128_N {
+        group[i] *= FWHT128_SCALE * signs1[i];
+    }
+}
+
+/// Forward FWHT-128 rotation of an activation, exactly what the GPU
+/// `mq_rotate_x_128_v2` kernel does to the qt 53 down projection's input, per
+/// 128-element group: `x * signs1` (seed 43), radix-2 butterfly with strides
+/// 1, 2, 4, …, `* 1/sqrt(128) * signs2` (seed 1043). The butterfly stage order
+/// and operand order match the kernel's, so the result is bitwise the
+/// kernel's.
+///
+/// Unlike [`rotate_x`], `x.len()` need not be a multiple of 128: the last
+/// group is zero-padded for the transform and only the first `x.len() % 128`
+/// outputs are kept (the kernel's tail contract, which the encoder mirrors by
+/// zero-padding the weight row).
+pub fn rotate_x_128_v2(x: &mut [f32]) {
+    let (s1, s2) = (&*SIGNS128_1, &*SIGNS128_2);
+    for block in x.chunks_mut(FWHT128_N) {
+        let mut group = [0.0f32; FWHT128_N];
+        for (i, v) in block.iter().enumerate() {
+            group[i] = *v * s1[i];
+        }
+        butterfly128(&mut group);
+        for (i, v) in block.iter_mut().enumerate() {
+            *v = group[i] * FWHT128_SCALE * s2[i];
+        }
+    }
+}
+
+/// Forward-rotate `x` in place with the rotation `q`'s stored codes expect
+/// ([`CpuQuant::input_rotation`]): [`rotate_x`] for the FWHT-256 formats,
+/// [`rotate_x_128_v2`] for qt 53, nothing for the natural-basis formats.
+pub fn rotate_input(q: CpuQuant, x: &mut [f32]) {
+    match q.input_rotation() {
+        InputRotation::None => {}
+        InputRotation::FwhtG256 => rotate_x(x),
+        InputRotation::FwhtG128V2 => rotate_x_128_v2(x),
     }
 }
 
@@ -593,6 +736,15 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
                 *o = scale * nibble as f32 + zero;
             }
         }
+        CpuQuant::Mq4G128V2 => {
+            // fp16 `[scale][zero]`, then 64 B of nibbles (low nibble = even
+            // element), the `decode_mq4g128v2` / GPU down-kernel layout.
+            let scale = f16_at(packed, 0);
+            let zero = f16_at(packed, 2);
+            for (i, o) in out[..ge].iter_mut().enumerate() {
+                *o = scale * code4(packed, 4, i) + zero;
+            }
+        }
         CpuQuant::Mq6G256 | CpuQuant::Hfq6G256 => {
             let scale = f32_at(packed, 0);
             let zero = f32_at(packed, 4);
@@ -794,6 +946,10 @@ pub fn dequant_group(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
     if q.is_fwht_g256() {
         let group: &mut [f32; FWHT_N] = (&mut out[..FWHT_N]).try_into().expect("group is 256");
         fwht256_inplace(group, signs1(), signs2());
+    } else if q.is_fwht_g128() {
+        let group: &mut [f32; FWHT128_N] =
+            (&mut out[..FWHT128_N]).try_into().expect("group is 128");
+        fwht128_inplace(group, &*SIGNS128_1, &*SIGNS128_2);
     }
 }
 
@@ -1630,6 +1786,7 @@ mod test {
         (49, CpuQuant::Mq3G256V2, 256, 104, true),
         (50, CpuQuant::Mq2G256V2, 256, 72, true),
         (51, CpuQuant::Mq2G256LloydU, 256, 72, false),
+        (53, CpuQuant::Mq4G128V2, 128, 68, false),
     ];
 
     #[test]
@@ -1642,6 +1799,29 @@ mod test {
                 "qt {qt} {q:?}"
             );
             assert_eq!(q.is_fwht_g256(), rotated, "qt {qt} {q:?} rotation");
+            assert_eq!(
+                q.is_fwht_g128(),
+                q == CpuQuant::Mq4G128V2,
+                "qt {qt} {q:?} g128 rotation"
+            );
+            assert!(
+                !(q.is_fwht_g256() && q.is_fwht_g128()),
+                "qt {qt} {q:?} claims both rotations"
+            );
+            let want = if q.is_fwht_g256() {
+                InputRotation::FwhtG256
+            } else if q == CpuQuant::Mq4G128V2 {
+                InputRotation::FwhtG128V2
+            } else {
+                InputRotation::None
+            };
+            assert_eq!(q.input_rotation(), want, "qt {qt} {q:?} input_rotation");
+            // 128-group formats take k % 128; every other format keeps k % 256.
+            assert_eq!(
+                q.k_multiple(),
+                if ge == 128 { 128 } else { 256 },
+                "qt {qt} {q:?} k_multiple"
+            );
         }
         // Deliberately NOT covered, each for a structural reason (see the crate
         // and `docs/perf-checkpoints/2026-09-27-gfx1201-cpu-exec-offload.md`):
@@ -1816,5 +1996,285 @@ mod test {
     #[should_panic(expected = "not a multiple of 256")]
     fn rotate_x_panics_on_unaligned_input() {
         rotate_x(&mut [0.0f32; 255]);
+    }
+
+    // ---- qt 53 `Mq4G128V2` ------------------------------------------------
+
+    /// A hand-built group with known values pins the wire layout against the
+    /// layout in `quant_fwht.rs`/`quant_e8.rs` independent of any encoder:
+    /// `[f16 scale @0][f16 zero @2][nibbles @4..68]`, low nibble = even element.
+    #[test]
+    fn mq4g128v2_hand_built_group_layout() {
+        // Two groups of one row, distinct headers so a wrong group stride or a
+        // swapped scale/zero shows up.
+        let mut packed = vec![0u8; 2 * 68];
+        // Group 0: scale 0.5 (0x3800), zero -1.0 (0xbc00); byte i = (i%16) | (15 - i%16) << 4.
+        packed[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        packed[2..4].copy_from_slice(&0xbc00u16.to_le_bytes());
+        for i in 0..64 {
+            packed[4 + i] = ((i % 16) as u8) | ((15 - (i % 16) as u8) << 4);
+        }
+        // Group 1: scale 0.25 (0x3400), zero 2.0 (0x4000); all nibbles 0xA / 0x3.
+        packed[68..70].copy_from_slice(&0x3400u16.to_le_bytes());
+        packed[70..72].copy_from_slice(&0x4000u16.to_le_bytes());
+        for i in 0..64 {
+            packed[68 + 4 + i] = 0x3A;
+        }
+        let mut out = [0.0f32; 128];
+        decode_group_codes(CpuQuant::Mq4G128V2, &packed, &mut out);
+        for i in 0..64 {
+            let (lo, hi) = ((i % 16) as f32, (15 - i % 16) as f32);
+            assert_eq!(out[2 * i], 0.5 * lo - 1.0, "g0 even element {i}");
+            assert_eq!(out[2 * i + 1], 0.5 * hi - 1.0, "g0 odd element {i}");
+        }
+        decode_group_codes(CpuQuant::Mq4G128V2, &packed[68..], &mut out);
+        for i in 0..64 {
+            assert_eq!(out[2 * i], 0.25 * 10.0 + 2.0, "g1 even element {i}");
+            assert_eq!(out[2 * i + 1], 0.25 * 3.0 + 2.0, "g1 odd element {i}");
+        }
+    }
+
+    fn lcg_floats(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // Sum of three uniforms: roughly bell-shaped, in [-1.5, 1.5).
+                let u = |sh: u32| ((s >> sh) & 0xFFFF) as f32 / 65536.0 - 0.5;
+                u(8) + u(24) + u(40)
+            })
+            .collect()
+    }
+
+    /// `decode_group_codes` is bit-for-bit the reference decoder over a tensor
+    /// the (transcribed) real encoder produced, and `dequant_group` — codes
+    /// plus inverse FWHT-128 — recovers the original weights to 4-bit
+    /// accuracy. A wrong inverse (sign tables, normalization, stage order) is
+    /// a relative error near or above 1, not a quantization error.
+    #[test]
+    fn mq4g128v2_decode_matches_encoder_reference() {
+        let (m, k) = (3usize, 640usize);
+        let w = lcg_floats(0x53, m * k);
+        let packed = crate::testfix::encode_mq4g128v2_ref(&w, m, k);
+        assert_eq!(
+            packed.len(),
+            m * crate::gemv::row_bytes(CpuQuant::Mq4G128V2, k)
+        );
+        assert_eq!(packed.len(), m * 5 * 68);
+        let reference = crate::testfix::decode_mq4g128v2_ref(&packed, m, k);
+        let (mut err2, mut ref2) = (0.0f64, 0.0f64);
+        for row in 0..m {
+            for g in 0..k / 128 {
+                let at = (row * (k / 128) + g) * 68;
+                let mut codes = [0.0f32; 128];
+                decode_group_codes(CpuQuant::Mq4G128V2, &packed[at..], &mut codes);
+                let r0 = row * k + g * 128;
+                assert_bits(
+                    &codes,
+                    &reference[r0..r0 + 128]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "qt53 codes vs reference decoder",
+                );
+                let mut orig = [0.0f32; 128];
+                dequant_group(CpuQuant::Mq4G128V2, &packed[at..], &mut orig);
+                for i in 0..128 {
+                    let d = (orig[i] - w[r0 + i]) as f64;
+                    err2 += d * d;
+                    ref2 += (w[r0 + i] as f64).powi(2);
+                }
+            }
+        }
+        let rel = (err2 / ref2).sqrt();
+        assert!(
+            rel < 0.2,
+            "qt53 dequant_group rel_l2 {rel:.4} vs the source weights"
+        );
+    }
+
+    /// The first 16 and last 4 signs of the two 128-wide tables (seeds 43 /
+    /// 1043), pinned literally from the generator `hipfire-quantize` and
+    /// `Gpu::ensure_mq_signs_128` share.
+    #[test]
+    fn fwht128_signs_are_pinned() {
+        let s1 = fwht_signs(FWHT128_SEED1, FWHT128_N);
+        let s2 = fwht_signs(FWHT128_SEED2, FWHT128_N);
+        assert_eq!(
+            s1[..16],
+            [
+                1.0, -1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0,
+                1.0
+            ]
+        );
+        assert_eq!(
+            s2[..16],
+            [
+                1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0,
+                -1.0
+            ]
+        );
+        assert_eq!(s1[124..], [1.0, 1.0, -1.0, -1.0]);
+        assert_eq!(s2[124..], [1.0, -1.0, 1.0, -1.0]);
+        assert_eq!(&SIGNS128_1[..], &s1[..]);
+        assert_eq!(&SIGNS128_2[..], &s2[..]);
+        // The kernel's literal is the f32 nearest 1/sqrt(128).
+        assert_eq!(FWHT128_SCALE, 1.0f32 / (128.0f32).sqrt());
+    }
+
+    /// Independent oracle: `R = (1/sqrt(128)) · D2 · H · D1` with `H` from its
+    /// definition. `rotate_x_128_v2` of a unit vector is a column of `R`.
+    #[test]
+    fn rotate_x_128_v2_matches_the_hadamard_matrix() {
+        let s1 = fwht_signs(43, 128);
+        let s2 = fwht_signs(1043, 128);
+        let norm = 1.0f32 / (128.0f32).sqrt();
+        for j in [0usize, 1, 17, 64, 127] {
+            let mut x = vec![0.0f32; 128];
+            x[j] = 1.0;
+            rotate_x_128_v2(&mut x);
+            for i in 0..128 {
+                let h = if (i & j).count_ones() % 2 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let want = norm * s2[i] * h * s1[j];
+                assert!(
+                    (x[i] - want).abs() <= 1e-7,
+                    "column {j}, row {i}: {} vs {want}",
+                    x[i]
+                );
+            }
+        }
+    }
+
+    /// Bitwise mirror of `mq_rotate_x_128_v2.hip`: 32 lanes x four adjacent
+    /// values, in-lane stages (strides 1, 2), cross-lane XOR stages where the
+    /// `tid & stride` lane computes `partner - mine`, then
+    /// `* 0.0883883476 * signs2`. Includes the kernel's zero-fill of a short
+    /// tail and its "only K values written" contract.
+    fn gpu_kernel_mirror(x: &[f32]) -> Vec<f32> {
+        let s1 = fwht_signs(43, 128);
+        let s2 = fwht_signs(1043, 128);
+        let mut out = vec![0.0f32; x.len()];
+        for group in 0..x.len().div_ceil(128) {
+            let at = |i: usize| -> f32 { x.get(group * 128 + i).copied().unwrap_or(0.0) };
+            let mut v = vec![[0.0f32; 4]; 32];
+            for (tid, lane) in v.iter_mut().enumerate() {
+                let d0 = tid * 4;
+                let (mut v0, mut v1, mut v2, mut v3) = (
+                    at(d0) * s1[d0],
+                    at(d0 + 1) * s1[d0 + 1],
+                    at(d0 + 2) * s1[d0 + 2],
+                    at(d0 + 3) * s1[d0 + 3],
+                );
+                let t = v0;
+                v0 += v1;
+                v1 = t - v1;
+                let t = v2;
+                v2 += v3;
+                v3 = t - v3;
+                let t = v0;
+                v0 += v2;
+                v2 = t - v2;
+                let t = v1;
+                v1 += v3;
+                v3 = t - v3;
+                *lane = [v0, v1, v2, v3];
+            }
+            let mut stride = 1usize;
+            while stride < 32 {
+                let old = v.clone();
+                for tid in 0..32 {
+                    for el in 0..4 {
+                        let (partner, mine) = (old[tid ^ stride][el], old[tid][el]);
+                        v[tid][el] = if tid & stride != 0 {
+                            partner - mine
+                        } else {
+                            mine + partner
+                        };
+                    }
+                }
+                stride <<= 1;
+            }
+            for tid in 0..32 {
+                for el in 0..4 {
+                    let d = tid * 4 + el;
+                    if group * 128 + d < x.len() {
+                        out[group * 128 + d] = v[tid][el] * 0.0883883476f32 * s2[d];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rotate_x_128_v2_is_bitwise_the_gpu_kernel() {
+        // k = 640 (the Flash-Next down shape, 5 groups), a single group, and
+        // short/tail shapes including a non-multiple of 128.
+        for len in [128usize, 640, 1, 200, 255, 130] {
+            let x = lcg_floats(len as u64, len);
+            let mut got = x.clone();
+            rotate_x_128_v2(&mut got);
+            let want = gpu_kernel_mirror(&x);
+            let a: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            let b: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(a, b, "len {len}");
+        }
+    }
+
+    /// A tail group is rotated as if zero-padded to 128, and only the first
+    /// `len % 128` outputs are kept.
+    #[test]
+    fn rotate_x_128_v2_tail_is_zero_padded() {
+        let x = lcg_floats(7, 200);
+        let mut got = x.clone();
+        rotate_x_128_v2(&mut got);
+        let mut padded = x.clone();
+        padded.resize(256, 0.0);
+        rotate_x_128_v2(&mut padded);
+        assert_eq!(got[..], padded[..200]);
+    }
+
+    #[test]
+    fn fwht128_inplace_inverts_rotate_x_128_v2() {
+        for seed in 0..3u64 {
+            let x = lcg_floats(seed + 100, 384);
+            let mut r = x.clone();
+            rotate_x_128_v2(&mut r);
+            assert_ne!(r, x, "rotation is a no-op");
+            for block in r.chunks_exact_mut(FWHT128_N) {
+                let group: &mut [f32; FWHT128_N] = block.try_into().unwrap();
+                fwht128_inplace(group, &*SIGNS128_1, &*SIGNS128_2);
+            }
+            for (a, b) in r.iter().zip(&x) {
+                assert!((a - b).abs() <= 1e-6 * b.abs().max(1.0), "{a} vs {b}");
+            }
+        }
+    }
+
+    /// `rotate_input` picks the rotation the format's stored codes need, and
+    /// leaves natural-basis formats alone.
+    #[test]
+    fn rotate_input_dispatches_on_the_format() {
+        let x = lcg_floats(9, 256);
+        let apply = |q: CpuQuant| {
+            let mut v = x.clone();
+            rotate_input(q, &mut v);
+            v
+        };
+        let mut g256 = x.clone();
+        rotate_x(&mut g256);
+        let mut g128 = x.clone();
+        rotate_x_128_v2(&mut g128);
+        assert_eq!(apply(CpuQuant::Mq4G256V2), g256);
+        assert_eq!(apply(CpuQuant::Mq4G128V2), g128);
+        assert_ne!(g128, g256);
+        assert_eq!(apply(CpuQuant::Hfq4G128), x);
+        assert_eq!(apply(CpuQuant::Mq2G256LloydU), x);
     }
 }
