@@ -775,23 +775,30 @@ Caveats that are part of the fixture, not trivia:
   A same-request AR floor guards the default route: the request's first
   window is one ordinary target-only token, timed (a sampled draw included)
   as the AR price and followed by one head append; up to three speculative
-  probe windows then run under the table-ordered route. The AR verdict (retire
-  or keep drafting) then reads only options measured on this request (batched
-  depth by its decayed window time over the agreement-predicted tokens,
-  interleaved by its time per emitted token); once a measured option beats AR
-  the window runs the cheapest candidate: every measured option plus every
-  unmeasured batched depth next to a measured one (d±1), priced by the
-  request's own window-cost fit (a decayed least-squares line of each priced
-  batched window's wall time on its drafted depth; its slope is the measured
-  cost of one more verify row + draft step, ridge-pulled toward
-  `MTP_ROW_COST_PRIOR`, 0.27 AR steps per row, until windows at two depths are
-  priced). A request climbs one depth at a time, up to 7 (the 8-row verify),
-  while the next row's measured price stays below its predicted yield, and
-  stays shallow where it does not. On the singleton drafter the first batched
-  window at each drafted depth (across requests) is observed unpriced and
-  spends a probe: the process's first verify at a row count carries one-time
-  kernel work. Chooser candidates and the fitted per-row cost appear in
-  `HIPFIRE_MTP_FLOOR_TRACE` lines (`modeled`, `row_us`). When none costs
+  probe windows then run under the table-ordered route. A batched depth is
+  priced by the depth (cap) it was routed at: the cap's decayed mean window
+  time over the agreement-predicted tokens of its windows' drafted-depth mix,
+  so the windows the margin prune cuts short count at their real, lower, cost
+  and yield (the drafted-depth model kept Halo prose at depth 2 while forced
+  K=4 with the prune ran +8.4%); interleaved by its time per emitted token.
+  The AR verdict (retire or keep drafting) then reads only options measured on
+  this request; once a measured option beats AR the window runs the cheapest
+  candidate: every cap, its evidence blended with the neighbouring cap's
+  (d±1, the one with more windows) for what that neighbour holds beyond it,
+  shifted by one row on the neighbour's windows that drafted its whole cap.
+  The row is the request's own window-cost fit (a decayed least-squares line
+  of each priced batched window's wall time on its drafted depth, ridge-pulled
+  toward `MTP_ROW_COST_PRIOR`, 0.27 AR steps per row, until windows at two
+  depths are priced), and every cap's evidence decays with every batched
+  window, so an unmeasured cap or one measured only during a poor start is
+  priced from the cap that runs. A request climbs one cap at a time, up to 7
+  (the 8-row verify), while the next row pays, and stays shallow where it does
+  not. On the singleton drafter the first batched window at each drafted
+  depth (across requests) is observed unpriced and spends a probe: the
+  process's first speculative window binds the whole verify route's kernels
+  (gfx1151: ~+17-20 ms once per process). Chooser candidates and the fitted
+  per-row cost appear in `HIPFIRE_MTP_FLOOR_TRACE` lines (`capN`, `modeled`,
+  `drafted`, `row_us`). When none costs
   strictly less per emitted token than AR (a
   tie, or an invalid AR timing, counts as no win) the request retires to
   head-free AR for good, unless n-gram windows keep it alive: a request stays
@@ -803,16 +810,17 @@ Caveats that are part of the fixture, not trivia:
   advances fall back to the target alone, and only `configure_request`
   (a new request) resets it, not `mtp_reset` or a prefill realign. At most one
   calibration head append and three probe windows precede the first measured
-  decision; this bounds the speculation work, not the full-request time. Each
-  floor-observed native window ends with one device sync so its whole GPU tail
-  is priced (forced routes skip it unless phase timing is enabled), and the
-  retired token host-syncs its top-1, which the AR producer does not.
+  decision; this bounds the speculation work, not the full-request time. A
+  floor-observed native window is priced from its start to the next window's
+  plan, an interval that holds its whole GPU tail without a device sync at
+  every window end, and the retired token host-syncs its top-1, which the AR
+  producer does not.
   With `HIPFIRE_MTP_PHASE_TIMING=1`, batched `window_us` includes the snapshot
   and commit tail; diagnostic forced routes synchronize for cost accuracy.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
   interleaved; either forced route is a diagnostic override that bypasses the
   floor entirely. `HIPFIRE_MTP_AR_FLOOR=0` opts out of the floor (diagnostic
-  A/B): no calibration token, probe windows, retirement or floor sync, and the
+  A/B): no calibration token, probe windows or retirement, and the
   per-window chooser routes as before the floor; the forced routes win if both
   are set. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
   AR target's single-row route. With Q8 GDN recurrent state, the row-capture

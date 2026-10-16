@@ -1120,13 +1120,13 @@ fn forward_inner(
                     continue;
                 };
                 match window.route {
-                    LaneRoute::Batched { .. } => {
+                    LaneRoute::Batched { k_max } => {
                         let units = cost.window_units(
                             decode_lanes,
                             outcome.drafts_generated,
                             spill_per_window,
                         );
-                        policy.observe_batched(outcome, units, window.budget);
+                        policy.observe_batched(outcome, units, k_max, window.budget);
                         stats.windows += 1;
                         stats.drafts += outcome.drafts_generated as u64;
                         stats.accepted += outcome.accepted as u64;
