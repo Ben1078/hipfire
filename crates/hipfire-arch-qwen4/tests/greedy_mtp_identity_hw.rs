@@ -29,8 +29,8 @@
 //! - `ngram-batched`, `ngram-incremental`, `ngram-adaptive`: the drafter is built
 //!   `.with_ngram(Some(qwen4_ngram_mod_config(ngram_mod_triple_for_arch(16, arch))))
 //!   .with_copy_lane(mtp_ngram_copy_enabled_for_arch(16, arch))` (the product
-//!   switch `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by
-//!   default: the native-MTP n-gram takeover, `on` runs the copy lane; the
+//!   switch `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, `auto` =
+//!   on for gfx1151 only: the native-MTP n-gram takeover, `on` / `off` forces the copy lane / the 5/3/3 pool; the
 //!   `NGRAM` line prints `copy_lane=`) and the request armed with
 //!   `allow_ngram_modifier: true`, with route knob
 //!   `HIPFIRE_MTP_INCREMENTAL` `0` / `1` / unset;
