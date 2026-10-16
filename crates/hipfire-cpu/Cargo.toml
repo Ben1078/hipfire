@@ -6,6 +6,7 @@ license.workspace = true
 description = "CPU execution core for host-mapped (spilled) quantized weights"
 
 [dependencies]
+libc.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]
