@@ -20,6 +20,7 @@
 //! 2. Run debug builds to catch silent mis-binds via the bind_thread invariant.
 //! 3. Pass the multi-GPU coherence gate.
 
+pub mod transport;
 use std::ffi::c_void;
 
 use crate::device_mesh::{DeviceMesh, DimKind};

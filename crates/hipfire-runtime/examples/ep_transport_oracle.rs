@@ -45,9 +45,9 @@
 //! # Distinct-device mode (`--devices`, no GPU peer access required)
 //!
 //! ```sh
-//! ep_transport_oracle --devices 0,1[,..] [--transport host|peer|both]
+//! ep_transport_oracle --devices 0,1[,..] [--transport auto|host|peer|both]
 //!     [--host-flags mapped|coherent|all]
-//!     [--suites xrows,xtiles,xctl,xtime,xhop] [--rounds 6] [--reps 200]
+//!     [--suites xrows,xtiles,xctl,xtime,xhop,xedge] [--rounds 6] [--reps 200]
 //!     [--layers 48] [--seed N] [--json receipt.json]
 //! ```
 //!
@@ -56,13 +56,31 @@
 //! (`gpu.active_stream`); every kernel, event record and async copy of a rank is on
 //! that stream. `--transport` defaults to env `HIPFIRE_QWEN4_EP_TRANSPORT`
 //! (`auto|peer|host`, unset = `auto`); `auto` = `host` when any directed pair
-//! lacks `can_access_peer`, else `peer`; `both` runs every suite per transport
-//! (the peer arm is skipped with a `SKIP` line + receipt note when a pair lacks
-//! peer access). In `host` transport nothing calls `enable_peer_access` and every
-//! kernel pointer is checked against the rank's own allocations + its alias of
-//! each host bank (a violation is an error, never a launch). `--host-flags`:
+//! is not byte-qualified (below), else `peer`; `both` runs every suite per transport
+//! (the peer arm is skipped with a `SKIP` line + receipt note when a pair is not
+//! byte-qualified). In `host` transport the oracle never calls `enable_peer_access`
+//! and every kernel pointer is checked against the rank's own allocations + its alias
+//! of each host bank (a violation is an error, never a launch). `--host-flags`:
 //! `mapped` = `HIP_HOST_MALLOC_MAPPED`, `coherent` = mapped | `HIP_HOST_MALLOC_COHERENT`,
-//! `all` = both.
+//! `all` = both (rank suites only; the `xedge` service chooses its own bank flags).
+//!
+//! ## Peer byte qualification (preflight)
+//!
+//! Peer is never chosen from `can_access_peer` alone. Unless `--transport host`, a
+//! sequential coordinator runs BEFORE any rank thread: for every unordered device
+//! pair it initializes exactly two `Gpu`s, calls
+//! `multi_gpu::transport::qualify_peer` (peer-pointer kernel reads in BOTH directions)
+//! and drops them. The receipt's `peer_qualification` holds the per-pair rows and the
+//! directed `matrix` (`true|false`, `null` on the diagonal). `auto` picks the host arm
+//! when any directed pair fails; `peer` runs only fully qualified sets.
+//!
+//! Explicit `--transport host` does NOT probe: nothing in the process touches
+//! `enable_peer_access`. `auto`/`both` (and `peer`) probe, and `qualify_peer` may
+//! enable peer access at process level (it cannot be undone). The receipt keeps the
+//! two facts apart: `peer_qualification.performed` / `per_rank[].peer_access_enabled.
+//! probe_ran` say a probe ran (so peer access MAY be enabled by `qualify_peer`), while
+//! `peer_access_enabled.host` / `.peer` record whether the oracle's own arms called
+//! `enable_peer_access` (always `false` for the host arm).
 //!
 //! ## Host bank and exchange protocol (host transport)
 //!
@@ -97,11 +115,38 @@
 //!   10,240 B / 40,960 B / 15,728,640 B with methods `mapped`, `mapped-sw`,
 //!   `mapped-sw-chain` (5 hops, total/5), `staged` (pinned buffer) and `peer`.
 //!
-//! Output: `PASS <case>` / `FAIL <case>: <detail>`, `TIME <suite> <shape>
+//! * `xedge`: the shared edge transport service (`multi_gpu::transport`: `provision`,
+//!   `EdgeLease::{publish, receive, poison, drain}`, lab `inject_fault`) driven directly
+//!   by a dedicated coordinator thread BEFORE the rank threads (it needs two `Gpu`s on
+//!   one thread, so it does not go through the two-thread `Env`). For every ADJACENT
+//!   device pair of `--devices` and every selected edge transport (`host` -> HostMapped;
+//!   `peer` -> Peer only for a byte-qualified pair; `auto` -> Peer when the pair is
+//!   qualified else HostMapped; `both` -> HostMapped + Peer when qualified). Payloads
+//!   are the HC row shapes F32 (40,960 B/row) and BF16 (20,480 B/row). Cases per
+//!   `xedge <transport> dev<A>-dev<B>` prefix: `fixed <dt> rows=<1|8|1536|4096>`
+//!   (unique seeded bytes per generation, every byte compared, source unchanged);
+//!   `chain6 <dt> rows=<R>` (six alternating-device hops over two leases, two
+//!   iterations, every hop destination compared); `reuse <dt> dir=fwd|rev` (mixed
+//!   row counts across k+2 bank reuse, 256 B poisoned destination tail and random
+//!   source tail must stay untouched); `delayed-producer|delayed-consumer <shape>`
+//!   (a GPU stall of ~100+ ms is enqueued on the producer/consumer stream so a
+//!   premature bank read/overwrite shows up as STALE data); `poison <FaultPoint>` for
+//!   all nine lab hooks (primes generations 0 and 1, injects at generation 2 so real
+//!   bank reuse is exercised, requires the faulting call plus every later publish and
+//!   receive to fail closed, `drain` to succeed, then a reprovisioned lease to run
+//!   clean); `poison explicit`; `reject <short-view|row-align|dtype-bytes|rows-zero|
+//!   over-max|foreign-view|recv-op|recv-rows|recv-dtype|recv-epoch>`; `reprovision`
+//!   (fresh epoch, restarted generations, stale-epoch descriptor refused). Every lease
+//!   is drained before any tensor, stream or device is freed; a failed drain
+//!   quarantines (leaks) the lease and tensors and stops that pair.
+//!
+//! Output: `PASS <case>` / `FAIL <case>: <detail>`, `PROBE ...` (peer qualification),
+//! `TIME <suite> <shape>
 //! <transport>/<flags> median_us=.. p10_us=.. p90_us=.. [GBps=..] publish_us=[..]
 //! gather_us=[..]`, final `RESULT:` line; `--json` writes the receipt (arch, device
-//! ids, PCI bus id, resolved transports, `can_access_peer` matrix, host flags,
-//! alias==host per rank, cases, timings, `peer_access_enabled` per rank).
+//! ids, PCI bus id, resolved transports, `can_access_peer` matrix, `peer_qualification`
+//! (probe matrix), `xedge` arms, host flags, alias==host per rank, cases, timings,
+//! `peer_access_enabled` per rank).
 //! Exit status: 0 only when every correctness case passed (timing has no thresholds);
 //! 1 on any FAIL or rank error; 2 on usage errors / no device / no runnable transport.
 
@@ -115,8 +160,13 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+
+use hipfire_runtime::mesh_placement::EdgeTransport;
+use hipfire_runtime::multi_gpu::transport::{
+    provision, qualify_peer, EdgeDescriptor, EdgeId, EdgeLease, EdgeSpec, FaultPoint,
+};
 
 type R<T> = Result<T, String>;
 
@@ -476,8 +526,8 @@ fn pull_case(
 
 // ───────────────────────────── driver ─────────────────────────────
 
-const USAGE: &str = "usage: ep_transport_oracle [--ranks 2,3,6] [--seed N] [--slots 37] [--device 0] [--suites rows,tile] [--json FILE]\n       ep_transport_oracle --devices 0,1[,..] [--transport host|peer|both] [--host-flags mapped|coherent|all] [--suites xrows,xtiles,xctl,xtime,xhop] [--rounds 6] [--reps 200] [--layers 48] [--seed N] [--json FILE]";
-const X_SUITES: [&str; 5] = ["xrows", "xtiles", "xctl", "xtime", "xhop"];
+const USAGE: &str = "usage: ep_transport_oracle [--ranks 2,3,6] [--seed N] [--slots 37] [--device 0] [--suites rows,tile] [--json FILE]\n       ep_transport_oracle --devices 0,1[,..] [--transport auto|host|peer|both] [--host-flags mapped|coherent|all] [--suites xrows,xtiles,xctl,xtime,xhop,xedge] [--rounds 6] [--reps 200] [--layers 48] [--seed N] [--json FILE]";
+const X_SUITES: [&str; 6] = ["xrows", "xtiles", "xctl", "xtime", "xhop", "xedge"];
 
 struct Args {
     ranks: Vec<usize>,
@@ -914,6 +964,7 @@ struct Cfg {
     xctl: bool,
     xtime: bool,
     xhop: bool,
+    xedge: bool,
     rounds: usize,
     reps: usize,
     layers: usize,
@@ -968,6 +1019,7 @@ struct Rec {
     init_err: Option<String>,
     resolved: Vec<String>,
     arms: Vec<String>,
+    xedge_arms: Vec<Value>,
 }
 
 impl Rec {
@@ -1011,6 +1063,7 @@ struct Shared {
     hop_t0: AtomicU64,
     hop_t1: AtomicU64,
     epoch: Instant,
+    pre: OnceLock<Preflight>,
 }
 
 impl Shared {
@@ -1041,10 +1094,14 @@ impl Shared {
             hop_t0: AtomicU64::new(0),
             hop_t1: AtomicU64::new(0),
             epoch: Instant::now(),
+            pre: OnceLock::new(),
         }
     }
     fn now_ns(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
+    }
+    fn pre(&self) -> &Preflight {
+        self.pre.get().expect("preflight not run")
     }
 }
 
@@ -3373,15 +3430,7 @@ fn suite_xhop(env: &mut Env<'_>, arm: Arm, first_host: bool) -> R<()> {
 // ── driver for one rank ──
 
 fn resolve_arms(sh: &Shared, announce: bool) -> Vec<Arm> {
-    let mut all_peer = true;
-    for q in 0..sh.n {
-        let info = lock(&sh.infos[q]);
-        for (p, c) in info.can_access.iter().enumerate() {
-            if p != q && *c != Some(true) {
-                all_peer = false;
-            }
-        }
-    }
+    let all_peer = sh.pre().all_ok(sh.n);
     let (want_host, want_peer) = match sh.cfg.transport {
         TransportReq::Auto => (!all_peer, all_peer),
         TransportReq::Host => (true, false),
@@ -3397,10 +3446,10 @@ fn resolve_arms(sh: &Shared, announce: bool) -> Vec<Arm> {
             arms.push(Arm::Peer);
         } else {
             if announce {
-                println!("SKIP peer transport: not every directed device pair has can_access_peer");
+                println!("SKIP peer transport: not every directed device pair is byte-qualified (qualify_peer)");
                 lock(&sh.rec)
                     .notes
-                    .push("peer arm skipped: a directed pair lacks peer access".into());
+                    .push("peer arm skipped: a directed pair is not byte-qualified".into());
             }
         }
     }
@@ -3445,6 +3494,12 @@ fn run_all(env: &mut Env<'_>) -> R<()> {
             }
         }
         rec.resolved = resolved;
+        if sh.pre().probed && arms.iter().any(|a| a.is_host()) {
+            rec.note(
+                "host arm ran after a qualify_peer probe: the probe may have enabled peer access at process level; the host arm itself never calls enable_peer_access (peer_access_enabled.host=false)"
+                    .into(),
+            );
+        }
     }
     env.warm_kernels()?;
     let mut first_host = true;
@@ -3545,6 +3600,1350 @@ fn rank_thread(sh: &Shared, rank: usize) {
     }
 }
 
+// ───────────────────────────── peer qualification preflight ─────────────────────────────
+
+/// Byte qualification of every directed device pair, produced once by the
+/// sequential coordinator before any rank thread starts.
+struct Preflight {
+    /// `false` for explicit `--transport host`: nothing was probed.
+    probed: bool,
+    /// `qual[p][q]` (`p != q`): rank `p` -> rank `q` byte-qualified by `qualify_peer`.
+    /// `qualify_peer` qualifies both directions of an unordered pair in one call, so
+    /// `qual[a][b] == qual[b][a]`.
+    qual: Vec<Vec<Option<bool>>>,
+    pairs: Vec<Value>,
+}
+
+impl Preflight {
+    fn directed_ok(&self, p: usize, q: usize) -> bool {
+        self.probed && self.qual.get(p).and_then(|r| r.get(q)).copied().flatten() == Some(true)
+    }
+    fn pair_ok(&self, a: usize, b: usize) -> bool {
+        self.directed_ok(a, b) && self.directed_ok(b, a)
+    }
+    fn all_ok(&self, n: usize) -> bool {
+        (0..n).all(|p| (0..n).all(|q| p == q || self.directed_ok(p, q)))
+    }
+}
+
+impl Cfg {
+    /// Any suite that runs on the two-thread rank `Env`.
+    fn rank_suites(&self) -> bool {
+        self.xrows || self.xtiles || self.xctl || self.xtime || self.xhop
+    }
+}
+
+fn quiesce(g: &Gpu) -> R<()> {
+    ctx(g.bind_thread(), "bind_thread")?;
+    ctx(g.hip.device_synchronize(), "device_synchronize")
+}
+
+/// Raw capability queries, `qualify_peer`, then a device-wide quiesce of both sides.
+/// Any error is returned (the caller leaks both `Gpu`s: their state is unknown).
+/// Returns (byte-qualified both directions, can_access a->b, can_access b->a).
+fn probe_pair(
+    sh: &Shared,
+    a: (usize, i32, &mut Gpu),
+    b: (usize, i32, &mut Gpu),
+) -> R<(bool, bool, bool)> {
+    let (ra, da, ga) = a;
+    let (rb, db, gb) = b;
+    ctx(ga.bind_thread(), "bind_thread")?;
+    let can_ab = ctx(ga.hip.can_access_peer(da, db), "can_access_peer")?;
+    ctx(gb.bind_thread(), "bind_thread")?;
+    let can_ba = ctx(gb.hip.can_access_peer(db, da), "can_access_peer")?;
+    for (r, g, d) in [(ra, &*ga, da), (rb, &*gb, db)] {
+        let mut info = lock(&sh.infos[r]);
+        info.arch = g.arch.clone();
+        info.pci = g.hip.device_pci_bus_id(d).ok();
+    }
+    // Only Ok(false) may select the host arm; an Err fails the whole preflight closed.
+    let ok = qualify_peer(ga, gb).map_err(|e| format!("qualify_peer dev{da}<->dev{db}: {e}"))?;
+    quiesce(gb)?;
+    quiesce(ga)?;
+    Ok((ok, can_ab, can_ba))
+}
+
+/// Sequential coordinator: two `Gpu`s at a time, never concurrent with rank threads.
+fn preflight(sh: &Shared) -> R<()> {
+    let n = sh.n;
+    let mut pre = Preflight {
+        probed: false,
+        qual: vec![vec![None; n]; n],
+        pairs: Vec::new(),
+    };
+    if sh.cfg.transport != TransportReq::Host {
+        pre.probed = true;
+        for a in 0..n {
+            for b in a + 1..n {
+                let (da, db) = (sh.cfg.devices[a], sh.cfg.devices[b]);
+                let mut ga = ctx(
+                    Gpu::init_with_device(da),
+                    &format!("preflight init device {da}"),
+                )?;
+                let mut gb = match ctx(
+                    Gpu::init_with_device(db),
+                    &format!("preflight init device {db}"),
+                ) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        std::mem::forget(ga);
+                        return Err(e);
+                    }
+                };
+                let (ok, can_ab, can_ba) = match probe_pair(sh, (a, da, &mut ga), (b, db, &mut gb))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Fail closed: never drop/free Gpus in an unknown state.
+                        std::mem::forget(gb);
+                        std::mem::forget(ga);
+                        return Err(e);
+                    }
+                };
+                drop(gb);
+                drop(ga);
+                pre.qual[a][b] = Some(ok);
+                pre.qual[b][a] = Some(ok);
+                println!(
+                    "PROBE rank{a}=dev{da} <-> rank{b}=dev{db}: byte_qualified={ok} can_access_peer={can_ab}/{can_ba}"
+                );
+                pre.pairs.push(json!({
+                    "rank_a": a, "rank_b": b, "device_a": da, "device_b": db,
+                    "qualified_both_directions": ok,
+                    "can_access_peer_a_to_b": can_ab, "can_access_peer_b_to_a": can_ba,
+                }));
+            }
+        }
+        lock(&sh.rec).note(
+            "peer probe ran via qualify_peer (kernel reads, both directions); qualify_peer may enable peer access at process level, which is not undone"
+                .into(),
+        );
+    }
+    sh.pre
+        .set(pre)
+        .map_err(|_| "preflight already ran".to_string())
+}
+
+// ───────────────────────────── xedge: transport service oracle ─────────────────────────────
+
+#[derive(Clone, Copy)]
+struct Payload {
+    name: &'static str,
+    dtype_bytes: usize,
+    row_bytes: usize,
+}
+
+/// Qwen4 HC row: 4 branches x 2560 hidden, F32 / BF16.
+const HC_F32: Payload = Payload {
+    name: "f32",
+    dtype_bytes: 4,
+    row_bytes: 40_960,
+};
+const HC_BF16: Payload = Payload {
+    name: "bf16",
+    dtype_bytes: 2,
+    row_bytes: 20_480,
+};
+const XEDGE_PAYLOADS: [Payload; 2] = [HC_F32, HC_BF16];
+const XEDGE_ROWS: [usize; 4] = [1, 8, 1536, 4096];
+const STALL_BYTES: usize = 128 << 20;
+const STALL_ITERS: usize = 600;
+const FAIL_CLOSED_LIMIT: Duration = Duration::from_secs(20);
+const TAIL_BYTES: usize = 256;
+const TAIL_SEED: u64 = 0x7A11_7A11_5EED_0001;
+
+fn poison_bytes(len: usize) -> Vec<u8> {
+    POISON_WORD
+        .to_le_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(len)
+        .collect()
+}
+
+/// Unique, reproducible seed per (run seed, case label, generation).
+fn xseed(seed: u64, label: &str, k: usize) -> u64 {
+    let mut h = splitmix(seed);
+    for b in label.bytes() {
+        h = splitmix(h ^ b as u64);
+    }
+    splitmix(h ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+struct XSide {
+    device: i32,
+    gpu: Gpu,
+    scratch: Option<DeviceBuffer>,
+    stall_ms: f64,
+}
+
+impl XSide {
+    fn new(sh: &Shared, rank: usize) -> R<Self> {
+        let device = sh.cfg.devices[rank];
+        let mut gpu = ctx(
+            Gpu::init_with_device(device),
+            &format!("xedge init device {device} (rank {rank})"),
+        )?;
+        ctx(gpu.bind_thread(), "bind_thread")?;
+        let stream = ctx(gpu.hip.stream_create(), "stream_create")?;
+        gpu.active_stream = Some(stream);
+        {
+            let mut info = lock(&sh.infos[rank]);
+            info.arch = gpu.arch.clone();
+            info.pci = gpu.hip.device_pci_bus_id(device).ok();
+        }
+        let mut side = XSide {
+            device,
+            gpu,
+            scratch: None,
+            stall_ms: 0.0,
+        };
+        if let Err(e) = side.arm_stall() {
+            side.teardown(false);
+            return Err(e);
+        }
+        Ok(side)
+    }
+
+    fn bind(&self) -> R<()> {
+        ctx(self.gpu.bind_thread(), "bind_thread")
+    }
+
+    fn sync(&self) -> R<()> {
+        self.bind()?;
+        let s = self
+            .gpu
+            .active_stream
+            .as_ref()
+            .ok_or("xedge side has no active stream")?;
+        ctx(
+            self.gpu.hip.stream_synchronize(s),
+            &format!("stream_synchronize dev{}", self.device),
+        )
+    }
+
+    /// Enqueue a long chain of memsets on this side's active stream (GPU-side delay).
+    fn stall(&self) -> R<()> {
+        self.bind()?;
+        let s = self
+            .gpu
+            .active_stream
+            .as_ref()
+            .ok_or("xedge side has no active stream")?;
+        let buf = self.scratch.as_ref().ok_or("no stall scratch")?;
+        for _ in 0..STALL_ITERS {
+            ctx(
+                self.gpu.hip.memset_async(buf, 0, STALL_BYTES, s),
+                "stall memset_async",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn arm_stall(&mut self) -> R<()> {
+        self.bind()?;
+        self.scratch = Some(ctx(
+            self.gpu.hip.malloc(STALL_BYTES),
+            "stall scratch malloc",
+        )?);
+        let t = Instant::now();
+        self.stall()?;
+        self.sync()?;
+        self.stall_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    /// Drain, free scratch, destroy the stream. A quarantined side is leaked: its
+    /// streams may still reference leased resources.
+    fn teardown(mut self, quarantined: bool) {
+        if quarantined || self.sync().is_err() || self.bind().is_err() {
+            // Quarantined, or the device cannot be proven idle: leak, never free.
+            std::mem::forget(self);
+            return;
+        }
+        if let Some(b) = self.scratch.take() {
+            let _ = self.gpu.hip.free(b);
+        }
+        if let Some(s) = self.gpu.active_stream.take() {
+            let _ = self.gpu.hip.stream_destroy(s);
+        }
+    }
+}
+
+/// Tensors of one case; freed only after the lease drained.
+#[derive(Default)]
+struct Held {
+    items: Vec<(bool, GpuTensor)>,
+}
+
+impl Held {
+    fn push(&mut self, on_a: bool, t: GpuTensor) -> usize {
+        self.items.push((on_a, t));
+        self.items.len() - 1
+    }
+    fn t(&self, i: usize) -> &GpuTensor {
+        &self.items[i].1
+    }
+}
+
+/// Two devices on the coordinator thread. Side `a` = logical edge device 0, side `b`
+/// = logical edge device 1.
+struct XPair {
+    a: XSide,
+    b: XSide,
+    quarantined: bool,
+}
+
+impl XPair {
+    fn init(sh: &Shared, ra: usize, rb: usize) -> R<Self> {
+        let a = XSide::new(sh, ra)?;
+        let b = match XSide::new(sh, rb) {
+            Ok(b) => b,
+            Err(e) => {
+                a.teardown(false);
+                return Err(e);
+            }
+        };
+        Ok(XPair {
+            a,
+            b,
+            quarantined: false,
+        })
+    }
+
+    fn teardown(self) {
+        let q = self.quarantined;
+        self.a.teardown(q);
+        self.b.teardown(q);
+    }
+
+    fn side(&self, on_a: bool) -> &XSide {
+        if on_a {
+            &self.a
+        } else {
+            &self.b
+        }
+    }
+
+    /// (producer, consumer) for the edge direction.
+    fn gpus(&mut self, fwd: bool) -> (&mut Gpu, &mut Gpu) {
+        if fwd {
+            (&mut self.a.gpu, &mut self.b.gpu)
+        } else {
+            (&mut self.b.gpu, &mut self.a.gpu)
+        }
+    }
+
+    fn up(&self, on_a: bool, bytes: &[u8], what: &str) -> R<GpuTensor> {
+        let s = self.side(on_a);
+        s.bind()?;
+        ctx(s.gpu.upload_raw(bytes, &[bytes.len()]), what)
+    }
+
+    fn dl(&self, on_a: bool, t: &GpuTensor) -> R<Vec<u8>> {
+        let s = self.side(on_a);
+        s.sync()?;
+        ctx(s.gpu.download_raw_bytes(t), "download_raw_bytes")
+    }
+
+    fn sync_both(&self) -> R<()> {
+        let x = self.a.sync();
+        let y = self.b.sync();
+        x.and(y)
+    }
+
+    fn publish(&mut self, fwd: bool, lease: &EdgeLease, t: &GpuTensor, d: EdgeDescriptor) -> R<()> {
+        let (src, _) = self.gpus(fwd);
+        ctx(src.bind_thread(), "bind_thread")?;
+        lease.publish(src, t, d)
+    }
+
+    fn receive(&mut self, fwd: bool, lease: &EdgeLease, t: &GpuTensor, d: EdgeDescriptor) -> R<()> {
+        let (_, dst) = self.gpus(fwd);
+        ctx(dst.bind_thread(), "bind_thread")?;
+        lease.receive(dst, t, d)
+    }
+
+    /// Drain (stops submissions, syncs both devices, releases banks/events), then drop
+    /// the lease. A failed drain quarantines: the lease is leaked, never freed.
+    fn finish(&mut self, fwd: bool, mut lease: EdgeLease) -> R<()> {
+        let drained = {
+            let (src, dst) = self.gpus(fwd);
+            lease.drain(src, dst)
+        };
+        match drained {
+            Ok(()) => {
+                drop(lease);
+                let synced = self.sync_both();
+                if synced.is_err() {
+                    self.quarantined = true;
+                }
+                synced.map_err(|e| format!("stream error after drain, pair quarantined: {e}"))
+            }
+            Err(e) => {
+                self.quarantined = true;
+                std::mem::forget(lease);
+                Err(format!("drain failed, resources quarantined: {e}"))
+            }
+        }
+    }
+
+    fn free_held(&mut self, held: Held) -> R<()> {
+        if self.quarantined {
+            for (_, t) in held.items {
+                std::mem::forget(t);
+            }
+            return Ok(());
+        }
+        let mut first: Option<String> = None;
+        for (on_a, t) in held.items {
+            let gpu = if on_a {
+                &mut self.a.gpu
+            } else {
+                &mut self.b.gpu
+            };
+            if let Err(e) = gpu.free_tensor(t) {
+                first.get_or_insert(format!("free_tensor: {e}"));
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+}
+
+fn provision_edge(
+    pair: &mut XPair,
+    fwd: bool,
+    tr: EdgeTransport,
+    max_bytes: usize,
+) -> R<EdgeLease> {
+    let edge = if fwd {
+        EdgeId {
+            src_device: 0,
+            dst_device: 1,
+        }
+    } else {
+        EdgeId {
+            src_device: 1,
+            dst_device: 0,
+        }
+    };
+    let result = (|| {
+        let (src, dst) = pair.gpus(fwd);
+        ctx(dst.bind_thread(), "bind_thread")?;
+        ctx(src.bind_thread(), "bind_thread")?;
+        provision(
+            src,
+            dst,
+            EdgeSpec {
+                edge,
+                transport: tr,
+                max_bytes,
+            },
+        )
+        .map_err(|e| format!("provision: {e}"))
+    })();
+    // A failed provision may leave a quarantined lease referencing both devices.
+    if result.is_err() {
+        pair.quarantined = true;
+    }
+    result
+}
+
+/// Provision, run `f`, then ALWAYS drain, drop the lease, and only then free tensors.
+fn with_lease<F>(
+    pair: &mut XPair,
+    fwd: bool,
+    tr: EdgeTransport,
+    max_bytes: usize,
+    f: F,
+) -> R<Vec<String>>
+where
+    F: FnOnce(&mut XPair, &mut EdgeLease, &mut Held) -> R<Vec<String>>,
+{
+    let mut lease = provision_edge(pair, fwd, tr, max_bytes)?;
+    let mut held = Held::default();
+    let mut problems = match f(pair, &mut lease, &mut held) {
+        Ok(p) => p,
+        Err(e) => vec![format!("error: {e}")],
+    };
+    if let Err(e) = pair.finish(fwd, lease) {
+        problems.push(e);
+    }
+    if let Err(e) = pair.free_held(held) {
+        problems.push(e);
+    }
+    Ok(problems)
+}
+
+#[derive(Clone, Copy)]
+struct SeqGen {
+    p: Payload,
+    rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SeqOpts {
+    /// Extra bytes after the live extent on both views (destination = poison, source
+    /// = random); the service must neither read nor write them.
+    tail: usize,
+    stall_prod: bool,
+    stall_cons: bool,
+    sleep_ms: u64,
+}
+
+const SEQ_PLAIN: SeqOpts = SeqOpts {
+    tail: 0,
+    stall_prod: false,
+    stall_cons: false,
+    sleep_ms: 0,
+};
+
+#[derive(Clone, Copy)]
+struct XSlot {
+    si: usize,
+    di: usize,
+    len: usize,
+    seed: u64,
+    rows: usize,
+    row_bytes: usize,
+    desc: EdgeDescriptor,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_slots(
+    sh: &Shared,
+    pair: &XPair,
+    lease: &EdgeLease,
+    held: &mut Held,
+    fwd: bool,
+    label: &str,
+    gens: &[SeqGen],
+    tail: usize,
+) -> R<Vec<XSlot>> {
+    let (prod_a, cons_a) = (fwd, !fwd);
+    let mut slots = Vec::with_capacity(gens.len());
+    for (k, g) in gens.iter().enumerate() {
+        let len = g.rows * g.p.row_bytes;
+        let seed = xseed(sh.cfg.seed, label, k);
+        let mut src = random_bytes(seed, len);
+        src.extend_from_slice(&random_bytes(seed ^ TAIL_SEED, tail));
+        let si = held.push(prod_a, pair.up(prod_a, &src, "upload source view")?);
+        drop(src);
+        let di = held.push(
+            cons_a,
+            pair.up(
+                cons_a,
+                &poison_bytes(len + tail),
+                "upload poisoned destination",
+            )?,
+        );
+        slots.push(XSlot {
+            si,
+            di,
+            len,
+            seed,
+            rows: g.rows,
+            row_bytes: g.p.row_bytes,
+            desc: EdgeDescriptor {
+                epoch: lease.epoch(),
+                // Arbitrary, non-monotonic: the service's generation is independent of op.
+                op: (seed & 0xFFFF_FFFF) + 1,
+                rows: g.rows,
+                dtype_bytes: g.p.dtype_bytes,
+                bytes: len,
+            },
+        });
+    }
+    Ok(slots)
+}
+
+fn consume(
+    pair: &mut XPair,
+    fwd: bool,
+    lease: &EdgeLease,
+    held: &Held,
+    s: &XSlot,
+    o: &SeqOpts,
+) -> R<()> {
+    if o.stall_cons {
+        pair.side(!fwd).stall()?;
+    }
+    if o.sleep_ms > 0 {
+        std::thread::sleep(Duration::from_millis(o.sleep_ms));
+    }
+    pair.receive(fwd, lease, held.t(s.di), s.desc)
+}
+
+/// Depth-2 pipeline: publish(k), receive(k-1); both banks stay in flight and every
+/// generation >= 2 reuses a bank. Destinations are verified after the whole run, so
+/// nothing host-synchronizes between transfers.
+#[allow(clippy::too_many_arguments)]
+fn run_seq(
+    sh: &Shared,
+    pair: &mut XPair,
+    fwd: bool,
+    lease: &EdgeLease,
+    held: &mut Held,
+    label: &str,
+    gens: &[SeqGen],
+    o: &SeqOpts,
+) -> R<Vec<String>> {
+    let (prod_a, cons_a) = (fwd, !fwd);
+    let slots = make_slots(sh, pair, lease, held, fwd, label, gens, o.tail)?;
+    let n = slots.len();
+    for k in 0..n {
+        if o.stall_prod {
+            pair.side(prod_a).stall()?;
+        }
+        pair.publish(fwd, lease, held.t(slots[k].si), slots[k].desc)?;
+        if k >= 1 {
+            consume(pair, fwd, lease, held, &slots[k - 1], o)?;
+        }
+    }
+    if n > 0 {
+        consume(pair, fwd, lease, held, &slots[n - 1], o)?;
+    }
+    pair.sync_both()?;
+    let mut problems = Vec::new();
+    for (k, s) in slots.iter().enumerate() {
+        let want = random_bytes(s.seed, s.len);
+        let got = pair.dl(cons_a, held.t(s.di))?;
+        if let Some(d) = first_diff(
+            &format!("gen {k} rows={} destination", s.rows),
+            &want,
+            &got[..s.len],
+            s.row_bytes,
+        ) {
+            problems.push(d);
+        }
+        if o.tail > 0 {
+            if let Some(d) = first_diff(
+                &format!("gen {k} destination tail"),
+                &poison_bytes(o.tail),
+                &got[s.len..],
+                16,
+            ) {
+                problems.push(d);
+            }
+        }
+        let src = pair.dl(prod_a, held.t(s.si))?;
+        if let Some(d) = first_diff(
+            &format!("gen {k} source view mutated"),
+            &want,
+            &src[..s.len],
+            s.row_bytes,
+        ) {
+            problems.push(d);
+        }
+        if o.tail > 0 {
+            if let Some(d) = first_diff(
+                &format!("gen {k} source tail mutated"),
+                &random_bytes(s.seed ^ TAIL_SEED, o.tail),
+                &src[s.len..],
+                16,
+            ) {
+                problems.push(d);
+            }
+        }
+    }
+    Ok(problems)
+}
+
+fn seq_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    fwd: bool,
+    label: &str,
+    gens: &[SeqGen],
+    o: &SeqOpts,
+) -> R<Vec<String>> {
+    let max = gens
+        .iter()
+        .map(|g| g.rows * g.p.row_bytes)
+        .max()
+        .unwrap_or(16);
+    with_lease(pair, fwd, tr, max, |pair, lease, held| {
+        run_seq(sh, pair, fwd, lease, held, label, gens, o)
+    })
+}
+
+fn fixed_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+    p: Payload,
+    rows: usize,
+) -> R<Vec<String>> {
+    // >= 4 generations: both banks are reused at least once.
+    let n = if rows >= 4096 { 4 } else { 5 };
+    let gens = vec![SeqGen { p, rows }; n];
+    let label = format!("{pfx} fixed {} rows={rows}", p.name);
+    seq_case(sh, pair, tr, true, &label, &gens, &SEQ_PLAIN)
+}
+
+fn reuse_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+    p: Payload,
+    fwd: bool,
+) -> R<Vec<String>> {
+    // Mixed live sizes on every bank: a short generation lands on a bank that held a
+    // longer one, so stale bank bytes beyond the live extent would show up.
+    let gens: Vec<SeqGen> = [1536usize, 1, 4096, 8, 1, 4096, 1536, 8]
+        .iter()
+        .map(|&rows| SeqGen { p, rows })
+        .collect();
+    let label = format!(
+        "{pfx} reuse {} dir={}",
+        p.name,
+        if fwd { "fwd" } else { "rev" }
+    );
+    let o = SeqOpts {
+        tail: TAIL_BYTES,
+        ..SEQ_PLAIN
+    };
+    seq_case(sh, pair, tr, fwd, &label, &gens, &o)
+}
+
+fn delayed_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+    producer: bool,
+    p: Payload,
+    rows: usize,
+) -> R<Vec<String>> {
+    let gens = vec![SeqGen { p, rows }; 6];
+    let label = format!(
+        "{pfx} delayed-{} {} rows={rows}",
+        if producer { "producer" } else { "consumer" },
+        p.name
+    );
+    let o = SeqOpts {
+        tail: 0,
+        stall_prod: producer,
+        stall_cons: !producer,
+        sleep_ms: if producer { 0 } else { 25 },
+    };
+    seq_case(sh, pair, tr, true, &label, &gens, &o)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_body(
+    sh: &Shared,
+    pair: &mut XPair,
+    l_ab: &EdgeLease,
+    l_ba: &EdgeLease,
+    held: &mut Held,
+    label: &str,
+    p: Payload,
+    rows: usize,
+) -> R<Vec<String>> {
+    let bytes = rows * p.row_bytes;
+    let mut problems = Vec::new();
+    for it in 0..2usize {
+        let seed = xseed(sh.cfg.seed, label, it);
+        let want = random_bytes(seed, bytes);
+        let mut cur = held.push(true, pair.up(true, &want, "upload chain source")?);
+        let mut hops: Vec<(usize, bool)> = Vec::new();
+        for h in 0..6usize {
+            let fwd = h % 2 == 0;
+            let lease = if fwd { l_ab } else { l_ba };
+            let dst = held.push(
+                !fwd,
+                pair.up(!fwd, &poison_bytes(bytes), "upload hop destination")?,
+            );
+            let desc = EdgeDescriptor {
+                epoch: lease.epoch(),
+                op: (splitmix(seed ^ h as u64) & 0xFFFF_FFFF) + 1,
+                rows,
+                dtype_bytes: p.dtype_bytes,
+                bytes,
+            };
+            pair.publish(fwd, lease, held.t(cur), desc)?;
+            pair.receive(fwd, lease, held.t(dst), desc)?;
+            hops.push((dst, !fwd));
+            cur = dst;
+        }
+        pair.sync_both()?;
+        for (h, (idx, on_a)) in hops.iter().enumerate() {
+            let got = pair.dl(*on_a, held.t(*idx))?;
+            if let Some(d) = first_diff(
+                &format!(
+                    "iteration {it} hop {h} ({})",
+                    if h % 2 == 0 { "A>B" } else { "B>A" }
+                ),
+                &want,
+                &got,
+                p.row_bytes,
+            ) {
+                problems.push(d);
+            }
+        }
+    }
+    Ok(problems)
+}
+
+/// Six alternating-device hops (A>B, B>A, ...) over two leases; hop h+1 publishes the
+/// tensor hop h received. All six hops are enqueued before anything is read back.
+fn chain_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+    p: Payload,
+    rows: usize,
+) -> R<Vec<String>> {
+    let bytes = rows * p.row_bytes;
+    let label = format!("{pfx} chain6 {} rows={rows}", p.name);
+    let l_ab = provision_edge(pair, true, tr, bytes)?;
+    let l_ba = match provision_edge(pair, false, tr, bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            return Err(match pair.finish(true, l_ab) {
+                Ok(()) => e,
+                Err(d) => format!("{e}; {d}"),
+            });
+        }
+    };
+    let mut held = Held::default();
+    let mut problems = match chain_body(sh, pair, &l_ab, &l_ba, &mut held, &label, p, rows) {
+        Ok(v) => v,
+        Err(e) => vec![format!("error: {e}")],
+    };
+    if let Err(e) = pair.finish(true, l_ab) {
+        problems.push(e);
+    }
+    if let Err(e) = pair.finish(false, l_ba) {
+        problems.push(e);
+    }
+    if let Err(e) = pair.free_held(held) {
+        problems.push(e);
+    }
+    Ok(problems)
+}
+
+/// (hook, receipt name, fires inside `publish`)
+fn fault_points() -> [(FaultPoint, &'static str, bool); 9] {
+    [
+        (FaultPoint::BeforeReuseWait, "BeforeReuseWait", true),
+        (FaultPoint::AfterReuseWait, "AfterReuseWait", true),
+        (FaultPoint::AfterPublishCopy, "AfterPublishCopy", true),
+        (FaultPoint::AfterReadyRecord, "AfterReadyRecord", true),
+        (
+            FaultPoint::AfterReadyPublication,
+            "AfterReadyPublication",
+            true,
+        ),
+        (FaultPoint::AfterReadyWait, "AfterReadyWait", false),
+        (FaultPoint::AfterReceiveCopy, "AfterReceiveCopy", false),
+        (FaultPoint::AfterDoneRecord, "AfterDoneRecord", false),
+        (
+            FaultPoint::AfterDonePublication,
+            "AfterDonePublication",
+            false,
+        ),
+    ]
+}
+
+fn expect_err(problems: &mut Vec<String>, what: &str, r: R<()>) {
+    if r.is_ok() {
+        problems.push(format!("{what} returned Ok"));
+    }
+}
+
+fn poison_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+    point: FaultPoint,
+    name: &str,
+    publish_side: bool,
+) -> R<Vec<String>> {
+    let label = format!("{pfx} poison {name}");
+    let p = HC_F32;
+    let rows = 8usize;
+    let mut problems = with_lease(pair, true, tr, rows * p.row_bytes, |pair, lease, held| {
+        let gens = vec![SeqGen { p, rows }; 4];
+        let s = make_slots(sh, pair, lease, held, true, &label, &gens, 0)?;
+        // Prime generations 0 and 1 through both banks, then inject so generation 2 is
+        // a real bank reuse (done-generation wait) for every hook.
+        for k in 0..2 {
+            pair.publish(true, lease, held.t(s[k].si), s[k].desc)?;
+        }
+        for k in 0..2 {
+            pair.receive(true, lease, held.t(s[k].di), s[k].desc)?;
+        }
+        lease.inject_fault(point);
+        let t0 = Instant::now();
+        let mut problems = Vec::new();
+        let first = pair.publish(true, lease, held.t(s[2].si), s[2].desc);
+        if publish_side {
+            expect_err(&mut problems, "publish(g2) at the fault point", first);
+        } else {
+            match first {
+                Err(e) => problems.push(format!(
+                    "publish(g2) failed before the receive-side fault: {e}"
+                )),
+                Ok(()) => expect_err(
+                    &mut problems,
+                    "receive(g2) at the fault point",
+                    pair.receive(true, lease, held.t(s[2].di), s[2].desc),
+                ),
+            }
+        }
+        // Poisoned: every later call fails closed, immediately.
+        expect_err(
+            &mut problems,
+            "publish after the fault",
+            pair.publish(true, lease, held.t(s[3].si), s[3].desc),
+        );
+        expect_err(
+            &mut problems,
+            "receive after the fault",
+            pair.receive(true, lease, held.t(s[2].di), s[2].desc),
+        );
+        let el = t0.elapsed();
+        if el > FAIL_CLOSED_LIMIT {
+            problems.push(format!(
+                "fail-closed path took {:.1}s (limit {}s)",
+                el.as_secs_f64(),
+                FAIL_CLOSED_LIMIT.as_secs()
+            ));
+        }
+        Ok(problems)
+    })?;
+    if !pair.quarantined {
+        let gens = vec![SeqGen { p, rows }; 3];
+        let rec = seq_case(
+            sh,
+            pair,
+            tr,
+            true,
+            &format!("{label} recovery"),
+            &gens,
+            &SEQ_PLAIN,
+        )?;
+        problems.extend(
+            rec.into_iter()
+                .map(|r| format!("recovery after poison: {r}")),
+        );
+    }
+    Ok(problems)
+}
+
+fn poison_explicit_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+) -> R<Vec<String>> {
+    let label = format!("{pfx} poison explicit");
+    let p = HC_F32;
+    let rows = 8usize;
+    with_lease(pair, true, tr, rows * p.row_bytes, |pair, lease, held| {
+        let gens = vec![SeqGen { p, rows }; 3];
+        let s = make_slots(sh, pair, lease, held, true, &label, &gens, 0)?;
+        pair.publish(true, lease, held.t(s[0].si), s[0].desc)?;
+        lease.poison();
+        let mut problems = Vec::new();
+        expect_err(
+            &mut problems,
+            "receive after explicit poison",
+            pair.receive(true, lease, held.t(s[0].di), s[0].desc),
+        );
+        expect_err(
+            &mut problems,
+            "publish after explicit poison",
+            pair.publish(true, lease, held.t(s[1].si), s[1].desc),
+        );
+        Ok(problems)
+    })
+}
+
+fn up_view(pair: &XPair, held: &mut Held, on_a: bool, len: usize, seed: u64) -> R<usize> {
+    Ok(held.push(
+        on_a,
+        pair.up(on_a, &random_bytes(seed, len), "upload view")?,
+    ))
+}
+
+fn reject_case(
+    sh: &Shared,
+    pair: &mut XPair,
+    tr: EdgeTransport,
+    pfx: &str,
+    which: &str,
+) -> R<Vec<String>> {
+    let label = format!("{pfx} reject {which}");
+    let seed = xseed(sh.cfg.seed, &label, 0);
+    let row = HC_F32.row_bytes;
+    let small = 8 * row;
+    with_lease(pair, true, tr, small, |pair, lease, held| {
+        let ok = EdgeDescriptor {
+            epoch: lease.epoch(),
+            op: 7,
+            rows: 8,
+            dtype_bytes: 4,
+            bytes: small,
+        };
+        let one = EdgeDescriptor {
+            rows: 1,
+            bytes: row,
+            ..ok
+        };
+        let mut problems = Vec::new();
+        match which {
+            "short-view" => {
+                let v = up_view(pair, held, true, row - 16, seed)?;
+                let r = pair.publish(true, lease, held.t(v), one);
+                expect_err(
+                    &mut problems,
+                    "publish with a view shorter than the descriptor",
+                    r,
+                );
+            }
+            "row-align" => {
+                let v = up_view(pair, held, true, 64, seed)?;
+                let d = EdgeDescriptor {
+                    rows: 1,
+                    bytes: 40,
+                    ..ok
+                };
+                let r = pair.publish(true, lease, held.t(v), d);
+                expect_err(
+                    &mut problems,
+                    "publish with a row size that is not a multiple of 16",
+                    r,
+                );
+            }
+            "dtype-bytes" => {
+                let v = up_view(pair, held, true, row, seed)?;
+                let d = EdgeDescriptor {
+                    dtype_bytes: 3,
+                    ..one
+                };
+                let r = pair.publish(true, lease, held.t(v), d);
+                expect_err(&mut problems, "publish with dtype_bytes=3", r);
+            }
+            "rows-zero" => {
+                let v = up_view(pair, held, true, row, seed)?;
+                let d = EdgeDescriptor { rows: 0, ..one };
+                let r = pair.publish(true, lease, held.t(v), d);
+                expect_err(&mut problems, "publish with rows=0", r);
+            }
+            "over-max" => {
+                let v = up_view(pair, held, true, small + 16, seed)?;
+                let d = EdgeDescriptor {
+                    rows: 1,
+                    bytes: small + 16,
+                    ..ok
+                };
+                let r = pair.publish(true, lease, held.t(v), d);
+                expect_err(
+                    &mut problems,
+                    "publish larger than the provisioned max_bytes",
+                    r,
+                );
+            }
+            "foreign-view" => {
+                // A view that lives on the OTHER device must be refused by the producer.
+                let v = up_view(pair, held, false, small, seed)?;
+                let r = pair.publish(true, lease, held.t(v), ok);
+                expect_err(
+                    &mut problems,
+                    "publish of a view owned by the consumer device",
+                    r,
+                );
+            }
+            "recv-op" | "recv-rows" | "recv-dtype" | "recv-epoch" => {
+                let s = up_view(pair, held, true, small, seed)?;
+                let d = up_view(pair, held, false, small, seed ^ 1)?;
+                pair.publish(true, lease, held.t(s), ok)?;
+                let bad = match which {
+                    "recv-op" => EdgeDescriptor {
+                        op: ok.op + 1,
+                        ..ok
+                    },
+                    "recv-rows" => EdgeDescriptor { rows: 16, ..ok },
+                    "recv-dtype" => EdgeDescriptor {
+                        dtype_bytes: 2,
+                        ..ok
+                    },
+                    _ => EdgeDescriptor {
+                        epoch: ok.epoch + 1,
+                        ..ok
+                    },
+                };
+                let r = pair.receive(true, lease, held.t(d), bad);
+                expect_err(&mut problems, "receive with a mismatching descriptor", r);
+            }
+            other => return Err(format!("unknown reject case {other:?}")),
+        }
+        Ok(problems)
+    })
+}
+
+fn reprovision_case(sh: &Shared, pair: &mut XPair, tr: EdgeTransport, pfx: &str) -> R<Vec<String>> {
+    let label = format!("{pfx} reprovision");
+    let p = HC_F32;
+    let (small, big) = (8 * p.row_bytes, 1536 * p.row_bytes);
+    let mut problems = Vec::new();
+
+    let l1 = provision_edge(pair, true, tr, small)?;
+    let e1 = l1.epoch();
+    let mut held1 = Held::default();
+    match run_seq(
+        sh,
+        pair,
+        true,
+        &l1,
+        &mut held1,
+        &format!("{label} lease1"),
+        &vec![SeqGen { p, rows: 8 }; 3],
+        &SEQ_PLAIN,
+    ) {
+        Ok(v) => problems.extend(v),
+        Err(e) => problems.push(format!("error: {e}")),
+    }
+    if let Err(e) = pair.finish(true, l1) {
+        problems.push(e);
+    }
+    if let Err(e) = pair.free_held(held1) {
+        problems.push(e);
+    }
+    if pair.quarantined {
+        return Ok(problems);
+    }
+
+    // New lease on the same edge (different capacity): fresh epoch, generations restart.
+    let l2 = provision_edge(pair, true, tr, big)?;
+    if l2.epoch() == e1 {
+        problems.push(format!("reprovisioned lease reused transport epoch {e1}"));
+    }
+    let mut held2 = Held::default();
+    match run_seq(
+        sh,
+        pair,
+        true,
+        &l2,
+        &mut held2,
+        &format!("{label} lease2"),
+        &vec![SeqGen { p, rows: 1536 }; 3],
+        &SEQ_PLAIN,
+    ) {
+        Ok(v) => problems.extend(v),
+        Err(e) => problems.push(format!("error: {e}")),
+    }
+    // Stale descriptor from the previous epoch must be refused (and poisons l2).
+    match up_view(pair, &mut held2, true, small, xseed(sh.cfg.seed, &label, 9)) {
+        Ok(v) => {
+            let stale = EdgeDescriptor {
+                epoch: e1,
+                op: 1,
+                rows: 8,
+                dtype_bytes: 4,
+                bytes: small,
+            };
+            let r = pair.publish(true, &l2, held2.t(v), stale);
+            expect_err(&mut problems, "publish with the previous lease's epoch", r);
+        }
+        Err(e) => problems.push(format!("error: {e}")),
+    }
+    if let Err(e) = pair.finish(true, l2) {
+        problems.push(e);
+    }
+    if let Err(e) = pair.free_held(held2) {
+        problems.push(e);
+    }
+    Ok(problems)
+}
+
+fn record_x(sh: &Shared, name: &str, r: R<Vec<String>>) {
+    let detail = match r {
+        Ok(v) if v.is_empty() => None,
+        Ok(v) => Some(v.into_iter().take(4).collect::<Vec<_>>().join("; ")),
+        Err(e) => Some(format!("error: {e}")),
+    };
+    lock(&sh.rec).case(name.to_string(), detail);
+}
+
+fn edge_suite(sh: &Shared, pair: &mut XPair, tr: EdgeTransport, d0: i32, d1: i32) {
+    let pfx = format!("xedge {tr} dev{d0}-dev{d1}");
+    macro_rules! run_case {
+        ($name:expr, $body:expr) => {{
+            if pair.quarantined {
+                return;
+            }
+            let name: String = $name;
+            let r: R<Vec<String>> = $body;
+            record_x(sh, &name, r);
+        }};
+    }
+    for p in XEDGE_PAYLOADS {
+        for rows in XEDGE_ROWS {
+            run_case!(
+                format!("{pfx} fixed {} rows={rows}", p.name),
+                fixed_case(sh, pair, tr, &pfx, p, rows)
+            );
+        }
+    }
+    for p in XEDGE_PAYLOADS {
+        for rows in XEDGE_ROWS {
+            run_case!(
+                format!("{pfx} chain6 {} rows={rows}", p.name),
+                chain_case(sh, pair, tr, &pfx, p, rows)
+            );
+        }
+    }
+    for p in XEDGE_PAYLOADS {
+        for fwd in [true, false] {
+            run_case!(
+                format!(
+                    "{pfx} reuse {} dir={}",
+                    p.name,
+                    if fwd { "fwd" } else { "rev" }
+                ),
+                reuse_case(sh, pair, tr, &pfx, p, fwd)
+            );
+        }
+    }
+    for producer in [true, false] {
+        for (p, rows) in [(HC_F32, 8usize), (HC_BF16, 1536usize)] {
+            run_case!(
+                format!(
+                    "{pfx} delayed-{} {} rows={rows}",
+                    if producer { "producer" } else { "consumer" },
+                    p.name
+                ),
+                delayed_case(sh, pair, tr, &pfx, producer, p, rows)
+            );
+        }
+    }
+    for (point, name, publish_side) in fault_points() {
+        run_case!(
+            format!("{pfx} poison {name}"),
+            poison_case(sh, pair, tr, &pfx, point, name, publish_side)
+        );
+    }
+    run_case!(
+        format!("{pfx} poison explicit"),
+        poison_explicit_case(sh, pair, tr, &pfx)
+    );
+    for which in [
+        "short-view",
+        "row-align",
+        "dtype-bytes",
+        "rows-zero",
+        "over-max",
+        "foreign-view",
+        "recv-op",
+        "recv-rows",
+        "recv-dtype",
+        "recv-epoch",
+    ] {
+        run_case!(
+            format!("{pfx} reject {which}"),
+            reject_case(sh, pair, tr, &pfx, which)
+        );
+    }
+    run_case!(
+        format!("{pfx} reprovision"),
+        reprovision_case(sh, pair, tr, &pfx)
+    );
+}
+
+/// Dedicated coordinator for `xedge`: adjacent device pairs, on this thread, before
+/// any rank thread exists.
+fn xedge_main(sh: &Shared) {
+    let pre = sh.pre();
+    for i in 0..sh.n - 1 {
+        let j = i + 1;
+        let (d0, d1) = (sh.cfg.devices[i], sh.cfg.devices[j]);
+        let qualified = pre.pair_ok(i, j);
+        let mut arms: Vec<EdgeTransport> = Vec::new();
+        match sh.cfg.transport {
+            TransportReq::Host => arms.push(EdgeTransport::HostMapped),
+            TransportReq::Peer => {
+                if qualified {
+                    arms.push(EdgeTransport::Peer);
+                }
+            }
+            TransportReq::Both => {
+                arms.push(EdgeTransport::HostMapped);
+                if qualified {
+                    arms.push(EdgeTransport::Peer);
+                }
+            }
+            TransportReq::Auto => arms.push(if qualified {
+                EdgeTransport::Peer
+            } else {
+                EdgeTransport::HostMapped
+            }),
+        }
+        if matches!(sh.cfg.transport, TransportReq::Peer | TransportReq::Both) && !qualified {
+            println!("SKIP xedge peer dev{d0}-dev{d1}: pair is not byte-qualified by qualify_peer");
+            lock(&sh.rec).notes.push(format!(
+                "xedge peer dev{d0}-dev{d1} skipped: pair not byte-qualified"
+            ));
+        }
+        if arms.is_empty() {
+            continue;
+        }
+        let mut pair = match XPair::init(sh, i, j) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut rec = lock(&sh.rec);
+                rec.init_err.get_or_insert(e.clone());
+                rec.case(format!("xedge dev{d0}-dev{d1} init"), Some(e.clone()));
+                rec.errors.push(format!("xedge dev{d0}-dev{d1}: {e}"));
+                continue;
+            }
+        };
+        {
+            let (sa, sb) = (pair.a.stall_ms, pair.b.stall_ms);
+            let mut rec = lock(&sh.rec);
+            rec.note(format!(
+                "xedge dev{d0}-dev{d1}: stall calibration dev{d0}={sa:.1} ms dev{d1}={sb:.1} ms (delayed-producer/consumer enqueue one stall per transfer)"
+            ));
+            if sa < 5.0 || sb < 5.0 {
+                rec.note(format!(
+                    "xedge dev{d0}-dev{d1}: stall under 5 ms; delayed cases are weak on this device"
+                ));
+            }
+        }
+        for tr in arms {
+            lock(&sh.rec).xedge_arms.push(json!({
+                "ranks": [i, j],
+                "devices": [d0, d1],
+                "transport": tr.to_string(),
+                "pair_byte_qualified": qualified,
+            }));
+            if tr == EdgeTransport::HostMapped && pre.probed {
+                lock(&sh.rec).note(format!(
+                    "xedge host-mapped dev{d0}-dev{d1} ran after a qualify_peer probe: the probe may have enabled peer access at process level; the HostMapped service itself never queries or enables peer access"
+                ));
+            }
+            edge_suite(sh, &mut pair, tr, d0, d1);
+            if pair.quarantined {
+                lock(&sh.rec).errors.push(format!(
+                    "xedge dev{d0}-dev{d1}: pair quarantined after a failed provision, drain or post-drain sync; remaining cases skipped"
+                ));
+                break;
+            }
+        }
+        pair.teardown();
+    }
+}
+
 fn multi_main(args: &Args) -> ! {
     let devices = args.devices.clone().unwrap_or_default();
     let env_transport = std::env::var("HIPFIRE_QWEN4_EP_TRANSPORT").ok();
@@ -3589,6 +4988,7 @@ fn multi_main(args: &Args) -> ! {
         xctl: has("xctl"),
         xtime: has("xtime"),
         xhop: has("xhop"),
+        xedge: has("xedge"),
         rounds: args.rounds,
         reps: args.reps,
         layers: args.layers,
@@ -3596,12 +4996,23 @@ fn multi_main(args: &Args) -> ! {
     };
     let n = cfg.devices.len();
     let sh = Shared::new(cfg);
-    std::thread::scope(|s| {
-        for rank in 0..n {
-            let sh = &sh;
-            s.spawn(move || rank_thread(sh, rank));
-        }
-    });
+    // Sequential coordinator phases run on this thread, before any rank thread.
+    let mut coordinated = true;
+    if let Err(e) = preflight(&sh) {
+        lock(&sh.rec).init_err.get_or_insert(e);
+        coordinated = false;
+    }
+    if coordinated && sh.cfg.xedge {
+        xedge_main(&sh);
+    }
+    if coordinated && sh.cfg.rank_suites() {
+        std::thread::scope(|s| {
+            for rank in 0..n {
+                let sh = &sh;
+                s.spawn(move || rank_thread(sh, rank));
+            }
+        });
+    }
     let rec = lock(&sh.rec);
     if let Some(e) = &rec.init_err {
         eprintln!("no device: {e}");
@@ -3619,8 +5030,10 @@ fn multi_main(args: &Args) -> ! {
     for e in &rec.errors {
         eprintln!("error: {e}");
     }
-    let no_transport = rec.arms.is_empty();
+    let no_transport = (sh.cfg.rank_suites() && rec.arms.is_empty())
+        || (sh.cfg.xedge && rec.xedge_arms.is_empty());
     if let Some(path) = &args.json {
+        let pre = sh.pre();
         let ranks: Vec<Value> = (0..n)
             .map(|q| {
                 let info = lock(&sh.infos[q]);
@@ -3629,7 +5042,11 @@ fn multi_main(args: &Args) -> ! {
                     "device": sh.cfg.devices[q],
                     "arch": info.arch,
                     "pci_bus_id": info.pci,
-                    "peer_access_enabled": {"host": info.peer_enabled_host, "peer": info.peer_enabled_final},
+                    "peer_access_enabled": {
+                        "host": info.peer_enabled_host,
+                        "peer": info.peer_enabled_final,
+                        "probe_ran": pre.probed,
+                    },
                 })
             })
             .collect();
@@ -3648,6 +5065,17 @@ fn multi_main(args: &Args) -> ! {
             "transport_resolved": rec.resolved,
             "arms": rec.arms,
             "can_access_peer": matrix,
+            "peer_qualification": {
+                "performed": pre.probed,
+                "api": "multi_gpu::transport::qualify_peer (kernel reads, both directions)",
+                "probe_may_enable_peer_access": pre.probed,
+                "matrix": pre.qual,
+                "pairs": pre.pairs,
+            },
+            "xedge": {
+                "enabled": sh.cfg.xedge,
+                "arms": rec.xedge_arms,
+            },
             "host_flags": sh.cfg.host_flags.iter().map(|f| f.name()).collect::<Vec<_>>(),
             "per_rank": ranks,
             "host_banks": rec.banks,
