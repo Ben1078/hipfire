@@ -418,9 +418,13 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
             read_prefix(gpu, ple_conv, ple_conv.byte_size())?,
         );
     }
+    let hyper_feedback = st
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
     push(
         "hyper_feedback".into(),
-        read_prefix(gpu, &st.hyper_feedback, st.hyper_feedback.byte_size())?,
+        read_prefix(gpu, hyper_feedback, hyper_feedback.byte_size())?,
     );
     let prev = st.ple_history.previous();
     let mut hist = Vec::with_capacity(12);

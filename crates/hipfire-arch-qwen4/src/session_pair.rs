@@ -134,7 +134,12 @@ impl Qwen4Bundle {
         stage.position = Some(position);
         // Feedback is an unchanged fixed part on this route, but is still
         // captured: the cache stores it even on profiles without PLE.
-        stage.copy(gpu, stage.fixed.len() - 1, &self.state.hyper_feedback)?;
+        let hyper_feedback = self
+            .state
+            .hyper_feedback
+            .as_ref()
+            .expect("hyper_feedback is input-band state");
+        stage.copy(gpu, stage.fixed.len() - 1, hyper_feedback)?;
         Ok(Some(stage))
     }
 

@@ -475,7 +475,12 @@ fn snapshot(gpu: &Gpu, bundle: &Qwen4Bundle, logits: &GpuTensor) -> Result<Snaps
         .as_ref()
         .map(|tensor| ("ple.conv", tensor))
         .into_iter()
-        .chain([("ple.hyper_feedback", &state.hyper_feedback)])
+        .chain(
+            state
+                .hyper_feedback
+                .as_ref()
+                .map(|t| ("ple.hyper_feedback", t)),
+        )
     {
         regions.push((name.to_string(), whole_bytes(gpu, tensor)?));
     }

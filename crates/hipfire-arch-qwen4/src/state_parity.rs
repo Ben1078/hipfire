@@ -682,7 +682,11 @@ fn mutate_target(gpu: &mut Gpu, state: &mut Qwen4State) -> Result<(), String> {
     if let Some(ple_conv) = &state.ple_conv {
         write_scalar_f32(gpu, ple_conv, 95.0)?;
     }
-    write_scalar_f32(gpu, &state.hyper_feedback, 96.0)
+    let hyper_feedback = state
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
+    write_scalar_f32(gpu, hyper_feedback, 96.0)
 }
 
 fn mutate_mtp(gpu: &mut Gpu, state: &MtpGpuState) -> Result<(), String> {
@@ -786,7 +790,11 @@ fn target_families(
     if let Some(ple_conv) = &state.ple_conv {
         families.insert("ple_conv".into(), tensor(gpu, ple_conv)?);
     }
-    families.insert("hyper_feedback".into(), tensor(gpu, &state.hyper_feedback)?);
+    let hyper_feedback = state
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
+    families.insert("hyper_feedback".into(), tensor(gpu, hyper_feedback)?);
     families.insert("metadata".into(), metadata.finish());
     Ok(families)
 }
@@ -2703,11 +2711,12 @@ pub fn run_mtp_takeover_fill_oracle(
         if let Some(ple_conv) = &bundle.state.ple_conv {
             append(&mut target, ple_conv, ple_conv.numel())?;
         }
-        append(
-            &mut target,
-            &bundle.state.hyper_feedback,
-            bundle.state.hyper_feedback.numel(),
-        )?;
+        let hyper_feedback = bundle
+            .state
+            .hyper_feedback
+            .as_ref()
+            .expect("hyper_feedback is input-band state");
+        append(&mut target, hyper_feedback, hyper_feedback.numel())?;
         let state = bundle
             .mtp
             .as_ref()

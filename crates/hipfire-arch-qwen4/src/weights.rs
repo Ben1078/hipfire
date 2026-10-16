@@ -13,18 +13,106 @@
 
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen4Profile};
 use hipfire_runtime::external_rows::RowEncoding;
+use hipfire_runtime::mesh_placement::BandPlacement;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
     DTypeConstraint, ExpertSourceLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry,
-    StateKind, WeightEntry,
+    StateKind, StateScope, WeightEntry,
 };
 use hipfire_runtime::weight_store::{TakenWeight, WeightHandle, WeightLoadTransaction};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Range;
+
+/// Rank-local ownership projected from the admitted, absolute trunk partition.
+/// This value owns neither devices nor an independent topology.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4BandScope {
+    pub band: Range<usize>,
+    pub input: bool,
+    pub output: bool,
+}
+
+impl Qwen4BandScope {
+    /// The historical whole-model allocation and assembly scope.
+    pub fn single(config: &Qwen4Config) -> Self {
+        Self {
+            band: 0..config.num_hidden_layers,
+            input: true,
+            output: true,
+        }
+    }
+
+    /// Project one admitted stage, refusing a PLE cut off the input owner.
+    pub fn from_placement(
+        config: &Qwen4Config,
+        placement: &BandPlacement,
+        stage: usize,
+    ) -> Result<Self, String> {
+        if placement.n_trunk_layers != config.num_hidden_layers || stage >= placement.stages() {
+            return Err("Qwen4 band placement does not match the model or stage".to_string());
+        }
+        if let Some(ple) = &config.ple {
+            if !placement.band(0).contains(&ple.layer) {
+                return Err("Qwen4 PLE layer must belong to the input band".to_string());
+            }
+        }
+        let scope = Self {
+            band: placement.band(stage),
+            input: stage == 0,
+            output: stage + 1 == placement.stages(),
+        };
+        scope.validate(config)?;
+        Ok(scope)
+    }
+
+    /// Check absolute geometry and endpoint ownership before side effects.
+    pub fn validate(&self, config: &Qwen4Config) -> Result<(), String> {
+        if self.band.is_empty()
+            || self.band.end > config.num_hidden_layers
+            || config.layer_types.len() != config.num_hidden_layers
+            || self.input != (self.band.start == 0)
+            || self.output != (self.band.end == config.num_hidden_layers)
+        {
+            return Err("invalid Qwen4 band or endpoint ownership".to_string());
+        }
+        if config
+            .ple
+            .as_ref()
+            .is_some_and(|ple| self.input != self.owns_layer(ple.layer))
+        {
+            return Err("Qwen4 PLE layer must belong to the input band".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn owns_layer(&self, layer: usize) -> bool {
+        self.band.contains(&layer)
+    }
+
+    /// MTP is an output-pinned auxiliary namespace, never another trunk layer.
+    pub fn owns_entry(&self, entry: &WeightEntry) -> bool {
+        if entry.name.starts_with("mtp.") {
+            return self.output;
+        }
+        if let Some(layer) = entry.layer {
+            return self.owns_layer(layer);
+        }
+        match entry.placement {
+            PlacementHint::Pin(PinTarget::Embed) => self.input,
+            PlacementHint::Pin(PinTarget::Output) => self.output,
+            PlacementHint::Policy => match entry.policy {
+                ShardPolicy::Pin(PinTarget::Embed) => self.input,
+                _ => self.output,
+            },
+        }
+    }
+}
 
 /// The routed experts' declared targets: gate/up at the aligned-K group width
 /// and down at the row-local one.
@@ -1381,6 +1469,64 @@ impl Qwen4Manifest {
             .map(|entry| (entry.name.as_str(), entry.layer))
     }
 
+    /// Keep declaration order and source identities while removing every
+    /// resource not owned by this band. Single is the unchanged declaration.
+    pub fn with_band_scope(
+        mut self,
+        config: &Qwen4Config,
+        scope: &Qwen4BandScope,
+    ) -> Result<Self, WeightError> {
+        scope.validate(config).map_err(WeightError::Config)?;
+        if *scope == Qwen4BandScope::single(config) {
+            return Ok(self);
+        }
+        if self.weights.iter().any(|entry| {
+            matches!(
+                entry.policy,
+                ShardPolicy::ExpertSharded { .. } | ShardPolicy::ExpertTensorSharded { .. }
+            )
+        }) {
+            return Err(WeightError::EpPlacement(
+                "Qwen4 pipeline bands cannot be combined with expert parallelism".to_string(),
+            ));
+        }
+        self.weights.retain(|entry| scope.owns_entry(entry));
+        for entry in &mut self.weights {
+            if entry.name.starts_with("mtp.") {
+                entry.placement = PlacementHint::Pin(PinTarget::Output);
+            }
+        }
+        self.state.retain(|entry| match entry.scope {
+            StateScope::Layer(layer) => scope.owns_layer(layer),
+            StateScope::Pin(PinTarget::Embed) => scope.input,
+            StateScope::Pin(PinTarget::Output) => scope.output,
+        });
+        if !scope.input {
+            self.metadata.clear();
+        }
+        Ok(self)
+    }
+
+    /// Exact ordered placement keys for an admitted local band.
+    pub fn placements_for_scope(
+        &self,
+        config: &Qwen4Config,
+        scope: &Qwen4BandScope,
+        device: usize,
+    ) -> Result<Vec<Qwen4Placement>, WeightError> {
+        scope.validate(config).map_err(WeightError::Config)?;
+        Ok(self
+            .weights
+            .iter()
+            .filter(|entry| !entry.residency.is_external() && scope.owns_entry(entry))
+            .map(|entry| Qwen4Placement {
+                name: entry.name.clone(),
+                layer: entry.layer,
+                device,
+            })
+            .collect())
+    }
+
     /// Number of source tensor records represented by this text manifest.
     /// The only non-source record is the tied MTP embedding alias (absent
     /// without an MTP head); the exact I64 PLE metadata arrays (absent
@@ -2353,14 +2499,18 @@ pub struct Qwen4Weights {
     /// and a linear scan over every taken weight cost ~3 ms per decode token.
     taken_by_name: HashMap<String, Vec<usize>>,
     pub root: Qwen4RootWeights,
+    /// Compact owned layers in absolute order; use [`Self::layer`] for an
+    /// absolute layer ID instead of indexing this vector.
     pub layer_refs: Vec<Qwen4LayerWeights>,
-    /// `Some` iff `config.mtp` is declared.
+    /// `Some` iff native MTP is declared and this scope owns the output.
     pub mtp: Option<Qwen4MtpWeights>,
     /// `Some` iff the routed experts were uploaded expert-sharded for one
     /// rank of an expert-parallel mesh (compact tensors of `local_count(512)`
     /// experts); `None` on the single-device route.
     ep: Option<Qwen4EpPlacement>,
     pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    scope: Qwen4BandScope,
+    device: usize,
 }
 
 impl Qwen4Weights {
@@ -2378,8 +2528,9 @@ impl Qwen4Weights {
         config: &Qwen4Config,
         recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
     ) -> Result<Self, WeightError> {
-        Self::assemble_impl(tx, config, recipe, placements, None)
+        Self::assemble_impl(tx, config, recipe, placements, scope, None)
     }
 
     /// [`Self::assemble`] for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the trunk
@@ -2392,9 +2543,10 @@ impl Qwen4Weights {
         config: &Qwen4Config,
         recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
         lease: crate::expert_tier_owners::ExpertTierLease,
     ) -> Result<Self, WeightError> {
-        Self::assemble_impl(tx, config, recipe, placements, Some(lease))
+        Self::assemble_impl(tx, config, recipe, placements, scope, Some(lease))
     }
 
     fn assemble_impl(
@@ -2402,14 +2554,45 @@ impl Qwen4Weights {
         config: &Qwen4Config,
         recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
         expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
     ) -> Result<Self, WeightError> {
         let mut manifest = assembly_manifest(config, recipe)?;
         if expert_tiers.is_some() {
             manifest = manifest.with_expert_tiers()?;
         }
-        check_placement_set(&manifest, placements)?;
-        let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
+        let placements = if *scope == Qwen4BandScope::single(config) {
+            Cow::Borrowed(placements)
+        } else {
+            Cow::Owned(
+                placements
+                    .iter()
+                    .filter(|placement| {
+                        manifest
+                            .entry(&placement.name, placement.layer)
+                            .is_none_or(|entry| scope.owns_entry(entry))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let manifest = manifest.with_band_scope(config, scope)?;
+        check_placement_set(&manifest, &placements)?;
+        let device = placements.first().map_or(0, |placement| placement.device);
+        if placements
+            .iter()
+            .any(|placement| placement.device != device)
+        {
+            return Err(WeightError::Config(
+                "Qwen4 band assembly requires one owning device".to_string(),
+            ));
+        }
+        let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, device))?;
+        if ep.is_some() && *scope != Qwen4BandScope::single(config) {
+            return Err(WeightError::EpPlacement(
+                "Qwen4 pipeline bands cannot be combined with expert parallelism".to_string(),
+            ));
+        }
         if recipe.is_stock_fp8() {
             // Checked before anything is taken, so a refusal leaves every
             // handle with the transaction for its normal rollback.
@@ -2425,7 +2608,7 @@ impl Qwen4Weights {
                 .iter()
                 .filter(|entry| is_routed_expert_tensor(&entry.name))
             {
-                match tx.get(&entry.name, entry.layer, 0) {
+                match tx.get(&entry.name, entry.layer, device) {
                     Some(WeightHandle::Resident(tensor)) => {
                         Fp8B128ExpertTable::from_tensor(&entry.name, tensor)?;
                     }
@@ -2433,14 +2616,14 @@ impl Qwen4Weights {
                         return Err(WeightError::MissingResident {
                             name: entry.name.clone(),
                             layer: entry.layer,
-                            device: 0,
+                            device,
                         })
                     }
                 }
             }
         }
         let mut assembly = tx.begin_assembly();
-        for placement in placements {
+        for placement in placements.iter() {
             if assembly
                 .take(&placement.name, placement.layer, placement.device)
                 .is_none()
@@ -2452,16 +2635,16 @@ impl Qwen4Weights {
                 });
             }
         }
-        let taken = assembly.commit().finalize();
-        let mut taken_by_name: HashMap<String, Vec<usize>> = HashMap::new();
-        for (slot, weight) in taken.iter().enumerate() {
-            taken_by_name
-                .entry(weight.key.name.clone())
-                .or_default()
-                .push(slot);
+        let assembly = assembly.commit();
+        let mut root = build_root_refs(config)?;
+        if !scope.input && scope.output && config.mtp.is_some() {
+            root.embedding.name = "mtp.embed_tokens.weight".to_string();
         }
-        let root = build_root_refs(config)?;
-        let mut layer_refs = build_layer_refs(config)?;
+        let mut layer_refs = if *scope == Qwen4BandScope::single(config) {
+            build_layer_refs(config)?
+        } else {
+            build_layer_refs_scoped(config, scope)?
+        };
         if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = recipe {
             for layer in &mut layer_refs {
                 let Qwen4FfnWeights::Moe(moe) = &mut layer.ffn else {
@@ -2491,9 +2674,18 @@ impl Qwen4Weights {
         }
         let mtp = config
             .mtp
-            .is_some()
-            .then(|| build_mtp_refs(config))
+            .as_ref()
+            .filter(|_| scope.output)
+            .map(|_| build_mtp_refs(config))
             .transpose()?;
+        let taken = assembly.finalize();
+        let mut taken_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (slot, weight) in taken.iter().enumerate() {
+            taken_by_name
+                .entry(weight.key.name.clone())
+                .or_default()
+                .push(slot);
+        }
         Ok(Self {
             manifest,
             taken,
@@ -2503,7 +2695,27 @@ impl Qwen4Weights {
             mtp,
             ep,
             expert_tiers,
+            scope: scope.clone(),
+            device,
         })
+    }
+
+    /// Absolute half-open trunk interval owned by this rank.
+    pub fn owned_layers(&self) -> Range<usize> {
+        self.scope.band.clone()
+    }
+
+    /// The validated endpoint and trunk ownership used during assembly.
+    pub fn band_scope(&self) -> &Qwen4BandScope {
+        &self.scope
+    }
+
+    /// Resolve an absolute layer ID to its compact rank-local reference.
+    pub fn layer(&self, absolute: usize) -> Option<&Qwen4LayerWeights> {
+        let local = absolute.checked_sub(self.scope.band.start)?;
+        self.layer_refs
+            .get(local)
+            .filter(|layer| layer.layer == absolute)
     }
 
     pub fn expert_tiers(&self) -> Option<&crate::expert_tier_owners::ExpertTierLease> {
@@ -2525,11 +2737,11 @@ impl Qwen4Weights {
 
     /// Resolve one immutable typed reference to its resident GPU buffer.
     ///
-    /// Qwen4 is currently admitted only on the Single route, so device zero is
-    /// the sole logical placement.  Tied weights are followed by their
-    /// canonical source name and never trigger I/O or allocation.
+    /// Resolve only on the assembled band's owning logical device. Local ties
+    /// follow their source; separately materialized endpoint ties resolve their
+    /// own handle. Neither path performs I/O or allocation.
     pub fn resident(&self, reference: &TensorRef) -> Result<&GpuTensor, WeightError> {
-        self.resident_named(&reference.name, reference.layer, 0, 0)
+        self.resident_named(&reference.name, reference.layer, self.device, 0)
     }
 
     fn resident_named(
@@ -2903,6 +3115,14 @@ fn build_hyper_refs(
 }
 
 fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, WeightError> {
+    build_layer_refs_scoped(config, &Qwen4BandScope::single(config))
+}
+
+fn build_layer_refs_scoped(
+    config: &Qwen4Config,
+    scope: &Qwen4BandScope,
+) -> Result<Vec<Qwen4LayerWeights>, WeightError> {
+    scope.validate(config).map_err(WeightError::Config)?;
     let hidden = config.hidden_size;
     let hc_wide = config.hc_count * hidden;
     let hc_rank = config.hc_lowrank;
@@ -2913,8 +3133,9 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
     let gdn_qk = config.linear_num_key_heads * config.linear_key_head_dim;
     let gdn_v = config.linear_num_value_heads * config.linear_value_head_dim;
     let gdn_qkv = 2 * gdn_qk + gdn_v;
-    let mut refs = Vec::with_capacity(config.num_hidden_layers);
-    for (layer, kind) in config.layer_types.iter().copied().enumerate() {
+    let mut refs = Vec::with_capacity(scope.band.len());
+    for layer in scope.band.clone() {
+        let kind = config.layer_types[layer];
         let prefix = format!("model.language_model.layers.{layer}");
         let attn_hyper = build_hyper_refs(
             &format!("{prefix}.attn_hyper_connection"),
@@ -5809,5 +6030,244 @@ mod tests {
         // must stay loadable: both tiers are admitted by the same declaration.
         assert!(ple.dtype_constraint.accepts(DType::BF16));
         assert!(!ple.dtype_constraint.accepts(DType::MQ4G128V2));
+    }
+
+    #[test]
+    fn single_band_preserves_manifest_keys_references_and_assembly_order() {
+        let config = pinned_config();
+        let base = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let scope = Qwen4BandScope::single(&config);
+        let scoped = base.clone().with_band_scope(&config, &scope).unwrap();
+        assert_eq!(scoped, base);
+        let placements = scoped.placements_for_scope(&config, &scope, 0).unwrap();
+        let keys: Vec<_> = base.resident_keys().collect();
+        assert_eq!(
+            placements
+                .iter()
+                .map(|p| (p.name.as_str(), p.layer))
+                .collect::<Vec<_>>(),
+            keys
+        );
+        let refs = build_layer_refs_scoped(&config, &scope).unwrap();
+        assert_eq!(
+            refs.iter().map(|layer| layer.layer).collect::<Vec<_>>(),
+            (0..config.num_hidden_layers).collect::<Vec<_>>()
+        );
+        // Exercise the real assembly take order using the store's CPU-only
+        // symbolic ownership seam. No GPU tensor is fabricated or allocated.
+        let mut store = hipfire_runtime::weight_store::WeightStore::default();
+        for entry in base
+            .weights
+            .iter()
+            .filter(|entry| !entry.residency.is_external())
+        {
+            store
+                .stage_alias(
+                    &entry.name,
+                    entry.layer,
+                    0,
+                    "test-source",
+                    hipfire_runtime::weight_store::WeightProjection {
+                        kind: hipfire_runtime::weight_store::WeightProjectionKind::Static,
+                        axis: None,
+                        rank: 0,
+                        world_size: 1,
+                        logical_shape: entry.logical_shape.clone(),
+                        dtype: entry.dtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut tx = WeightLoadTransaction::new(store);
+        let weights =
+            Qwen4Weights::assemble(&mut tx, &config, &base.identity.recipe, &placements, &scope)
+                .unwrap();
+        assert_eq!(
+            weights
+                .taken
+                .iter()
+                .map(|taken| (taken.key.name.as_str(), taken.key.layer))
+                .collect::<Vec<_>>(),
+            keys
+        );
+        assert!(tx.is_empty());
+        for absolute in scope.band.clone() {
+            assert_eq!(weights.layer(absolute).unwrap().layer, absolute);
+        }
+        assert!(weights.layer(config.num_hidden_layers).is_none());
+    }
+
+    #[test]
+    fn pp2_and_pp6_partition_every_flash_next_key_exactly_once() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let config = pinned_config();
+        let base = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let expected: BTreeSet<_> = base
+            .weights
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.layer))
+            .collect();
+        for counts in [&[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, 48, counts).unwrap();
+            let mut union = BTreeSet::new();
+            let mut states = Vec::new();
+            for stage in 0..counts.len() {
+                let scope = Qwen4BandScope::from_placement(&config, &placement, stage).unwrap();
+                let local = base.clone().with_band_scope(&config, &scope).unwrap();
+                let expected_order: Vec<_> = base
+                    .weights
+                    .iter()
+                    .filter(|entry| scope.owns_entry(entry))
+                    .map(|entry| (entry.name.as_str(), entry.layer))
+                    .collect();
+                assert_eq!(
+                    local
+                        .weights
+                        .iter()
+                        .map(|entry| (entry.name.as_str(), entry.layer))
+                        .collect::<Vec<_>>(),
+                    expected_order
+                );
+                let placements = base.placements_for_scope(&config, &scope, stage).unwrap();
+                check_placement_set(&local, &placements).unwrap();
+                assert!(placements.iter().all(|entry| entry.device == stage));
+                assert_eq!(
+                    build_layer_refs_scoped(&config, &scope)
+                        .unwrap()
+                        .iter()
+                        .map(|layer| layer.layer)
+                        .collect::<Vec<_>>(),
+                    scope.band.clone().collect::<Vec<_>>()
+                );
+                for entry in &local.weights {
+                    assert!(
+                        union.insert((entry.name.clone(), entry.layer)),
+                        "{}",
+                        entry.name
+                    );
+                    if let Some(layer) = entry.layer {
+                        assert!(scope.owns_layer(layer));
+                    }
+                    if entry.name.starts_with("mtp.") {
+                        assert!(scope.output);
+                        assert_eq!(entry.placement, PlacementHint::Pin(PinTarget::Output));
+                    }
+                }
+                assert_eq!(local.metadata.is_empty(), !scope.input);
+                states.extend(local.state);
+            }
+            assert_eq!(union, expected);
+            assert_eq!(states.len(), base.state.len());
+            for state in &base.state {
+                assert_eq!(
+                    states.iter().filter(|entry| *entry == state).count(),
+                    base.state.iter().filter(|entry| *entry == state).count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_embedding_preserves_tied_source_without_input_allocation() {
+        let config = pinned_config();
+        let base = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let scope = Qwen4BandScope {
+            band: 24..48,
+            input: false,
+            output: true,
+        };
+        let local = base.with_band_scope(&config, &scope).unwrap();
+        assert!(local
+            .entry("model.language_model.embed_tokens.weight", None)
+            .is_none());
+        let tied = local.entry("mtp.embed_tokens.weight", None).unwrap();
+        assert_eq!(
+            tied.policy,
+            ShardPolicy::Tied {
+                source: "model.language_model.embed_tokens.weight".to_string()
+            }
+        );
+        assert_eq!(tied.placement, PlacementHint::Pin(PinTarget::Output));
+    }
+
+    #[test]
+    fn bands_refuse_invalid_endpoints_ple_cut_and_expert_parallelism() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let config = pinned_config();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let bad = BandPlacement::from_counts(&mesh, 48, &[1, 47]).unwrap();
+        for stage in 0..2 {
+            assert!(Qwen4BandScope::from_placement(&config, &bad, stage).is_err());
+        }
+        assert!(Qwen4BandScope::from_placement(&config, &bad, 2).is_err());
+        assert!(Qwen4BandScope {
+            band: 24..48,
+            input: true,
+            output: true
+        }
+        .validate(&config)
+        .is_err());
+        let ep = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0)
+            .unwrap()
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .unwrap();
+        let scope = Qwen4BandScope {
+            band: 0..24,
+            input: true,
+            output: false,
+        };
+        assert!(matches!(
+            ep.with_band_scope(&config, &scope),
+            Err(WeightError::EpPlacement(_))
+        ));
+    }
+
+    #[test]
+    fn scoped_assembly_failure_returns_taken_handles_to_the_transaction() {
+        let config = pinned_config();
+        let manifest = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let scope = Qwen4BandScope {
+            band: 0..24,
+            input: true,
+            output: false,
+        };
+        let placements = manifest.placements_for_scope(&config, &scope, 0).unwrap();
+        let mut store = hipfire_runtime::weight_store::WeightStore::default();
+        for placement in placements.iter().take(5) {
+            let entry = manifest.entry(&placement.name, placement.layer).unwrap();
+            store
+                .stage_alias(
+                    &entry.name,
+                    entry.layer,
+                    0,
+                    "test-source",
+                    hipfire_runtime::weight_store::WeightProjection {
+                        kind: hipfire_runtime::weight_store::WeightProjectionKind::Static,
+                        axis: None,
+                        rank: 0,
+                        world_size: 1,
+                        logical_shape: entry.logical_shape.clone(),
+                        dtype: entry.dtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut tx = WeightLoadTransaction::new(store);
+        assert!(matches!(
+            Qwen4Weights::assemble(
+                &mut tx,
+                &config,
+                &manifest.identity.recipe,
+                &placements,
+                &scope,
+            ),
+            Err(WeightError::MissingPlacement { .. })
+        ));
+        assert_eq!(tx.len(), 5);
+        for placement in placements.iter().take(5) {
+            assert!(tx.contains(&placement.name, placement.layer, 0));
+            assert!(tx.projection(&placement.name, placement.layer, 0).is_some());
+        }
     }
 }

@@ -10,6 +10,7 @@
 use crate::config::{LayerType, Qwen4Config};
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::ple::PleHistory;
+use crate::weights::Qwen4BandScope;
 use hipfire_dispatch::pipeline::GdnRowCapture;
 use hipfire_runtime::kv_backend::{
     KvChunkPlan, KvChunkPlanError, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
@@ -25,6 +26,7 @@ use rdna_compute::qsa_pooled_mirror::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// GDN key and value head width of the few-row capture route.
@@ -138,11 +140,9 @@ fn arena_regions<'a>(
     if let (Some(live), Some(saved)) = (&state.ple_conv, &arena.ple_conv) {
         copies.push(pair(live, saved, live.byte_size()));
     }
-    copies.push(pair(
-        &state.hyper_feedback,
-        &arena.hyper_feedback,
-        state.hyper_feedback.byte_size(),
-    ));
+    if let (Some(live), Some(saved)) = (&state.hyper_feedback, &arena.hyper_feedback) {
+        copies.push(pair(live, saved, live.byte_size()));
+    }
     Ok(copies)
 }
 
@@ -880,7 +880,7 @@ pub(crate) struct Qwen4StateSnapshotArena {
     qsa_raw_circular: Vec<GpuTensor>,
     qsa_selected: Vec<GpuTensor>,
     ple_conv: Option<GpuTensor>,
-    hyper_feedback: GpuTensor,
+    hyper_feedback: Option<GpuTensor>,
     qsa_marks: Vec<QsaMark>,
     ple_history: PleHistory,
     position: usize,
@@ -902,7 +902,7 @@ impl Qwen4StateSnapshotArena {
         gdn: &[GdnGpuState],
         qsa: &[QsaGpuState],
         ple_conv: Option<&GpuTensor>,
-        hyper_feedback: &GpuTensor,
+        hyper_feedback: Option<&GpuTensor>,
         model_id: u64,
         ple_history: PleHistory,
         position: usize,
@@ -952,14 +952,16 @@ impl Qwen4StateSnapshotArena {
                         .map_err(StateError::Hip)?,
                 );
             }
-            allocated.push(
-                gpu.zeros(&hyper_feedback.shape, DType::F32)
-                    .map_err(StateError::Hip)?,
-            );
+            if let Some(hyper_feedback) = hyper_feedback {
+                allocated.push(
+                    gpu.zeros(&hyper_feedback.shape, DType::F32)
+                        .map_err(StateError::Hip)?,
+                );
+            }
             Ok(())
         })();
         if let Err(error) = result {
-            for tensor in allocated {
+            for tensor in allocated.into_iter().rev() {
                 let _ = gpu.free_tensor(tensor);
             }
             return Err(error);
@@ -982,9 +984,9 @@ impl Qwen4StateSnapshotArena {
             qsa_selected.push(next());
         }
         let ple_conv = ple_conv.map(|_| next());
-        let hyper_feedback = next();
+        let hyper_feedback = hyper_feedback.map(|_| next());
         if !allocated.is_empty() {
-            for tensor in allocated {
+            for tensor in allocated.into_iter().rev() {
                 let _ = gpu.free_tensor(tensor);
             }
             return Err(StateError::AllocationBookkeeping);
@@ -1049,7 +1051,7 @@ impl Qwen4StateSnapshotArena {
                 .map_or(0, |arena| arena.mirror.numel()));
         }
         mix(state.ple_conv.as_ref().map_or(0, GpuTensor::numel));
-        mix(state.hyper_feedback.numel());
+        mix(state.hyper_feedback.as_ref().map_or(0, GpuTensor::numel));
         SnapshotDimensions {
             gdn_count: state.gdn.len(),
             qsa_count: state.qsa.len(),
@@ -1112,7 +1114,8 @@ impl Qwen4StateSnapshotArena {
         }
         if self.ple_conv.as_ref().map(GpuTensor::numel)
             != state.ple_conv.as_ref().map(GpuTensor::numel)
-            || self.hyper_feedback.numel() != state.hyper_feedback.numel()
+            || self.hyper_feedback.as_ref().map(GpuTensor::numel)
+                != state.hyper_feedback.as_ref().map(GpuTensor::numel)
         {
             return Err(StateError::SnapshotShape);
         }
@@ -1161,7 +1164,7 @@ impl Qwen4StateSnapshotArena {
             .chain(self.qsa_raw_circular)
             .chain(self.qsa_selected)
             .chain(self.ple_conv)
-            .chain([self.hyper_feedback]);
+            .chain(self.hyper_feedback);
         let mut first = None;
         for tensor in tensors {
             if let Err(error) = gpu.free_tensor(tensor) {
@@ -1172,17 +1175,624 @@ impl Qwen4StateSnapshotArena {
     }
 }
 
+/// Absolute-to-local ownership of one rank's request state (S5). A rank owns
+/// the GDN/QSA state of exactly the trunk layers of its band; the PLE
+/// convolution history (when the profile has PLE) and the legacy
+/// `hyper_feedback` tensor belong to the input scope only. Allocation, reset,
+/// digest, snapshot, session and repair loops all walk the compact local
+/// vectors, so the only place an absolute layer id appears is this map.
+/// [`Qwen4BandScope::single`] gives today's whole-model layout, bit for bit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4StateMap {
+    band: Range<usize>,
+    input: bool,
+    output: bool,
+    /// Owns the PLE convolution history: the input scope of a PLE profile.
+    ple: bool,
+    layers: usize,
+    /// Absolute layer of each local GDN / QSA slot, ascending.
+    gdn_layers: Vec<usize>,
+    qsa_layers: Vec<usize>,
+    /// Local slot of each absolute layer (`None` = not owned here).
+    gdn_slot: Vec<Option<usize>>,
+    qsa_slot: Vec<Option<usize>>,
+    /// GDN / QSA layers of the whole model before the band's first layer.
+    gdn_base: usize,
+    qsa_base: usize,
+}
+
+impl Qwen4StateMap {
+    /// The map of `scope` over `config`'s trunk. Refuses a band that is empty
+    /// or outside the trunk, input/output flags that disagree with the band
+    /// ends, and a PLE profile whose zero-based PLE layer is not in the input
+    /// band (the PLE history is input-owned, frozen review §3.1).
+    pub fn new(config: &Qwen4Config, scope: &Qwen4BandScope) -> Result<Self, String> {
+        scope.validate(config)?;
+        let layers = config.layer_types.len();
+        let band = scope.band.clone();
+        if band.start >= band.end || band.end > layers {
+            return Err(format!(
+                "qwen4 state: band {}..{} is empty or outside the {layers} trunk layers",
+                band.start, band.end
+            ));
+        }
+        if scope.input != (band.start == 0) || scope.output != (band.end == layers) {
+            return Err(format!(
+                "qwen4 state: band {}..{} disagrees with input={} output={}",
+                band.start, band.end, scope.input, scope.output
+            ));
+        }
+        if let Some(ple) = &config.ple {
+            if band.contains(&ple.layer) != scope.input {
+                return Err(format!(
+                    "qwen4 state: PLE layer {} and its convolution history belong to the input \
+                     band; band {}..{} (input={}) does not own them consistently",
+                    ple.layer, band.start, band.end, scope.input
+                ));
+            }
+        }
+        let mut gdn_layers = Vec::new();
+        let mut qsa_layers = Vec::new();
+        let mut gdn_slot = vec![None; layers];
+        let mut qsa_slot = vec![None; layers];
+        for abs in band.clone() {
+            match config.layer_types[abs] {
+                LayerType::LinearAttention => {
+                    gdn_slot[abs] = Some(gdn_layers.len());
+                    gdn_layers.push(abs);
+                }
+                LayerType::FullAttention => {
+                    qsa_slot[abs] = Some(qsa_layers.len());
+                    qsa_layers.push(abs);
+                }
+            }
+        }
+        let before = |wanted: LayerType| {
+            config.layer_types[..band.start]
+                .iter()
+                .filter(|kind| **kind == wanted)
+                .count()
+        };
+        let (gdn_base, qsa_base) = (
+            before(LayerType::LinearAttention),
+            before(LayerType::FullAttention),
+        );
+        Ok(Self {
+            input: scope.input,
+            output: scope.output,
+            ple: scope.input && config.ple.is_some(),
+            band,
+            layers,
+            gdn_layers,
+            qsa_layers,
+            gdn_slot,
+            qsa_slot,
+            gdn_base,
+            qsa_base,
+        })
+    }
+
+    /// The absolute trunk layers this state owns.
+    pub fn band(&self) -> Range<usize> {
+        self.band.clone()
+    }
+
+    /// Whole-model ownership (one band covering the trunk): today's layout.
+    pub fn is_single(&self) -> bool {
+        self.band == (0..self.layers)
+    }
+
+    pub fn owns_input(&self) -> bool {
+        self.input
+    }
+
+    pub fn owns_output(&self) -> bool {
+        self.output
+    }
+
+    /// PLE convolution history lives here (input scope of a PLE profile).
+    pub fn owns_ple(&self) -> bool {
+        self.ple
+    }
+
+    pub fn gdn_count(&self) -> usize {
+        self.gdn_layers.len()
+    }
+
+    pub fn qsa_count(&self) -> usize {
+        self.qsa_layers.len()
+    }
+
+    /// Absolute layer of each local GDN slot, ascending.
+    pub fn gdn_layers(&self) -> &[usize] {
+        &self.gdn_layers
+    }
+
+    /// Absolute layer of each local QSA slot, ascending.
+    pub fn qsa_layers(&self) -> &[usize] {
+        &self.qsa_layers
+    }
+
+    /// Local GDN slot of absolute layer `abs` (`None`: not an owned GDN layer).
+    pub fn gdn_local(&self, abs: usize) -> Option<usize> {
+        self.gdn_slot.get(abs).copied().flatten()
+    }
+
+    /// Local QSA slot of absolute layer `abs` (`None`: not an owned QSA layer).
+    pub fn qsa_local(&self, abs: usize) -> Option<usize> {
+        self.qsa_slot.get(abs).copied().flatten()
+    }
+
+    /// Absolute layer of local GDN slot `slot`.
+    pub fn gdn_layer(&self, slot: usize) -> Option<usize> {
+        self.gdn_layers.get(slot).copied()
+    }
+
+    /// Absolute layer of local QSA slot `slot`.
+    pub fn qsa_layer(&self, slot: usize) -> Option<usize> {
+        self.qsa_layers.get(slot).copied()
+    }
+
+    /// GDN layers of the whole model before this band: whole-model GDN ordinal
+    /// of local slot `s` is `gdn_base() + s`.
+    pub fn gdn_base(&self) -> usize {
+        self.gdn_base
+    }
+
+    /// QSA layers of the whole model before this band.
+    pub fn qsa_base(&self) -> usize {
+        self.qsa_base
+    }
+
+    /// Identity of the ownership in a session snapshot's reserved meta word:
+    /// 0 for the whole model (today's bytes), nonzero and band-specific
+    /// otherwise, so a snapshot of one band never restores into another.
+    pub(crate) fn session_tag(&self) -> u64 {
+        if self.is_single() {
+            return 0;
+        }
+        let mut hash = 0xcbf29ce484222325u64;
+        for word in [
+            self.band.start as u64,
+            self.band.end as u64,
+            u64::from(self.input),
+            u64::from(self.output),
+        ] {
+            hash ^= word;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash.max(1)
+    }
+}
+
+/// (GDN, QSA) layers of `config`'s trunk inside `scope.band`.
+pub(crate) fn scope_layer_counts(config: &Qwen4Config, scope: &Qwen4BandScope) -> (usize, usize) {
+    let mut counts = (0, 0);
+    for (abs, kind) in config.layer_types.iter().enumerate() {
+        if scope.band.contains(&abs) {
+            match kind {
+                LayerType::LinearAttention => counts.0 += 1,
+                LayerType::FullAttention => counts.1 += 1,
+            }
+        }
+    }
+    counts
+}
+
+/// Shape constants every state allocation derives from `config`/`format`.
+struct StateGeometry {
+    gdn_recurrent: usize,
+    conv_len: usize,
+    full_width: usize,
+    full_row_units: usize,
+    raw_width: usize,
+    pooled_capacity: usize,
+    selected_capacity: usize,
+}
+
+impl StateGeometry {
+    fn new(
+        config: &Qwen4Config,
+        format: &Qwen4StateFormat,
+        max_seq_len: usize,
+    ) -> Result<Self, StateError> {
+        let gdn_recurrent = format.gdn.state_units(
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        );
+        let conv_channels = config
+            .linear_num_key_heads
+            .checked_mul(config.linear_key_head_dim)
+            .and_then(|v| v.checked_mul(2))
+            .and_then(|v| {
+                v.checked_add(
+                    config
+                        .linear_num_value_heads
+                        .checked_mul(config.linear_value_head_dim)?,
+                )
+            })
+            .ok_or(StateError::DimensionOverflow)?;
+        let conv_len = conv_channels
+            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))
+            .ok_or(StateError::DimensionOverflow)?;
+        let full_width = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or(StateError::DimensionOverflow)?;
+        let full_row_units = format
+            .qsa
+            .kv_row_units(config.num_key_value_heads, config.head_dim);
+        let raw_width = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)
+            .ok_or(StateError::DimensionOverflow)?;
+        let pooled_capacity = max_seq_len
+            .checked_add(config.indexer_compress_ratio - 1)
+            .ok_or(StateError::DimensionOverflow)?
+            / config.indexer_compress_ratio;
+        Ok(Self {
+            gdn_recurrent,
+            conv_len,
+            full_width,
+            full_row_units,
+            raw_width,
+            pooled_capacity,
+            selected_capacity: config.qsa_selected_capacity(),
+        })
+    }
+}
+
+/// One device tensor `Qwen4State` allocates: its absolute-layer key, element
+/// count, dtype and whether it is a QSA context arena (VMM-owned under the
+/// VMM backend).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StateTensorSpec {
+    pub(crate) key: String,
+    pub(crate) elements: usize,
+    pub(crate) dtype: DType,
+    pub(crate) context_arena: bool,
+}
+
+impl StateTensorSpec {
+    fn new(key: String, elements: usize, dtype: DType, context_arena: bool) -> Self {
+        Self {
+            key,
+            elements,
+            dtype,
+            context_arena,
+        }
+    }
+}
+
+/// Allocation order of a state over `map`: owned layers in absolute order (a
+/// GDN layer's recurrent then conv; a QSA layer's seven fixed/context tensors,
+/// then the F16 arena K/V, then the pooled BF16 mirror), then, on the input
+/// scope only, the PLE convolution history (PLE profiles) and
+/// `hyper_feedback`. Under the whole-model map this is exactly the order the
+/// constructor always allocated.
+fn state_tensor_plan(
+    config: &Qwen4Config,
+    format: &Qwen4StateFormat,
+    max_seq_len: usize,
+    geometry: &StateGeometry,
+    map: &Qwen4StateMap,
+) -> Result<Vec<StateTensorSpec>, StateError> {
+    let layout = format.layout();
+    let qsa_format = format.qsa;
+    let ratio = config.indexer_compress_ratio;
+    let mut plan = Vec::new();
+    for abs in map.band() {
+        match config.layer_types[abs] {
+            LayerType::LinearAttention => {
+                plan.push(StateTensorSpec::new(
+                    format!("gdn[L{abs}].recurrent"),
+                    geometry.gdn_recurrent,
+                    format.gdn.dtype(),
+                    false,
+                ));
+                plan.push(StateTensorSpec::new(
+                    format!("gdn[L{abs}].conv"),
+                    geometry.conv_len,
+                    DType::F32,
+                    false,
+                ));
+            }
+            LayerType::FullAttention => {
+                let full_elements = max_seq_len
+                    .checked_mul(geometry.full_row_units)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let raw_elements = max_seq_len
+                    .checked_mul(geometry.raw_width)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let pooled_elements = geometry
+                    .pooled_capacity
+                    .checked_mul(geometry.raw_width)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let partial_key_elements = ratio
+                    .checked_mul(geometry.raw_width)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let partial_value_elements = ratio
+                    .checked_mul(geometry.full_width)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let selected_bytes = geometry
+                    .selected_capacity
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .ok_or(StateError::DimensionOverflow)?;
+                // The derived F16 K and block-transposed V arenas: whole
+                // four-token blocks, `full_width` F16 channels per token.
+                let arena_elements = if layout.f16_arena {
+                    qsa_f16_arena_rows(max_seq_len)
+                        .checked_mul(geometry.full_width)
+                        .ok_or(StateError::DimensionOverflow)?
+                } else {
+                    0
+                };
+                let mut specs = vec![
+                    ("full_keys", full_elements, qsa_format.kv_dtype(), true),
+                    ("full_values", full_elements, qsa_format.kv_dtype(), true),
+                    ("raw_index_keys", raw_elements, layout.index_dtype(), true),
+                    ("pooled_keys", pooled_elements, layout.index_dtype(), true),
+                    ("partial_keys", partial_key_elements, DType::F32, false),
+                    ("partial_values", partial_value_elements, DType::F32, false),
+                    ("selected_indices", selected_bytes, DType::Raw, false),
+                ];
+                if layout.f16_arena {
+                    specs.push(("f16_keys", arena_elements, DType::F16, true));
+                    specs.push(("f16_values", arena_elements, DType::F16, true));
+                }
+                // The derived BF16 pooled-key mirror (same row count and
+                // width as `pooled_keys`).
+                if layout.pooled_bf16 {
+                    specs.push(("pooled_bf16", pooled_elements, DType::BF16, true));
+                }
+                for (name, elements, dtype, context_arena) in specs {
+                    plan.push(StateTensorSpec::new(
+                        format!("qsa[L{abs}].{name}"),
+                        elements,
+                        dtype,
+                        context_arena,
+                    ));
+                }
+            }
+        }
+    }
+    // PLE channels are the HC-wide rows of the key projection:
+    // `hidden_size * hc_count` (`ple_embed_dim` is its input width). A
+    // profile without PLE has no convolution history to hold.
+    if map.owns_ple() {
+        let ple_channels = config
+            .hidden_size
+            .checked_mul(config.hc_count)
+            .ok_or(StateError::DimensionOverflow)?;
+        let ple_elements = config
+            .ple_conv_history_rows()
+            .checked_mul(ple_channels)
+            .ok_or(StateError::DimensionOverflow)?;
+        plan.push(StateTensorSpec::new(
+            "ple_conv".into(),
+            ple_elements,
+            DType::F32,
+            false,
+        ));
+    }
+    if map.owns_input() {
+        let feedback_elements = config
+            .hc_count
+            .checked_mul(config.hidden_size)
+            .ok_or(StateError::DimensionOverflow)?;
+        plan.push(StateTensorSpec::new(
+            "hyper_feedback".into(),
+            feedback_elements,
+            DType::F32,
+            false,
+        ));
+    }
+    Ok(plan)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QsaDigestField {
+    FullKeys,
+    FullValues,
+    RawIndexKeys,
+    PooledKeys,
+    PartialKeys,
+    PartialValues,
+    SelectedIndices,
+}
+
+impl QsaDigestField {
+    const ALL: [Self; 7] = [
+        Self::FullKeys,
+        Self::FullValues,
+        Self::RawIndexKeys,
+        Self::PooledKeys,
+        Self::PartialKeys,
+        Self::PartialValues,
+        Self::SelectedIndices,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::FullKeys => "full_keys",
+            Self::FullValues => "full_values",
+            Self::RawIndexKeys => "raw_index_keys",
+            Self::PooledKeys => "pooled_keys",
+            Self::PartialKeys => "partial_keys",
+            Self::PartialValues => "partial_values",
+            Self::SelectedIndices => "selected_indices",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureDigestField {
+    Ring,
+    Inputs,
+    Recurrence,
+}
+
+impl CaptureDigestField {
+    const ALL: [Self; 3] = [Self::Ring, Self::Inputs, Self::Recurrence];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ring => "ring",
+            Self::Inputs => "inputs",
+            Self::Recurrence => "recurrence",
+        }
+    }
+}
+
+/// One row of a state digest; slots are local indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DigestRow {
+    Position,
+    /// Canonical only: the host position, once per owned absolute layer.
+    LayerPosition(usize),
+    PleHistoryPrevious,
+    PleHistoryEos,
+    GdnLive,
+    /// Canonical only: the GDN ring slot, once per owned GDN slot.
+    GdnLiveLayer(usize),
+    RowCaptureRows,
+    QsaMappedTokens,
+    QsaMarks(usize),
+    GdnRecurrent(usize),
+    GdnConv(usize),
+    Qsa(usize, QsaDigestField),
+    PleConv,
+    HyperFeedback,
+    RowCapture(usize, CaptureDigestField),
+    RowCaptureOutput,
+}
+
+/// The ordered rows of a digest over `map`. The non-canonical plan is
+/// [`Qwen4State::debug_digest`]: under the whole-model map it is exactly the
+/// historical row order. The canonical plan ([`Qwen4State::canonical_digest_rows`])
+/// keeps only semantic state: it drops the capacity rows (`row_capture_rows`,
+/// `qsa_mapped_tokens`) and the rollback re-run's discarded `row_capture_output`
+/// scratch (written fully by the re-run launch, never read by any forward or
+/// repair), and replaces the two global host rows by per-layer rows so every
+/// canonical key has exactly one owner: `layer[L<abs>].position` for each
+/// owned trunk layer and `gdn[L<abs>].live` for each owned GDN layer (PLE
+/// history stays on the input scope, which owns it once).
+fn digest_plan(
+    map: &Qwen4StateMap,
+    canonical: bool,
+    row_capture: bool,
+    row_capture_output: bool,
+) -> Vec<DigestRow> {
+    let mut plan = if canonical {
+        map.band().map(DigestRow::LayerPosition).collect()
+    } else {
+        vec![DigestRow::Position]
+    };
+    if map.owns_input() {
+        plan.push(DigestRow::PleHistoryPrevious);
+        plan.push(DigestRow::PleHistoryEos);
+    }
+    if canonical {
+        plan.extend((0..map.gdn_count()).map(DigestRow::GdnLiveLayer));
+    } else {
+        plan.push(DigestRow::GdnLive);
+    }
+    if !canonical {
+        plan.push(DigestRow::RowCaptureRows);
+        plan.push(DigestRow::QsaMappedTokens);
+    }
+    plan.extend((0..map.qsa_count()).map(DigestRow::QsaMarks));
+    for slot in 0..map.gdn_count() {
+        plan.push(DigestRow::GdnRecurrent(slot));
+        plan.push(DigestRow::GdnConv(slot));
+    }
+    for slot in 0..map.qsa_count() {
+        plan.extend(
+            QsaDigestField::ALL
+                .into_iter()
+                .map(|field| DigestRow::Qsa(slot, field)),
+        );
+    }
+    if map.owns_ple() {
+        plan.push(DigestRow::PleConv);
+    }
+    if map.owns_input() {
+        plan.push(DigestRow::HyperFeedback);
+    }
+    if row_capture {
+        for slot in 0..map.gdn_count() {
+            plan.extend(
+                CaptureDigestField::ALL
+                    .into_iter()
+                    .map(|field| DigestRow::RowCapture(slot, field)),
+            );
+        }
+    }
+    if !canonical && row_capture_output {
+        plan.push(DigestRow::RowCaptureOutput);
+    }
+    plan
+}
+
+/// The key of `row`: local-slot labels (`qsa[2]`) for the debug digest,
+/// absolute-layer labels (`qsa[L11]`) for the canonical projection.
+fn digest_key(map: &Qwen4StateMap, row: DigestRow, canonical: bool) -> String {
+    let gdn = |slot: usize| {
+        if canonical {
+            format!("gdn[L{}]", map.gdn_layers[slot])
+        } else {
+            format!("gdn[{slot}]")
+        }
+    };
+    let qsa = |slot: usize| {
+        if canonical {
+            format!("qsa[L{}]", map.qsa_layers[slot])
+        } else {
+            format!("qsa[{slot}]")
+        }
+    };
+    match row {
+        DigestRow::Position => "position".into(),
+        DigestRow::LayerPosition(abs) => format!("layer[L{abs}].position"),
+        DigestRow::PleHistoryPrevious => "ple_history.previous".into(),
+        DigestRow::PleHistoryEos => "ple_history.eos".into(),
+        DigestRow::GdnLive => "gdn_live".into(),
+        DigestRow::GdnLiveLayer(slot) => format!("gdn[L{}].live", map.gdn_layers[slot]),
+        DigestRow::RowCaptureRows => "row_capture_rows".into(),
+        DigestRow::QsaMappedTokens => "qsa_mapped_tokens".into(),
+        DigestRow::QsaMarks(slot) => format!("{}.marks", qsa(slot)),
+        DigestRow::GdnRecurrent(slot) => format!("{}.recurrent", gdn(slot)),
+        DigestRow::GdnConv(slot) => format!("{}.conv", gdn(slot)),
+        DigestRow::Qsa(slot, field) => format!("{}.{}", qsa(slot), field.name()),
+        DigestRow::PleConv => "ple_conv".into(),
+        DigestRow::HyperFeedback => "hyper_feedback".into(),
+        DigestRow::RowCapture(slot, field) => {
+            let layer = if canonical {
+                format!("row_capture[L{}]", map.gdn_layers[slot])
+            } else {
+                format!("row_capture[{slot}]")
+            };
+            format!("{layer}.{}", field.name())
+        }
+        DigestRow::RowCaptureOutput => "row_capture_output".into(),
+    }
+}
+
 /// The sole production request-state owner for Qwen4.
 pub struct Qwen4State {
     pub gdn: Vec<GdnGpuState>,
     pub qsa: Vec<QsaGpuState>,
     /// The PLE short-convolution history; `None` exactly when the profile
-    /// declares no PLE (`config.ple`).  `hyper_feedback` below is not PLE
-    /// state (its width is `hc_count * hidden_size` whatever the profile,
-    /// and no PLE step reads or writes it), so it is allocated for every
-    /// profile and the Flash-Next layout does not depend on this option.
+    /// declares no PLE (`config.ple`) or the scope is not the input band.
+    /// `hyper_feedback` below is not PLE state (its width is
+    /// `hc_count * hidden_size` whatever the profile, and no PLE step reads or
+    /// writes it), so it is allocated for every profile on the input scope
+    /// and the Flash-Next layout does not depend on this option.
     pub ple_conv: Option<GpuTensor>,
-    pub hyper_feedback: GpuTensor,
+    /// Legacy HC feedback tensor: owned by the input scope only (`None` on
+    /// every other band); always present under the whole-model scope.
+    pub hyper_feedback: Option<GpuTensor>,
     pub ple_history: PleHistory,
     pub position: usize,
     pub max_seq_len: usize,
@@ -1220,6 +1830,8 @@ pub struct Qwen4State {
     qsa_compress: usize,
     model_id: u64,
     reset_epoch: u64,
+    /// Absolute-to-local ownership of `gdn` / `qsa` (compact local vectors).
+    map: Qwen4StateMap,
     transaction_generation: u64,
 }
 
@@ -1235,6 +1847,25 @@ impl Qwen4State {
         Self::new_with_backend(gpu, config, max_seq_len, format, Qwen4KvBackend::Legacy)
     }
 
+    /// [`Self::new`] for one band of a pipeline-parallel mesh; see
+    /// [`Self::new_with_backend_scoped`].
+    pub fn new_scoped(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_seq_len: usize,
+        format: Qwen4StateFormat,
+        scope: &Qwen4BandScope,
+    ) -> Result<Self, StateError> {
+        Self::new_with_backend_scoped(
+            gpu,
+            config,
+            max_seq_len,
+            format,
+            Qwen4KvBackend::Legacy,
+            scope,
+        )
+    }
+
     /// Allocate all mutable device buffers once.  QSA full K/V, raw and
     /// pooled key arenas have the `max_seq_len` capacity shape in
     /// `format.qsa`, the GDN recurrent states `format.gdn`; only active
@@ -1242,7 +1873,7 @@ impl Qwen4State {
     /// arenas are VMM owners with nothing mapped: callers must
     /// [`Self::ensure_mapped_capacity`] before any row access. `backend` is
     /// load admission's choice; a VMM failure is an error, never a legacy
-    /// fallback.
+    /// fallback. The whole model: [`Qwen4BandScope::single`].
     pub(crate) fn new_with_backend(
         gpu: &mut Gpu,
         config: &Qwen4Config,
@@ -1250,7 +1881,31 @@ impl Qwen4State {
         format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
     ) -> Result<Self, StateError> {
+        Self::new_with_backend_scoped(
+            gpu,
+            config,
+            max_seq_len,
+            format,
+            backend,
+            &Qwen4BandScope::single(config),
+        )
+    }
+
+    /// [`Self::new_with_backend`] over `scope`: GDN/QSA state is allocated
+    /// for the band's layers only (compact local vectors, absolute layer ids
+    /// in [`Self::scope_map`]); the PLE convolution history and
+    /// `hyper_feedback` only on the input scope. Under the single scope the
+    /// allocations, their order and their bytes are the historical ones.
+    pub(crate) fn new_with_backend_scoped(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_seq_len: usize,
+        format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
+        scope: &Qwen4BandScope,
+    ) -> Result<Self, StateError> {
         config.validate().map_err(StateError::Config)?;
+        let map = Qwen4StateMap::new(config, scope).map_err(StateError::Config)?;
         let qsa_format = format.qsa;
         if !qsa_format.supports(config.num_key_value_heads, config.head_dim) {
             return Err(StateError::Config(format!(
@@ -1285,176 +1940,62 @@ impl Qwen4State {
                 config.linear_value_head_dim
             )));
         }
-        let gdn_recurrent = gdn_format.state_units(
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-        );
-        let conv_channels = config
-            .linear_num_key_heads
-            .checked_mul(config.linear_key_head_dim)
-            .and_then(|v| v.checked_mul(2))
-            .and_then(|v| {
-                v.checked_add(
-                    config
-                        .linear_num_value_heads
-                        .checked_mul(config.linear_value_head_dim)?,
-                )
-            })
-            .ok_or(StateError::DimensionOverflow)?;
-        let conv_len = conv_channels
-            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))
-            .ok_or(StateError::DimensionOverflow)?;
-        let full_width = config
-            .num_key_value_heads
-            .checked_mul(config.head_dim)
-            .ok_or(StateError::DimensionOverflow)?;
-        let full_row_units = qsa_format.kv_row_units(config.num_key_value_heads, config.head_dim);
-        let raw_width = config
-            .indexer_kv_heads
-            .checked_mul(config.indexer_head_dim)
-            .ok_or(StateError::DimensionOverflow)?;
-        let pooled_capacity = max_seq_len
-            .checked_add(config.indexer_compress_ratio - 1)
-            .ok_or(StateError::DimensionOverflow)?
-            / config.indexer_compress_ratio;
+        let geometry = StateGeometry::new(config, &format, max_seq_len)?;
         if format.qsa_pooled_bf16
-            && (qsa_format != QsaKvFormat::F32 || raw_width != 128 || !gpu.arch_caps.is_gfx1151())
+            && (qsa_format != QsaKvFormat::F32
+                || geometry.raw_width != 128
+                || !gpu.arch_caps.is_gfx1151())
         {
             return Err(StateError::Config(format!(
                 "QSA pooled BF16 mirror needs exact F32 K/V on gfx1151 with index_dim 128, got {} on {} with {}",
                 qsa_format.name(),
                 gpu.arch,
-                raw_width
+                geometry.raw_width
             )));
         }
-        let selected_capacity = config.qsa_selected_capacity();
-        let mut allocated = Vec::new();
+        let plan = state_tensor_plan(config, &format, max_seq_len, &geometry, &map)?;
+        let selected_capacity = geometry.selected_capacity;
+        let pooled_capacity = geometry.pooled_capacity;
+        let full_row_units = geometry.full_row_units;
+        let device = gpu.device_id;
+        let mut allocated = Vec::with_capacity(plan.len());
         let allocation = (|| -> Result<(), StateError> {
-            for kind in &config.layer_types {
-                match kind {
-                    LayerType::LinearAttention => {
-                        allocated.push(
-                            gpu.zeros(&[gdn_recurrent], format.gdn.dtype())
-                                .map_err(StateError::Hip)?,
-                        );
-                        allocated.push(
-                            gpu.zeros(&[conv_len], DType::F32)
-                                .map_err(StateError::Hip)?,
-                        );
-                    }
-                    LayerType::FullAttention => {
-                        let full_elements = max_seq_len
-                            .checked_mul(full_row_units)
-                            .ok_or(StateError::DimensionOverflow)?;
-                        let raw_elements = max_seq_len
-                            .checked_mul(raw_width)
-                            .ok_or(StateError::DimensionOverflow)?;
-                        let pooled_elements = pooled_capacity
-                            .checked_mul(raw_width)
-                            .ok_or(StateError::DimensionOverflow)?;
-                        let partial_key_elements = config
-                            .indexer_compress_ratio
-                            .checked_mul(raw_width)
-                            .ok_or(StateError::DimensionOverflow)?;
-                        let partial_value_elements = config
-                            .indexer_compress_ratio
-                            .checked_mul(full_width)
-                            .ok_or(StateError::DimensionOverflow)?;
-                        let selected_bytes = selected_capacity
-                            .checked_mul(std::mem::size_of::<i32>())
-                            .ok_or(StateError::DimensionOverflow)?;
-                        let device = gpu.device_id;
-                        // The derived F16 K and block-transposed V arenas: whole
-                        // four-token blocks, `full_width` F16 channels per token.
-                        let arena_elements = if layout.f16_arena {
-                            qsa_f16_arena_rows(max_seq_len)
-                                .checked_mul(full_width)
-                                .ok_or(StateError::DimensionOverflow)?
-                        } else {
-                            0
-                        };
-                        // (elements, dtype, context arena: VMM-owned under the VMM backend).
-                        let mut specs = vec![
-                            (full_elements, qsa_format.kv_dtype(), true),
-                            (full_elements, qsa_format.kv_dtype(), true),
-                            (raw_elements, layout.index_dtype(), true),
-                            (pooled_elements, layout.index_dtype(), true),
-                            (partial_key_elements, DType::F32, false),
-                            (partial_value_elements, DType::F32, false),
-                            (selected_bytes, DType::Raw, false),
-                        ];
-                        if layout.f16_arena {
-                            specs.push((arena_elements, DType::F16, true));
-                            specs.push((arena_elements, DType::F16, true));
-                        }
-                        // The derived BF16 pooled-key mirror (same row count and
-                        // width as `pooled_keys`).
-                        if layout.pooled_bf16 {
-                            specs.push((pooled_elements, DType::BF16, true));
-                        }
-                        for &(elements, dtype, context_arena) in &specs {
-                            let tensor = if context_arena && backend == Qwen4KvBackend::Vmm {
-                                // SAFETY: nothing is mapped; every access is
-                                // bounded by `ensure_mapped_capacity`'s prefix
-                                // (`buf.size()` reports only mapped bytes).
-                                unsafe { gpu.alloc_vmm_tensor(&[elements], dtype, 0, &[device]) }
-                            } else {
-                                gpu.zeros(&[elements], dtype)
-                            };
-                            allocated.push(tensor.map_err(StateError::Hip)?);
-                        }
-                    }
-                }
+            for spec in &plan {
+                let tensor = if spec.context_arena && backend == Qwen4KvBackend::Vmm {
+                    // SAFETY: nothing is mapped; every access is
+                    // bounded by `ensure_mapped_capacity`'s prefix
+                    // (`buf.size()` reports only mapped bytes).
+                    unsafe { gpu.alloc_vmm_tensor(&[spec.elements], spec.dtype, 0, &[device]) }
+                } else {
+                    gpu.zeros(&[spec.elements], spec.dtype)
+                };
+                allocated.push(tensor.map_err(StateError::Hip)?);
             }
-            // PLE channels are the HC-wide rows of the key projection:
-            // `hidden_size * hc_count` (`ple_embed_dim` is its input width).
-            // A profile without PLE has no convolution history to hold.
-            if config.ple.is_some() {
-                let ple_channels = config
-                    .hidden_size
-                    .checked_mul(config.hc_count)
-                    .ok_or(StateError::DimensionOverflow)?;
-                let ple_elements = config
-                    .ple_conv_history_rows()
-                    .checked_mul(ple_channels)
-                    .ok_or(StateError::DimensionOverflow)?;
-                allocated.push(
-                    gpu.zeros(&[ple_elements], DType::F32)
-                        .map_err(StateError::Hip)?,
-                );
-            }
-            let feedback_elements = config
-                .hc_count
-                .checked_mul(config.hidden_size)
-                .ok_or(StateError::DimensionOverflow)?;
-            allocated.push(
-                gpu.zeros(&[feedback_elements], DType::F32)
-                    .map_err(StateError::Hip)?,
-            );
             Ok(())
         })();
         if let Err(error) = allocation {
-            for tensor in allocated {
+            for tensor in allocated.into_iter().rev() {
                 let _ = gpu.free_tensor(tensor);
             }
             return Err(error);
         }
 
-        let expected_tensors = config
-            .layer_types
-            .iter()
-            .map(|kind| match kind {
-                LayerType::LinearAttention => 2,
-                LayerType::FullAttention => {
-                    7 + 2 * usize::from(layout.f16_arena) + usize::from(layout.pooled_bf16)
-                }
+        let expected_tensors = map
+            .gdn_count()
+            .checked_mul(2)
+            .and_then(|gdn| {
+                map.qsa_count()
+                    .checked_mul(
+                        7 + 2 * usize::from(layout.f16_arena) + usize::from(layout.pooled_bf16),
+                    )
+                    .and_then(|qsa| gdn.checked_add(qsa))
             })
-            .sum::<usize>()
-            .checked_add(1 + usize::from(config.ple.is_some()))
+            .and_then(|layers| {
+                layers.checked_add(usize::from(map.owns_ple()) + usize::from(map.owns_input()))
+            })
             .ok_or(StateError::DimensionOverflow)?;
         if allocated.len() != expected_tensors {
-            for tensor in allocated {
+            for tensor in allocated.into_iter().rev() {
                 let _ = gpu.free_tensor(tensor);
             }
             return Err(StateError::AllocationBookkeeping);
@@ -1466,10 +2007,10 @@ impl Qwen4State {
                 .next()
                 .expect("Qwen4 state tensor count checked before reconstruction")
         };
-        let mut gdn = Vec::with_capacity(config.n_linear_layers());
-        let mut qsa = Vec::with_capacity(config.n_full_layers());
-        for kind in &config.layer_types {
-            match kind {
+        let mut gdn = Vec::with_capacity(map.gdn_count());
+        let mut qsa = Vec::with_capacity(map.qsa_count());
+        for abs in map.band() {
+            match config.layer_types[abs] {
                 LayerType::LinearAttention => {
                     let recurrent = next_tensor();
                     let conv = next_tensor();
@@ -1520,8 +2061,8 @@ impl Qwen4State {
                 }
             }
         }
-        let ple_conv = config.ple.is_some().then(|| next_tensor());
-        let hyper_feedback = next_tensor();
+        let ple_conv = map.owns_ple().then(|| next_tensor());
+        let hyper_feedback = map.owns_input().then(|| next_tensor());
         let model_id = next_qwen4_model_id();
         let ple_history = PleHistory::new(config.eos_token_id);
         let snapshot_arena = match Qwen4StateSnapshotArena::new(
@@ -1529,38 +2070,49 @@ impl Qwen4State {
             &gdn,
             &qsa,
             ple_conv.as_ref(),
-            &hyper_feedback,
+            hyper_feedback.as_ref(),
             model_id,
             ple_history,
             0,
         ) {
             Ok(arena) => arena,
             Err(error) => {
-                for layer in gdn {
-                    let _ = gpu.free_tensor(layer.recurrent);
-                    let _ = gpu.free_tensor(layer.conv);
-                }
-                for layer in qsa {
-                    for tensor in [
-                        layer.full_keys,
-                        layer.full_values,
-                        layer.raw_index_keys,
-                        layer.pooled_keys,
-                        layer.partial_keys,
-                        layer.partial_values,
-                        layer.selected_indices,
-                    ]
-                    .into_iter()
-                    .chain(layer.f16_arena.into_iter().flat_map(|a| [a.keys, a.values]))
-                    .chain(layer.pooled_bf16.into_iter().map(|a| a.mirror))
-                    {
-                        let _ = gpu.free_tensor(tensor);
-                    }
+                // Reverse of allocation: feedback, PLE, then layers last to first.
+                if let Some(hyper_feedback) = hyper_feedback {
+                    let _ = gpu.free_tensor(hyper_feedback);
                 }
                 if let Some(ple_conv) = ple_conv {
                     let _ = gpu.free_tensor(ple_conv);
                 }
-                let _ = gpu.free_tensor(hyper_feedback);
+                let mut owned = Vec::new();
+                for abs in map.band() {
+                    match config.layer_types[abs] {
+                        LayerType::LinearAttention => {
+                            let layer = gdn.remove(0);
+                            owned.push(layer.recurrent);
+                            owned.push(layer.conv);
+                        }
+                        LayerType::FullAttention => {
+                            let layer = qsa.remove(0);
+                            owned.extend([
+                                layer.full_keys,
+                                layer.full_values,
+                                layer.raw_index_keys,
+                                layer.pooled_keys,
+                                layer.partial_keys,
+                                layer.partial_values,
+                                layer.selected_indices,
+                            ]);
+                            owned.extend(
+                                layer.f16_arena.into_iter().flat_map(|a| [a.keys, a.values]),
+                            );
+                            owned.extend(layer.pooled_bf16.into_iter().map(|a| a.mirror));
+                        }
+                    }
+                }
+                for tensor in owned.into_iter().rev() {
+                    let _ = gpu.free_tensor(tensor);
+                }
                 return Err(error);
             }
         };
@@ -1590,6 +2142,7 @@ impl Qwen4State {
             model_id,
             reset_epoch: 0,
             transaction_generation: 0,
+            map,
         })
     }
 
@@ -1603,6 +2156,19 @@ impl Qwen4State {
         config: &Qwen4Config,
         format: Qwen4StateFormat,
         context: &Qwen4ContextCommit,
+    ) -> Option<usize> {
+        Self::device_bytes_scoped(config, format, context, &Qwen4BandScope::single(config))
+    }
+
+    /// [`Self::device_bytes`] of one band: only the band's GDN/QSA layers, and
+    /// the PLE conv history and hyper feedback (with their snapshot mirrors)
+    /// only when `scope.input`. Summed over every band of a placement this is
+    /// exactly the whole-model figure (no state is duplicated across bands).
+    pub(crate) fn device_bytes_scoped(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+        scope: &Qwen4BandScope,
     ) -> Option<usize> {
         let f32_bytes = std::mem::size_of::<f32>();
         let recurrent = format
@@ -1657,10 +2223,15 @@ impl Qwen4State {
         let qsa_layer = context_arenas
             .checked_add(qsa_fixed)?
             .checked_add(circular)?;
-        let per_request = ple.checked_add(feedback)?.checked_mul(2)?;
+        let per_request = if scope.input {
+            ple.checked_add(feedback)?.checked_mul(2)?
+        } else {
+            0
+        };
+        let (gdn_layers, qsa_layers) = scope_layer_counts(config, scope);
         gdn_layer
-            .checked_mul(config.n_linear_layers())?
-            .checked_add(qsa_layer.checked_mul(config.n_full_layers())?)?
+            .checked_mul(gdn_layers)?
+            .checked_add(qsa_layer.checked_mul(qsa_layers)?)?
             .checked_add(per_request)
     }
 
@@ -1740,9 +2311,11 @@ impl Qwen4State {
                 .memset(&ple_conv.buf, 0, ple_conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
-        gpu.hip
-            .memset(&self.hyper_feedback.buf, 0, self.hyper_feedback.buf.size())
-            .map_err(StateError::Hip)?;
+        if let Some(hyper_feedback) = &self.hyper_feedback {
+            gpu.hip
+                .memset(&hyper_feedback.buf, 0, hyper_feedback.buf.size())
+                .map_err(StateError::Hip)?;
+        }
         self.ple_history.reset();
         self.position = 0;
         Ok(())
@@ -1865,9 +2438,36 @@ impl Qwen4State {
     /// pointer table (device addresses differ per process); the process-local
     /// `model_id` / `reset_epoch` / `transaction_generation` counters.
     pub fn debug_digest(&self, gpu: &mut Gpu) -> Result<Vec<(String, String)>, StateError> {
+        self.digest_rows(gpu, false)
+    }
+
+    /// Canonical logical ownership projection of this rank's state: the
+    /// semantic rows of [`Self::debug_digest`] keyed by ABSOLUTE layer
+    /// (`qsa[L11].full_keys`, `gdn[L0].recurrent`, `row_capture[L0].ring`)
+    /// instead of the local slot, in ascending absolute order. Values are the
+    /// same digests. The union over the ranks of a placement equals the
+    /// whole-model state's canonical rows (the global rows `position`,
+    /// `gdn_live` appear on every rank that owns state they describe, with
+    /// equal values; PLE history on the input rank only). Capacity and
+    /// scratch rows (`row_capture_rows`, `qsa_mapped_tokens`,
+    /// `row_capture_output`, the snapshot arena, device pointers, process
+    /// counters) are not part of it: the rollback re-run's discarded output
+    /// is rewritten in full by every re-run launch before anything could
+    /// read it, so no live cache hides behind that exclusion.
+    pub fn canonical_digest_rows(
+        &self,
+        gpu: &mut Gpu,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        self.digest_rows(gpu, true)
+    }
+
+    fn digest_rows(
+        &self,
+        gpu: &mut Gpu,
+        canonical: bool,
+    ) -> Result<Vec<(String, String)>, StateError> {
         use sha2::{Digest, Sha256};
         gpu.hip.device_synchronize().map_err(StateError::Hip)?;
-        let mut rows: Vec<(String, String)> = Vec::new();
         // SHA-256 of the first `bytes` bytes of `tensor`, as a row value.
         let hash_prefix = |tensor: &GpuTensor, bytes: usize| -> Result<String, StateError> {
             if bytes > tensor.buf.size() {
@@ -1887,139 +2487,110 @@ impl Qwen4State {
         // A whole tensor: its logical extent (`numel * dtype`), not the
         // allocation, which a pooled allocator may round up with stale tail
         // bytes no kernel reads.
-        let device = |rows: &mut Vec<(String, String)>,
-                      name: String,
-                      tensor: &GpuTensor|
-         -> Result<(), StateError> {
+        let device = |tensor: &GpuTensor| -> Result<String, StateError> {
             let bytes = tensor.byte_size().min(tensor.buf.size());
             let hex = hash_prefix(tensor, bytes)?;
-            rows.push((name, format!("{hex} bytes={bytes}")));
-            Ok(())
+            Ok(format!("{hex} bytes={bytes}"))
         };
         // The first `live` of `capacity` rows of an arena.
-        let active = |rows: &mut Vec<(String, String)>,
-                      name: String,
-                      tensor: &GpuTensor,
-                      capacity: usize,
-                      live: usize|
-         -> Result<(), StateError> {
-            if live > capacity {
-                return Err(StateError::SnapshotLength);
-            }
-            let bytes = arena_row_bytes(tensor, capacity)?
-                .checked_mul(live)
-                .ok_or(StateError::DimensionOverflow)?;
-            let hex = hash_prefix(tensor, bytes)?;
-            rows.push((name, format!("{hex} bytes={bytes} rows={live}")));
-            Ok(())
-        };
-        rows.push(("position".into(), self.position.to_string()));
-        rows.push((
-            "ple_history.previous".into(),
-            format!("{:?}", self.ple_history.previous()),
-        ));
-        rows.push((
-            "ple_history.eos".into(),
-            self.ple_history.eos_token_id().to_string(),
-        ));
-        rows.push(("gdn_live".into(), self.gdn_live.to_string()));
-        rows.push(("row_capture_rows".into(), self.row_capture_rows.to_string()));
-        rows.push((
-            "qsa_mapped_tokens".into(),
-            self.qsa_mapped_tokens.to_string(),
-        ));
-        for (index, layer) in self.qsa.iter().enumerate() {
-            let mark = layer.mark();
-            rows.push((
-                format!("qsa[{index}].marks"),
-                format!(
-                    "full={} raw={} pooled={} partial={} selected={} position={}",
-                    mark.full_len,
-                    mark.raw_len,
-                    mark.pooled_len,
-                    mark.partial_len,
-                    mark.selected_len,
-                    mark.position
-                ),
-            ));
-        }
-        for (index, layer) in self.gdn.iter().enumerate() {
-            device(
-                &mut rows,
-                format!("gdn[{index}].recurrent"),
-                &layer.recurrent,
-            )?;
-            device(&mut rows, format!("gdn[{index}].conv"), &layer.conv)?;
-        }
-        for (index, layer) in self.qsa.iter().enumerate() {
-            for (what, tensor, capacity, live) in [
-                (
-                    "full_keys",
-                    &layer.full_keys,
-                    layer.full_capacity,
-                    layer.full_len,
-                ),
-                (
-                    "full_values",
-                    &layer.full_values,
-                    layer.full_capacity,
-                    layer.full_len,
-                ),
-                (
-                    "raw_index_keys",
-                    &layer.raw_index_keys,
-                    layer.raw_capacity,
-                    layer.raw_len,
-                ),
-                (
-                    "pooled_keys",
-                    &layer.pooled_keys,
-                    layer.pooled_capacity,
-                    layer.pooled_len,
-                ),
-                (
-                    "partial_keys",
-                    &layer.partial_keys,
-                    layer.partial_capacity,
-                    layer.partial_len,
-                ),
-                (
-                    "partial_values",
-                    &layer.partial_values,
-                    layer.partial_capacity,
-                    layer.partial_len,
-                ),
-                (
-                    "selected_indices",
-                    &layer.selected_indices,
-                    layer.selected_capacity,
-                    layer.selected_len,
-                ),
-            ] {
-                active(
-                    &mut rows,
-                    format!("qsa[{index}].{what}"),
-                    tensor,
-                    capacity,
-                    live,
-                )?;
-            }
-        }
-        if let Some(ple_conv) = &self.ple_conv {
-            device(&mut rows, "ple_conv".into(), ple_conv)?;
-        }
-        device(&mut rows, "hyper_feedback".into(), &self.hyper_feedback)?;
-        for (index, (ring, inputs, recurrence)) in self.row_capture.iter().enumerate() {
-            device(&mut rows, format!("row_capture[{index}].ring"), ring)?;
-            device(&mut rows, format!("row_capture[{index}].inputs"), inputs)?;
-            device(
-                &mut rows,
-                format!("row_capture[{index}].recurrence"),
-                recurrence,
-            )?;
-        }
-        if let Some((output, _pointer_table)) = &self.row_capture_output {
-            device(&mut rows, "row_capture_output".into(), output)?;
+        let active =
+            |tensor: &GpuTensor, capacity: usize, live: usize| -> Result<String, StateError> {
+                if live > capacity {
+                    return Err(StateError::SnapshotLength);
+                }
+                let bytes = arena_row_bytes(tensor, capacity)?
+                    .checked_mul(live)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let hex = hash_prefix(tensor, bytes)?;
+                Ok(format!("{hex} bytes={bytes} rows={live}"))
+            };
+        let missing = || StateError::AllocationBookkeeping;
+        let plan = digest_plan(
+            &self.map,
+            canonical,
+            !self.row_capture.is_empty(),
+            self.row_capture_output.is_some(),
+        );
+        let mut rows = Vec::with_capacity(plan.len());
+        for row in plan {
+            let value = match row {
+                DigestRow::Position => self.position.to_string(),
+                DigestRow::LayerPosition(_) => self.position.to_string(),
+                DigestRow::PleHistoryPrevious => format!("{:?}", self.ple_history.previous()),
+                DigestRow::PleHistoryEos => self.ple_history.eos_token_id().to_string(),
+                DigestRow::GdnLive => self.gdn_live.to_string(),
+                DigestRow::GdnLiveLayer(_) => self.gdn_live.to_string(),
+                DigestRow::RowCaptureRows => self.row_capture_rows.to_string(),
+                DigestRow::QsaMappedTokens => self.qsa_mapped_tokens.to_string(),
+                DigestRow::QsaMarks(slot) => {
+                    let mark = self.qsa.get(slot).ok_or_else(missing)?.mark();
+                    format!(
+                        "full={} raw={} pooled={} partial={} selected={} position={}",
+                        mark.full_len,
+                        mark.raw_len,
+                        mark.pooled_len,
+                        mark.partial_len,
+                        mark.selected_len,
+                        mark.position
+                    )
+                }
+                DigestRow::GdnRecurrent(slot) => {
+                    device(&self.gdn.get(slot).ok_or_else(missing)?.recurrent)?
+                }
+                DigestRow::GdnConv(slot) => device(&self.gdn.get(slot).ok_or_else(missing)?.conv)?,
+                DigestRow::Qsa(slot, field) => {
+                    let layer = self.qsa.get(slot).ok_or_else(missing)?;
+                    let (tensor, capacity, live) = match field {
+                        QsaDigestField::FullKeys => {
+                            (&layer.full_keys, layer.full_capacity, layer.full_len)
+                        }
+                        QsaDigestField::FullValues => {
+                            (&layer.full_values, layer.full_capacity, layer.full_len)
+                        }
+                        QsaDigestField::RawIndexKeys => {
+                            (&layer.raw_index_keys, layer.raw_capacity, layer.raw_len)
+                        }
+                        QsaDigestField::PooledKeys => {
+                            (&layer.pooled_keys, layer.pooled_capacity, layer.pooled_len)
+                        }
+                        QsaDigestField::PartialKeys => (
+                            &layer.partial_keys,
+                            layer.partial_capacity,
+                            layer.partial_len,
+                        ),
+                        QsaDigestField::PartialValues => (
+                            &layer.partial_values,
+                            layer.partial_capacity,
+                            layer.partial_len,
+                        ),
+                        QsaDigestField::SelectedIndices => (
+                            &layer.selected_indices,
+                            layer.selected_capacity,
+                            layer.selected_len,
+                        ),
+                    };
+                    active(tensor, capacity, live)?
+                }
+                DigestRow::PleConv => device(self.ple_conv.as_ref().ok_or_else(missing)?)?,
+                DigestRow::HyperFeedback => {
+                    device(self.hyper_feedback.as_ref().ok_or_else(missing)?)?
+                }
+                DigestRow::RowCapture(slot, field) => {
+                    let (ring, inputs, recurrence) =
+                        self.row_capture.get(slot).ok_or_else(missing)?;
+                    device(match field {
+                        CaptureDigestField::Ring => ring,
+                        CaptureDigestField::Inputs => inputs,
+                        CaptureDigestField::Recurrence => recurrence,
+                    })?
+                }
+                DigestRow::RowCaptureOutput => {
+                    let (output, _pointer_table) =
+                        self.row_capture_output.as_ref().ok_or_else(missing)?;
+                    device(output)?
+                }
+            };
+            rows.push((digest_key(&self.map, row, canonical), value));
         }
         Ok(rows)
     }
@@ -2058,7 +2629,9 @@ impl Qwen4State {
         if let Some(ple_conv) = &self.ple_conv {
             fixed.push(whole_part(ple_conv));
         }
-        fixed.push(whole_part(&self.hyper_feedback));
+        if let Some(hyper_feedback) = &self.hyper_feedback {
+            fixed.push(whole_part(hyper_feedback));
+        }
         Ok(StateLayout { fixed, rows })
     }
 
@@ -2078,7 +2651,7 @@ impl Qwen4State {
         history: PleHistory,
         commits: Option<&[(usize, usize, usize, usize, usize)]>,
     ) -> Result<(Vec<u8>, StateLayout<'_>), StateError> {
-        let mut words = vec![0, position as u64];
+        let mut words = vec![self.map.session_tag(), position as u64];
         if self.ple_conv.is_some() {
             let [ple0, ple1] = history.previous();
             words.extend([u64::from(ple0), u64::from(ple1)]);
@@ -2136,6 +2709,10 @@ impl Qwen4State {
         let words = meta_words(meta).ok_or(StateError::SnapshotShape)?;
         let to_u32 = |word: u64| u32::try_from(word).map_err(|_| StateError::SnapshotShape);
         if words.len() * 8 != self.session_meta_bytes() {
+            return Err(StateError::SnapshotShape);
+        }
+        // The reserved word carries the band identity (0 = whole model).
+        if words[0] != self.map.session_tag() {
             return Err(StateError::SnapshotShape);
         }
         let ple_words = self.session_ple_words();
@@ -2262,7 +2839,7 @@ impl Qwen4State {
         let generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), StateError> {
             self.snapshot_arena.gdn_live =
-                (self.row_capture_armed && !self.row_capture.is_empty()).then_some(self.gdn_live);
+                (self.row_capture_armed && self.row_capture_ringed()).then_some(self.gdn_live);
             let copies = arena_regions(self, &self.snapshot_arena, true)?;
             copy_regions(gpu, &copies).map_err(StateError::Hip)?;
             let arena = &mut self.snapshot_arena;
@@ -2428,7 +3005,9 @@ impl Qwen4State {
         if let Some(ple_conv) = self.ple_conv {
             free(ple_conv);
         }
-        free(self.hyper_feedback);
+        if let Some(hyper_feedback) = self.hyper_feedback {
+            free(hyper_feedback);
+        }
         for (ring, inputs, recurrence) in self.row_capture {
             free(ring);
             free(inputs);
@@ -2452,6 +3031,16 @@ impl Qwen4State {
         gdn: GdnStateFormat,
         rows: usize,
     ) -> Option<usize> {
+        Self::row_capture_bytes_scoped(config, gdn, rows, config.n_linear_layers())
+    }
+
+    /// [`Self::row_capture_bytes`] for a band owning `gdn_layers` GDN layers.
+    pub(crate) fn row_capture_bytes_scoped(
+        config: &Qwen4Config,
+        gdn: GdnStateFormat,
+        rows: usize,
+        gdn_layers: usize,
+    ) -> Option<usize> {
         if rows < 2 {
             return Some(0);
         }
@@ -2471,7 +3060,6 @@ impl Qwen4State {
             .checked_mul(qkv)?
             .checked_add(rows.checked_mul(qkv.checked_add(2 * value_heads)?)?)?
             .checked_mul(std::mem::size_of::<f32>())?;
-        let gdn_layers = config.n_linear_layers();
         let output = rows
             .checked_mul(value_heads * GDN_HEAD_DIM)?
             .checked_mul(std::mem::size_of::<f32>())?;
@@ -2495,6 +3083,14 @@ impl Qwen4State {
         conv_history: usize,
     ) -> Result<(), StateError> {
         if rows <= self.row_capture_rows || rows < 2 {
+            return Ok(());
+        }
+        if self.gdn.is_empty() {
+            // A band without GDN layers has no recurrence to capture; the
+            // rows and live slot still track the other owners so a rollback
+            // agrees with them.
+            self.row_capture_rows = rows;
+            self.gdn_live = 0;
             return Ok(());
         }
         let mut next = Vec::with_capacity(self.gdn.len());
@@ -2649,11 +3245,11 @@ impl Qwen4State {
             .gdn_live
             .ok_or(StateError::SnapshotTicket)?;
         let base = self.capture_base(before);
-        let (output, table) = self
-            .row_capture_output
-            .as_ref()
-            .ok_or(StateError::SnapshotTicket)?;
         if let Some(first) = self.gdn.first() {
+            let (output, table) = self
+                .row_capture_output
+                .as_ref()
+                .ok_or(StateError::SnapshotTicket)?;
             // One launch re-runs every layer: they share one geometry.
             let (state, conv) = (first.recurrent.numel(), first.conv.numel());
             if self
@@ -2799,6 +3395,57 @@ impl Qwen4State {
 
     pub fn gdn_mut(&mut self, linear_layer_index: usize) -> Option<&mut GdnGpuState> {
         self.gdn.get_mut(linear_layer_index)
+    }
+
+    /// The ownership map: absolute layer <-> local slot of `gdn` / `qsa`.
+    pub fn scope_map(&self) -> &Qwen4StateMap {
+        &self.map
+    }
+
+    /// Local `gdn` slot of absolute layer `abs` (`None`: not owned here).
+    pub fn gdn_local(&self, abs: usize) -> Option<usize> {
+        self.map.gdn_local(abs)
+    }
+
+    /// Local `qsa` slot of absolute layer `abs` (`None`: not owned here).
+    pub fn qsa_local(&self, abs: usize) -> Option<usize> {
+        self.map.qsa_local(abs)
+    }
+
+    /// GDN layers of the whole model before this band's first layer.
+    pub fn gdn_base(&self) -> usize {
+        self.map.gdn_base()
+    }
+
+    /// QSA layers of the whole model before this band's first layer.
+    pub fn qsa_base(&self) -> usize {
+        self.map.qsa_base()
+    }
+
+    /// The GDN state of absolute layer `abs`.
+    pub fn gdn_by_layer(&self, abs: usize) -> Option<&GdnGpuState> {
+        self.gdn.get(self.map.gdn_local(abs)?)
+    }
+
+    pub fn gdn_by_layer_mut(&mut self, abs: usize) -> Option<&mut GdnGpuState> {
+        let slot = self.map.gdn_local(abs)?;
+        self.gdn.get_mut(slot)
+    }
+
+    /// The QSA state of absolute layer `abs`.
+    pub fn qsa_by_layer(&self, abs: usize) -> Option<&QsaGpuState> {
+        self.qsa.get(self.map.qsa_local(abs)?)
+    }
+
+    pub fn qsa_by_layer_mut(&mut self, abs: usize) -> Option<&mut QsaGpuState> {
+        let slot = self.map.qsa_local(abs)?;
+        self.qsa.get_mut(slot)
+    }
+
+    /// A verify ring is in effect: allocated per owned GDN layer, or, for a
+    /// band without GDN layers (nothing to allocate), requested rows only.
+    fn row_capture_ringed(&self) -> bool {
+        !self.row_capture.is_empty() || (self.gdn.is_empty() && self.row_capture_rows != 0)
     }
 }
 
@@ -3016,6 +3663,362 @@ mod tests {
                 per_layer
             );
             assert_eq!(per_layer * config.n_full_layers(), tokens / 4 * 256 * 12);
+        }
+    }
+
+    /// Scopes of consecutive bands `counts` over the trunk: first is input,
+    /// last is output.
+    fn pp_scopes(counts: &[usize]) -> Vec<Qwen4BandScope> {
+        let mut start = 0;
+        counts
+            .iter()
+            .enumerate()
+            .map(|(stage, &count)| {
+                let band = start..start + count;
+                start += count;
+                Qwen4BandScope {
+                    band,
+                    input: stage == 0,
+                    output: stage + 1 == counts.len(),
+                }
+            })
+            .collect()
+    }
+
+    const PP_LAYOUTS: [&[usize]; 2] = [&[9, 8, 8, 8, 8, 7], &[24, 24]];
+    const QSA_FIELD_NAMES: [&str; 7] = [
+        "full_keys",
+        "full_values",
+        "raw_index_keys",
+        "pooled_keys",
+        "partial_keys",
+        "partial_values",
+        "selected_indices",
+    ];
+
+    fn tensor_plan_for(config: &Qwen4Config, scope: &Qwen4BandScope) -> Vec<StateTensorSpec> {
+        let format = Qwen4StateFormat::F32;
+        let map = Qwen4StateMap::new(config, scope).expect("state map");
+        let geometry = StateGeometry::new(config, &format, 1024).expect("geometry");
+        state_tensor_plan(config, &format, 1024, &geometry, &map).expect("tensor plan")
+    }
+
+    fn layer_of_key(key: &str) -> Option<usize> {
+        let digits = key.split_once("[L")?.1.split_once(']')?.0;
+        digits.parse().ok()
+    }
+
+    #[test]
+    fn single_scope_state_plan_is_todays_layout() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let map = Qwen4StateMap::new(&config, &single).expect("single map");
+        assert!(map.is_single() && map.owns_input() && map.owns_output() && map.owns_ple());
+        assert_eq!(
+            (
+                map.gdn_count(),
+                map.qsa_count(),
+                map.gdn_base(),
+                map.qsa_base()
+            ),
+            (36, 12, 0, 0)
+        );
+        assert_eq!(map.session_tag(), 0);
+        assert_eq!(scope_layer_counts(&config, &single), (36, 12));
+
+        let plan = tensor_plan_for(&config, &single);
+        assert_eq!(plan.len(), 36 * 2 + 12 * 7 + 2);
+        let mut expected = Vec::new();
+        for (abs, kind) in config.layer_types.iter().enumerate() {
+            match kind {
+                LayerType::LinearAttention => {
+                    expected.push(format!("gdn[L{abs}].recurrent"));
+                    expected.push(format!("gdn[L{abs}].conv"));
+                }
+                LayerType::FullAttention => {
+                    expected.extend(QSA_FIELD_NAMES.map(|name| format!("qsa[L{abs}].{name}")));
+                }
+            }
+        }
+        expected.push("ple_conv".into());
+        expected.push("hyper_feedback".into());
+        let keys: Vec<_> = plan.iter().map(|spec| spec.key.clone()).collect();
+        assert_eq!(keys, expected);
+
+        // Hand geometry (F32 state at 1024 tokens; see device_bytes test).
+        let by_key = |key: &str| plan.iter().find(|spec| spec.key == key).expect(key);
+        assert_eq!(by_key("gdn[L0].recurrent").elements, 48 * 128 * 128);
+        assert_eq!(by_key("gdn[L0].conv").elements, 10_240 * 3);
+        assert_eq!(by_key("qsa[L3].full_keys").elements, 1024 * 512);
+        assert!(by_key("qsa[L3].full_keys").context_arena);
+        assert_eq!(by_key("qsa[L3].raw_index_keys").elements, 1024 * 128);
+        assert_eq!(by_key("qsa[L3].pooled_keys").elements, 256 * 128);
+        assert_eq!(by_key("qsa[L3].partial_keys").elements, 4 * 128);
+        assert_eq!(by_key("qsa[L3].partial_values").elements, 4 * 512);
+        assert_eq!(by_key("qsa[L3].selected_indices").elements, (2048 + 3) * 4);
+        assert_eq!(by_key("qsa[L3].selected_indices").dtype, DType::Raw);
+        assert!(!by_key("qsa[L3].partial_keys").context_arena);
+        assert_eq!(by_key("ple_conv").elements, 9 * 2560 * 4);
+        assert_eq!(by_key("hyper_feedback").elements, 4 * 2560);
+    }
+
+    #[test]
+    fn single_scope_debug_digest_rows_keep_their_historical_labels() {
+        let config = crate::config::compact_test_config();
+        let map = Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).expect("map");
+        let keys = |row_capture: bool, output: bool| -> Vec<String> {
+            digest_plan(&map, false, row_capture, output)
+                .into_iter()
+                .map(|row| digest_key(&map, row, false))
+                .collect()
+        };
+        let mut expected: Vec<String> = [
+            "position",
+            "ple_history.previous",
+            "ple_history.eos",
+            "gdn_live",
+            "row_capture_rows",
+            "qsa_mapped_tokens",
+        ]
+        .map(String::from)
+        .into();
+        expected.extend((0..12).map(|i| format!("qsa[{i}].marks")));
+        for i in 0..36 {
+            expected.push(format!("gdn[{i}].recurrent"));
+            expected.push(format!("gdn[{i}].conv"));
+        }
+        for i in 0..12 {
+            expected.extend(QSA_FIELD_NAMES.map(|name| format!("qsa[{i}].{name}")));
+        }
+        expected.push("ple_conv".into());
+        expected.push("hyper_feedback".into());
+        assert_eq!(keys(false, false), expected);
+        for i in 0..36 {
+            for name in ["ring", "inputs", "recurrence"] {
+                expected.push(format!("row_capture[{i}].{name}"));
+            }
+        }
+        assert_eq!(keys(true, false), expected);
+        expected.push("row_capture_output".into());
+        assert_eq!(keys(true, true), expected);
+    }
+
+    #[test]
+    fn pp_state_maps_partition_the_single_layout_and_round_trip() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).expect("map");
+        for counts in PP_LAYOUTS {
+            let scopes = pp_scopes(counts);
+            let (mut gdn_union, mut qsa_union) = (Vec::new(), Vec::new());
+            let (mut gdn_before, mut qsa_before) = (0, 0);
+            let mut start = 0;
+            for (stage, scope) in scopes.iter().enumerate() {
+                let map = Qwen4StateMap::new(&config, scope).expect("band map");
+                assert_eq!(map.band(), start..start + counts[stage]);
+                start += counts[stage];
+                assert_eq!(map.is_single(), counts.len() == 1);
+                assert_eq!(map.owns_input(), stage == 0);
+                assert_eq!(map.owns_ple(), stage == 0);
+                assert_eq!(map.owns_output(), stage + 1 == counts.len());
+                assert_eq!((map.gdn_base(), map.qsa_base()), (gdn_before, qsa_before));
+                assert_eq!(
+                    (map.gdn_count(), map.qsa_count()),
+                    scope_layer_counts(&config, scope)
+                );
+                for (slot, &abs) in map.gdn_layers().iter().enumerate() {
+                    assert_eq!(config.layer_types[abs], LayerType::LinearAttention);
+                    assert_eq!(map.gdn_local(abs), Some(slot));
+                    assert_eq!(map.gdn_layer(slot), Some(abs));
+                    assert_eq!(map.qsa_local(abs), None);
+                    // Whole-model GDN ordinal = base + local slot.
+                    assert_eq!(single.gdn_local(abs), Some(map.gdn_base() + slot));
+                }
+                for (slot, &abs) in map.qsa_layers().iter().enumerate() {
+                    assert_eq!(config.layer_types[abs], LayerType::FullAttention);
+                    assert_eq!(map.qsa_local(abs), Some(slot));
+                    assert_eq!(map.qsa_layer(slot), Some(abs));
+                    assert_eq!(map.gdn_local(abs), None);
+                    assert_eq!(single.qsa_local(abs), Some(map.qsa_base() + slot));
+                }
+                for abs in (0..48).filter(|abs| !map.band().contains(abs)) {
+                    assert_eq!((map.gdn_local(abs), map.qsa_local(abs)), (None, None));
+                }
+                assert_eq!(map.gdn_layer(map.gdn_count()), None);
+                assert_eq!(map.qsa_layer(map.qsa_count()), None);
+                gdn_before += map.gdn_count();
+                qsa_before += map.qsa_count();
+                gdn_union.extend_from_slice(map.gdn_layers());
+                qsa_union.extend_from_slice(map.qsa_layers());
+            }
+            assert_eq!(start, 48);
+            assert_eq!((gdn_before, qsa_before), (36, 12));
+            assert_eq!(gdn_union.as_slice(), single.gdn_layers());
+            assert_eq!(qsa_union.as_slice(), single.qsa_layers());
+        }
+    }
+
+    #[test]
+    fn pp_tensor_plans_union_to_the_single_tensors_exactly_once() {
+        let config = crate::config::compact_test_config();
+        let mut single = tensor_plan_for(&config, &Qwen4BandScope::single(&config));
+        single.sort_by(|a, b| a.key.cmp(&b.key));
+        for counts in PP_LAYOUTS {
+            let scopes = pp_scopes(counts);
+            let plans: Vec<_> = scopes
+                .iter()
+                .map(|scope| tensor_plan_for(&config, scope))
+                .collect();
+            let mut union: Vec<_> = plans.iter().flatten().cloned().collect();
+            union.sort_by(|a, b| a.key.cmp(&b.key));
+            assert_eq!(union, single, "{counts:?}");
+            for (stage, (plan, scope)) in plans.iter().zip(&scopes).enumerate() {
+                let (gdn, qsa) = scope_layer_counts(&config, scope);
+                assert_eq!(
+                    plan.len(),
+                    2 * gdn + 7 * qsa + if stage == 0 { 2 } else { 0 }
+                );
+                let has = |key: &str| plan.iter().any(|spec| spec.key == key);
+                assert_eq!(has("ple_conv"), stage == 0);
+                assert_eq!(has("hyper_feedback"), stage == 0);
+                // Owned layers only, ascending, then the input-only tail.
+                let layers: Vec<usize> = plan
+                    .iter()
+                    .filter_map(|spec| layer_of_key(&spec.key))
+                    .collect();
+                assert!(layers.windows(2).all(|pair| pair[0] <= pair[1]));
+                assert!(layers.iter().all(|layer| scope.band.contains(layer)));
+                let tail = plan.len() - if stage == 0 { 2 } else { 0 };
+                assert!(plan[..tail]
+                    .iter()
+                    .all(|spec| layer_of_key(&spec.key).is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn pp_canonical_digest_rows_union_to_the_single_rows() {
+        let config = crate::config::compact_test_config();
+        let canonical_keys = |scope: &Qwen4BandScope| -> Vec<String> {
+            let map = Qwen4StateMap::new(&config, scope).expect("map");
+            digest_plan(&map, true, true, true)
+                .into_iter()
+                .map(|row| digest_key(&map, row, true))
+                .collect()
+        };
+        let single = canonical_keys(&Qwen4BandScope::single(&config));
+        assert!(single.contains(&"qsa[L11].full_keys".to_string()));
+        assert!(single.contains(&"gdn[L0].recurrent".to_string()));
+        assert!(single.contains(&"row_capture[L2].ring".to_string()));
+        for banned in [
+            "row_capture_rows",
+            "qsa_mapped_tokens",
+            "row_capture_output",
+        ] {
+            assert!(!single.iter().any(|key| key == banned), "{banned}");
+        }
+        // Every owned layer reports its own position, every GDN layer its
+        // own ring slot; the debug digest keeps the two global rows.
+        let count = |prefix: &str, suffix: &str| {
+            single
+                .iter()
+                .filter(|key| key.starts_with(prefix) && key.ends_with(suffix))
+                .count()
+        };
+        assert_eq!(count("layer[L", ".position"), 48);
+        assert_eq!(count("gdn[L", ".live"), 36);
+        assert!(!single
+            .iter()
+            .any(|key| key == "position" || key == "gdn_live"));
+        let single_set: std::collections::BTreeSet<_> = single.iter().cloned().collect();
+        assert_eq!(single_set.len(), single.len(), "canonical keys are unique");
+        for counts in PP_LAYOUTS {
+            let mut seen = std::collections::BTreeMap::<String, usize>::new();
+            for scope in pp_scopes(counts) {
+                let keys = canonical_keys(&scope);
+                let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+                assert_eq!(unique.len(), keys.len(), "unique within a rank");
+                for key in keys {
+                    *seen.entry(key).or_default() += 1;
+                }
+            }
+            let union: std::collections::BTreeSet<_> = seen.keys().cloned().collect();
+            assert_eq!(union, single_set, "{counts:?}");
+            for (key, count) in &seen {
+                assert_eq!(*count, 1, "{key} is owned exactly once");
+            }
+        }
+    }
+
+    #[test]
+    fn pp_state_census_sums_to_the_single_census_without_duplicates() {
+        let config = crate::config::compact_test_config();
+        let format = Qwen4StateFormat::F32;
+        let context = Qwen4ContextCommit::legacy(1024);
+        let single = Qwen4State::device_bytes(&config, format, &context).unwrap();
+        let single_scope = Qwen4BandScope::single(&config);
+        assert_eq!(
+            Qwen4State::device_bytes_scoped(&config, format, &context, &single_scope),
+            Some(single)
+        );
+        for counts in PP_LAYOUTS {
+            let bytes: Vec<usize> = pp_scopes(counts)
+                .iter()
+                .map(|scope| {
+                    Qwen4State::device_bytes_scoped(&config, format, &context, scope).unwrap()
+                })
+                .collect();
+            assert_eq!(bytes.iter().sum::<usize>(), single, "{counts:?}");
+        }
+        // PP2 has 6 QSA + 18 GDN layers per band: the input band's surplus
+        // is exactly the per-request PLE history and feedback (live+mirror).
+        let pp2: Vec<usize> = pp_scopes(&[24, 24])
+            .iter()
+            .map(|scope| Qwen4State::device_bytes_scoped(&config, format, &context, scope).unwrap())
+            .collect();
+        let per_request = 2 * (9 * 2560 * 4 * 4 + 4 * 2560 * 4);
+        assert_eq!(pp2[0] - pp2[1], per_request);
+        // The ring census of the whole model equals the all-GDN scoped one.
+        assert_eq!(
+            Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, 4, 36),
+            Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4)
+        );
+        assert!(
+            Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, 4, 18)
+                < Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4)
+        );
+    }
+
+    #[test]
+    fn state_map_refuses_inconsistent_scopes() {
+        let config = crate::config::compact_test_config();
+        let scope = |band: Range<usize>, input, output| Qwen4BandScope {
+            band,
+            input,
+            output,
+        };
+        // PLE layer 2 is not inside an input band that starts past it.
+        assert!(Qwen4StateMap::new(&config, &scope(3..48, true, true)).is_err());
+        // The PLE layer inside a non-input band, wrong end flags, empty and
+        // out-of-trunk bands are refused.
+        assert!(Qwen4StateMap::new(&config, &scope(1..48, false, true)).is_err());
+        assert!(Qwen4StateMap::new(&config, &scope(0..24, true, true)).is_err());
+        assert!(Qwen4StateMap::new(&config, &scope(24..24, false, false)).is_err());
+        assert!(Qwen4StateMap::new(&config, &scope(24..49, false, true)).is_err());
+        let tail = Qwen4StateMap::new(&config, &scope(24..48, false, true)).expect("tail band");
+        assert!(!tail.owns_input() && !tail.owns_ple() && tail.owns_output());
+        assert_ne!(tail.session_tag(), 0);
+    }
+
+    #[test]
+    fn band_session_tags_identify_the_ownership() {
+        let config = crate::config::compact_test_config();
+        let mut tags = std::collections::BTreeSet::new();
+        for counts in PP_LAYOUTS {
+            for scope in pp_scopes(counts) {
+                let tag = Qwen4StateMap::new(&config, &scope).unwrap().session_tag();
+                assert_ne!(tag, 0);
+                assert!(tags.insert(tag), "{:?}", scope.band);
+            }
         }
     }
 
