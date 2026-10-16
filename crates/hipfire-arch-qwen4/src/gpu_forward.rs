@@ -4642,6 +4642,10 @@ pub struct Qwen4GpuForward {
     /// single-token HIP forward, for expert-cache sizing. `None` when unset.
     route_trace: Option<RouteTrace>,
     pub(crate) qsa_tap: Option<Qwen4QsaTap>,
+    /// `HIPFIRE_QWEN4_CUT_LAYERS`, read once at construction: when set, the
+    /// program runs as separate interpreter runs split at these layers (eager
+    /// only; no retained replay).
+    cut_layers: Option<CutLayers>,
     /// `HIPFIRE_QWEN4_TRUNK_IU4`: per layer, the GDN Z|beta|alpha fold the
     /// IU4 trunk's V2B SET reads (see [`prepare_trunk_iu4`]); empty when the
     /// route is off or the trunk did not verify.
@@ -4764,6 +4768,94 @@ impl TokenReadback {
         }
         Ok(i32::from_ne_bytes(bytes) as u32)
     }
+}
+
+/// `HIPFIRE_QWEN4_CUT_LAYERS`: developer knob naming the absolute trunk layer
+/// indices at which a new band starts (the cut-safe Single schedule).
+pub const CUT_LAYERS_ENV: &str = "HIPFIRE_QWEN4_CUT_LAYERS";
+
+/// At most seven cuts (eight bands).
+pub(crate) const MAX_CUT_LAYERS: usize = 7;
+
+/// Validated, strictly increasing cut layers; fixed storage, no heap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CutLayers {
+    layers: [usize; MAX_CUT_LAYERS],
+    len: usize,
+}
+
+impl CutLayers {
+    pub(crate) fn as_slice(&self) -> &[usize] {
+        &self.layers[..self.len]
+    }
+
+    fn contains(&self, layer: usize) -> bool {
+        self.as_slice().contains(&layer)
+    }
+}
+
+/// Parses `HIPFIRE_QWEN4_CUT_LAYERS`: 1..=7 comma-separated, strictly
+/// increasing layer indices, each `>= 1`, `< num_hidden_layers`, and past the
+/// PLE layer when the profile has one (the PLE layer stays in the first band).
+pub(crate) fn parse_qwen4_cut_layers(
+    raw: &str,
+    num_hidden_layers: usize,
+    ple_layer_index: Option<usize>,
+) -> Result<CutLayers, String> {
+    let mut cuts = CutLayers { layers: [0; MAX_CUT_LAYERS], len: 0 };
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        let layer: usize = entry
+            .parse()
+            .map_err(|_| format!("`{entry}` is not a layer index"))?;
+        if cuts.len == MAX_CUT_LAYERS {
+            return Err(format!("more than {MAX_CUT_LAYERS} cut layers"));
+        }
+        if layer == 0 {
+            return Err("cut layer 0 is not a cut (layers start at 1)".to_string());
+        }
+        if layer >= num_hidden_layers {
+            return Err(format!(
+                "cut layer {layer} is outside the {num_hidden_layers}-layer trunk"
+            ));
+        }
+        if let Some(ple) = ple_layer_index {
+            if layer <= ple {
+                return Err(format!(
+                    "cut layer {layer} must be after the PLE layer {ple}"
+                ));
+            }
+        }
+        if cuts.len > 0 && layer <= cuts.layers[cuts.len - 1] {
+            return Err(format!(
+                "cut layer {layer} is not strictly after {}",
+                cuts.layers[cuts.len - 1]
+            ));
+        }
+        cuts.layers[cuts.len] = layer;
+        cuts.len += 1;
+    }
+    Ok(cuts)
+}
+
+/// Segment boundaries of the cut-safe schedule: the PLE split (when present,
+/// always before every cut) then the recorded cut step indices.
+fn cut_boundaries(
+    ple_split: Option<usize>,
+    cut_steps: &[usize],
+) -> ([usize; MAX_CUT_LAYERS + 1], usize) {
+    let mut bounds = [0usize; MAX_CUT_LAYERS + 1];
+    let mut count = 0usize;
+    if let Some(split) = ple_split {
+        debug_assert!(cut_steps.first().map_or(true, |&cut| split < cut));
+        bounds[0] = split;
+        count = 1;
+    }
+    for &cut in cut_steps {
+        bounds[count] = cut;
+        count += 1;
+    }
+    (bounds, count)
 }
 
 /// Environment knob naming the routing-trace output file (appended).
@@ -4981,6 +5073,7 @@ impl Qwen4GpuForward {
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
+        let mut cut_layers: Option<CutLayers> = None;
         let mut expert_stage = None;
         let mut ep: Option<Qwen4ForwardEp> = None;
         let mut trunk_zba = Vec::new();
@@ -5174,6 +5267,18 @@ impl Qwen4GpuForward {
                 });
                 eprintln!("  qwen4 routing trace -> {path}");
             }
+            if let Ok(raw) = hipfire_config::developer_var(CUT_LAYERS_ENV) {
+                let config = &bundle.config;
+                let ple_layer_index = config
+                    .ple
+                    .as_ref()
+                    .and_then(|_| config.ple_layer_ids.first())
+                    .and_then(|id| id.checked_sub(1));
+                cut_layers = Some(
+                    parse_qwen4_cut_layers(&raw, config.num_hidden_layers, ple_layer_index)
+                        .map_err(|error| invalid(format!("{CUT_LAYERS_ENV}={raw}: {error}")))?,
+                );
+            }
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
@@ -5222,6 +5327,7 @@ impl Qwen4GpuForward {
             moe,
             decode_q8,
             route_trace,
+            cut_layers,
             trunk_zba,
             trunk_a4,
             qsa_tap: None,
@@ -6022,6 +6128,9 @@ impl Qwen4GpuForward {
             #[cfg(target_os = "linux")]
             if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
             {
+                if self.cut_layers.is_some() {
+                    return Err(invalid(format!("{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route")));
+                }
                 let rows=banks[0]+banks[1];
                 self.note_npu_trunk_pair(banks,bundle.state.position);
                 let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
@@ -6133,6 +6242,9 @@ impl Qwen4GpuForward {
             #[cfg(target_os = "linux")]
             if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
             {
+                if self.cut_layers.is_some() {
+                    return Err(invalid(format!("{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route")));
+                }
                 let rows=banks[0]+banks[1];
                 self.note_npu_trunk_pair(banks,bundle.state.position);
                 self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
@@ -6658,7 +6770,17 @@ impl Qwen4GpuForward {
         // `HIPFIRE_CHUNK_DUMP_DIR` (developer diagnostic; off by default).
         let chunk_dump = crate::chunk_dump::config().filter(|_| route_n > 1);
         let mut dump_ends: Vec<(usize, usize, bool)> = Vec::new();
+        // `HIPFIRE_QWEN4_CUT_LAYERS`: step index at which each listed layer starts.
+        let cut_layers = self.cut_layers;
+        let mut cut_steps = [0usize; MAX_CUT_LAYERS];
+        let mut cut_count = 0usize;
         for layer_index in 0..config.num_hidden_layers {
+            if let Some(cuts) = cut_layers.as_ref() {
+                if cuts.contains(layer_index) {
+                    cut_steps[cut_count] = steps.len();
+                    cut_count += 1;
+                }
+            }
             let layer = &bundle.weights.layer_refs[layer_index];
             if ple_layer_index == Some(layer_index) {
                 let ple_weights = layer
@@ -7360,7 +7482,30 @@ impl Qwen4GpuForward {
                 && !gpu.prefill_invariant_scope
                 && wide_hidden_capture.is_none()
                 && self.qsa_tap.is_none()
+                && self.cut_layers.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+            // `HIPFIRE_QWEN4_CUT_LAYERS` is the cut-safe eager schedule: refuse
+            // every route that would execute the program some other way.
+            if cut_layers.is_some() {
+                let conflict = if chunk_dump.is_some() {
+                    Some("the chunk dump (HIPFIRE_CHUNK_DUMP_DIR)")
+                } else if self.qsa_tap.is_some() {
+                    Some("the QSA parity tap")
+                } else if self.route_trace.is_some() {
+                    Some("the routing trace (HIPFIRE_QWEN4_ROUTE_TRACE)")
+                } else if n > 1 && hipfire_config::developer_var("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP").is_ok() {
+                    Some("HIPFIRE_QWEN4_PREFILL_ROUTE_DUMP")
+                } else if self.ep.is_some() {
+                    Some("expert parallelism")
+                } else {
+                    None
+                };
+                if let Some(conflict) = conflict {
+                    return Err(invalid(format!(
+                        "{CUT_LAYERS_ENV} cannot run with {conflict}"
+                    )));
+                }
+            }
             gpu.replay.set_forward_eligible(eligible);
             // A manual shadow controller states the executor directly: one prepared
             // tape is compared across the exact-kernarg HIP oracle, the retained
@@ -7561,13 +7706,29 @@ impl Qwen4GpuForward {
                                 })
                             })
                     };
-                    match ple_split {
-                        Some(split) => {
-                            run(gpu, &steps[..split])?;
-                            stage_ple(gpu)?;
-                            run(gpu, &steps[split..])?;
+                    if cut_layers.is_some() {
+                        // Cut-safe schedule: separate interpreter runs split at
+                        // the PLE step and every recorded cut, one hook state.
+                        let (bounds, count) = cut_boundaries(ple_split, &cut_steps[..cut_count]);
+                        let mut start = 0usize;
+                        for &end in bounds[..count].iter().chain(std::iter::once(&steps.len())) {
+                            if end > start {
+                                run(gpu, &steps[start..end])?;
+                            }
+                            if ple_split == Some(end) {
+                                stage_ple(gpu)?;
+                            }
+                            start = end;
                         }
-                        None => run(gpu, &steps)?,
+                    } else {
+                        match ple_split {
+                            Some(split) => {
+                                run(gpu, &steps[..split])?;
+                                stage_ple(gpu)?;
+                                run(gpu, &steps[split..])?;
+                            }
+                            None => run(gpu, &steps)?,
+                        }
                     }
                 } else {
                     let trace = self.route_trace.as_ref().filter(|_| n == 1);
@@ -7626,6 +7787,22 @@ impl Qwen4GpuForward {
                                 }
                             }
                             if start < steps.len() { execute(gpu, &steps[start..])?; }
+                        }
+                        // `HIPFIRE_QWEN4_CUT_LAYERS`: separate interpreter runs split
+                        // at the PLE step and every recorded cut (fresh fusion state
+                        // per segment).
+                        (_, None) if cut_layers.is_some() => {
+                            let (bounds, count) = cut_boundaries(ple_split, &cut_steps[..cut_count]);
+                            let mut start = 0usize;
+                            for &end in bounds[..count].iter().chain(std::iter::once(&steps.len())) {
+                                if end > start {
+                                    execute(gpu, &steps[start..end])?;
+                                }
+                                if ple_split == Some(end) {
+                                    stage_ple(gpu)?;
+                                }
+                                start = end;
+                            }
                         }
                         (Some(split), None) => {
                             execute(gpu, &steps[..split])?;
@@ -8287,6 +8464,53 @@ mod ep_table_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_qwen4_cut_layers_accepts_valid_lists() {
+        let cuts = super::parse_qwen4_cut_layers("9,17,25,33,41", 48, Some(0)).unwrap();
+        assert_eq!(cuts.as_slice(), &[9, 17, 25, 33, 41]);
+        let cuts = super::parse_qwen4_cut_layers("2,24,47", 48, Some(1)).unwrap();
+        assert_eq!(cuts.as_slice(), &[2, 24, 47]);
+        let cuts = super::parse_qwen4_cut_layers(" 24 ", 48, None).unwrap();
+        assert_eq!(cuts.as_slice(), &[24]);
+        let cuts = super::parse_qwen4_cut_layers("1,2,3,4,5,6,7", 48, None).unwrap();
+        assert_eq!(cuts.as_slice(), &[1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn parse_qwen4_cut_layers_rejects_invalid_lists() {
+        for (raw, layers, ple) in [
+            ("", 48, None),
+            ("0", 48, None),
+            ("1", 48, Some(1)),
+            ("48", 48, None),
+            ("9,9", 48, None),
+            ("17,9", 48, None),
+            ("1,2,3,4,5,6,7,8", 48, None),
+            ("9,,17", 48, None),
+            ("9,", 48, None),
+            ("x", 48, None),
+            ("-3", 48, None),
+            ("9;17", 48, None),
+        ] {
+            assert!(
+                super::parse_qwen4_cut_layers(raw, layers, ple).is_err(),
+                "{raw:?} with {layers} layers and PLE {ple:?} must be rejected"
+            );
+        }
+        let error = super::parse_qwen4_cut_layers("48", 48, None).unwrap_err();
+        assert!(error.contains("48"), "{error}");
+    }
+
+    #[test]
+    fn cut_boundaries_merge_the_ple_split_before_the_cuts() {
+        let (bounds, count) = super::cut_boundaries(Some(3), &[10, 20]);
+        assert_eq!(&bounds[..count], &[3, 10, 20]);
+        let (bounds, count) = super::cut_boundaries(None, &[10, 20]);
+        assert_eq!(&bounds[..count], &[10, 20]);
+        let (bounds, count) = super::cut_boundaries(Some(3), &[]);
+        assert_eq!(&bounds[..count], &[3]);
+    }
+
     #[test]
     fn gfx942_trunk_profile_is_pinned_without_changing_rdna() {
         for knob in [false, true] {
