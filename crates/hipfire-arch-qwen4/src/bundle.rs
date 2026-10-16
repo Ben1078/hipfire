@@ -539,11 +539,12 @@ impl Qwen4Bundle {
                 return Err(cleanup_transaction(error, transaction.rollback(gpu)));
             }
         };
+        let scope = crate::weights::Qwen4BandScope::single(&config);
         let assembled = match expert_tiers {
             Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
-                &mut transaction, &config, recipe, placements, lease,
+                &mut transaction, &config, recipe, placements, &scope, lease,
             ),
-            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements),
+            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, &scope),
         };
         let weights = match assembled {
             Ok(weights) => weights,

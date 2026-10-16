@@ -3716,7 +3716,12 @@ fn redline_qwen4_snapshot(
         .as_ref()
         .map(|tensor| ("ple.conv", tensor))
         .into_iter()
-        .chain([("ple.hyper_feedback", &state.hyper_feedback)])
+        .chain(
+            state
+                .hyper_feedback
+                .as_ref()
+                .map(|t| ("ple.hyper_feedback", t)),
+        )
     {
         let mut bytes = Vec::new();
         redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;

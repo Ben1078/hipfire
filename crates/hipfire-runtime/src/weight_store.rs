@@ -22,6 +22,7 @@ use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
 use crate::tp_shard::ExpertAssign;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 thread_local! {
@@ -287,8 +288,8 @@ pub struct WeightStore {
     /// stay journaled; rollback skips keys that are no longer resident, so a
     /// key is freed at most once.
     journal: Vec<WeightPlacementKey>,
-    /// Tied-source edges (`lm_head -> token_embd`) recorded at insert.
-    /// Retained after assembly takes the alias handle.
+    /// Tied-source edges (`lm_head -> token_embd`) for local aliases and
+    /// separately materialized endpoints. Retained after assembly takes handles.
     aliases: HashMap<WeightPlacementKey, String>,
     origin: Option<WeightOrigin>,
 }
@@ -389,8 +390,8 @@ impl WeightLoadTransaction {
             })
     }
 
-    /// Tied-source edge recorded for an alias identity, if it was staged as
-    /// one. Survives assembly like the projection census.
+    /// Tied-source identity for an alias or a separately materialized endpoint.
+    /// Survives assembly like the projection census.
     pub fn alias_source(&self, name: &str, layer: Option<usize>, device: usize) -> Option<&str> {
         self.store
             .as_ref()
@@ -511,7 +512,7 @@ impl WeightStore {
         self.projections.len()
     }
 
-    /// Tied-source edge for an alias identity. Retained after assembly.
+    /// Tied-source identity for either kind of handle. Retained after assembly.
     pub fn alias_source(&self, name: &str, layer: Option<usize>, device: usize) -> Option<&str> {
         self.aliases
             .get(&WeightPlacementKey::new(name, layer, device))
@@ -1099,6 +1100,49 @@ fn rollback_fulfill_error(
     error
 }
 
+/// A nonlocal tied endpoint reads the original source identity, but uploads
+/// under the tied entry's own placement key. Local sources remain aliases.
+fn fulfillment_source(entry: &WeightEntry) -> Cow<'_, WeightEntry> {
+    match &entry.policy {
+        ShardPolicy::Tied { source } => {
+            let mut request = entry.clone();
+            request.name = source.clone();
+            request.policy = ShardPolicy::Replicate;
+            Cow::Owned(request)
+        }
+        _ => Cow::Borrowed(entry),
+    }
+}
+
+/// The full logical manifest validates ties against the input declaration.
+/// A scoped, explicitly output-pinned materialization may omit that input;
+/// validate its source contract without adding a fulfillment/allocation entry.
+fn validate_fulfillment_manifest(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+) -> Result<(), String> {
+    let mut logical = Cow::Borrowed(weights);
+    for entry in weights {
+        if let ShardPolicy::Tied { source } = &entry.policy {
+            if !logical
+                .iter()
+                .any(|candidate| candidate.name == *source && candidate.layer == entry.layer)
+                && entry.placement
+                    == crate::weight_manifest::PlacementHint::Pin(
+                        crate::weight_manifest::PinTarget::Output,
+                    )
+            {
+                logical
+                    .to_mut()
+                    .push(fulfillment_source(entry).into_owned());
+            }
+        }
+    }
+    crate::weight_manifest::validate_weight_layers(&logical, n_layers)
+        .and_then(|_| crate::weight_manifest::validate_manifest(&logical, mesh))
+}
+
 /// Fulfill a manifest for a plain LLaMA Single target.
 ///
 /// The source callback is the architecture-owned namespace seam and returns
@@ -1127,9 +1171,7 @@ where
     if let Some(error) = target_error(mesh) {
         return Err(error);
     }
-    if let Err(reason) = crate::weight_manifest::validate_weight_layers(weights, n_layers)
-        .and_then(|_| crate::weight_manifest::validate_manifest(weights, mesh))
-    {
+    if let Err(reason) = validate_fulfillment_manifest(weights, mesh, n_layers) {
         return Err(FulfillError {
             name: "<manifest>".to_string(),
             layer: None,
@@ -1186,45 +1228,37 @@ where
                 Some(WeightHandle::Resident(tensor)) => Some(tensor.dtype),
                 Some(WeightHandle::Alias(_)) | None => None,
             };
-            let Some(actual_dtype) = source_dtype else {
-                let error = FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: 0,
-                    reason: format!(
-                        "tied source '{source_name}' is unresolved or has no actual resident dtype"
-                    ),
-                };
-                return Err(rollback_fulfill_error(store, gpu, error));
-            };
-            if !entry.dtype_constraint.accepts(actual_dtype) {
-                let error = FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: 0,
-                    reason: format!(
-                        "tied source '{source_name}' actual dtype {actual_dtype:?} is excluded by constraint {:?}",
-                        entry.dtype_constraint
-                    ),
-                };
-                return Err(rollback_fulfill_error(store, gpu, error));
+            if let Some(actual_dtype) = source_dtype {
+                if !entry.dtype_constraint.accepts(actual_dtype) {
+                    let error = FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: 0,
+                        reason: format!(
+                            "tied source '{source_name}' actual dtype {actual_dtype:?} is excluded by constraint {:?}",
+                            entry.dtype_constraint
+                        ),
+                    };
+                    return Err(rollback_fulfill_error(store, gpu, error));
+                }
+                let projection = projection_for(entry, 0, 1, actual_dtype);
+                if let Err(reason) =
+                    store.insert(key, WeightHandle::Alias(source_name.clone()), projection)
+                {
+                    let error = FulfillError {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device: 0,
+                        reason: reason.to_string(),
+                    };
+                    return Err(rollback_fulfill_error(store, gpu, error));
+                }
+                continue;
             }
-            let projection = projection_for(entry, 0, 1, actual_dtype);
-            if let Err(reason) =
-                store.insert(key, WeightHandle::Alias(source_name.clone()), projection)
-            {
-                let error = FulfillError {
-                    name: entry.name.clone(),
-                    layer: entry.layer,
-                    device: 0,
-                    reason: reason.to_string(),
-                };
-                return Err(rollback_fulfill_error(store, gpu, error));
-            }
-            continue;
         }
 
-        let (bytes, dtype) = match source(entry) {
+        let read_entry = fulfillment_source(entry);
+        let (bytes, dtype) = match source(&read_entry) {
             Ok(value) => value,
             Err(reason) => {
                 let error = FulfillError {
@@ -1292,6 +1326,12 @@ where
             };
             return Err(rollback_fulfill_error(store, gpu, error));
         }
+        if let ShardPolicy::Tied { source } = &entry.policy {
+            store.aliases.insert(
+                WeightPlacementKey::new(&entry.name, entry.layer, 0),
+                source.clone(),
+            );
+        }
         if test_support::record_resident_upload() {
             let error = FulfillError {
                 name: entry.name.clone(),
@@ -1348,8 +1388,13 @@ fn validate_source_range_identity(
         .find(|range| range.name == entry.name);
     let Some(range) = range else {
         if require_named_entry {
+            let kind = if entry.residency.is_external() {
+                "external entry"
+            } else {
+                "entry"
+            };
             return Err(format!(
-                "HFQ source identity has no indexed range for external entry '{}'",
+                "HFQ source identity has no indexed range for {kind} '{}'",
                 entry.name
             ));
         }
@@ -1571,9 +1616,7 @@ where
     if let Some(error) = target_error(mesh) {
         return Err(error);
     }
-    if let Err(reason) = crate::weight_manifest::validate_weight_layers(weights, n_layers)
-        .and_then(|_| crate::weight_manifest::validate_manifest(weights, mesh))
-    {
+    if let Err(reason) = validate_fulfillment_manifest(weights, mesh, n_layers) {
         return Err(FulfillError {
             name: "<manifest>".to_string(),
             layer: None,
@@ -1638,43 +1681,33 @@ where
                 Some(WeightHandle::Resident(tensor)) => Some(tensor.dtype),
                 Some(WeightHandle::Alias(_)) | None => None,
             };
-            let Some(actual_dtype) = source_dtype else {
-                return Err(rollback_fulfill_error(
-                    store,
-                    gpu,
-                    fulfill_entry_error(
-                        entry,
-                        format!(
-                            "tied source '{source_name}' is unresolved or has no actual resident dtype"
+            if let Some(actual_dtype) = source_dtype {
+                if !entry.dtype_constraint.accepts(actual_dtype) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(
+                            entry,
+                            format!(
+                                "tied source '{source_name}' actual dtype {actual_dtype:?} \
+                                 is excluded by constraint {:?}",
+                                entry.dtype_constraint
+                            ),
                         ),
-                    ),
-                ));
-            };
-            if !entry.dtype_constraint.accepts(actual_dtype) {
-                return Err(rollback_fulfill_error(
-                    store,
-                    gpu,
-                    fulfill_entry_error(
-                        entry,
-                        format!(
-                            "tied source '{source_name}' actual dtype {actual_dtype:?} \
-                             is excluded by constraint {:?}",
-                            entry.dtype_constraint
-                        ),
-                    ),
-                ));
+                    ));
+                }
+                let projection = projection_for(entry, 0, 1, actual_dtype);
+                if let Err(reason) =
+                    store.insert(key, WeightHandle::Alias(source_name.clone()), projection)
+                {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason.to_string()),
+                    ));
+                }
+                continue;
             }
-            let projection = projection_for(entry, 0, 1, actual_dtype);
-            if let Err(reason) =
-                store.insert(key, WeightHandle::Alias(source_name.clone()), projection)
-            {
-                return Err(rollback_fulfill_error(
-                    store,
-                    gpu,
-                    fulfill_entry_error(entry, reason.to_string()),
-                ));
-            }
-            continue;
         }
 
         if let (Some(ep), ShardPolicy::ExpertSharded { n_experts, assign }) = (ep, &entry.policy) {
@@ -1716,7 +1749,8 @@ where
             }
             continue;
         }
-        let payload = match source(entry) {
+        let read_entry = fulfillment_source(entry);
+        let payload = match source(&read_entry) {
             Ok(payload) => payload,
             Err(reason) => {
                 return Err(rollback_fulfill_error(
@@ -1726,6 +1760,26 @@ where
                 ));
             }
         };
+        if matches!(entry.policy, ShardPolicy::Tied { .. }) {
+            let actual_name = match &payload {
+                SourcePayload::Borrowed { info, .. } => Some(info.name.as_str()),
+                SourcePayload::Owned { info, .. } => Some(info.name.as_str()),
+                SourcePayload::Range(_) => None,
+            };
+            if actual_name.is_some_and(|name| name != read_entry.name) {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(
+                        entry,
+                        format!(
+                            "tied materialization requested '{}' but received {actual_name:?}",
+                            read_entry.name
+                        ),
+                    ),
+                ));
+            }
+        }
         match payload {
             SourcePayload::Borrowed { info, bytes } => {
                 if entry.residency.is_external() {
@@ -1903,9 +1957,10 @@ where
                     }
                 };
                 if let Err(reason) = validate_source_range_identity(
-                    entry,
+                    &read_entry,
                     &descriptor,
-                    entry.residency.is_external(),
+                    entry.residency.is_external()
+                        || matches!(entry.policy, ShardPolicy::Tied { .. }),
                 ) {
                     return Err(rollback_fulfill_error(
                         store,
@@ -2016,6 +2071,12 @@ where
                     ));
                 }
             }
+        }
+        if let ShardPolicy::Tied { source } = &entry.policy {
+            store.aliases.insert(
+                WeightPlacementKey::new(&entry.name, entry.layer, 0),
+                source.clone(),
+            );
         }
     }
     Ok(WeightLoadTransaction::new(store))
@@ -2323,6 +2384,110 @@ mod tests {
         assert!(target_error(&mesh).is_some());
         let placement = BandPlacement::uniform(&mesh, 1).unwrap();
         assert_eq!(placement_devices(&entry, &mesh, &placement), vec![0]);
+    }
+
+    #[test]
+    fn output_tie_validates_and_requests_the_nonlocal_source_identity() {
+        let mesh = DeviceMesh::single().unwrap();
+        let tied = WeightEntry::model(
+            "mtp.embed_tokens",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "embed_tokens".to_string(),
+            },
+        )
+        .with_placement(crate::weight_manifest::PlacementHint::Pin(
+            PinTarget::Output,
+        ));
+        // The general manifest still requires a full declaration. Fulfillment
+        // alone accepts the explicit scoped output materialization contract.
+        assert!(crate::weight_manifest::validate_manifest(&[tied.clone()], &mesh).is_err());
+        validate_fulfillment_manifest(&[tied.clone()], &mesh, 48).unwrap();
+        let request = fulfillment_source(&tied);
+        assert_eq!(request.name, "embed_tokens");
+        assert_eq!(request.logical_shape, tied.logical_shape);
+        assert_eq!(request.dtype_constraint, tied.dtype_constraint);
+        assert_eq!(request.policy, ShardPolicy::Replicate);
+        assert!(matches!(tied.policy, ShardPolicy::Tied { .. }));
+        let plain = WeightEntry::model("plain", vec![1], DType::F16, ShardPolicy::Replicate);
+        assert!(matches!(fulfillment_source(&plain), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn local_tie_and_nonlocal_output_materialization_keep_the_same_provenance() {
+        let Ok(mut gpu) = Gpu::init() else {
+            return;
+        };
+        let mesh = DeviceMesh::single().unwrap();
+        let source = WeightEntry::model("source", vec![1], DType::F32, ShardPolicy::Replicate);
+        let tied = WeightEntry::model(
+            "output",
+            vec![1],
+            DType::F32,
+            ShardPolicy::Tied {
+                source: "source".to_string(),
+            },
+        )
+        .with_placement(crate::weight_manifest::PlacementHint::Pin(
+            PinTarget::Output,
+        ));
+        for payloads in [false, true] {
+            for local in [false, true] {
+                let weights = if local {
+                    vec![source.clone(), tied.clone()]
+                } else {
+                    vec![tied.clone()]
+                };
+                let expected = WeightOrigin::for_single(&mesh, &gpu);
+                let calls = std::cell::Cell::new(0);
+                let tx = if payloads {
+                    fulfill_manifest_from_payloads(
+                        &weights,
+                        &mesh,
+                        1,
+                        &mut gpu,
+                        expected,
+                        |entry| {
+                            assert_eq!(entry.name, "source");
+                            calls.set(calls.get() + 1);
+                            Ok(SourcePayload::Owned {
+                                info: crate::model_source::TensorInfo {
+                                    name: "source".to_string(),
+                                    shape: vec![1],
+                                    dtype: "F32".to_string(),
+                                    quant_type: 0xFF,
+                                    data_offset: 0,
+                                    data_size: 4,
+                                },
+                                bytes: vec![0; 4],
+                            })
+                        },
+                    )
+                    .unwrap()
+                } else {
+                    fulfill_manifest_single(&weights, &mesh, 1, &mut gpu, expected, |entry| {
+                        assert_eq!(entry.name, "source");
+                        calls.set(calls.get() + 1);
+                        Ok((vec![0; 4], DType::F32))
+                    })
+                    .unwrap()
+                };
+                assert_eq!(calls.get(), 1);
+                assert_eq!(tx.alias_source("output", None, 0), Some("source"));
+                assert_eq!(tx.origin(), Some(expected));
+                assert_eq!(tx.projection("output", None, 0).unwrap().dtype, DType::F32);
+                assert_eq!(
+                    matches!(tx.get("output", None, 0), Some(WeightHandle::Alias(_))),
+                    local
+                );
+                assert_eq!(
+                    matches!(tx.get("output", None, 0), Some(WeightHandle::Resident(_))),
+                    !local
+                );
+                tx.rollback(&mut gpu).unwrap();
+            }
+        }
     }
 
     #[test]

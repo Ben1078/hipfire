@@ -17,8 +17,8 @@ use crate::expert_hotset::HOTSET_ENV;
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
-    is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, WeightError,
-    RECIPE_METADATA_KEY,
+    is_ple_shard_name_within, Qwen4BandScope, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe,
+    WeightError, RECIPE_METADATA_KEY,
 };
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
@@ -170,6 +170,30 @@ pub struct Qwen4HfqmArtifact {
     /// (`Qwen4Bundle::assemble_with_ple_rows`); [`Qwen4PleRows::Absent`] when
     /// the profile has no PLE.
     pub ple_rows: Qwen4PleRows,
+}
+
+impl Qwen4HfqmArtifact {
+    /// Project this already-admitted inventory before rank-local fulfillment.
+    /// Source sealing and codec admission are never repeated or weakened.
+    pub fn for_band(
+        mut self,
+        scope: &Qwen4BandScope,
+        device: usize,
+    ) -> Result<Self, Qwen4ArtifactError> {
+        self.placements = self
+            .manifest
+            .placements_for_scope(&self.config, scope, device)
+            .map_err(|error| Qwen4ArtifactError::new(error.to_string()))?;
+        self.manifest = self
+            .manifest
+            .with_band_scope(&self.config, scope)
+            .map_err(|error| Qwen4ArtifactError::new(error.to_string()))?;
+        if !scope.input {
+            self.ple = None;
+            self.ple_rows = Qwen4PleRows::Absent;
+        }
+        Ok(self)
+    }
 }
 
 /// A checked artifact boundary failure.  Keeping the error owned and typed
@@ -1471,13 +1495,8 @@ pub fn admit_hfqm_artifact_on(
     };
 
     let placements = manifest
-        .resident_keys()
-        .map(|(name, layer)| Qwen4Placement {
-            name: name.to_string(),
-            layer,
-            device: 0,
-        })
-        .collect();
+        .placements_for_scope(&config, &Qwen4BandScope::single(&config), 0)
+        .map_err(|error| Qwen4ArtifactError::new(error.to_string()))?;
     Ok(Qwen4HfqmArtifact {
         config,
         manifest,

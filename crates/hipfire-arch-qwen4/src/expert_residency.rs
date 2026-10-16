@@ -13,7 +13,7 @@
 //! token reads only its routed experts' bytes from host RAM.
 
 use crate::gpu_forward::Qwen4ForwardScratchMode;
-use crate::weights::Qwen4EpPlacement;
+use crate::weights::{Qwen4BandScope, Qwen4EpPlacement};
 use crate::Qwen4Config;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::uma_memory::{
@@ -164,6 +164,22 @@ pub fn routed_expert_bytes_ranks(
                 bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
             Ok(total + rank_share(entry, bytes, 0, ranks)?)
         })
+}
+
+/// [`routed_expert_bytes`] for one pipeline-parallel band: every expert of
+/// the owned trunk layers (all 512, never a modulo-rank share) plus the MTP
+/// head's experts only on the output band, from the exact per-entry payload
+/// sizes. `Single` equals [`routed_expert_bytes`].
+pub fn routed_expert_bytes_scope(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    scope: &Qwen4BandScope,
+) -> Result<u64, String> {
+    let bytes = band_weight_census(weights, &bytes_of, scope)?;
+    bytes
+        .trunk
+        .checked_add(bytes.mtp)
+        .ok_or_else(|| "band routed-expert byte census overflows".to_string())
 }
 
 fn parse_expert_vram_layers(value: &str) -> Result<ExpertVramLayers, String> {
@@ -423,6 +439,608 @@ pub fn state_census(
     Ok(StateCensus { qsa_context, state, forward })
 }
 
+/// The forward scratch one pipeline-parallel rank allocates, split by who
+/// needs it, so every duplicate across ranks is explicit.
+///
+/// - `stage_shared`: fields every stage's trunk loop needs (hyper-connection
+///   streams and mixers, rotation, projections, attention mixer output, every
+///   MoE buffer, the BF16 scratch). Each stage carries its own copy: a declared
+///   per-stage duplicate, never shared across devices.
+/// - `band_local`: GDN fields only where the band has a GDN layer, QSA fields
+///   only where it has a QSA layer.
+/// - `input_only`: token ids, embedding rows and the PLE fields, input band
+///   only.
+/// - `output_only`: the language-model logits and the speculative
+///   logit/argmax rows, output band only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForwardCensus {
+    pub stage_shared: u64,
+    pub band_local: u64,
+    pub input_only: u64,
+    pub output_only: u64,
+}
+
+impl ForwardCensus {
+    /// All four terms, checked.
+    pub fn total(&self) -> Result<u64, String> {
+        [
+            self.stage_shared,
+            self.band_local,
+            self.input_only,
+            self.output_only,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| "forward census overflows".to_string())
+    }
+}
+
+/// [`crate::gpu_forward::qwen4_forward_device_bytes`] for one pipeline-parallel
+/// band: the same plan (`Qwen4GpuForwardScratch::plan`, owning slots only,
+/// borrowed views uncharged, plus the speculative logits/argmax), but a field
+/// is charged only on a rank that runs its operation. `Single` equals
+/// `qwen4_forward_device_bytes` exactly (pinned by a test over both modes).
+///
+/// Band-aware sizing: the projection scratch spans the QSA q/gate width only
+/// with a QSA layer and the GDN qkv width only with a GDN layer; the BF16
+/// scratch spans the GDN value width only with a GDN layer. In the compact
+/// plan the GDN recurrent output is a view of the QSA q/gate owner, so a
+/// compact band with GDN but no QSA layer is refused.
+pub fn forward_census_scope(
+    config: &Qwen4Config,
+    rows: usize,
+    mode: Qwen4ForwardScratchMode,
+    scope: &Qwen4BandScope,
+) -> Result<ForwardCensus, String> {
+    use crate::config::LayerType;
+    use rdna_compute::DType;
+    let overflow = || "forward census size overflows".to_string();
+    if rows == 0 {
+        return Err("forward census rows is zero".to_string());
+    }
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
+    let dims = crate::gpu_forward::program_dims(config);
+    let layout = crate::program::Qwen4ScratchLayout::for_rows(dims, rows)
+        .map_err(|error| error.to_string())?;
+    let has = |kind: LayerType| {
+        scope
+            .band
+            .clone()
+            .any(|layer| config.layer_types.get(layer) == Some(&kind))
+    };
+    let (has_gdn, has_qsa) = (
+        has(LayerType::LinearAttention),
+        has(LayerType::FullAttention),
+    );
+    let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
+    if compact && has_gdn && !has_qsa {
+        return Err(
+            "compact forward scratch aliases the GDN output onto QSA scratch, \
+            which a band without QSA layers does not own"
+                .to_string(),
+        );
+    }
+    let hidden = layout.hidden;
+    let wide = layout.wide;
+    let q_width = layout.q_width;
+    let qsa_qgate = 2 * q_width;
+    let gdn_value = layout.gdn_value;
+    let max_projection = wide
+        .max(hidden)
+        .max(if has_qsa { qsa_qgate } else { 0 })
+        .max(if has_gdn { layout.gdn_qkv } else { 0 });
+    let max_rotation = wide.max(hidden).max(config.ffn.intermediate_size());
+    let ple_embed_dim = config
+        .ple
+        .as_ref()
+        .map_or(0, |ple| ple.head_count * ple.row_width);
+    let ple_channels = wide;
+    let ffn_batch_rows = layout.routed_rows.max(layout.dense_rows);
+    let i32_bytes = std::mem::size_of::<i32>();
+    let rows_of = |width: usize| mul(rows, width);
+    let route_i32_bytes = mul(layout.slots, i32_bytes)?;
+    let grouped_bound = layout.grouped_rows;
+    let routed_width = mul(config.num_experts_per_tok, config.moe_intermediate_size)?;
+    let top_k = config.num_experts_per_tok;
+    let moe = config.moe_intermediate_size;
+
+    // MoE buffers whose compact size differs from the full plan.
+    let (mut gate_batch, mut up_batch, mut rot_batch) =
+        (ffn_batch_rows, ffn_batch_rows, rows_of(routed_width)?);
+    let (mut down_expanded, mut y_gate_up, mut y_down) = (
+        rows_of(mul(top_k, hidden)?)?,
+        mul(grouped_bound, 2 * moe)?,
+        mul(grouped_bound, hidden)?,
+    );
+    if compact {
+        if ple_channels != wide {
+            return Err(
+                "compact scratch requires PLE channels equal to the hyper-connection \
+                 width"
+                    .to_string(),
+            );
+        }
+        let f32_bytes = std::mem::size_of::<f32>();
+        let bf16_bytes = DType::BF16.size();
+        let fallback_rows = rows.min(crate::gpu_forward::QWEN4_COMPACT_FALLBACK_ROWS);
+        let fallback_grouped =
+            crate::program::grouped_m_total_bound(mul(fallback_rows, top_k)?, config.num_experts)
+                .map_err(|error| error.to_string())?;
+        let facade = |bytes: usize| bytes.div_ceil(f32_bytes);
+        let fallback_batch = mul(fallback_rows, routed_width)?;
+        (gate_batch, up_batch, rot_batch) = (fallback_batch, fallback_batch, fallback_batch);
+        let hidden_f32_bytes = mul(hidden, f32_bytes)?;
+        down_expanded = facade(
+            mul(mul(fallback_rows, top_k)?, hidden_f32_bytes)?
+                .max(mul(rows, hidden_f32_bytes)?)
+                .max(mul(mul(rows, top_k)?, 8)?),
+        );
+        y_gate_up = facade(
+            mul(fallback_grouped, mul(2 * moe, f32_bytes)?)?
+                .max(mul(grouped_bound, mul(moe, bf16_bytes)?)?),
+        );
+        y_down = facade(
+            mul(fallback_grouped, hidden_f32_bytes)?
+                .max(mul(grouped_bound, mul(hidden, bf16_bytes)?)?),
+        );
+        // `Qwen4GpuForwardScratch::plan`'s alias binds, checked as the plan
+        // checks them (every view fits its owner's capacity and row pitch) so
+        // a geometry the plan refuses is refused here too, whatever the band.
+        // `(owner elements, owner pitch, view pitch, view elements)`.
+        let at_least_one = |elements: usize| elements.max(1);
+        let wide_rows = at_least_one(rows_of(wide)?);
+        let ple_rows = at_least_one(rows_of(ple_channels)?);
+        let binds: [(usize, Option<usize>, usize, Vec<usize>); 6] = [
+            (
+                at_least_one(rows_of(max_projection)?),
+                Some(max_projection),
+                max_projection,
+                vec![wide_rows, ple_rows],
+            ),
+            (
+                at_least_one(rows_of(max_projection)?),
+                Some(max_projection),
+                max_projection,
+                vec![wide_rows, ple_rows],
+            ),
+            (
+                at_least_one(rows_of(max_rotation)?),
+                Some(max_rotation),
+                max_rotation,
+                vec![ple_rows],
+            ),
+            (y_down, None, ple_channels, vec![ple_rows]),
+            (
+                at_least_one(rows_of(hidden)?),
+                Some(hidden),
+                hidden,
+                vec![at_least_one(rows_of(hidden)?)],
+            ),
+            (
+                at_least_one(rows_of(qsa_qgate)?),
+                Some(qsa_qgate),
+                qsa_qgate,
+                vec![at_least_one(rows_of(gdn_value)?)],
+            ),
+        ];
+        for (owner_elements, owner_pitch, view_pitch, views) in &binds {
+            if let Some(pitch) = owner_pitch {
+                if *owner_elements < mul(rows, *pitch)? {
+                    return Err(
+                        "compact scratch alias owner is smaller than its row pitch".to_string()
+                    );
+                }
+            }
+            for view in views {
+                if view > owner_elements || *view > mul(rows, *view_pitch)? {
+                    return Err("compact scratch alias view does not fit its owner".to_string());
+                }
+            }
+        }
+    }
+
+    // Bytes of one owning slot (every slot holds at least one element).
+    let slot = |elements: usize, dtype: DType| -> Result<u64, String> {
+        u64::try_from(
+            elements
+                .max(1)
+                .checked_mul(dtype.size())
+                .ok_or_else(overflow)?,
+        )
+        .map_err(|_| overflow())
+    };
+    let sum = |slots: &[Result<u64, String>]| -> Result<u64, String> {
+        slots.iter().try_fold(0u64, |total, bytes| {
+            total.checked_add(bytes.clone()?).ok_or_else(overflow)
+        })
+    };
+    // Compact plan: eight phase-disjoint fields are uncharged views.
+    let owned = |view: bool, bytes: Result<u64, String>| -> Result<u64, String> {
+        if compact && view {
+            Ok(0)
+        } else {
+            bytes
+        }
+    };
+    let f32 = DType::F32;
+    // Compact plan: the overridden MoE buffers are exact element counts
+    // (possibly zero); everywhere else every slot holds at least one element.
+    let moe_slot = |elements: usize| -> Result<u64, String> {
+        if compact {
+            u64::try_from(elements.checked_mul(f32.size()).ok_or_else(overflow)?)
+                .map_err(|_| overflow())
+        } else {
+            slot(elements, f32)
+        }
+    };
+    let stage_shared = sum(&[
+        slot(rows_of(wide)?, f32),              // Streams
+        owned(true, slot(rows_of(wide)?, f32)), // HcNormalized (view)
+        slot(rows_of(config.hc_lowrank)?, f32), // HcLow
+        owned(true, slot(rows_of(wide)?, f32)), // HcUp (view)
+        slot(rows_of(hidden)?, f32),            // HcMixed
+        slot(rows_of(config.hc_count)?, f32),   // HcGates
+        slot(rows_of(max_rotation)?, f32),      // Rotation
+        slot(rows_of(max_projection)?, f32),    // Projection
+        slot(rows_of(max_projection)?, f32),    // Projection2
+        // GdnBf16: also the QSA and hyper-connection BF16 scratch.
+        slot(
+            if has_gdn { gdn_value } else { 0 }
+                .max(hidden)
+                .max(config.hc_lowrank),
+            DType::BF16,
+        ),
+        slot(rows_of(hidden)?, f32), // AttentionOutput
+        slot(rows_of(dims_router_columns(config))?, f32), // RouterLogits
+        slot(rows_of(hidden)?, f32), // MoeXRot
+        slot(rows_of(2 * moe)?, f32), // MoeGateUp
+        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeGate
+        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeUp
+        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeHidden
+        slot(rows_of(hidden)?, f32), // FfnOutput
+        slot(rows_of(hidden)?, f32), // MoeSharedOutput
+        moe_slot(gate_batch),
+        moe_slot(up_batch),
+        moe_slot(rot_batch),
+        slot(route_i32_bytes, DType::Raw), // MoeTopkIndices
+        slot(rows_of(top_k)?, f32),        // MoeTopkWeights
+        moe_slot(down_expanded),
+        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeScalar
+        slot(mul(config.num_experts, i32_bytes)?, DType::Raw),       // MoeExpertTokenCounts
+        slot(mul(config.num_experts + 1, i32_bytes)?, DType::Raw),   // MoeExpertOffsets
+        slot(mul(grouped_bound, i32_bytes)?, DType::Raw),            // MoeSortedSlotIndex
+        slot(mul(grouped_bound / 16, i32_bytes)?, DType::Raw),       // MoeExpertTileIds
+        slot(route_i32_bytes, DType::Raw),                           // MoeInversePerm
+        moe_slot(y_gate_up),
+        moe_slot(y_down),
+    ])?;
+    let gdn_local = if has_gdn {
+        let value_rows = rows_of(gdn_value)?;
+        sum(&[
+            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnA
+            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnB
+            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnGate
+            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnBeta
+            owned(true, slot(value_rows, f32)),                 // GdnRecurrentOutput (view)
+            slot(value_rows, f32),                              // GdnZ
+            slot(value_rows, f32),                              // GdnOutput
+        ])?
+    } else {
+        0
+    };
+    let qsa_local = if has_qsa {
+        let kv_width = mul(config.num_key_value_heads, config.head_dim)?;
+        let selected = mul(mul(rows, config.qsa_selected_capacity())?, i32_bytes)?;
+        sum(&[
+            slot(rows_of(layout.index_width)?, f32), // QsaIndex
+            slot(rows_of(qsa_qgate)?, f32),          // QsaQgate
+            slot(rows_of(kv_width)?, f32),           // QsaK
+            slot(rows_of(kv_width)?, f32),           // QsaV
+            slot(rows_of(q_width)?, f32),            // QsaOutput
+            slot(selected, DType::Raw),              // QsaSelected
+        ])?
+    } else {
+        0
+    };
+    let band_local = gdn_local.checked_add(qsa_local).ok_or_else(overflow)?;
+    let input_only = if scope.input {
+        sum(&[
+            slot(rows_of(i32_bytes)?, DType::Raw),          // TokenIds
+            slot(rows_of(hidden)?, f32),                    // EmbeddingRot
+            slot(rows_of(hidden)?, f32),                    // Embeddings
+            slot(rows_of(ple_embed_dim)?, DType::BF16),     // PleStaged
+            slot(rows_of(ple_embed_dim.max(hidden))?, f32), // PleRows
+            owned(true, slot(rows_of(ple_channels)?, f32)), // PleKey (view)
+            owned(true, slot(rows_of(hidden)?, f32)),       // PleValue (view)
+            owned(true, slot(rows_of(ple_channels)?, f32)), // PleQuery (view)
+            owned(true, slot(rows_of(ple_channels)?, f32)), // PleGated (view)
+            slot(rows_of(ple_channels)?, f32),              // PleNormed (dedicated)
+            owned(true, slot(rows_of(ple_channels)?, f32)), // PleOutput (view)
+        ])?
+    } else {
+        0
+    };
+    let output_only = if scope.output {
+        let logit_row_bytes = config
+            .vocab_size
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(4))
+            .ok_or_else(overflow)?;
+        let spec = crate::gpu_forward::qwen4_spec_logit_rows(rows)
+            .checked_mul(logit_row_bytes)
+            .ok_or_else(overflow)?;
+        slot(config.vocab_size, f32)?
+            .checked_add(u64::try_from(spec).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?
+    } else {
+        0
+    };
+    Ok(ForwardCensus {
+        stage_shared,
+        band_local,
+        input_only,
+        output_only,
+    })
+}
+
+/// `router_columns` of the config's program dims (one placeholder column for
+/// a dense FFN).
+fn dims_router_columns(config: &Qwen4Config) -> usize {
+    crate::gpu_forward::router_columns(crate::gpu_forward::program_dims(config))
+}
+
+/// [`state_census`] for one pipeline-parallel band: the GDN and QSA state of
+/// the band's own layers, the PLE conv history and `hyper_feedback` only on
+/// the input band (`Qwen4State::device_bytes_scoped`), the QSA context of
+/// the band's own QSA layers and the band's own forward scratch
+/// ([`forward_census_scope`]). `Single` equals [`state_census`].
+pub fn state_census_scope(
+    config: &Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+    scope: &Qwen4BandScope,
+) -> Result<StateCensus, String> {
+    scope.validate(config)?;
+    let overflow = |what: &str| format!("reserve census {what} overflows");
+    let qsa_layers = scope
+        .band
+        .clone()
+        .filter(|&layer| {
+            config.layer_types.get(layer) == Some(&crate::config::LayerType::FullAttention)
+        })
+        .count();
+    let qsa_context = context
+        .committed_layer_bytes(config, format.layout())
+        .and_then(|bytes| bytes.checked_mul(qsa_layers))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| overflow("QSA context"))?;
+    let state = crate::state::Qwen4State::device_bytes_scoped(config, format, context, scope)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| overflow("state"))?;
+    let state = state
+        .checked_sub(qsa_context)
+        .ok_or_else(|| overflow("state without its QSA context"))?;
+    let forward = forward_census_scope(config, chunk_rows, mode, scope)?.total()?;
+    Ok(StateCensus {
+        qsa_context,
+        state,
+        forward,
+    })
+}
+
+/// Refuse a pipeline band combined with expert parallelism: PP never reuses
+/// the modulo-rank expert split, so any `ranks > 1` with a band that does not
+/// cover the whole model is an error. `Single` with any rank count passes.
+pub fn refuse_band_with_expert_parallel(
+    config: &Qwen4Config,
+    scope: &Qwen4BandScope,
+    ranks: usize,
+) -> Result<(), String> {
+    let whole = scope.input && scope.output && scope.band == (0..config.num_hidden_layers);
+    if ranks > 1 && !whole {
+        return Err(format!(
+            "pipeline-parallel band {}..{} cannot combine with {ranks}-way expert parallelism",
+            scope.band.start, scope.band.end
+        ));
+    }
+    Ok(())
+}
+
+/// One pipeline-parallel rank's byte census (Single: the whole model). The
+/// weight terms come from the manifest entries the band owns and the same
+/// payload sizes as [`resident_split`]; EP is not involved, no routed expert
+/// is split by rank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BandCensus {
+    pub band: std::ops::Range<usize>,
+    pub input: bool,
+    pub output: bool,
+    /// MoE layers owned: the band's trunk layers plus the MTP layer on output.
+    pub moe_layers: usize,
+    /// Owned resident non-routed payloads (tied aliases and external rows have
+    /// none).
+    pub non_expert_bytes: u64,
+    /// Routed experts of the owned trunk layers, every expert, exact codec bytes.
+    pub routed_trunk_bytes: u64,
+    /// Routed experts of the MTP head's layer (output band only).
+    pub routed_mtp_bytes: u64,
+    /// Routed bytes of the largest single owned trunk layer.
+    pub max_layer_routed_bytes: u64,
+    /// The separately owned materialization of a tied source the source's
+    /// owner also holds (the MTP embedding of `embed_tokens` on an output
+    /// band that is not the input band). Zero for `Single`.
+    pub endpoint_duplicate_bytes: u64,
+    pub f16_shadow_bytes: u64,
+    /// `state.forward` is `forward.total()`.
+    pub state: StateCensus,
+    /// The band's forward scratch by role: the per-stage shared copy is an
+    /// explicit duplicate across ranks, the rest is owned once.
+    pub forward: ForwardCensus,
+}
+
+impl BandCensus {
+    /// Trunk plus MTP routed expert bytes, checked.
+    pub fn routed_bytes(&self) -> Result<u64, String> {
+        self.routed_trunk_bytes
+            .checked_add(self.routed_mtp_bytes)
+            .ok_or_else(|| "band routed-expert byte census overflows".to_string())
+    }
+
+    /// Every resident weight byte of the band: non-expert, routed and the
+    /// endpoint duplicate, checked. Shadows and state are separate terms.
+    pub fn weight_bytes(&self) -> Result<u64, String> {
+        self.routed_bytes()?
+            .checked_add(self.non_expert_bytes)
+            .and_then(|bytes| bytes.checked_add(self.endpoint_duplicate_bytes))
+            .ok_or_else(|| "band weight byte census overflows".to_string())
+    }
+}
+
+/// Byte terms of [`band_weight_census`].
+struct BandWeightBytes {
+    non_expert: u64,
+    trunk: u64,
+    mtp: u64,
+    max_layer: u64,
+    endpoint_duplicate: u64,
+}
+
+/// Owned routed-expert bytes of trunk layers and of the MTP head (exact sums
+/// over the entries' payloads), the owned non-expert bytes, the largest owned
+/// trunk layer's routed bytes and the tied endpoint duplicates, for `scope`.
+/// Sums are checked; `Single` equals [`routed_expert_bytes`] and
+/// [`resident_split`]'s non-expert bytes.
+///
+/// `weights` may be the full manifest or one already filtered to the band
+/// (`Qwen4Manifest::with_band_scope`), which drops a tied source another band
+/// owns. Then the source's payload is requested through `bytes_of` from a
+/// clone of the tied entry renamed to the source with a replicated policy
+/// (same logical shape and dtype): no source is uploaded, the bytes are the
+/// output band's own materialization, counted as an endpoint duplicate and
+/// never as an alias.
+///
+/// A non-`Single` scope refuses expert-sharded entries before any `bytes_of`
+/// call: pipeline bands never reuse the expert-parallel split.
+fn band_weight_census(
+    weights: &[WeightEntry],
+    bytes_of: &impl Fn(&WeightEntry) -> Option<u64>,
+    scope: &Qwen4BandScope,
+) -> Result<BandWeightBytes, String> {
+    if !(scope.input && scope.output)
+        && weights.iter().any(|entry| {
+            matches!(
+                entry.policy,
+                ShardPolicy::ExpertSharded { .. } | ShardPolicy::ExpertTensorSharded { .. }
+            )
+        })
+    {
+        return Err(
+            "pipeline-parallel bands cannot be combined with expert parallelism".to_string(),
+        );
+    }
+    let overflow = |what: &str| format!("band census {what} overflows");
+    let payload = |entry: &WeightEntry| {
+        bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))
+    };
+    let (mut non_expert, mut trunk, mut mtp, mut duplicate) = (0u64, 0u64, 0u64, 0u64);
+    let mut per_layer = std::collections::BTreeMap::<usize, u64>::new();
+    for entry in weights {
+        if entry.residency.is_external() {
+            continue;
+        }
+        if let ShardPolicy::Tied { source } = &entry.policy {
+            if scope.owns_entry(entry) {
+                let origin = weights.iter().find(|candidate| &candidate.name == source);
+                let materialized = match origin {
+                    Some(origin) if scope.owns_entry(origin) => None,
+                    Some(origin) => Some(payload(origin)?),
+                    None => {
+                        let mut request = entry.clone();
+                        request.name = source.clone();
+                        request.policy = ShardPolicy::Replicate;
+                        Some(payload(&request)?)
+                    }
+                };
+                if let Some(bytes) = materialized {
+                    duplicate = duplicate
+                        .checked_add(bytes)
+                        .ok_or_else(|| overflow("endpoint duplicates"))?;
+                }
+            }
+            continue;
+        }
+        if !scope.owns_entry(entry) {
+            continue;
+        }
+        let bytes = payload(entry)?;
+        if !is_routed_expert(&entry.name) {
+            non_expert = non_expert
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("non-expert bytes"))?;
+        } else if entry.name.starts_with("mtp.") {
+            mtp = mtp
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("MTP routed bytes"))?;
+        } else {
+            let layer = entry
+                .layer
+                .ok_or_else(|| format!("routed expert '{}' has no trunk layer", entry.name))?;
+            trunk = trunk
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("trunk routed bytes"))?;
+            let slot = per_layer.entry(layer).or_default();
+            *slot = slot
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("layer routed bytes"))?;
+        }
+    }
+    let max_layer = per_layer.values().copied().max().unwrap_or(0);
+    Ok(BandWeightBytes {
+        non_expert,
+        trunk,
+        mtp,
+        max_layer,
+        endpoint_duplicate: duplicate,
+    })
+}
+
+/// The band-aware byte census of one pipeline-parallel rank, from the
+/// manifest's own entries and the actual state backend: routed bytes (owned
+/// trunk layers; MTP only on output), non-expert bytes, F16 shadows,
+/// [`moe_layer_count_scope`] and [`state_census_scope`]. Expert-parallel
+/// counts are untouched ([`routed_expert_bytes_ranks`] and friends); a band
+/// is validated first and no routed stack is split by rank.
+#[allow(clippy::too_many_arguments)]
+pub fn band_census(
+    config: &Qwen4Config,
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    scope: &Qwen4BandScope,
+    format: crate::Qwen4StateFormat,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Result<BandCensus, String> {
+    scope.validate(config)?;
+    let weights_census = band_weight_census(weights, &bytes_of, scope)?;
+    Ok(BandCensus {
+        band: scope.band.clone(),
+        input: scope.input,
+        output: scope.output,
+        moe_layers: moe_layer_count_scope(config, scope),
+        non_expert_bytes: weights_census.non_expert,
+        routed_trunk_bytes: weights_census.trunk,
+        routed_mtp_bytes: weights_census.mtp,
+        max_layer_routed_bytes: weights_census.max_layer,
+        endpoint_duplicate_bytes: weights_census.endpoint_duplicate,
+        f16_shadow_bytes: f16_shadow_bytes_scope(weights, config.num_hidden_layers, scope)?,
+        state: state_census_scope(config, format, context, chunk_rows, mode, scope)?,
+        forward: forward_census_scope(config, chunk_rows, mode, scope)?,
+    })
+}
+
 /// Name suffixes, below a trunk layer's `model.language_model.layers.{i}.`
 /// prefix, of the BF16 matrices the long-prefill F16 WMMA routes read through
 /// a model-lifetime F16 shadow (`Gpu::ensure_bf16_f16_shadow`, keyed by the
@@ -454,16 +1072,44 @@ const F16_SHADOW_ROOT: &str = "model.language_model.hyper_connection_mixer.input
 /// current warm cache. Entries are the manifest's own, so a profile or dtype
 /// without them (an MQ-quantized trunk) charges nothing.
 pub fn f16_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
+    f16_shadow_bytes_owned(weights, num_layers, |_| true, true)
+}
+
+/// [`f16_shadow_bytes`] for one pipeline-parallel band: only the shadows of
+/// the band's own trunk layers (the PLE projections ride with layer 1 on the
+/// input band), and the final hyper-connection's down mix only on the output
+/// band. `Single` equals [`f16_shadow_bytes`]. The MTP head has no shadows.
+pub fn f16_shadow_bytes_scope(
+    weights: &[WeightEntry],
+    num_layers: usize,
+    scope: &Qwen4BandScope,
+) -> Result<u64, String> {
+    f16_shadow_bytes_owned(
+        weights,
+        num_layers,
+        |layer| scope.owns_layer(layer),
+        scope.output,
+    )
+}
+
+fn f16_shadow_bytes_owned(
+    weights: &[WeightEntry],
+    num_layers: usize,
+    owns_layer: impl Fn(usize) -> bool,
+    owns_root: bool,
+) -> Result<u64, String> {
     use rdna_compute::DType;
     const LAYER_PREFIX: &str = "model.language_model.layers.";
     let shadowed = |name: &str| {
         if name == F16_SHADOW_ROOT {
-            return true;
+            return owns_root;
         }
         name.strip_prefix(LAYER_PREFIX)
             .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(layer, suffix)| {
-                layer.parse::<usize>().is_ok_and(|layer| layer < num_layers)
+                layer
+                    .parse::<usize>()
+                    .is_ok_and(|layer| layer < num_layers && owns_layer(layer))
                     && F16_SHADOW_LAYER_SUFFIXES.contains(&suffix)
             })
     };
@@ -869,6 +1515,13 @@ fn rank_share(entry: &WeightEntry, bytes: u64, rank: usize, ranks: usize) -> Res
 /// MoE layers of the model: the trunk's plus the MTP head's.
 pub fn moe_layer_count(config: &Qwen4Config) -> usize {
     config.num_hidden_layers + usize::from(config.mtp.is_some())
+}
+
+/// MoE layers one pipeline-parallel band owns: its trunk layers, plus the MTP
+/// head's layer only on the output band. `Single` equals [`moe_layer_count`].
+/// Expert-parallel counts never use this: they stay [`moe_layer_count`].
+pub fn moe_layer_count_scope(config: &Qwen4Config, scope: &Qwen4BandScope) -> usize {
+    scope.band.len() + usize::from(scope.output && config.mtp.is_some())
 }
 
 /// How many of the model's MoE layers (trunk first, the MTP layer last) one
@@ -2523,5 +3176,336 @@ mod tests {
         }
         assert!(lines[2].contains(&format!("this rank alone fits {tight}")), "{}", lines[2]);
         assert!(lines[1].contains(&format!("this rank alone fits {roomy}")), "{}", lines[1]);
+    }
+
+    fn band_scopes(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
+        assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
+        let mut start = 0;
+        counts
+            .iter()
+            .map(|&count| {
+                let band = start..start + count;
+                start += count;
+                let scope = Qwen4BandScope {
+                    input: band.start == 0,
+                    output: band.end == config.num_hidden_layers,
+                    band,
+                };
+                scope.validate(config).expect("valid band");
+                scope
+            })
+            .collect()
+    }
+
+    fn census_of(
+        config: &Qwen4Config,
+        weights: &[WeightEntry],
+        scope: &Qwen4BandScope,
+    ) -> BandCensus {
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        band_census(
+            config,
+            weights,
+            element_bytes,
+            scope,
+            target_state_format(),
+            &context,
+            256,
+            Full,
+        )
+        .expect("band census")
+    }
+
+    #[test]
+    fn single_band_census_equals_todays_whole_model_queries() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let single = Qwen4BandScope::single(&config);
+        let census = census_of(&config, weights, &single);
+        let (non_expert, _) = resident_split(weights, element_bytes).unwrap();
+        let routed = routed_expert_bytes(weights, element_bytes).unwrap();
+        assert!(routed > 0 && non_expert > 0);
+        assert_eq!(census.non_expert_bytes, non_expert);
+        assert_eq!(census.routed_bytes(), Ok(routed));
+        assert_eq!(
+            routed_expert_bytes_scope(weights, element_bytes, &single),
+            Ok(routed)
+        );
+        assert_eq!(census.endpoint_duplicate_bytes, 0);
+        assert_eq!(census.moe_layers, moe_layer_count(&config));
+        assert_eq!(
+            moe_layer_count_scope(&config, &single),
+            moe_layer_count(&config)
+        );
+        assert_eq!(
+            census.f16_shadow_bytes,
+            f16_shadow_bytes(weights, config.num_hidden_layers).unwrap()
+        );
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        assert_eq!(
+            census.state,
+            state_census(&config, target_state_format(), &context, 256, Full).unwrap()
+        );
+        assert_eq!(
+            refuse_band_with_expert_parallel(&config, &single, 4),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn pp_band_censuses_sum_to_single_plus_only_the_declared_endpoint_duplicates() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let single = census_of(&config, weights, &Qwen4BandScope::single(&config));
+        let embed = weights
+            .iter()
+            .find(|entry| entry.name == "model.language_model.embed_tokens.weight")
+            .map(|entry| element_bytes(entry).unwrap())
+            .expect("embedding");
+        let layer_bytes = single.routed_trunk_bytes / config.num_hidden_layers as u64;
+        assert!(layer_bytes > 0 && single.routed_mtp_bytes > 0);
+        assert_eq!(single.max_layer_routed_bytes, layer_bytes);
+
+        for counts in [&[24usize, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let scopes = band_scopes(&config, counts);
+            let ranks: Vec<_> = scopes
+                .iter()
+                .map(|scope| census_of(&config, weights, scope))
+                .collect();
+            let sum = |field: fn(&BandCensus) -> u64| ranks.iter().map(field).sum::<u64>();
+            // Trunk experts: every owned layer exactly once, all experts.
+            assert_eq!(
+                sum(|c| c.routed_trunk_bytes),
+                single.routed_trunk_bytes,
+                "{counts:?}"
+            );
+            for (census, count) in ranks.iter().zip(counts) {
+                assert_eq!(census.routed_trunk_bytes, layer_bytes * *count as u64);
+                assert_eq!(census.max_layer_routed_bytes, layer_bytes);
+                assert_eq!(census.band.len(), *count);
+            }
+            // The MTP head's experts and layer only on the output rank.
+            let last = ranks.len() - 1;
+            for (rank, census) in ranks.iter().enumerate() {
+                let mtp = rank == last;
+                assert_eq!(
+                    census.routed_mtp_bytes,
+                    if mtp { single.routed_mtp_bytes } else { 0 }
+                );
+                assert_eq!(census.moe_layers, counts[rank] + usize::from(mtp));
+            }
+            assert_eq!(
+                ranks.iter().map(|c| c.moe_layers).sum::<usize>(),
+                single.moe_layers
+            );
+            assert_eq!(sum(|c| c.routed_mtp_bytes), single.routed_mtp_bytes);
+            assert_eq!(sum(|c| c.non_expert_bytes), single.non_expert_bytes);
+            assert_eq!(sum(|c| c.f16_shadow_bytes), single.f16_shadow_bytes);
+            // The only duplicate is the tied MTP embedding at the output endpoint.
+            assert_eq!(sum(|c| c.endpoint_duplicate_bytes), embed);
+            assert_eq!(ranks[last].endpoint_duplicate_bytes, embed);
+            assert_eq!(
+                ranks.iter().map(|c| c.weight_bytes().unwrap()).sum::<u64>(),
+                single.weight_bytes().unwrap() + embed
+            );
+            // State: owned layers only, PLE and feedback only on the input band.
+            assert_eq!(sum(|c| c.state.qsa_context), single.state.qsa_context);
+            assert_eq!(sum(|c| c.state.state), single.state.state);
+            // Forward scratch: input-only and output-only fields exactly once,
+            // the per-stage shared copy and the GDN/QSA fields on every band
+            // that runs them (every band here has both layer kinds).
+            assert_eq!(sum(|c| c.forward.input_only), single.forward.input_only);
+            assert_eq!(sum(|c| c.forward.output_only), single.forward.output_only);
+            for (rank, census) in ranks.iter().enumerate() {
+                assert_eq!(census.forward.stage_shared, single.forward.stage_shared);
+                assert_eq!(census.forward.band_local, single.forward.band_local);
+                assert_eq!(census.state.forward, census.forward.total().unwrap());
+                assert_eq!(census.forward.input_only == 0, rank != 0);
+                assert_eq!(census.forward.output_only == 0, rank != last);
+            }
+            // Input holds the embedding, output the head: heavier than a middle rank.
+            if ranks.len() > 2 {
+                let middle = &ranks[1];
+                assert!(ranks[0].non_expert_bytes > middle.non_expert_bytes);
+                assert!(ranks[last].non_expert_bytes > middle.non_expert_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn single_forward_census_equals_the_whole_model_forward_bytes() {
+        use crate::config::Qwen4FfnConfig;
+        let dense = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            true,
+            true,
+        );
+        let mut full_seen = 0;
+        for config in [crate::config::compact_test_config(), dense] {
+            let single = Qwen4BandScope::single(&config);
+            for rows in [1usize, 7, 64, 256, 513, 2048, 8192] {
+                for mode in [Full, FnSymGfx1201] {
+                    let scoped = forward_census_scope(&config, rows, mode, &single)
+                        .and_then(|census| census.total())
+                        .ok();
+                    let whole = crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode);
+                    assert_eq!(scoped, whole, "rows {rows} {mode:?}");
+                    full_seen += usize::from(scoped.is_some() && mode == FnSymGfx1201);
+                }
+            }
+        }
+        assert!(
+            full_seen > 0,
+            "the compact plan must be compared at least once"
+        );
+    }
+
+    #[test]
+    fn compact_forward_census_refuses_a_gdn_band_without_a_qsa_owner() {
+        let config = crate::config::compact_test_config();
+        // Layers 0..3 are GDN, the first QSA layer is 3.
+        let gdn_only = Qwen4BandScope {
+            band: 0..3,
+            input: true,
+            output: false,
+        };
+        assert!(forward_census_scope(&config, 256, FnSymGfx1201, &gdn_only).is_err());
+        let full = forward_census_scope(&config, 256, Full, &gdn_only).expect("full plan");
+        assert!(full.band_local > 0 && full.output_only == 0 && full.input_only > 0);
+        let single = forward_census_scope(&config, 256, Full, &Qwen4BandScope::single(&config))
+            .expect("single");
+        // No QSA scratch and a narrower projection than the whole model.
+        assert!(full.band_local < single.band_local && full.stage_shared < single.stage_shared);
+    }
+
+    #[test]
+    fn band_census_of_a_scope_filtered_manifest_equals_the_full_manifests() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let embed = manifest
+            .weights
+            .iter()
+            .find(|entry| entry.name == "model.language_model.embed_tokens.weight")
+            .map(|entry| element_bytes(entry).unwrap())
+            .expect("embedding");
+        for counts in [&[48usize][..], &[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+            for scope in band_scopes(&config, counts) {
+                let scoped = manifest
+                    .clone()
+                    .with_band_scope(&config, &scope)
+                    .expect("scope-filtered manifest");
+                if !scope.input {
+                    // The tied source is gone from the filtered manifest.
+                    assert!(scoped
+                        .weights
+                        .iter()
+                        .all(|entry| entry.name != "model.language_model.embed_tokens.weight"));
+                }
+                let full = census_of(&config, &manifest.weights, &scope);
+                let filtered = census_of(&config, &scoped.weights, &scope);
+                assert_eq!(full, filtered, "{counts:?} band {:?}", scope.band);
+                let duplicate = if scope.output && !scope.input {
+                    embed
+                } else {
+                    0
+                };
+                assert_eq!(
+                    filtered.endpoint_duplicate_bytes, duplicate,
+                    "{:?}",
+                    scope.band
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn band_census_refuses_expert_sharded_entries_for_a_band_but_not_single() {
+        use hipfire_runtime::tp_shard::ExpertAssign;
+        let config = crate::config::compact_test_config();
+        let mut manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let sharded = manifest
+            .weights
+            .iter_mut()
+            .find(|entry| is_routed_expert(&entry.name) && entry.layer == Some(0))
+            .expect("routed expert entry");
+        sharded.policy = ShardPolicy::ExpertSharded {
+            n_experts: config.num_experts,
+            assign: ExpertAssign::Stride,
+        };
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let calls = std::cell::Cell::new(0usize);
+        let counted = |entry: &WeightEntry| {
+            calls.set(calls.get() + 1);
+            element_bytes(entry)
+        };
+        for scope in band_scopes(&config, &[24, 24]) {
+            let error = band_census(
+                &config,
+                &manifest.weights,
+                counted,
+                &scope,
+                target_state_format(),
+                &context,
+                256,
+                Full,
+            )
+            .unwrap_err();
+            assert!(error.contains("expert parallelism"), "{error}");
+            assert!(
+                routed_expert_bytes_scope(&manifest.weights, counted, &scope)
+                    .unwrap_err()
+                    .contains("expert parallelism")
+            );
+        }
+        assert_eq!(calls.get(), 0, "refused before any payload callback");
+        let single = Qwen4BandScope::single(&config);
+        assert!(band_census(
+            &config,
+            &manifest.weights,
+            element_bytes,
+            &single,
+            target_state_format(),
+            &context,
+            256,
+            Full,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn band_census_refuses_a_band_without_the_ple_layer_and_pp_with_ep() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let ple_layer = config.ple.as_ref().expect("PLE profile").layer;
+        let bad = Qwen4BandScope {
+            band: 0..ple_layer,
+            input: true,
+            output: false,
+        };
+        let error = band_census(
+            &config,
+            &manifest.weights,
+            element_bytes,
+            &bad,
+            target_state_format(),
+            &context,
+            256,
+            Full,
+        )
+        .unwrap_err();
+        assert!(error.contains("PLE"), "{error}");
+        let scopes = band_scopes(&config, &[24, 24]);
+        for scope in &scopes {
+            assert_eq!(refuse_band_with_expert_parallel(&config, scope, 1), Ok(()));
+            let error = refuse_band_with_expert_parallel(&config, scope, 2).unwrap_err();
+            assert!(error.contains("expert parallelism"), "{error}");
+        }
     }
 }
