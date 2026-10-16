@@ -20,6 +20,7 @@
 //! 2. Run debug builds to catch silent mis-binds via the bind_thread invariant.
 //! 3. Pass the multi-GPU coherence gate.
 
+pub mod executor;
 pub mod transport;
 use std::ffi::c_void;
 
@@ -186,6 +187,8 @@ pub struct Gpus {
     tp_graph_payload_bytes: usize,
     tp_graph_barrier_count: usize,
     tp_graph_capture_epoch: usize,
+    /// Default-off generic mesh leases; legacy PP/TP/EP never populate this.
+    mesh_execution: executor::MeshExecutionState,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -466,6 +469,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            mesh_execution: Default::default(),
         }
     }
 
@@ -526,6 +530,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            mesh_execution: Default::default(),
         })
     }
 
@@ -579,6 +584,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            mesh_execution: Default::default(),
         })
     }
 
@@ -1711,6 +1717,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            mesh_execution: Default::default(),
         })
     }
 
