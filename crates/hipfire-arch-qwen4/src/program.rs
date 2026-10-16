@@ -1198,8 +1198,9 @@ pub fn qwen4_step_graph(config: &Qwen4Config, route: MeshRoute) -> Result<StepGr
 /// Every op carries `layer: Some(_)` so its pipeline stage never depends on
 /// issue order: the input op is attributed to layer 0 and the head ops to the
 /// last layer, hence the input pin is the band owning layer 0 and the output
-/// pin the band owning the last layer. The wide-hidden capture is not an op
-/// (refused under PP). The graph is the same for every [`MeshRoute`]; row
+/// pin the band owning the last layer. The wide-hidden capture is not an op:
+/// the output band's `forward_mesh_chunk` copies the final streams after the
+/// trunk ops. The graph is the same for every [`MeshRoute`]; row
 /// counts are not part of it (shapes are per row).
 ///
 /// Per layer, in order: `GroupedDepthwise` (PLE layer only), `HyperRead`,

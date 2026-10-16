@@ -1734,11 +1734,10 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // penalized sampled request keeps the MTP route. A penalized
             // greedy request, adaptive KV, or a force-AR switch keeps the
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
-            // Pipeline parallelism (`pp > 1`) is hidden inside the Qwen4
-            // bundle: it never takes the Qwen3.5-only `PipelineParallel`
-            // route, and it runs AR only (native MTP is refused at admission,
-            // and no speculator can demote it onto a spec route).
-            let spec_ok = i.pp <= 1
+            // Qwen4 PP uses the same native driver for greedy, unpenalized
+            // requests. Sampled or penalized requests explicitly keep the PP
+            // AR producer; they never enter the Qwen3.5-only PP route.
+            let spec_ok = (i.pp <= 1 || (i.temp <= 1e-6 && !i.nonneutral_penalties))
                 && i.has_speculator
                 && i.speculator_is_mtp
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
@@ -2434,6 +2433,20 @@ pub fn generate(
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let selected_route = select_generation_route(&route_inputs);
+    if selected_route == GenerationRoute::Qwen4Ar
+        && route_inputs.pp > 1
+        && route_inputs.has_speculator
+        && route_inputs.speculator_is_mtp
+        && (route_inputs.temp > 1e-6 || route_inputs.nonneutral_penalties)
+    {
+        static QWEN4_PP_MTP_AR_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !QWEN4_PP_MTP_AR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[hipfire] PP native MTP is greedy-only; sampled/penalized requests decode AR"
+            );
+        }
+    }
     let tools_nonempty = tools.map(|t| !t.is_empty()).unwrap_or(false);
     if tools_nonempty && !selected_route.supports_tools() {
         crate::dense::emit_active_attempt_error(
@@ -6884,7 +6897,7 @@ mod qwen4_pp_route_tests {
     }
 
     #[test]
-    fn qwen4_mtp_spec_route_is_single_device_only() {
+    fn qwen4_native_greedy_mtp_uses_the_same_route_under_pp() {
         let mut single = inputs(16, 1);
         single.has_speculator = true;
         single.speculator_is_mtp = true;
@@ -6894,9 +6907,18 @@ mod qwen4_pp_route_tests {
             i.pp = pp;
             assert_eq!(
                 select_generation_route(&i),
-                GenerationRoute::Qwen4Ar,
+                GenerationRoute::Qwen4Spec,
                 "pp {pp}"
             );
+            // Sampling-capable Single support does not qualify PP sampling.
+            i.supports_temp_swor = true;
+            i.temp = 0.7;
+            assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
+            i.temp = 0.0;
+            i.nonneutral_penalties = true;
+            assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
+            i.temp = 0.7;
+            assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
         }
     }
 

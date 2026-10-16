@@ -715,14 +715,7 @@ impl Carrier for Qwen4Carrier {
         let ep = hipfire_config::topology::qwen4_ep()?;
         let native_mtp =
             crate::admission::qwen4_native_mtp(ctx.spec, &ctx.gpu.arch, ctx.path, ctx.pp, 1, ep)?;
-        let max_k = ctx
-            .spec
-            .mtp_k
-            .or(hipfire_runtime::config::get().mtp_k)
-            .unwrap_or_else(|| {
-                hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, &ctx.gpu.arch)
-            })
-            .clamp(1, 10);
+        let max_k = qwen4_native_mtp_k(ctx.spec, &ctx.gpu.arch);
         let options = crate::admission::SourceAdmissionOptions {
             spec: ctx.spec,
             kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(ctx.kv_adaptive_override),
@@ -792,40 +785,15 @@ impl Carrier for Qwen4Carrier {
             sequence.card_cap = card_cap;
         }
         let (native_mtp, max_k, max_seq) = (loaded.native_mtp, loaded.max_k, loaded.max_seq);
-        let speculator = if native_mtp {
-            eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
-            let arch = hipfire_arch_qwen4::ARCH_ID;
-            let ngram = match hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
-                hipfire_config::ngram_mod_triple_for_arch(arch, &ctx.gpu.arch),
-            ) {
-                Ok(config) => {
-                    eprintln!(
-                        "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={})",
-                        if hipfire_config::mtp_ngram_enabled_for_arch(arch, &ctx.gpu.arch) {
-                            "on"
-                        } else {
-                            "off"
-                        },
-                        config.n_match,
-                        config.n_min,
-                        config.n_max
-                    );
-                    Some(config)
-                }
-                Err(error) => {
-                    eprintln!("  qwen4 native MTP n-gram: unavailable ({error})");
-                    None
-                }
-            };
-            Some(hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(
+        let speculator = native_mtp.then(|| {
+            qwen4_native_mtp_speculator(
                 max_k,
                 max_seq,
+                &ctx.gpu.arch,
                 meta.tokenizer.special_token_id("<|im_end|>"),
-                ngram,
-            ))
-        } else {
-            None
-        };
+                true,
+            )
+        });
 
         let mut model = LoadedModel {
             state: Some(Box::new(loaded.bundle)),
@@ -839,15 +807,7 @@ impl Carrier for Qwen4Carrier {
                 meta.chat_template,
             )
         };
-        model.mtp_weights_present = native_mtp;
-        if native_mtp {
-            model.mtp_k = max_k;
-            model.mtp_mode = if ctx.spec.mtp == Some(true) {
-                "on".to_string()
-            } else {
-                "auto".to_string()
-            };
-        }
+        apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
         Ok(model)
     }
 
@@ -967,6 +927,100 @@ pub(crate) fn qwen4_ep_option_refusal(
              drop the option or set topology.ep = 1 (HIPFIRE_QWEN4_EP=0)"
         )),
         None => Ok(()),
+    }
+}
+
+/// The native MTP draft window of a Qwen4 load: `speculation.mtp_k`, else the
+/// process config, else the architecture default, clamped to `1..=10`. The one
+/// resolution of the Single and the pipeline-parallel load.
+fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
+    spec.mtp_k
+        .or(hipfire_runtime::config::get().mtp_k)
+        .unwrap_or_else(|| {
+            hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, gpu_arch)
+        })
+        .clamp(1, 10)
+}
+
+/// The generic speculator around the native Qwen4 MTP head, with the load log
+/// lines. `end_of_turn` is the tokenizer's `<|im_end|>` id. `ngram_modifier`
+/// false (a pipeline-parallel load) builds it without an n-gram pool whatever
+/// `speculation.mtp_ngram` resolves to, so no request can arm a takeover.
+fn qwen4_native_mtp_speculator(
+    max_k: usize,
+    max_seq: usize,
+    gpu_arch: &str,
+    end_of_turn: Option<u32>,
+    ngram_modifier: bool,
+) -> Box<dyn hipfire_runtime::spec::Speculator> {
+    eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+    let arch = hipfire_arch_qwen4::ARCH_ID;
+    let ngram = if !ngram_modifier {
+        eprintln!("  qwen4 native MTP n-gram: off (topology.pp)");
+        None
+    } else {
+        match hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
+            hipfire_config::ngram_mod_triple_for_arch(arch, gpu_arch),
+        ) {
+            Ok(config) => {
+                eprintln!(
+                    "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={})",
+                    if hipfire_config::mtp_ngram_enabled_for_arch(arch, gpu_arch) {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    config.n_match,
+                    config.n_min,
+                    config.n_max
+                );
+                Some(config)
+            }
+            Err(error) => {
+                eprintln!("  qwen4 native MTP n-gram: unavailable ({error})");
+                None
+            }
+        }
+    };
+    hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(max_k, max_seq, end_of_turn, ngram)
+}
+
+/// The load's native MTP bookkeeping on its `LoadedModel`.
+fn apply_qwen4_native_mtp(
+    model: &mut LoadedModel,
+    native_mtp: bool,
+    max_k: usize,
+    spec: SpecLoadCfg,
+) {
+    model.mtp_weights_present = native_mtp;
+    if native_mtp {
+        model.mtp_k = max_k;
+        model.mtp_mode = if spec.mtp == Some(true) {
+            "on".to_string()
+        } else {
+            "auto".to_string()
+        };
+    }
+}
+
+/// Whether this rank attaches the native MTP head: every Single / expert
+/// parallel rank when it is on, a pipeline band only when it is the output
+/// band (the head and its experts live there alone).
+fn qwen4_rank_native_mtp(
+    native_mtp: bool,
+    band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
+) -> bool {
+    native_mtp && band.map_or(true, |scope| scope.output)
+}
+
+/// The session cache budget one rank attaches: a pipeline band with native
+/// MTP attaches none (the head's session snapshot is not run on a mesh, so
+/// MTP sessions stay refused); every other rank keeps `configured`.
+fn qwen4_pp_session_budget(pp_native_mtp: bool, configured: u64) -> u64 {
+    if pp_native_mtp {
+        0
+    } else {
+        configured
     }
 }
 
@@ -1531,10 +1585,12 @@ pub fn load_qwen4_rank(
 /// `Qwen4HfqmArtifact::for_band`, the manifest fulfills only the band's
 /// resources on `gpu`, and the bundle is assembled with
 /// `assemble_band_with_ple_rows`. A band attaches its own session cache from
-/// `session`, with no disk tier. Every routed expert of the band is
-/// resident (no host-mapped layers, hot set, MTP head or
-/// automatic context), and the forward scratch plan is the one chosen from
-/// the full manifest so every band agrees.
+/// `session`, with no disk tier (none at all under native MTP). Every routed
+/// expert of the band is resident (no host-mapped layers, hot set or
+/// automatic context); the output band alone attaches the native MTP head
+/// when it is on (`shared.native_mtp`, [`qwen4_rank_native_mtp`]); and the
+/// forward scratch plan is the one chosen from the full manifest so every
+/// band agrees.
 fn load_qwen4_rank_scoped(
     gpu: &mut rdna_compute::Gpu,
     ep: Option<hipfire_arch_qwen4::weights::Qwen4EpPlacement>,
@@ -1558,17 +1614,17 @@ fn load_qwen4_rank_scoped(
         }
     }
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
-    // A band carries a session cache (`session`) like a Single load; the
-    // other Single-only features stay refused.
+    // A band carries a session cache (`session`) like a Single load (except
+    // under native MTP) and the output band the native MTP head; the other
+    // Single-only features stay refused.
     if band.is_some()
         && (ep.is_some()
             || expert_vram_layers.is_some()
-            || shared.native_mtp
             || shared.sequence.is_some()
             || gpu.is_uma())
     {
         return Err(
-            "qwen4: a topology.pp band load admits no expert parallelism, MTP head, \
+            "qwen4: a topology.pp band load admits no expert parallelism, \
              automatic context or unified memory"
                 .into(),
         );
@@ -1643,17 +1699,16 @@ fn load_qwen4_rank_scoped(
     // happen here, before any allocation (source admission applies the
     // same checks).
     let requested_native_mtp = native_mtp;
-    native_mtp = if band.is_some() {
-        false
-    } else {
-        crate::admission::qwen4_native_mtp_for_head(
-            native_mtp,
-            ctx.spec.mtp,
-            receipt.config.mtp.is_some(),
-            receipt.config.profile.id(),
-        )?
-    };
-    if requested_native_mtp && !native_mtp {
+    let head_native_mtp = crate::admission::qwen4_native_mtp_for_head(
+        native_mtp,
+        ctx.spec.mtp,
+        receipt.config.mtp.is_some(),
+        receipt.config.profile.id(),
+    )?;
+    // Only the output band of a PP load attaches the head (and only its
+    // manifest declares the MTP weights it binds).
+    native_mtp = qwen4_rank_native_mtp(head_native_mtp, band);
+    if requested_native_mtp && !head_native_mtp {
         eprintln!(
             "  qwen4 native MTP: off (profile {} has no MTP head)",
             receipt.config.profile.id()
@@ -1800,7 +1855,15 @@ fn load_qwen4_rank_scoped(
             ]));
         domain
     });
-    let session_budget = hipfire_config::memory::session_cache_bytes();
+    let configured_session_budget = hipfire_config::memory::session_cache_bytes();
+    let session_budget =
+        qwen4_pp_session_budget(band.is_some() && head_native_mtp, configured_session_budget);
+    if session_budget != configured_session_budget && band.is_some_and(|scope| scope.output) {
+        eprintln!(
+            "  qwen4 session cache: off under topology.pp with native MTP (MTP session snapshots \
+             are not run on a pipeline mesh; AR sessions are unaffected)"
+        );
+    }
     // An automatic context (omitted max_seq; unified memory only) is
     // sized after load from what is left (card_cap).
     let automatic = ctx.sequence.is_some_and(|sequence| sequence.automatic);
@@ -3051,6 +3114,7 @@ fn load_qwen4_pp_bundle(
     (
         hipfire_arch_qwen4::bundle::Qwen4Bundle,
         hipfire_runtime::multi_gpu::Gpus,
+        bool,
     ),
     String,
 > {
@@ -3060,8 +3124,8 @@ fn load_qwen4_pp_bundle(
     if daemon.is_uma() {
         return Err("qwen4: topology.pp needs discrete GPUs".into());
     }
-    if shared.native_mtp || shared.sequence.is_some() {
-        return Err("qwen4: topology.pp admits no native MTP head and no automatic context".into());
+    if shared.sequence.is_some() {
+        return Err("qwen4: topology.pp admits no automatic context".into());
     }
     // Per-rank free VRAM from the daemon's runtime (no `Gpus`, no allocation):
     // every artifact and capacity refusal below happens before any device
@@ -3150,6 +3214,21 @@ fn load_qwen4_pp_bundle(
                     .map(|(_, bytes)| bytes.len() as u64)
             })
         };
+        // The native MTP reserves (the output band's head and request
+        // buffers, every band's own row capture) exactly when the head
+        // attaches.
+        let native_mtp = crate::admission::qwen4_native_mtp_for_head(
+            shared.native_mtp,
+            shared.spec.mtp,
+            config.mtp.is_some(),
+            config.profile.id(),
+        )?;
+        let native_mtp_inputs = native_mtp.then(|| q4::expert_residency::NativeMtpCensusInputs {
+            max_k: shared.max_k,
+            row_capture: q4::mtp_spec::native_mtp_row_capture(daemon, &config)
+                .then_some(state_format.gdn),
+            batched_fill: q4::mtp_spec::native_mtp_fill_scratch(daemon),
+        });
         let fits =
             crate::admission::qwen4_pp_band_budget(&crate::admission::Qwen4PpBudgetInputs {
                 config: &config,
@@ -3162,14 +3241,20 @@ fn load_qwen4_pp_bundle(
                 mode: scratch_mode,
                 free_per_rank: &free_per_rank,
                 reserve_bytes,
+                native_mtp: native_mtp_inputs,
             })?;
         for fit in &fits {
             eprintln!(
-                "  qwen4 PP rank {}: layers {:?} need {} MiB of {} MiB free",
+                "  qwen4 PP rank {}: layers {:?} need {} MiB of {} MiB free{}",
                 fit.stage,
                 fit.band,
                 fit.required >> 20,
-                fit.free >> 20
+                fit.free >> 20,
+                if native_mtp {
+                    format!(" (incl. {} MiB native MTP)", fit.native_mtp >> 20)
+                } else {
+                    String::new()
+                }
             );
         }
         let edge_bytes = crate::admission::qwen4_pp_edge_max_bytes(&config, chunk_rows)?;
@@ -3179,6 +3264,7 @@ fn load_qwen4_pp_bundle(
     gpus.provision_mesh_edges(admitted, placement, edge_bytes)
         .map_err(|error| format!("qwen4: topology.pp edge provisioning failed: {error}"))?;
     let mut bands: Vec<q4::bundle::Qwen4Bundle> = Vec::with_capacity(stages);
+    let mut output_native_mtp = false;
     let mut admitted_source = Some(src);
     for stage in 0..stages {
         let source = match admitted_source.take() {
@@ -3197,7 +3283,10 @@ fn load_qwen4_pp_bundle(
             )
         });
         match loaded {
-            Ok(load) => bands.push(load.bundle),
+            Ok(load) => {
+                output_native_mtp = load.native_mtp;
+                bands.push(load.bundle);
+            }
             Err(error) => {
                 return Err(abort_qwen4_pp_load(
                     gpus,
@@ -3215,7 +3304,7 @@ fn load_qwen4_pp_bundle(
     );
     let mut root = bands.pop().expect("a PP load has at least two bands");
     match root.attach_pp_mesh(&mut gpus, bands, placement.clone()) {
-        Ok(()) => Ok((root, gpus)),
+        Ok(()) => Ok((root, gpus, output_native_mtp)),
         Err(error) => {
             // The holder is installed before validation, so the root's own
             // teardown drains the epochs and edges and frees every band. A
@@ -3300,6 +3389,14 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             "qwen4: topology.pp has no automatic context sizing; set memory.max_seq".into(),
         );
     }
+    let native_mtp =
+        crate::admission::qwen4_native_mtp(ctx.spec, &ctx.gpu.arch, ctx.path, pp, 1, ep)?;
+    crate::admission::qwen4_pp_mtp_ngram_refusal(
+        pp,
+        native_mtp,
+        hipfire_config::mtp_ngram_enabled(),
+    )?;
+    let max_k = qwen4_native_mtp_k(ctx.spec, &ctx.gpu.arch);
     let meta = resolve_source_meta(&src, ctx.path)?;
     let shared = Qwen4RankShared {
         path: ctx.path.to_string(),
@@ -3310,8 +3407,8 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         kv_mode: kv_mode_from_ctx(ctx),
         state_quant: ctx.state_quant_override.map(str::to_string),
         spec: ctx.spec,
-        native_mtp: false,
-        max_k: 1,
+        native_mtp,
+        max_k,
     };
     // Every band attaches its own session cache from the source model's
     // tokenizer and template (the same seed the Single load takes).
@@ -3319,10 +3416,21 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         tokenizer: &meta.tokenizer,
         chat_template: meta.chat_template.as_deref(),
     });
-    let (bundle, gpus) = load_qwen4_pp_bundle(ctx.gpu, admitted, placement, &shared, session, src)?;
+    let (bundle, gpus, native_mtp) =
+        load_qwen4_pp_bundle(ctx.gpu, admitted, placement, &shared, session, src)?;
     let max_seq = ctx.max_seq;
-    Ok(LoadedModel {
+    let speculator = native_mtp.then(|| {
+        qwen4_native_mtp_speculator(
+            max_k,
+            max_seq,
+            &ctx.gpu.arch,
+            meta.tokenizer.special_token_id("<|im_end|>"),
+            false,
+        )
+    });
+    let mut model = LoadedModel {
         state: Some(Box::new(bundle)),
+        speculator,
         pp,
         pp_gpus: Some(gpus),
         ..LoadedModel::skeleton(
@@ -3333,7 +3441,9 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             ctx.path.to_string(),
             meta.chat_template,
         )
-    })
+    };
+    apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
+    Ok(model)
 }
 
 // ─── Qwen35Carrier ───────────────────────────────────────────────────
@@ -6710,5 +6820,48 @@ mod qwen4_pp_session_tests {
             qwen4_session_disk_tier(false, PathBuf::from("/cache"), 0),
             Some((PathBuf::from("/cache"), 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_native_mtp_tests {
+    use super::{qwen4_pp_session_budget, qwen4_rank_native_mtp};
+    use hipfire_arch_qwen4::weights::Qwen4BandScope;
+
+    fn band(band: std::ops::Range<usize>, input: bool, output: bool) -> Qwen4BandScope {
+        Qwen4BandScope {
+            band,
+            input,
+            output,
+        }
+    }
+
+    #[test]
+    fn only_the_output_band_attaches_the_head() {
+        let (first, middle, last) = (
+            band(0..16, true, false),
+            band(16..32, false, false),
+            band(32..48, false, true),
+        );
+        // Single and expert-parallel ranks (no band) follow the flag.
+        assert!(qwen4_rank_native_mtp(true, None));
+        assert!(!qwen4_rank_native_mtp(false, None));
+        for scope in [&first, &middle] {
+            assert!(!qwen4_rank_native_mtp(true, Some(scope)));
+            assert!(!qwen4_rank_native_mtp(false, Some(scope)));
+        }
+        assert!(qwen4_rank_native_mtp(true, Some(&last)));
+        // An AR load attaches no head anywhere.
+        assert!(!qwen4_rank_native_mtp(false, Some(&last)));
+        // A whole-model band (the Single scope) is its own output band.
+        assert!(qwen4_rank_native_mtp(true, Some(&band(0..48, true, true))));
+    }
+
+    #[test]
+    fn native_mtp_pp_attaches_no_session_cache_and_ar_keeps_its_budget() {
+        for configured in [0u64, 1 << 30, 8 << 30] {
+            assert_eq!(qwen4_pp_session_budget(false, configured), configured);
+            assert_eq!(qwen4_pp_session_budget(true, configured), 0);
+        }
     }
 }

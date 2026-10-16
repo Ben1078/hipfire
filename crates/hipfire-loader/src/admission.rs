@@ -228,10 +228,11 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
-/// Under expert parallelism (`ep` > 1) the head is attached only on an explicit
-/// request: `Some(true)` admits it (the drafter is replicated on every rank),
-/// while `auto` (`None`) and `Some(false)` stay AR, so the EP default and
-/// flag-off bytes are unchanged.
+/// Under expert parallelism (`ep` > 1) and pipeline parallelism (`pp` > 1) the
+/// head is attached only on an explicit request: `Some(true)` admits it (EP:
+/// the drafter is replicated on every rank; PP: the output band owns the one
+/// head), while `auto` (`None`) and `Some(false)` stay AR, so the EP/PP
+/// default and flag-off bytes are unchanged.
 pub(crate) fn qwen4_native_mtp(
     spec: SpecLoadCfg,
     gpu_arch: &str,
@@ -240,18 +241,7 @@ pub(crate) fn qwen4_native_mtp(
     tp: usize,
     ep: usize,
 ) -> Result<bool, String> {
-    if pp > 1 {
-        // Native MTP is refused under pipeline parallelism: `auto` stays AR
-        // (the head is never loaded), an explicit request is refused.
-        return match spec.mtp {
-            Some(true) => Err(qwen4_pp_unsupported(
-                pp,
-                "native MTP (speculation.mtp = on)",
-            )),
-            _ => Ok(false),
-        };
-    }
-    if ep > 1 {
+    if pp > 1 || ep > 1 {
         return Ok(spec.mtp == Some(true));
     }
     let retained = hipfire_runtime::config::retained_redline_default(
@@ -480,12 +470,6 @@ pub fn qwen4_request_admission(
         return Err(format!(
             "qwen4: only pp=1, tp=1 with expert-parallel ep in 1..=8, or tp=1, ep=1 with pipeline-parallel pp in 2..=8 is admitted (pp={}, tp={}, ep={})",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
-        ));
-    }
-    if effective_mesh.pp > 1 && native_mtp {
-        return Err(qwen4_pp_unsupported(
-            effective_mesh.pp,
-            "native MTP (speculation.mtp = on)",
         ));
     }
     Ok(())
@@ -1865,6 +1849,26 @@ pub fn parse_mesh_transport(raw: Option<&str>) -> Result<EdgeTransportPolicy, St
     }
 }
 
+/// The MTP n-gram modifier does not run on a pipeline mesh. With native MTP
+/// on, an explicit request for it (`speculation.mtp_ngram = on`, i.e.
+/// `hipfire_config::mtp_ngram_enabled()`) refuses before any allocation;
+/// `auto` and `off` are accepted and the load builds the speculator without
+/// an n-gram pool (`auto` would arm it on gfx1201, so the PP default is
+/// pinned off). Inert without native MTP. `pp <= 1` never refuses.
+pub(crate) fn qwen4_pp_mtp_ngram_refusal(
+    pp: usize,
+    native_mtp: bool,
+    explicit_on: bool,
+) -> Result<(), String> {
+    if pp > 1 && native_mtp && explicit_on {
+        return Err(qwen4_pp_unsupported(
+            pp,
+            "the MTP n-gram modifier (speculation.mtp_ngram = on; leave it auto or off)",
+        ));
+    }
+    Ok(())
+}
+
 /// Features the Qwen4 PP route does not run, refused from the load options
 /// before any source, device or cache work. `pp <= 1` never refuses.
 pub(crate) fn qwen4_pp_option_refusal(
@@ -1877,7 +1881,6 @@ pub(crate) fn qwen4_pp_option_refusal(
     }
     let spec = options.spec;
     let unsupported = [
-        (spec.mtp == Some(true), "native MTP (speculation.mtp = on)"),
         (draft_path.is_some() || spec.dflash == Some(true), "DFlash"),
         (spec.dspark == Some(true), "DSpark"),
         (spec.ngram_draft == Some(true), "n-gram drafting"),
@@ -2218,6 +2221,7 @@ pub fn admit_source_with_options(
         let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
         crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
         qwen4_pp_option_refusal(pp, draft_path, &options)?;
+        qwen4_pp_mtp_ngram_refusal(pp, native_mtp, hipfire_config::mtp_ngram_enabled())?;
         carrier.admit_options(draft_path, options)?;
         if let Some(refusal) = qwen4_ep_geometry_refusal(
             ep,
@@ -3333,10 +3337,8 @@ mod tests {
         }
         for pp in 2..=8 {
             assert_eq!(admit(pp, 1, 1, false), Ok(()), "pp {pp}");
-            assert!(
-                admit(pp, 1, 1, true).unwrap_err().contains("topology.pp"),
-                "pp {pp}"
-            );
+            // Native MTP is admitted on the mesh (the output band owns the head).
+            assert_eq!(admit(pp, 1, 1, true), Ok(()), "pp {pp}");
         }
         for (pp, tp, ep) in [(1, 2, 1), (2, 1, 2), (1, 2, 4), (2, 2, 1), (9, 1, 1)] {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
@@ -5595,11 +5597,6 @@ mod qwen4_pp_admission_tests {
     fn unsupported_load_options_are_refused_under_pp_only() {
         let cases: Vec<(&str, Option<&str>, SourceAdmissionOptions)> = vec![
             (
-                "native MTP",
-                None,
-                options_with(|o| o.spec.mtp = Some(true)),
-            ),
-            (
                 "DFlash",
                 Some("draft.hfq"),
                 SourceAdmissionOptions::default(),
@@ -5659,13 +5656,14 @@ mod qwen4_pp_admission_tests {
     }
 
     #[test]
-    fn native_mtp_is_ar_under_pp_and_an_explicit_request_refuses() {
+    fn native_mtp_under_pp_is_explicit_only_and_ar_otherwise() {
         let with = |mtp| SpecLoadCfg {
             mtp,
             ..SpecLoadCfg::default()
         };
         for pp in [2usize, 6, 8] {
             for arch in ["gfx1100", "gfx1201"] {
+                // `auto` and `off` keep the explicit AR default.
                 assert_eq!(
                     qwen4_native_mtp(with(None), arch, "m/fn.mq4", pp, 1, 1),
                     Ok(false)
@@ -5674,9 +5672,15 @@ mod qwen4_pp_admission_tests {
                     qwen4_native_mtp(with(Some(false)), arch, "m/fn.mq4", pp, 1, 1),
                     Ok(false)
                 );
-                let error =
-                    qwen4_native_mtp(with(Some(true)), arch, "m/fn.mq4", pp, 1, 1).unwrap_err();
-                assert!(error.contains(&format!("topology.pp = {pp}")), "{error}");
+                // An explicit request attaches the output band's head, also
+                // for a `.mq4r` name (no retained route exists under PP).
+                for path in ["m/fn.mq4", "m/fn.mq4r"] {
+                    assert_eq!(
+                        qwen4_native_mtp(with(Some(true)), arch, path, pp, 1, 1),
+                        Ok(true),
+                        "{arch} pp {pp} {path}"
+                    );
+                }
             }
         }
         // Single is unchanged.
@@ -5684,14 +5688,94 @@ mod qwen4_pp_admission_tests {
             qwen4_native_mtp(with(None), "gfx1151", "m/qwen3.8-flash-next.mq4", 1, 1, 1),
             Ok(true)
         );
-        // The request boundary refuses MTP on a PP mesh independently.
-        let pp2 = hipfire_arch_qwen4::EffectiveMesh::new(2, 1, 1);
-        assert!(qwen4_request_admission(pp2, InputModality::Text, false).is_ok());
-        let error = qwen4_request_admission(pp2, InputModality::Text, true).unwrap_err();
-        assert!(error.contains("topology.pp = 2"), "{error}");
+        // The request boundary admits MTP on a PP mesh and still refuses the
+        // meshes it never admitted.
+        for pp in 2..=8usize {
+            let mesh = hipfire_arch_qwen4::EffectiveMesh::new(pp, 1, 1);
+            assert!(qwen4_request_admission(mesh, InputModality::Text, false).is_ok());
+            assert!(qwen4_request_admission(mesh, InputModality::Text, true).is_ok());
+        }
         for (pp, tp, ep) in [(2, 2, 1), (2, 1, 2), (9, 1, 1)] {
             let mesh = hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep);
             assert!(qwen4_request_admission(mesh, InputModality::Text, false).is_err());
+            assert!(qwen4_request_admission(mesh, InputModality::Text, true).is_err());
+        }
+    }
+
+    #[test]
+    fn pp_mtp_ngram_refusal_truth_table() {
+        for pp in [1usize, 2, 8] {
+            for native_mtp in [false, true] {
+                for explicit_on in [false, true] {
+                    let result = qwen4_pp_mtp_ngram_refusal(pp, native_mtp, explicit_on);
+                    if pp > 1 && native_mtp && explicit_on {
+                        // Only an explicit `on` next to native MTP on a mesh refuses.
+                        let error = result.unwrap_err();
+                        assert!(
+                            error.contains(&format!("topology.pp = {pp}"))
+                                && error.contains("n-gram"),
+                            "pp {pp}: {error}"
+                        );
+                    } else {
+                        // Single, AR (native MTP off) and `auto`/`off` are untouched.
+                        assert_eq!(
+                            result,
+                            Ok(()),
+                            "pp {pp} native {native_mtp} explicit {explicit_on}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_speculator_stays_refused_next_to_pp_native_mtp() {
+        // Native MTP alone is admitted under PP; each other speculation
+        // mechanism still refuses, also when native MTP is requested too.
+        let mtp = options_with(|o| o.spec.mtp = Some(true));
+        assert_eq!(qwen4_pp_option_refusal(2, None, &mtp), Ok(()));
+        let refused: Vec<(&str, Option<&str>, SourceAdmissionOptions)> = vec![
+            ("DFlash", Some("draft.hfq"), mtp),
+            (
+                "DFlash",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.dflash = Some(true);
+                }),
+            ),
+            (
+                "DSpark",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.dspark = Some(true);
+                }),
+            ),
+            (
+                "n-gram drafting",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.ngram_draft = Some(true);
+                }),
+            ),
+            (
+                "DDTree",
+                None,
+                options_with(|o| {
+                    o.spec.mtp = Some(true);
+                    o.spec.ddtree_budget = Some(1);
+                }),
+            ),
+        ];
+        for (name, draft, options) in refused {
+            let error = qwen4_pp_option_refusal(4, draft, &options).unwrap_err();
+            assert!(
+                error.contains("topology.pp = 4") && error.contains(name),
+                "{name}: {error}"
+            );
         }
     }
 
@@ -5860,10 +5944,38 @@ mod qwen4_pp_admission_tests {
             )
             .unwrap_err();
             assert!(error.contains("config admission failed"), "{error}");
+            // An explicit native MTP request is admitted under PP too: it
+            // reaches the source's own validation instead of a PP refusal.
+            let error = admit(
+                &path,
+                1,
+                2,
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        mtp: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("config admission failed") && !error.contains("topology.pp"),
+                "{error}"
+            );
             // Every refusal precedes it and names topology.pp.
             for options in [
                 SourceAdmissionOptions {
                     spec: SpecLoadCfg {
+                        dflash: Some(true),
+                        mtp: Some(true),
+                        ..defaults
+                    },
+                    ..Default::default()
+                },
+                SourceAdmissionOptions {
+                    spec: SpecLoadCfg {
+                        dspark: Some(true),
                         mtp: Some(true),
                         ..defaults
                     },

@@ -3075,6 +3075,31 @@ pub fn generate_dflash(
         return true;
     }
 
+    // Qwen4 pipeline parallelism runs native greedy MTP on the mesh only (no
+    // n-gram takeover, DFlash/DSpark or sampled verify); anything else is
+    // refused here, before the prompt plan or any state mutation. Handled
+    // (true): the caller must not also emit an AR response.
+    let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
+    if pp_mesh {
+        let native_drafter = m
+            .speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .is_some_and(|any| any.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+        if let Some(refusal) = qwen4_pp_spec_refusal(
+            spec_name,
+            native_drafter,
+            temp,
+            m.pp_gpus.is_some(),
+            m.eviction.is_some(),
+            false,
+        ) {
+            emit_active_attempt_error(stdout, Some(id), &refusal, "validation", false, false);
+            let _ = stdout.flush();
+            return true;
+        }
+    }
+
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
     // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
@@ -3475,8 +3500,9 @@ pub fn generate_dflash(
     // longest of the live state (this conversation's previous turn) and a
     // cold-exact session snapshot.
     if qwen4_native_mtp {
-        // Native MTP never reuses a session under pipeline parallelism (MTP
-        // itself is refused there); `plan_qwen4_session` returns 0 for a mesh.
+        // Native MTP never reuses a session under pipeline parallelism (its
+        // sessions are not distributed); `plan_qwen4_session` returns 0 for a
+        // mesh on the MTP route.
         let start = plan_qwen4_session(m, &prompt_tokens, SessionRoute::Mtp);
         trace_qwen4_session_plan(
             SessionRoute::Mtp,
@@ -3541,6 +3567,7 @@ pub fn generate_dflash(
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
+                && !pp_mesh
                 && hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, &gpu.arch),
             repeat_penalty,
             repeat_window,
@@ -4092,6 +4119,35 @@ pub fn generate_spec(
             return None;
         }
     };
+    // Qwen4 pipeline parallelism runs native greedy MTP on the mesh only;
+    // every other speculative request is refused before any state mutation.
+    let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
+    if pp_mesh {
+        let native_drafter = m
+            .speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .is_some_and(|any| any.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+        if let Some(refusal) = qwen4_pp_spec_refusal(
+            m.speculator.as_ref().map_or("", |s| s.name()),
+            native_drafter,
+            temp,
+            m.pp_gpus.is_some(),
+            m.eviction.is_some(),
+            resume_from.is_some(),
+        ) {
+            crate::ar::emit_active_route_error(
+                stdout,
+                Some(id),
+                &refusal,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return None;
+        }
+    }
     // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
     // (`m.model_path` is a disjoint field → no borrow conflict with the
     // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
@@ -4119,6 +4175,10 @@ pub fn generate_spec(
         }
     };
     let spec = m.speculator.as_mut().unwrap();
+    // The mesh's `Gpus` (disjoint from the target guard and the speculator),
+    // present exactly when the request runs on the pipeline-parallel mesh.
+    let mut pp: Option<&mut hipfire_runtime::multi_gpu::Gpus> =
+        if pp_mesh { m.pp_gpus.as_mut() } else { None };
 
     // Divergent-render RESUME: restore the drafter-local + target recurrent
     // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the
@@ -4145,13 +4205,14 @@ pub fn generate_spec(
             // Partial GPU restore must not continue with host checkpoint
             // coordinates. Fail-closed: live rollback + one correlated error.
             let msg = format!("rewind_to: {e}");
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -4258,8 +4319,10 @@ pub fn generate_spec(
             return None;
         }
     };
-    let prefill_outcome = spec.prefill(
+    let prefill_outcome = spec_prefill(
+        pp.as_deref_mut(),
         gpu,
+        spec.as_mut(),
         slot,
         &prompt_tokens,
         &prefill_tokens,
@@ -4272,13 +4335,14 @@ pub fn generate_spec(
         Ok(PrefillOutcome::Ready { first_token }) => first_token,
         Ok(PrefillOutcome::Aborted) => {
             // Fail-closed cancel: reset+sync first; terminal follows attestation.
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -4287,13 +4351,14 @@ pub fn generate_spec(
         }
         Err(e) => {
             let msg = format!("prefill: {}", e);
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -4304,21 +4369,25 @@ pub fn generate_spec(
 
     // serve-fault-inject: fire after prefill mutated GPU/KV/recurrent and
     // before first_token begin / any visible event. Host fields only —
-    // guard holds m.state; spec holds m.speculator.
+    // guard holds m.state; spec holds m.speculator. The hooks are qwen35
+    // only (arch 5 | 6) and roll back on the daemon GPU, so a Qwen4 pipeline
+    // mesh never takes them: its rollbacks all go through `spec_rollback_live`.
     #[cfg(feature = "serve-fault-inject")]
-    if maybe_inject_fault_after_prefill_dflash(
-        arch_id,
-        &mut m.seq_pos,
-        &mut m.conversation_tokens,
-        &mut m.prefill_checkpoints,
-        &mut m.dflash_checkpoints,
-        &mut m.asst_turn_cache,
-        gpu,
-        stdout,
-        id,
-        slot,
-        spec.as_mut(),
-    ) {
+    if pp.is_none()
+        && maybe_inject_fault_after_prefill_dflash(
+            arch_id,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+            stdout,
+            id,
+            slot,
+            spec.as_mut(),
+        )
+    {
         drop(guard);
         return None;
     }
@@ -4329,19 +4398,21 @@ pub fn generate_spec(
     // fail-closed terminal. Consumes the same `test_fault_after_first_decode`
     // arm the AR loop consults at `ar.rs:4249` — no new mechanism.
     #[cfg(feature = "serve-fault-inject")]
-    if maybe_inject_fault_after_first_decode_dflash(
-        arch_id,
-        &mut m.seq_pos,
-        &mut m.conversation_tokens,
-        &mut m.prefill_checkpoints,
-        &mut m.dflash_checkpoints,
-        &mut m.asst_turn_cache,
-        gpu,
-        stdout,
-        id,
-        slot,
-        spec.as_mut(),
-    ) {
+    if pp.is_none()
+        && maybe_inject_fault_after_first_decode_dflash(
+            arch_id,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            gpu,
+            stdout,
+            id,
+            slot,
+            spec.as_mut(),
+        )
+    {
         drop(guard);
         return None;
     }
@@ -4350,7 +4421,10 @@ pub fn generate_spec(
     // (and any decode capture/record): map the target's context for the
     // whole `max_tokens` budget plus the speculator's draft rows. Best
     // effort; the target logs and swallows a failure (on-demand growth).
-    slot.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, spec.block_size());
+    // A pipeline-parallel mesh maps its own per-band contexts.
+    if pp.is_none() {
+        slot.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, spec.block_size());
+    }
     let t_prefill = Instant::now();
 
     // Per-token emission (EosFilter byte stream + grammar + think force-close +
@@ -4391,13 +4465,14 @@ pub fn generate_spec(
             // otherwise the next turn LCPs against a dirty GPU
             // (audit-Dflash Broken 4).
             let msg = format!("make_spec_emitter: {e}");
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -4458,13 +4533,14 @@ pub fn generate_spec(
             Some(kv) => ev.maybe_evict(gpu, kv, position),
             None => {
                 let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
                     &mut m.asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec.as_mut(),
                 );
@@ -4498,13 +4574,14 @@ pub fn generate_spec(
                         },
                     ) {
                         let _ = classify_evict_failure_wire();
-                        let ep = production_fail_closed_rollback_live(
+                        let ep = spec_rollback_live(
                             &mut m.seq_pos,
                             &mut m.conversation_tokens,
                             &mut m.prefill_checkpoints,
                             &mut m.dflash_checkpoints,
                             &mut m.asst_turn_cache,
                             gpu,
+                            pp.as_deref_mut(),
                             slot,
                             spec.as_mut(),
                         );
@@ -4524,13 +4601,14 @@ pub fn generate_spec(
             Ok(None) => {}
             Err(e) => {
                 let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
                     &mut m.asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec.as_mut(),
                 );
@@ -4600,6 +4678,7 @@ pub fn generate_spec(
                 &mut pending_seed_committable,
                 emit.as_mut(),
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
                 stdout,
@@ -4644,13 +4723,14 @@ pub fn generate_spec(
         // worth of wasted work.
         if check_abort(id) {
             // Mid-decode cancel: reset+sync first; terminal follows attestation.
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -4664,7 +4744,14 @@ pub fn generate_spec(
         // the VMM driver instead of making the peer wait. Greedy requests
         // only: this path reseeds and substitutes AR, which a sampled
         // speculative request must never undergo.
-        if promo_shape_ok && pending_seed_committable && semantic_stop.is_none() && m.eviction.is_none() {
+        // Pipeline parallelism never promotes: lanes and the VMM driver are
+        // single-card owners.
+        if promo_shape_ok
+            && pp.is_none()
+            && pending_seed_committable
+            && semantic_stop.is_none()
+            && m.eviction.is_none()
+        {
             // Qwen4 (Flash-Next): the running singleton moves into an exact
             // lane — trunk/head/draft states and the drafter's pending hidden
             // — and the daemon drives it in `drive_qwen4_lane_batch`.
@@ -4903,8 +4990,10 @@ pub fn generate_spec(
         );
         let window_seed = seed_token;
         let mtp_outer_t0 = std::time::Instant::now();
-        let step = match spec.step(
+        let step = match spec_step(
+            pp.as_deref_mut(),
             gpu,
+            spec.as_mut(),
             slot,
             position,
             seed_token,
@@ -4917,13 +5006,14 @@ pub fn generate_spec(
             Err(e) => {
                 // Authoritative failure: reset+sync first, then one correlated
                 // error; no finish/calls/cache/done (return None before epilogue).
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
                     &mut m.asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec.as_mut(),
                 );
@@ -5088,8 +5178,10 @@ pub fn generate_spec(
             // the replayed consumed prefix, with the last consumed token
             // pending for the normal terminal flush / forced advance — the
             // exact state a Realign or terminal reset would reconstruct.
-            let repaired = match spec.repair_terminal_prefix(
+            let repaired = match spec_repair_terminal_prefix(
+                pp.as_deref_mut(),
                 gpu,
+                spec.as_mut(),
                 slot,
                 position_before,
                 window_seed,
@@ -5097,13 +5189,14 @@ pub fn generate_spec(
             ) {
                 Ok(repaired) => repaired,
                 Err(e) => {
-                    let ep = production_fail_closed_rollback_live(
+                    let ep = spec_rollback_live(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
                         &mut m.dflash_checkpoints,
                         &mut m.asst_turn_cache,
                         gpu,
+                        pp.as_deref_mut(),
                         slot,
                         spec.as_mut(),
                     );
@@ -5141,23 +5234,17 @@ pub fn generate_spec(
             // live state via the target's terminal reset and conversation-LCP
             // invalidation at turn end. Qwen4's durable session snapshots
             // remain available for the next request.
-            let reset_error = slot
-                .reset_after_unrepaired_terminal(gpu)
-                .err()
-                .map(|e| format!("reset_after_unrepaired_terminal: {e}"))
-                .or_else(|| {
-                    spec.reset_for_realign(gpu)
-                        .err()
-                        .map(|e| format!("spec.reset_for_realign: {e}"))
-                });
+            let reset_error =
+                spec_reset_for_realign(pp.as_deref_mut(), gpu, spec.as_mut(), slot, true);
             if let Some(msg) = reset_error {
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
                     &mut m.asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec.as_mut(),
                 );
@@ -5186,13 +5273,14 @@ pub fn generate_spec(
                 compact_offset,
                 m.eviction.is_some(),
             ) {
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
                     &mut m.asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec.as_mut(),
                 );
@@ -5200,23 +5288,17 @@ pub fn generate_spec(
                 drop(guard);
                 return None;
             }
-            let reset_error = slot
-                .reset_recurrent(gpu)
-                .err()
-                .map(|e| format!("reset_recurrent: {e}"))
-                .or_else(|| {
-                    spec.reset_for_realign(gpu)
-                        .err()
-                        .map(|e| format!("spec.reset_for_realign: {e}"))
-                });
+            let reset_error =
+                spec_reset_for_realign(pp.as_deref_mut(), gpu, spec.as_mut(), slot, false);
             if let Some(msg) = reset_error {
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
                     &mut m.prefill_checkpoints,
                     &mut m.dflash_checkpoints,
                     &mut m.asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec.as_mut(),
                 );
@@ -5232,8 +5314,10 @@ pub fn generate_spec(
                 return None;
             }
             let id_for_realign = id.to_string();
-            let realign = spec.prefill(
+            let realign = spec_prefill(
+                pp.as_deref_mut(),
                 gpu,
+                spec.as_mut(),
                 slot,
                 &plan.replay,
                 &plan.replay,
@@ -5252,13 +5336,14 @@ pub fn generate_spec(
                 }
                 Ok(PrefillOutcome::Aborted) => {
                     // One cancel terminal only — classified by rollback attestation.
-                    let ep = production_fail_closed_rollback_live(
+                    let ep = spec_rollback_live(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
                         &mut m.dflash_checkpoints,
                         &mut m.asst_turn_cache,
                         gpu,
+                        pp.as_deref_mut(),
                         slot,
                         spec.as_mut(),
                     );
@@ -5267,13 +5352,14 @@ pub fn generate_spec(
                 }
                 Err(e) => {
                     let msg = format!("spec_prefix_realign: {e}");
-                    let ep = production_fail_closed_rollback_live(
+                    let ep = spec_rollback_live(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
                         &mut m.dflash_checkpoints,
                         &mut m.asst_turn_cache,
                         gpu,
+                        pp.as_deref_mut(),
                         slot,
                         spec.as_mut(),
                     );
@@ -5308,6 +5394,7 @@ pub fn generate_spec(
                 &mut pending_seed_committable,
                 emit.as_mut(),
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
                 stdout,
@@ -5350,13 +5437,14 @@ pub fn generate_spec(
                 Some(kv) => ev.maybe_evict(gpu, kv, position),
                 None => {
                     let _ = classify_evict_failure_wire();
-                    let ep = production_fail_closed_rollback_live(
+                    let ep = spec_rollback_live(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
                         &mut m.dflash_checkpoints,
                         &mut m.asst_turn_cache,
                         gpu,
+                        pp.as_deref_mut(),
                         slot,
                         spec.as_mut(),
                     );
@@ -5385,13 +5473,14 @@ pub fn generate_spec(
                             },
                         ) {
                             let _ = classify_evict_failure_wire();
-                            let ep = production_fail_closed_rollback_live(
+                            let ep = spec_rollback_live(
                                 &mut m.seq_pos,
                                 &mut m.conversation_tokens,
                                 &mut m.prefill_checkpoints,
                                 &mut m.dflash_checkpoints,
                                 &mut m.asst_turn_cache,
                                 gpu,
+                                pp.as_deref_mut(),
                                 slot,
                                 spec.as_mut(),
                             );
@@ -5411,13 +5500,14 @@ pub fn generate_spec(
                 Ok(None) => {}
                 Err(e) => {
                     let _ = classify_evict_failure_wire();
-                    let ep = production_fail_closed_rollback_live(
+                    let ep = spec_rollback_live(
                         &mut m.seq_pos,
                         &mut m.conversation_tokens,
                         &mut m.prefill_checkpoints,
                         &mut m.dflash_checkpoints,
                         &mut m.asst_turn_cache,
                         gpu,
+                        pp.as_deref_mut(),
                         slot,
                         spec.as_mut(),
                     );
@@ -5462,13 +5552,14 @@ pub fn generate_spec(
         let tx = spec_terminal_pending_seed_tx(seed_token);
         if check_abort(id) {
             let _ = classify_forced_gpu_advance(true);
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -5485,7 +5576,15 @@ pub fn generate_spec(
                 false
             }
         };
-        let flush_res = match spec.on_forced_advance(gpu, slot, &tx.commit, position, &abort_cb) {
+        let flush_res = match spec_forced_advance(
+            pp.as_deref_mut(),
+            gpu,
+            spec.as_mut(),
+            slot,
+            &tx.commit,
+            position,
+            &abort_cb,
+        ) {
             Ok(true) => Ok(()),
             Ok(false) => match slot.spec_advance(gpu, &tx.commit, position, false, &abort_cb, None)
             {
@@ -5499,13 +5598,14 @@ pub fn generate_spec(
             Err(e) => Err(e),
         };
         if let Err(e) = flush_res {
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -5518,13 +5618,14 @@ pub fn generate_spec(
             classify_forced_gpu_advance(abort_observed),
             ForcedGpuAdvanceKind::Cancelled
         ) {
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
             );
@@ -5565,13 +5666,14 @@ pub fn generate_spec(
     let mut fail_closed_rollback = None;
     if grammar_violated {
         eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
-        fail_closed_rollback = Some(production_fail_closed_rollback_live(
+        fail_closed_rollback = Some(spec_rollback_live(
             &mut m.seq_pos,
             &mut m.conversation_tokens,
             &mut m.prefill_checkpoints,
             &mut m.dflash_checkpoints,
             &mut m.asst_turn_cache,
             gpu,
+            pp.as_deref_mut(),
             slot,
             spec.as_mut(),
         ));
@@ -7654,6 +7756,7 @@ pub fn apply_spec_forced_pending_seed(
     pending_seed_committable: &mut bool,
     emit: &mut dyn SpecEmit,
     gpu: &mut rdna_compute::Gpu,
+    mut pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     slot: &mut dyn SpecTarget,
     spec: &mut dyn Speculator,
     stdout: &mut impl std::io::Write,
@@ -7704,13 +7807,14 @@ pub fn apply_spec_forced_pending_seed(
     // Physical-cap admission on the exact commit slice (actual tx.commit.len()).
     // Reject before any GPU write. Capacity failure is fail-closed ErrorOnly.
     if !spec_forced_commit_admits(*position, tx.commit.len(), physical_cap, eviction.is_some()) {
-        let ep = production_fail_closed_rollback_live(
+        let ep = spec_rollback_live(
             seq_pos,
             conversation_tokens,
             prefill_checkpoints,
             dflash_checkpoints,
             asst_turn_cache,
             gpu,
+            pp.as_deref_mut(),
             slot,
             spec,
         );
@@ -7736,13 +7840,14 @@ pub fn apply_spec_forced_pending_seed(
     // the staged forced tokens (fail-closed discards the whole turn).
     if check_abort(id) {
         let _ = classify_forced_gpu_advance(true);
-        let ep = production_fail_closed_rollback_live(
+        let ep = spec_rollback_live(
             seq_pos,
             conversation_tokens,
             prefill_checkpoints,
             dflash_checkpoints,
             asst_turn_cache,
             gpu,
+            pp.as_deref_mut(),
             slot,
             spec,
         );
@@ -7770,7 +7875,15 @@ pub fn apply_spec_forced_pending_seed(
     let forced_res = if tx.commit.is_empty() {
         Ok(())
     } else {
-        match spec.on_forced_advance(gpu, slot, &tx.commit, *position, &abort_cb) {
+        match spec_forced_advance(
+            pp.as_deref_mut(),
+            gpu,
+            spec,
+            slot,
+            &tx.commit,
+            *position,
+            &abort_cb,
+        ) {
             Ok(true) => Ok(()),
             Ok(false) => {
                 match slot.spec_advance(gpu, &tx.commit, *position, false, &abort_cb, None) {
@@ -7788,13 +7901,14 @@ pub fn apply_spec_forced_pending_seed(
     if let Err(e) = forced_res {
         // Authoritative failure: reset+sync first, then one correlated error;
         // no finish/calls/cache/done. Staged outcomes are discarded.
-        let ep = production_fail_closed_rollback_live(
+        let ep = spec_rollback_live(
             seq_pos,
             conversation_tokens,
             prefill_checkpoints,
             dflash_checkpoints,
             asst_turn_cache,
             gpu,
+            pp.as_deref_mut(),
             slot,
             spec,
         );
@@ -7806,13 +7920,14 @@ pub fn apply_spec_forced_pending_seed(
         classify_forced_gpu_advance(abort_observed),
         ForcedGpuAdvanceKind::Cancelled
     ) {
-        let ep = production_fail_closed_rollback_live(
+        let ep = spec_rollback_live(
             seq_pos,
             conversation_tokens,
             prefill_checkpoints,
             dflash_checkpoints,
             asst_turn_cache,
             gpu,
+            pp.as_deref_mut(),
             slot,
             spec,
         );
@@ -7829,13 +7944,14 @@ pub fn apply_spec_forced_pending_seed(
             Some(kv) => ev.maybe_evict(gpu, kv, post_position),
             None => {
                 let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     seq_pos,
                     conversation_tokens,
                     prefill_checkpoints,
                     dflash_checkpoints,
                     asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec,
                 );
@@ -7862,13 +7978,14 @@ pub fn apply_spec_forced_pending_seed(
                         },
                     ) {
                         let _ = classify_evict_failure_wire();
-                        let ep = production_fail_closed_rollback_live(
+                        let ep = spec_rollback_live(
                             seq_pos,
                             conversation_tokens,
                             prefill_checkpoints,
                             dflash_checkpoints,
                             asst_turn_cache,
                             gpu,
+                            pp.as_deref_mut(),
                             slot,
                             spec,
                         );
@@ -7888,13 +8005,14 @@ pub fn apply_spec_forced_pending_seed(
             Ok(None) => {}
             Err(e) => {
                 let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
+                let ep = spec_rollback_live(
                     seq_pos,
                     conversation_tokens,
                     prefill_checkpoints,
                     dflash_checkpoints,
                     asst_turn_cache,
                     gpu,
+                    pp.as_deref_mut(),
                     slot,
                     spec,
                 );
@@ -7912,13 +8030,14 @@ pub fn apply_spec_forced_pending_seed(
         // Pending seed requires a legal next write slot after eviction.
         if post_position >= physical_cap {
             let _ = classify_evict_failure_wire();
-            let ep = production_fail_closed_rollback_live(
+            let ep = spec_rollback_live(
                 seq_pos,
                 conversation_tokens,
                 prefill_checkpoints,
                 dflash_checkpoints,
                 asst_turn_cache,
                 gpu,
+                pp.as_deref_mut(),
                 slot,
                 spec,
             );
@@ -9766,6 +9885,309 @@ fn qwen4_bundle_and_mesh(
         (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
     })?;
     Some((bundle, model.pp_gpus.as_mut()))
+}
+
+/// Why a Qwen4 speculative request cannot run on the pipeline-parallel mesh
+/// (`None` = it can). Only native greedy MTP reaches the mesh, on the model's
+/// own `Gpus`, without eviction or a divergent-render resume; everything else
+/// is refused before any state mutation.
+fn qwen4_pp_spec_refusal(
+    spec_name: &str,
+    native_drafter: bool,
+    temp: f32,
+    has_gpus: bool,
+    evicting: bool,
+    resumes: bool,
+) -> Option<String> {
+    if spec_name != "mtp" || !native_drafter {
+        return Some(format!(
+            "qwen4 topology.pp supports native MTP speculation only; `{spec_name}` is refused"
+        ));
+    }
+    if !(temp.is_finite() && temp <= 1.0e-6) {
+        return Some(format!(
+            "qwen4 topology.pp native MTP is greedy only; a sampled request (temp {temp}) is refused"
+        ));
+    }
+    if !has_gpus {
+        return Some("qwen4 topology.pp native MTP has no admitted Gpus owner".to_string());
+    }
+    if evicting {
+        return Some("qwen4 topology.pp native MTP does not support KV eviction".to_string());
+    }
+    if resumes {
+        return Some(
+            "qwen4 topology.pp native MTP does not support a checkpoint resume".to_string(),
+        );
+    }
+    None
+}
+
+#[cfg(test)]
+mod qwen4_pp_spec_refusal_tests {
+    use super::qwen4_pp_spec_refusal;
+
+    #[test]
+    fn greedy_native_mtp_with_gpus_is_admitted() {
+        assert_eq!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn other_speculators_and_foreign_drafters_are_refused() {
+        for name in ["dflash", "dspark", "ngram", ""] {
+            assert!(qwen4_pp_spec_refusal(name, true, 0.0, true, false, false).is_some());
+        }
+        assert!(qwen4_pp_spec_refusal("mtp", false, 0.0, true, false, false).is_some());
+    }
+
+    #[test]
+    fn sampled_requests_are_refused() {
+        for temp in [0.7, 1.0e-3, f32::NAN, f32::INFINITY] {
+            assert!(qwen4_pp_spec_refusal("mtp", true, temp, true, false, false).is_some());
+        }
+    }
+
+    #[test]
+    fn missing_gpus_eviction_and_resume_are_refused() {
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, true, true, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true).is_some());
+    }
+}
+
+/// The typed native-MTP drafter and the Qwen4 bundle behind the generic
+/// speculator/target seams, for the mesh entries (`Gpus` is passed alongside).
+fn qwen4_pp_mtp_parts<'a>(
+    spec: &'a mut dyn Speculator,
+    slot: &'a mut dyn SpecTarget,
+) -> Result<
+    (
+        &'a mut hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter,
+        &'a mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    ),
+    String,
+> {
+    let drafter = spec
+        .drafter_any_mut()
+        .and_then(|any| any.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+        .ok_or_else(|| "qwen4 topology.pp speculator is not the native MTP drafter".to_string())?;
+    let bundle = slot
+        .as_any_mut()
+        .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        .ok_or_else(|| "qwen4 topology.pp spec target is not a Qwen4 bundle".to_string())?;
+    Ok((drafter, bundle))
+}
+
+/// [`production_fail_closed_rollback_live`] for the spec loop: the mesh form
+/// (all-band reset plus the drafter's) on a pipeline-parallel Qwen4 model, the
+/// single-GPU form otherwise.
+#[allow(clippy::too_many_arguments)]
+fn spec_rollback_live(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> RollbackEpilogue {
+    match pp {
+        Some(gpus) => production_fail_closed_rollback_live_pp(
+            seq_pos,
+            conversation_tokens,
+            prefill_checkpoints,
+            dflash_checkpoints,
+            asst_turn_cache,
+            gpus,
+            slot,
+            spec,
+        ),
+        None => production_fail_closed_rollback_live(
+            seq_pos,
+            conversation_tokens,
+            prefill_checkpoints,
+            dflash_checkpoints,
+            asst_turn_cache,
+            gpu,
+            slot,
+            spec,
+        ),
+    }
+}
+
+/// `Speculator::prefill` of the spec loop, on the mesh for a pipeline-parallel
+/// Qwen4 model. The mesh form mirrors `MtpSpeculator::prefill`: a cache hit
+/// fills the suffix from `prefill_start`, a miss fills the whole prompt.
+#[allow(clippy::too_many_arguments)]
+fn spec_prefill(
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    gpu: &mut rdna_compute::Gpu,
+    spec: &mut dyn Speculator,
+    slot: &mut dyn SpecTarget,
+    prompt_tokens: &[u32],
+    prefill_tokens: &[u32],
+    prefill_start: usize,
+    cache_hit: bool,
+    resume_from: Option<usize>,
+    abort: &dyn Fn() -> bool,
+) -> Result<PrefillOutcome, String> {
+    let Some(gpus) = pp else {
+        return spec.prefill(
+            gpu,
+            slot,
+            prompt_tokens,
+            prefill_tokens,
+            prefill_start,
+            cache_hit,
+            resume_from,
+            abort,
+        );
+    };
+    let (drafter, bundle) = qwen4_pp_mtp_parts(spec, slot)?;
+    let (fill_tokens, start_pos): (&[u32], usize) = if cache_hit {
+        (prefill_tokens, prefill_start)
+    } else {
+        (prompt_tokens, 0)
+    };
+    drafter
+        .pp_mtp_prefill(
+            gpus,
+            bundle,
+            prompt_tokens,
+            fill_tokens,
+            start_pos,
+            cache_hit,
+            abort,
+        )
+        .map(|first_token| PrefillOutcome::Ready { first_token })
+}
+
+/// `Speculator::step` of the spec loop, on the mesh for a pipeline-parallel
+/// Qwen4 model. The mesh form mirrors `MtpSpeculator::step`: the draft budget
+/// is `min(proposal_capacity, max_emit - 1)`, the target's EOS bounds the
+/// window and the window lowers through the same `window_to_spec_step`.
+#[allow(clippy::too_many_arguments)]
+fn spec_step(
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    gpu: &mut rdna_compute::Gpu,
+    spec: &mut dyn Speculator,
+    slot: &mut dyn SpecTarget,
+    position: usize,
+    seed: u32,
+    emitted: &[u32],
+    grammar: Option<&mut dyn hipfire_runtime::spec::SpecGrammar>,
+    temp: f32,
+    max_emit: usize,
+) -> Result<hipfire_runtime::spec::SpecStep, String> {
+    let Some(gpus) = pp else {
+        return spec.step(gpu, slot, position, seed, emitted, grammar, temp, max_emit);
+    };
+    if max_emit == 0 {
+        return Err("MtpSpeculator: max_emit=0 (no remaining output budget)".to_string());
+    }
+    let eos = slot.eos_token();
+    let (drafter, bundle) = qwen4_pp_mtp_parts(spec, slot)?;
+    let k = max_emit
+        .saturating_sub(1)
+        .min(hipfire_runtime::spec::MtpDrafter::proposal_capacity(
+            &*drafter,
+        ));
+    let window = drafter.pp_mtp_step(gpus, bundle, position, seed, emitted, k, eos)?;
+    Ok(hipfire_arch_qwen4::mtp_spec::window_to_spec_step(window)?.cap_emit(max_emit))
+}
+
+/// `Speculator::on_forced_advance` of the spec loop, on the mesh for a
+/// pipeline-parallel Qwen4 model. The mesh drafter always advances the target
+/// itself: `Ok(false)` would send the caller to the single-card
+/// `spec_advance`, which a mesh bundle cannot run, so it is an error here.
+fn spec_forced_advance(
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    gpu: &mut rdna_compute::Gpu,
+    spec: &mut dyn Speculator,
+    slot: &mut dyn SpecTarget,
+    tokens: &[u32],
+    start_pos: usize,
+    abort: &dyn Fn() -> bool,
+) -> Result<bool, String> {
+    let Some(gpus) = pp else {
+        return spec.on_forced_advance(gpu, slot, tokens, start_pos, abort);
+    };
+    let (drafter, bundle) = qwen4_pp_mtp_parts(spec, slot)?;
+    match drafter.pp_mtp_forced_advance(gpus, bundle, tokens, start_pos, abort)? {
+        true => Ok(true),
+        false => Err(
+            "qwen4 topology.pp native MTP forced advance was not handled by the drafter"
+                .to_string(),
+        ),
+    }
+}
+
+/// `Speculator::repair_terminal_prefix` of the spec loop, on the mesh for a
+/// pipeline-parallel Qwen4 model (`Ok(false)` leaves the caller on its reset
+/// or realign path).
+fn spec_repair_terminal_prefix(
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    gpu: &mut rdna_compute::Gpu,
+    spec: &mut dyn Speculator,
+    slot: &mut dyn SpecTarget,
+    window_start: usize,
+    window_seed: u32,
+    consumed: &[u32],
+) -> Result<bool, String> {
+    let Some(gpus) = pp else {
+        return spec.repair_terminal_prefix(gpu, slot, window_start, window_seed, consumed);
+    };
+    let (drafter, bundle) = qwen4_pp_mtp_parts(spec, slot)?;
+    drafter.pp_mtp_repair_terminal_prefix(gpus, bundle, window_start, window_seed, consumed)
+}
+
+/// The target reset plus the drafter's realign reset the spec loop runs after
+/// an unrepaired terminal (`after_terminal`) or before a prefix-realign
+/// replay; the first failure's message, if any. On the mesh both are the
+/// all-band reset (a Qwen4 target's terminal reset is its ordinary reset).
+fn spec_reset_for_realign(
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    gpu: &mut rdna_compute::Gpu,
+    spec: &mut dyn Speculator,
+    slot: &mut dyn SpecTarget,
+    after_terminal: bool,
+) -> Option<String> {
+    let label = if after_terminal {
+        "reset_after_unrepaired_terminal"
+    } else {
+        "reset_recurrent"
+    };
+    let Some(gpus) = pp else {
+        let target = if after_terminal {
+            slot.reset_after_unrepaired_terminal(gpu)
+        } else {
+            slot.reset_recurrent(gpu)
+        };
+        return target.err().map(|e| format!("{label}: {e}")).or_else(|| {
+            spec.reset_for_realign(gpu)
+                .err()
+                .map(|e| format!("spec.reset_for_realign: {e}"))
+        });
+    };
+    let (drafter, bundle) = match qwen4_pp_mtp_parts(spec, slot) {
+        Ok(parts) => parts,
+        Err(error) => return Some(error),
+    };
+    bundle
+        .pp_reset(gpus)
+        .err()
+        .map(|e| format!("{label}: {e}"))
+        .or_else(|| {
+            drafter
+                .pp_mtp_reset_for_realign(gpus, bundle)
+                .err()
+                .map(|e| format!("spec.reset_for_realign: {e}"))
+        })
 }
 
 #[cfg(test)]

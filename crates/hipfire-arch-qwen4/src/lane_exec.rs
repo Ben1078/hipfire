@@ -941,7 +941,7 @@ fn forward_inner(
         state.row_capture_armed = true;
         let ticket = crate::mtp_lanes::lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
         match ticket {
-            Ok(ticket) => window.target_ticket = Some(ticket),
+            Ok(ticket) => window.target_ticket = Some(crate::mtp_spec::TargetTicket::Local(ticket)),
             Err(error) => {
                 state.row_capture_armed = false;
                 return Err(format!("target snapshot of {:?}: {error}", e.r.epoch));

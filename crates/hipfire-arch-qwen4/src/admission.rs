@@ -578,11 +578,6 @@ pub enum AdmissionError {
     UnsupportedModality(InputModality),
     UnsupportedCapability(Qwen4Capability),
     NonSingleMesh(EffectiveMesh),
-    /// A feature the pipeline-parallel (`topology.pp`) route does not run.
-    PipelineUnsupported {
-        pp: usize,
-        feature: &'static str,
-    },
     UnsupportedFormat(Qwen4ArtifactFormat),
     WrongGeometry {
         component: &'static str,
@@ -627,10 +622,6 @@ impl fmt::Display for AdmissionError {
                 f,
                 "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in 1..=8, or tp=1, ep=1 with pipeline-parallel pp in 2..=8 is admitted (pp={}, tp={}, ep={})",
                 mesh.pp, mesh.tp, mesh.ep
-            ),
-            Self::PipelineUnsupported { pp, feature } => write!(
-                f,
-                "qwen4 admission: pipeline parallelism (topology.pp = {pp}) does not support {feature}"
             ),
             Self::UnsupportedFormat(format) => {
                 write!(f, "qwen4 admission: unsupported artifact format {format:?}")
@@ -722,12 +713,6 @@ impl Qwen4Admission {
         }
         if !request.effective_mesh.is_qwen4_admitted() {
             return Err(AdmissionError::NonSingleMesh(request.effective_mesh));
-        }
-        if request.effective_mesh.pp > 1 && request.native_mtp {
-            return Err(AdmissionError::PipelineUnsupported {
-                pp: request.effective_mesh.pp,
-                feature: "native MTP",
-            });
         }
         if !request.artifact.format.is_hfqm() {
             return Err(AdmissionError::UnsupportedFormat(
@@ -864,8 +849,9 @@ pub struct Qwen4PpBudgetInputs<'a> {
     pub config: &'a Qwen4Config,
     /// The admitted placement (`BandPlacement::with_first_band_min(2)`).
     pub placement: &'a hipfire_runtime::mesh_placement::BandPlacement,
-    /// `manifest.weights`; `mtp.*` entries are ignored (MTP is refused under
-    /// PP, so the output band's MTP and head reserves are 0).
+    /// `manifest.weights`, the whole manifest. The output band's `mtp.*` head
+    /// entries (experts, projections, the tied embedding's materialization)
+    /// are counted: the band loads them whether or not the head attaches.
     pub weights: &'a [hipfire_runtime::weight_manifest::WeightEntry],
     pub bytes_of: &'a dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
     pub format: crate::Qwen4StateFormat,
@@ -876,6 +862,10 @@ pub struct Qwen4PpBudgetInputs<'a> {
     /// Free VRAM by LOGICAL rank (`AdmittedMesh::ranks` order).
     pub free_per_rank: &'a [u64],
     pub reserve_bytes: u64,
+    /// The native MTP request, `None` for an AR load (no MTP reserve and no
+    /// row capture on any band): the output band charges the head and its
+    /// request buffers, every band its own row capture.
+    pub native_mtp: Option<crate::expert_residency::NativeMtpCensusInputs>,
 }
 
 /// One rank's admitted budget line.
@@ -883,8 +873,11 @@ pub struct Qwen4PpBudgetInputs<'a> {
 pub struct Qwen4PpRankFit {
     pub stage: usize,
     pub band: std::ops::Range<usize>,
-    /// Weights + F16 shadows + QSA context + state + forward scratch + reserve.
+    /// Weights + F16 shadows + QSA context + state + forward scratch + native
+    /// MTP + reserve.
     pub required: u64,
+    /// The native MTP term of `required` (0 for an AR load).
+    pub native_mtp: u64,
     pub free: u64,
 }
 
@@ -901,37 +894,37 @@ pub fn qwen4_pp_band_budget(i: &Qwen4PpBudgetInputs<'_>) -> Result<Vec<Qwen4PpRa
             i.free_per_rank.len()
         ));
     }
-    let weights: Vec<_> = i
-        .weights
-        .iter()
-        .filter(|entry| !entry.name.starts_with("mtp."))
-        .cloned()
-        .collect();
     let overflow = || format!("{prefix}: band budget overflows");
     let mut fits = Vec::with_capacity(stages);
     let mut failures = Vec::new();
     for stage in 0..stages {
         let scope = Qwen4BandScope::from_placement(i.config, i.placement, stage)
             .map_err(|error| format!("{prefix}: {error}"))?;
-        let census = crate::expert_residency::band_census(
+        let census = crate::expert_residency::band_census_native_mtp(
             i.config,
-            &weights,
+            i.weights,
             |entry| (i.bytes_of)(entry),
             &scope,
             i.format,
             i.context,
             i.chunk_rows,
             i.mode,
+            i.native_mtp.as_ref(),
         )
         .map_err(|error| format!("{prefix}: rank {stage}: {error}"))?;
         let weight_bytes = census
             .weight_bytes()
             .map_err(|e| format!("{prefix}: {e}"))?;
+        let native_mtp = census
+            .mtp
+            .reserve()
+            .map_err(|e| format!("{prefix}: rank {stage}: {e}"))?;
         let required = [
             census.f16_shadow_bytes,
             census.state.qsa_context,
             census.state.state,
             census.state.forward,
+            native_mtp,
             i.reserve_bytes,
         ]
         .into_iter()
@@ -940,7 +933,7 @@ pub fn qwen4_pp_band_budget(i: &Qwen4PpBudgetInputs<'_>) -> Result<Vec<Qwen4PpRa
         let free = i.free_per_rank[stage];
         if required > free {
             failures.push(format!(
-                "rank {stage} (layers {}..{}) needs {required} bytes ({weight_bytes} weights + {} F16 shadows + {} QSA context + {} state + {} forward scratch + {} reserve) but {free} bytes are free (short by {})",
+                "rank {stage} (layers {}..{}) needs {required} bytes ({weight_bytes} weights + {} F16 shadows + {} QSA context + {} state + {} forward scratch + {native_mtp} native MTP + {} reserve) but {free} bytes are free (short by {})",
                 scope.band.start,
                 scope.band.end,
                 census.f16_shadow_bytes,
@@ -955,6 +948,7 @@ pub fn qwen4_pp_band_budget(i: &Qwen4PpBudgetInputs<'_>) -> Result<Vec<Qwen4PpRa
             stage,
             band: scope.band,
             required,
+            native_mtp,
             free,
         });
     }
@@ -1196,30 +1190,20 @@ mod tests {
                 Err(AdmissionError::NonSingleMesh(_))
             ));
         }
-        // Pure pipeline parallelism is admitted for AR at pp 2..=8 only.
+        // Pure pipeline parallelism is admitted at pp 2..=8 only, AR and
+        // native MTP alike (the output band attaches the one head).
         for pp in 2..=8 {
             let mesh = EffectiveMesh::new(pp, 1, 1);
             assert!(mesh.is_qwen4_admitted() && mesh.is_pipeline() && !mesh.is_single());
             let admitted = admit(mesh, false).expect("PP AR admitted");
             assert_eq!(admitted.effective_mesh.pp, pp);
             assert!(!admitted.native_mtp);
-            assert_eq!(
-                admit(mesh, true),
-                Err(AdmissionError::PipelineUnsupported {
-                    pp,
-                    feature: "native MTP"
-                })
-            );
+            let admitted = admit(mesh, true).expect("PP native MTP admitted");
+            assert_eq!(admitted.effective_mesh.pp, pp);
+            assert!(admitted.native_mtp && admitted.capabilities.native_mtp);
         }
         assert!(!EffectiveMesh::single().is_pipeline());
         assert!(!EffectiveMesh::new(1, 1, 4).is_pipeline());
-        let message = admit(EffectiveMesh::new(3, 1, 1), true)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            message.contains("topology.pp = 3") && message.contains("native MTP"),
-            "{message}"
-        );
         // Native MTP is admitted on every admitted mesh: under EP the drafter
         // is replicated on every rank.
         assert!(admit(EffectiveMesh::single(), true).is_ok());
@@ -1370,6 +1354,7 @@ mod tests {
 
     mod pp_budget {
         use super::*;
+        use crate::expert_residency::NativeMtpCensusInputs;
         use crate::gpu_forward::Qwen4ForwardScratchMode::Full;
         use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
         use hipfire_runtime::mesh_placement::BandPlacement;
@@ -1391,6 +1376,16 @@ mod tests {
             placement: &BandPlacement,
             free: &[u64],
         ) -> Result<Vec<Qwen4PpRankFit>, String> {
+            budget_mtp(config, weights, placement, free, None)
+        }
+
+        fn budget_mtp(
+            config: &Qwen4Config,
+            weights: &[WeightEntry],
+            placement: &BandPlacement,
+            free: &[u64],
+            native_mtp: Option<NativeMtpCensusInputs>,
+        ) -> Result<Vec<Qwen4PpRankFit>, String> {
             let context = crate::Qwen4ContextCommit::legacy(1024);
             qwen4_pp_band_budget(&Qwen4PpBudgetInputs {
                 config,
@@ -1408,6 +1403,7 @@ mod tests {
                 mode: Full,
                 free_per_rank: free,
                 reserve_bytes: QWEN4_PP_RESERVE_BYTES,
+                native_mtp,
             })
         }
 
@@ -1442,7 +1438,9 @@ mod tests {
         }
 
         #[test]
-        fn mtp_entries_never_charge_a_pipeline_rank() {
+        fn the_output_rank_counts_the_mtp_heads_weights_even_for_ar() {
+            // The output band loads its `mtp.*` entries whether or not the
+            // head attaches, so an AR budget counts them on that rank only.
             let config = crate::config::compact_test_config();
             let manifest = crate::weights::Qwen4Manifest::build(&config).unwrap();
             assert!(manifest.weights.iter().any(|e| e.name.starts_with("mtp.")));
@@ -1453,9 +1451,67 @@ mod tests {
                 .cloned()
                 .collect();
             let placement = placement(&[24, 24]);
-            assert_eq!(
-                budget(&config, &manifest.weights, &placement, &[u64::MAX; 2]),
-                budget(&config, &without, &placement, &[u64::MAX; 2]),
+            let with = budget(&config, &manifest.weights, &placement, &[u64::MAX; 2]).unwrap();
+            let without = budget(&config, &without, &placement, &[u64::MAX; 2]).unwrap();
+            assert_eq!(with[0], without[0]);
+            assert!(with[1].required > without[1].required);
+            assert!(with.iter().all(|fit| fit.native_mtp == 0));
+        }
+
+        #[test]
+        fn native_mtp_charges_the_head_on_the_output_rank_and_capture_on_every_rank() {
+            let config = crate::config::compact_test_config();
+            let manifest = crate::weights::Qwen4Manifest::build(&config).unwrap();
+            let placement = placement(&[9, 8, 8, 8, 8, 7]);
+            let gdn = crate::GdnStateFormat::Q8;
+            let mtp = NativeMtpCensusInputs {
+                max_k: 3,
+                row_capture: Some(gdn),
+                batched_fill: false,
+            };
+            let free = [u64::MAX; 6];
+            let ar = budget(&config, &manifest.weights, &placement, &free).unwrap();
+            let on = budget_mtp(&config, &manifest.weights, &placement, &free, Some(mtp)).unwrap();
+            let capture = |band: &std::ops::Range<usize>| {
+                let gdn_layers = band
+                    .clone()
+                    .filter(|&layer| {
+                        config.layer_types[layer] == crate::config::LayerType::LinearAttention
+                    })
+                    .count();
+                crate::state::Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, gdn_layers)
+                    .unwrap() as u64
+            };
+            for (stage, (ar, on)) in ar.iter().zip(&on).enumerate() {
+                // The whole MTP term, and nothing else, is the difference.
+                assert_eq!(on.required - ar.required, on.native_mtp, "rank {stage}");
+                assert_eq!(ar.native_mtp, 0);
+                if stage + 1 < 6 {
+                    // A rank without the head pays its own capture alone.
+                    assert_eq!(on.native_mtp, capture(&on.band), "rank {stage}");
+                } else {
+                    assert!(on.native_mtp > capture(&on.band));
+                }
+            }
+            // A byte short on the output rank alone refuses, naming the term.
+            let mut exact: Vec<u64> = on.iter().map(|fit| fit.required).collect();
+            assert!(budget_mtp(&config, &manifest.weights, &placement, &exact, Some(mtp)).is_ok());
+            exact[5] -= 1;
+            let error =
+                budget_mtp(&config, &manifest.weights, &placement, &exact, Some(mtp)).unwrap_err();
+            assert!(
+                error.contains("rank 5 (layers 41..48)")
+                    && error.contains("native MTP")
+                    && error.contains("short by 1")
+                    && !error.contains("rank 4"),
+                "{error}"
+            );
+            // The same free memory does not fit once MTP is on where the AR
+            // budget fit it exactly.
+            let ar_exact: Vec<u64> = ar.iter().map(|fit| fit.required).collect();
+            assert!(budget(&config, &manifest.weights, &placement, &ar_exact).is_ok());
+            assert!(
+                budget_mtp(&config, &manifest.weights, &placement, &ar_exact, Some(mtp)).is_err()
             );
         }
 

@@ -6869,6 +6869,23 @@ impl Qwen4GpuForward {
     /// head, argmax). Position, QSA marks and PLE history commit on every band.
     /// Nothing here waits on the GPU; capacity comes from
     /// [`Self::prepare_mesh_capacity`].
+    ///
+    /// `wide_hidden_capture` is the final pre-collapse wide hidden of this
+    /// epoch's `tokens.len()` rows (`hc_count * hidden_size` F32 per row, the
+    /// same capture [`Self::forward_chunk`] takes: the trunk's output HC
+    /// streams, widened from BF16 when the epoch's streams are BF16). It is
+    /// independent of `head`, so a silent prompt-fill chunk captures without
+    /// computing logits. Only the output band owns the final streams: a
+    /// non-output band refuses a capture. The caller passes the exact
+    /// sub-view for this call's rows (a chunk of a longer capture is
+    /// `capture.sub_offset(offset * wide, rows * wide)`).
+    ///
+    /// `MeshRoute::Verify` is the Single speculative verify forward
+    /// (`spec_forward_rows`): every band runs outside the prefill scope with
+    /// the epoch's actual rows as its routing rows, exactly like Decode but
+    /// for `1..=max_chunk` rows. The output band must carry a head
+    /// (verify logits); non-output bands carry none.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_mesh_chunk(
         &mut self,
         bundle: &mut Qwen4Bundle,
@@ -6877,19 +6894,31 @@ impl Qwen4GpuForward {
         route_rows: usize,
         route: MeshRoute,
         head: Option<Qwen4MeshHead<'_>>,
+        wide_hidden_capture: Option<&GpuTensor>,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.check_mesh_admission(bundle, gpu)?;
         let rows = tokens.len();
-        match route {
-            MeshRoute::Decode if rows != 1 => {
-                return Err(invalid("a mesh Decode forward carries exactly one row"));
-            }
-            MeshRoute::Verify => {
-                return Err(invalid(
-                    "mesh Verify windows are not admitted under pipeline parallelism",
-                ));
-            }
-            _ => {}
+        if route == MeshRoute::Decode && rows != 1 {
+            return Err(invalid("a mesh Decode forward carries exactly one row"));
+        }
+        if route == MeshRoute::Verify && self.scope.output && head.is_none() {
+            return Err(invalid(
+                "a mesh Verify forward on the output band carries a head for the verify logits",
+            ));
+        }
+        if route == MeshRoute::Verify && self.scope.output && wide_hidden_capture.is_none() {
+            // Every Single native-MTP verify captures the wide hidden, which
+            // also keeps its 1-row case off the retained decode body. A
+            // capture-less 1-row Verify could take that body in Single; the
+            // mesh never replays, so it is refused instead of assumed exact.
+            return Err(invalid(
+                "a mesh Verify forward on the output band captures the wide hidden",
+            ));
+        }
+        if wide_hidden_capture.is_some() && !self.scope.output {
+            return Err(invalid(
+                "only the output band takes a mesh wide hidden capture",
+            ));
         }
         let output_policy = match (&head, self.scope.output) {
             (Some(head), true) => Qwen4OutputPolicy::Rows(head.rows),
@@ -6905,6 +6934,15 @@ impl Qwen4GpuForward {
                 layout.route_rows
             )));
         }
+        if route != MeshRoute::Prefill && layout.route_rows != rows {
+            // Decode and Verify never canonicalize: their routing rows are
+            // their actual rows (the same scope Single's non-prefill spec
+            // forward runs under).
+            return Err(invalid(format!(
+                "a mesh {route:?} forward of {rows} rows must route its actual rows, got {}",
+                layout.route_rows
+            )));
+        }
         self.validate_tokens(bundle, tokens)?;
         let prior = (self.prefill_scope, self.mesh_route_rows);
         self.prefill_scope = route == MeshRoute::Prefill;
@@ -6916,7 +6954,7 @@ impl Qwen4GpuForward {
             None,
             head.map(|head| head.logits),
             head.and_then(|head| head.top1),
-            None,
+            wide_hidden_capture,
             output_policy,
         );
         (self.prefill_scope, self.mesh_route_rows) = prior;

@@ -435,6 +435,11 @@ harness exports pending their cleanup.
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
 | `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): one `HIPFIRE_MODULE_LOAD_AUDIT` stderr line per HIP module load (module, symbol, source SHA-256, recipe flags), per `hipModuleLoad`/`hipModuleLoadData` (handle, path or image FNV-1a; embedded PeaceMaker images included) and per resolved symbol, for offline route-closure audits of `kernel_registry::route_entries` and of the load-time barrier (a closed route shows every load before `loaded` and none after). Never set in production or timing runs. |
 
+Flash-Next/Qwen4 PP native MTP is greedy-only; sampled/penalized requests
+decode AR through the same PP mesh instead of failing the request. The route
+decision logs once per process. This does not change Single native-MTP
+sampling support or admit other speculative engines under PP.
+
 #### Logical GPU emulation (developer-only)
 
 `HIPFIRE_EMULATE_GPUS` is an environment-only diagnostic switch captured in

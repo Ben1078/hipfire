@@ -31,13 +31,17 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     qwen4_prefill_segment_rows, Qwen4MeshHead, Qwen4MeshLayout, SessionBoundaries,
 };
-use crate::mesh_bindings::{session_tickets, Qwen4MeshBindings, Qwen4RankBand};
+use crate::mesh_bindings::{
+    session_tickets, Qwen4MeshBindings, Qwen4RankBand, WindowCtx, WindowFinalize, WindowRestore,
+};
 use crate::program::qwen4_step_graph_with_output;
 use crate::weights::Qwen4BandScope;
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind, MeshEpoch};
 use hipfire_runtime::mesh_placement::BandPlacement;
 use hipfire_runtime::mesh_split::{split_program, SplitPlan};
-use hipfire_runtime::multi_gpu::executor::ForwardEpoch;
+use hipfire_runtime::multi_gpu::executor::{
+    ForwardEpoch, MeshCheckpoint, MeshCheckpointKey, MeshLifecycleError,
+};
 use hipfire_runtime::multi_gpu::transport::EdgeId;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::session_cache::{MeshSessionCache, MeshSessionRecord};
@@ -411,6 +415,8 @@ pub(crate) struct Qwen4PpMesh {
     /// been committed or aborted: the only request whose staged candidates
     /// may publish.
     committable: Option<u64>,
+    /// The one live aggregate MTP window (per-band local tickets and the head's).
+    windows: WindowStore<Qwen4StateSnapshot, MtpGpuStateSnapshot>,
 }
 
 impl Qwen4PpMesh {
@@ -586,6 +592,300 @@ impl TileError {
     }
 }
 
+/// Aggregate ticket of one native-MTP window over EVERY band (frozen §3.3): one
+/// handle for the per-band target tickets and the output head's, which live in
+/// the mesh holder ([`WindowStore`]). It is a different type from the local
+/// `Qwen4StateSnapshot` / `MtpGpuStateSnapshot`, so no local `validate_ticket`
+/// can be handed one, and a handle whose window was finalized, restored,
+/// released, superseded or reset stops validating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4PpWindow {
+    key: MeshCheckpointKey,
+    start: usize,
+    rows: usize,
+    bands: usize,
+    with_head: bool,
+    armed: bool,
+}
+
+impl Qwen4PpWindow {
+    /// A ticket with a dummy key for CPU tests of ticket typing (it names no
+    /// live window of any mesh).
+    #[cfg(test)]
+    pub(crate) fn for_test(start: usize, rows: usize, with_head: bool, armed: bool) -> Self {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).expect("a two-band mesh");
+        Self {
+            key: MeshCheckpointKey {
+                mesh_epoch: mesh.epoch(),
+                load_gen: 0,
+                reset_gen: 0,
+                request_gen: 0,
+                window_gen: 0,
+            },
+            start,
+            rows,
+            bands: 2,
+            with_head,
+            armed,
+        }
+    }
+
+    /// The committed position the window started at.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Rows the window's row capture was armed for.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether the window also holds the output MTP head's ticket.
+    pub fn has_head(&self) -> bool {
+        self.with_head
+    }
+
+    /// Whether every band opened armed with a ring covering `rows()`: the
+    /// ring-aware repair is available (otherwise restore + replay).
+    pub fn row_repair_ready(&self) -> bool {
+        self.armed
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowPhase {
+    /// Snapshotted; verify/repair/restore/finalize/release apply.
+    Open,
+    /// Committed with every local ticket kept active: only a retained restore
+    /// or a release apply.
+    Retained,
+}
+
+struct WindowRecord<L, H> {
+    ticket: Qwen4PpWindow,
+    checkpoint: MeshCheckpoint,
+    target: Vec<L>,
+    head: Option<H>,
+    phase: WindowPhase,
+}
+
+/// The one live aggregate window of a mesh and the generation counter that
+/// makes every handle unique. Generic over the local ticket types so the
+/// state machine is CPU-testable with fakes.
+struct WindowStore<L, H> {
+    next: u64,
+    live: Option<WindowRecord<L, H>>,
+}
+
+impl<L: Copy, H: Copy> WindowStore<L, H> {
+    fn new() -> Self {
+        Self {
+            next: 1,
+            live: None,
+        }
+    }
+
+    /// Reserve the generation of a new window. Refused while another window is
+    /// open (the local arenas allow one active snapshot); a retained window is
+    /// superseded: its handle stops validating, exactly as the next local
+    /// snapshot releases the retained arena entries.
+    fn begin(&mut self) -> Result<u64, String> {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|record| record.phase == WindowPhase::Open)
+        {
+            return Err("another window is still open".to_string());
+        }
+        let generation = self.next;
+        self.next = generation
+            .checked_add(1)
+            .ok_or_else(|| "window generations are exhausted".to_string())?;
+        self.live = None;
+        Ok(generation)
+    }
+
+    fn install(
+        &mut self,
+        ticket: Qwen4PpWindow,
+        checkpoint: MeshCheckpoint,
+        target: Vec<L>,
+        head: Option<H>,
+    ) -> Result<(), String> {
+        if self.live.is_some() {
+            return Err("a window is already live".to_string());
+        }
+        checkpoint
+            .check_shape(&ticket.key)
+            .map_err(|error| error.to_string())?;
+        if target.len() != ticket.bands
+            || checkpoint.per_owner.len() != ticket.bands
+            || head.is_some() != ticket.with_head
+            || checkpoint.head.is_some() != ticket.with_head
+        {
+            return Err("window tickets do not match its bands and head".to_string());
+        }
+        self.live = Some(WindowRecord {
+            ticket,
+            checkpoint,
+            target,
+            head,
+            phase: WindowPhase::Open,
+        });
+        Ok(())
+    }
+
+    /// The live record of exactly `ticket`, in one of `phases`.
+    fn require(
+        &self,
+        ticket: &Qwen4PpWindow,
+        phases: &[WindowPhase],
+    ) -> Result<&WindowRecord<L, H>, String> {
+        match &self.live {
+            Some(record) if record.ticket == *ticket && phases.contains(&record.phase) => {
+                Ok(record)
+            }
+            Some(record) if record.ticket == *ticket => Err(format!(
+                "the window is {:?}; this transition does not apply",
+                record.phase
+            )),
+            _ => Err(
+                "window ticket is stale: finalized, restored, released, superseded or reset"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// An open window was committed with its tickets kept.
+    fn retain(&mut self, ticket: &Qwen4PpWindow) -> Result<(), String> {
+        self.require(ticket, &[WindowPhase::Open])?;
+        if let Some(record) = self.live.as_mut() {
+            record.phase = WindowPhase::Retained;
+        }
+        Ok(())
+    }
+
+    /// Remove and return `ticket`'s record (`None` when it is not live).
+    fn take(&mut self, ticket: &Qwen4PpWindow) -> Option<WindowRecord<L, H>> {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|record| record.ticket == *ticket)
+        {
+            self.live.take()
+        } else {
+            None
+        }
+    }
+
+    fn remove(&mut self, ticket: &Qwen4PpWindow) -> bool {
+        self.take(ticket).is_some()
+    }
+
+    fn clear(&mut self) {
+        self.live = None;
+    }
+}
+
+/// Whether a window of `rows` rows arms the GDN row capture: a block of at
+/// least two rows that every band's ring covers (Single's rule per bundle,
+/// agreed across bands so every band can repair or none must).
+fn arm_decision(rings: impl IntoIterator<Item = usize>, rows: usize) -> bool {
+    rows >= 2 && rings.into_iter().all(|ring| ring >= rows)
+}
+
+/// Pure admission of a mesh epoch against the bands' `(armed, ring rows)`:
+/// every band agrees, and only a verify of at least two rows the rings cover
+/// may run armed (an armed snapshot skips the GDN copies, so a one-row armed
+/// forward cannot be undone).
+fn check_epoch_arming(bands: &[(bool, usize)], verify: bool, rows: usize) -> Result<(), String> {
+    let armed = bands.first().is_some_and(|band| band.0);
+    if bands.iter().any(|band| band.0 != armed)
+        || (armed && (!verify || rows < 2 || bands.iter().any(|band| band.1 < rows)))
+    {
+        return Err(
+            "the bands disagree on, or cannot honor, the armed row capture of this forward"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Pure admission of a ring-aware repair against `window` and the bands'
+/// `(ring rows, position)`.
+fn check_repair_request(
+    window: &Qwen4PpWindow,
+    keep: usize,
+    rows: usize,
+    bands: &[(usize, usize)],
+) -> Result<(), String> {
+    let end = window
+        .start
+        .checked_add(rows)
+        .ok_or_else(|| "repair position overflows".to_string())?;
+    if !window.armed {
+        return Err("the window was not opened with its row capture armed".to_string());
+    }
+    if rows < 2 || rows > window.rows || keep == 0 || keep >= rows {
+        return Err(format!(
+            "cannot keep {keep} of {rows} verified rows of a {}-row window",
+            window.rows
+        ));
+    }
+    if bands.len() != window.bands
+        || bands
+            .iter()
+            .any(|&(ring, position)| ring < rows || position != end)
+    {
+        return Err(
+            "a band's ring does not cover the verified rows or it is not at the verify's end"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Synchronize every device of the mesh (each on its own bound thread).
+fn sync_all_devices(gpus: &mut Gpus) -> Result<(), String> {
+    for (index, gpu) in gpus.devices.iter_mut().enumerate() {
+        gpu.bind_thread()
+            .map_err(|error| format!("device {index} bind before window drain: {error}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| format!("device {index} window drain failed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Run `body` over an adapter of every band (forwards taken, always put back).
+fn with_bindings<R>(
+    root: &mut Qwen4Bundle,
+    mesh: &mut Qwen4PpMesh,
+    body: impl FnOnce(&mut Qwen4MeshBindings<'_>) -> R,
+) -> Result<R, BundleError> {
+    let mut forwards = take_forwards(&mut mesh.bands, root)?;
+    let outcome = Qwen4MeshBindings::new(mesh_ranks(&mut mesh.bands, root, &mut forwards))
+        .map(|mut bindings| body(&mut bindings));
+    restore_forwards(&mut mesh.bands, root, forwards);
+    outcome.map_err(pp_error)
+}
+
+/// Turn an aggregate lifecycle failure into a bundle error, quarantining the
+/// holder when the owners could not be reconciled (the runtime has already
+/// poisoned its own state).
+fn lifecycle_failure(
+    mesh: &mut Qwen4PpMesh,
+    what: &str,
+    error: &MeshLifecycleError,
+    quarantine: bool,
+) -> BundleError {
+    let message = format!("window {what} failed: {error}");
+    if quarantine {
+        mesh.quarantine(message.clone());
+    }
+    pp_error(message)
+}
+
 /// Per-call work shared by every tile.
 struct Request<'r> {
     tokens: &'r [u32],
@@ -596,6 +896,9 @@ struct Request<'r> {
     /// The canonical session schedule: boundaries to capture at and the tiles
     /// cut at them. `None` = no capture; tiles are chunk-relative.
     session: Option<&'r SessionRun<'r>>,
+    /// Final pre-collapse wide hidden rows of the whole request (F32, `hc *
+    /// hidden` per row, on the output device), written by the output band.
+    wide: Option<&'r GpuTensor>,
 }
 
 /// Compute every rank's layout for every tile and prepare all capacity before
@@ -710,6 +1013,11 @@ fn run_tiles(
                     )
                 }
             };
+            // This tile's rows of the caller's wide hidden capture.
+            let wide_view = request.wide.map(|wide| {
+                let width = root.config.hc_count * root.config.hidden_size;
+                wide.sub_offset(tile.offset * width, tile.rows * width)
+            });
             let tile_layouts = &layouts[index * stages..(index + 1) * stages];
             let op_id = mesh.next_op;
             mesh.next_op = op_id
@@ -762,6 +1070,7 @@ fn run_tiles(
                 top1: top1_view.as_ref(),
                 rows: request.rows,
             }));
+            bindings.set_wide_capture(wide_view.as_ref());
             // Treat even a refused submit conservatively once it may have entered
             // a callback: a later tile's failure also invalidates all earlier work.
             submitted = true;
@@ -857,6 +1166,7 @@ impl Qwen4Bundle {
             sessions: MeshSessionCache::new(),
             sessions_enabled: false,
             committable: None,
+            windows: WindowStore::new(),
         });
         let verdict = self.validate_pp_attach(&mut holder, gpus);
         let result = match verdict {
@@ -904,8 +1214,14 @@ impl Qwen4Bundle {
             if band.config != config {
                 return Err("the bands have different model configurations".into());
             }
-            if band.ep.is_some() || band.lanes.is_some() || band.mtp.is_some() {
-                return Err("expert parallelism, lanes and native MTP are not admitted".into());
+            if band.ep.is_some()
+                || band.lanes.is_some()
+                || (band.mtp.is_some() && index + 1 < stages)
+            {
+                return Err(
+                    "expert parallelism, lanes and an MTP head off the output band are not admitted"
+                        .into(),
+                );
             }
             if index + 1 < stages && band.pp.is_some() {
                 return Err("a peer band carries its own pipeline mesh".into());
@@ -1008,7 +1324,11 @@ impl Qwen4Bundle {
     /// Run `tokens` through the pipeline: tiles of the common canonical chunk
     /// in order, the head only where `rows`/`logits` ask for it. `logits` and
     /// `top1` are the daemon's tensors on the output band's physical device;
-    /// they are complete when this returns.
+    /// they are complete when this returns. `wide_capture` (output device, F32,
+    /// `hc * hidden` per row of `tokens`) receives the final pre-collapse wide
+    /// hidden rows, independent of the head (a silent prompt-fill chunk passes
+    /// `logits: None`); the caller keeps it alive until the call returns and
+    /// consumes it before the next forward overwrites it.
     pub fn pp_forward(
         &mut self,
         gpus: &mut Gpus,
@@ -1017,6 +1337,7 @@ impl Qwen4Bundle {
         top1: Option<&GpuTensor>,
         rows: Qwen4OutputRows,
         route: MeshRoute,
+        wide_capture: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
         let mut mesh = self
             .pp
@@ -1032,10 +1353,605 @@ impl Qwen4Bundle {
                 rows,
                 route,
                 session: None,
+                wide: wide_capture,
             },
         );
         self.pp = Some(mesh);
         result
+    }
+
+    /// Output-band device of the mesh, thread bound (the head restore runs on it;
+    /// callers of the driver get the same device from `gpus.mesh_output_owner()`).
+    fn pp_output_gpu<'g>(&self, gpus: &'g mut Gpus) -> Result<&'g mut Gpu, BundleError> {
+        let mesh = self
+            .pp
+            .as_ref()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        mesh.require_ready(gpus)?;
+        let owner = gpus
+            .mesh_output_owner()
+            .ok_or_else(|| pp_error("the mesh has no output owner"))?;
+        let gpu = gpus
+            .devices
+            .get_mut(owner)
+            .ok_or_else(|| pp_error("the output device is unavailable"))?;
+        gpu.bind_thread().map_err(BundleError::Hip)?;
+        Ok(gpu)
+    }
+
+    /// The canonical chunk every band shares (the most rows one mesh epoch
+    /// takes), `None` outside PP.
+    pub(crate) fn pp_chunk_rows(&self) -> Option<usize> {
+        self.pp.as_ref().map(|mesh| mesh.chunk)
+    }
+
+    /// Pure preflight: a mesh is attached and healthy, and `gpus` is the device
+    /// set it was attached with (same mesh epoch and device count). Touches no
+    /// state; every `pp_*` entry point applies the same check itself.
+    pub(crate) fn pp_require_ready(&self, gpus: &Gpus) -> Result<(), BundleError> {
+        self.pp
+            .as_ref()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?
+            .require_ready(gpus)
+    }
+
+    /// Set (or clear) the armed GDN row capture of EVERY band at once, host
+    /// only. Windows arm it through [`Self::pp_window_open`]; the caller clears
+    /// it after the verify exactly as Single does.
+    pub(crate) fn pp_window_arm(&mut self, armed: bool) {
+        self.state.row_capture_armed = armed;
+        if let Some(mesh) = self.pp.as_mut() {
+            for band in &mut mesh.bands {
+                band.state.row_capture_armed = armed;
+            }
+        }
+    }
+
+    /// Allocate every band's few-row verify rollback ring for blocks of up to
+    /// `rows` rows on its own device. `Ok(false)`: this GPU's GDN route captures
+    /// no rows (on every band; a mix refuses). Refused while a window is live.
+    pub(crate) fn pp_ensure_row_capture(
+        &mut self,
+        gpus: &mut Gpus,
+        rows: usize,
+    ) -> Result<bool, BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_ensure_row_capture_detached(&mut mesh, gpus, rows);
+        self.pp = Some(mesh);
+        result
+    }
+
+    fn pp_ensure_row_capture_detached(
+        &mut self,
+        mesh: &mut Qwen4PpMesh,
+        gpus: &mut Gpus,
+        rows: usize,
+    ) -> Result<bool, BundleError> {
+        mesh.require_ready(gpus)?;
+        if mesh.windows.live.is_some() {
+            return Err(pp_error(
+                "row capture cannot be resized while a window is live",
+            ));
+        }
+        if rows < 2 {
+            return Ok(false);
+        }
+        let capable: Vec<bool> = gpus
+            .devices
+            .iter()
+            .map(|gpu| crate::mtp_spec::native_mtp_row_capture(gpu, &self.config))
+            .collect();
+        if capable.iter().all(|&capable| !capable) {
+            return Ok(false);
+        }
+        if capable.iter().any(|&capable| !capable) {
+            return Err(pp_error("the bands disagree on GDN row-capture support"));
+        }
+        let history = self.config.linear_conv_kernel_dim - 1;
+        for index in 0..mesh.stages() {
+            let gpu = &mut gpus.devices[index];
+            gpu.bind_thread().map_err(BundleError::Hip)?;
+            band_mut(&mut mesh.bands, self, index)
+                .state
+                .ensure_row_capture(gpu, rows, history)
+                .map_err(BundleError::State)?;
+        }
+        Ok(true)
+    }
+
+    /// The Single speculative verify (`spec_forward_rows`) over `block` on every
+    /// band: one `MeshRoute::Verify` epoch of exactly `block.len()` rows (routing
+    /// its actual rows, never rounded), at most one canonical chunk. The output
+    /// band writes `logits` (all rows, `block.len() * vocab` F32), optional
+    /// `top1` (Raw, 4 bytes per row) and the final pre-collapse wide hidden rows
+    /// into `wide` (F32, at least `block.len() * hc * hidden`), all on the output
+    /// device. Every band's armed row capture (see [`Self::pp_window_open`]) is
+    /// written. The mesh is drained before return. The caller owns clearing the
+    /// armed flag ([`Self::pp_window_arm`]).
+    ///
+    /// Refused BEFORE any mutation: an unhealthy mesh, an armed capture with a
+    /// one-row block (an armed snapshot skips the GDN copies, so a one-row
+    /// verify could be neither ring-repaired nor restored), or bands that
+    /// disagree on arming. A failure after submission quarantines the mesh.
+    pub(crate) fn pp_forward_verify(
+        &mut self,
+        gpus: &mut Gpus,
+        block: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_forward_detached(
+            &mut mesh,
+            gpus,
+            &Request {
+                tokens: block,
+                logits: Some(logits),
+                top1,
+                rows: Qwen4OutputRows::All,
+                route: MeshRoute::Verify,
+                session: None,
+                wide: Some(wide),
+            },
+        );
+        self.pp = Some(mesh);
+        result
+    }
+
+    /// Open the aggregate window of the next `rows`-row verify at the current
+    /// position (frozen §3.3 step 1): EVERY band arms its row capture (iff
+    /// `rows >= 2` and every band's ring holds `rows`) BEFORE any band
+    /// snapshots, then `Gpus::checkpoint_mesh` snapshots every band's target
+    /// state and, with `with_head`, the output MTP head, each on its own
+    /// device. All-or-nothing: a failure restores the bands already captured.
+    /// The returned ticket is the aggregate handle; the local tickets stay in
+    /// the mesh holder. Refused while another window is open; a retained
+    /// window is superseded (its handle stops validating).
+    pub(crate) fn pp_window_open(
+        &mut self,
+        gpus: &mut Gpus,
+        rows: usize,
+        with_head: bool,
+    ) -> Result<Qwen4PpWindow, BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_window_open_detached(&mut mesh, gpus, rows, with_head, true);
+        self.pp = Some(mesh);
+        result
+    }
+
+    /// [`Self::pp_window_open`] that never arms the row capture: `rows` is the
+    /// most rows the window may span. The interleaved one-row windows kept for
+    /// stop sequences advance the target by up to `rows` unarmed one-row verifies
+    /// before the window is finalized (retained) or restored; no transition
+    /// requires the position to be `start + rows`, only that every band and the
+    /// head agree. Such a window has no ring-aware repair (`row_repair_ready()`
+    /// is false).
+    pub(crate) fn pp_window_open_unarmed(
+        &mut self,
+        gpus: &mut Gpus,
+        rows: usize,
+        with_head: bool,
+    ) -> Result<Qwen4PpWindow, BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_window_open_detached(&mut mesh, gpus, rows, with_head, false);
+        self.pp = Some(mesh);
+        result
+    }
+
+    fn pp_window_open_detached(
+        &mut self,
+        mesh: &mut Qwen4PpMesh,
+        gpus: &mut Gpus,
+        rows: usize,
+        with_head: bool,
+        allow_arm: bool,
+    ) -> Result<Qwen4PpWindow, BundleError> {
+        mesh.require_ready(gpus)?;
+        if rows == 0 || rows > mesh.chunk {
+            return Err(pp_error(
+                "a window covers between one row and one canonical chunk",
+            ));
+        }
+        if with_head && self.mtp.is_none() {
+            return Err(pp_error("the output band has no MTP head to snapshot"));
+        }
+        let stages = mesh.stages();
+        let start = self.state.position;
+        if mesh.bands.iter().any(|band| band.state.position != start) {
+            return Err(pp_error("the bands disagree on position"));
+        }
+        let armed = allow_arm
+            && arm_decision(
+                mesh.bands
+                    .iter()
+                    .chain(std::iter::once(&*self))
+                    .map(|band| band.state.row_capture_rows()),
+                rows,
+            );
+        let generation = mesh.windows.begin().map_err(pp_error)?;
+        let key = MeshCheckpointKey {
+            mesh_epoch: gpus.mesh.epoch(),
+            load_gen: mesh.load_id,
+            reset_gen: 0,
+            request_gen: mesh.request_id,
+            window_gen: generation,
+        };
+        // Armed on every band before the first snapshot.
+        self.pp_arm_bands(mesh, armed);
+        let outcome = with_bindings(self, mesh, |bindings| {
+            bindings.set_window(WindowCtx::checkpoint(stages));
+            let checkpoint = gpus.checkpoint_mesh(&mut *bindings, &key, with_head);
+            (checkpoint, bindings.take_window())
+        });
+        let (checkpoint, context) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.pp_arm_bands(mesh, false);
+                return Err(error);
+            }
+        };
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.pp_arm_bands(mesh, false);
+                let rolled_back_cleanly = error.restore_failures.is_empty();
+                return Err(lifecycle_failure(
+                    mesh,
+                    "open",
+                    &error,
+                    !rolled_back_cleanly,
+                ));
+            }
+        };
+        let ticket = Qwen4PpWindow {
+            key,
+            start,
+            rows,
+            bands: stages,
+            with_head,
+            armed,
+        };
+        let installed = context
+            .and_then(WindowCtx::into_target)
+            .ok_or_else(|| "a band captured no window ticket".to_string())
+            .and_then(|(target, head)| mesh.windows.install(ticket, checkpoint, target, head));
+        match installed {
+            Ok(()) => Ok(ticket),
+            Err(message) => {
+                // Tickets exist that no handle names: the state cannot be
+                // reconciled.
+                self.pp_arm_bands(mesh, false);
+                mesh.quarantine(message.clone());
+                Err(pp_error(message))
+            }
+        }
+    }
+
+    fn pp_arm_bands(&mut self, mesh: &mut Qwen4PpMesh, armed: bool) {
+        self.state.row_capture_armed = armed;
+        for band in &mut mesh.bands {
+            band.state.row_capture_armed = armed;
+        }
+    }
+
+    /// Roll EVERY band (and the output head, when the window has one) back to
+    /// the window's start through `Gpus::restore_mesh`. `retain == false`
+    /// consumes the window (the error path; the handle is dead afterwards);
+    /// `retain == true` keeps every local ticket active for the retained
+    /// terminal/stop-prefix restore + replay (the driver then replays through
+    /// [`Self::pp_forward_verify`] and calls [`Self::pp_window_release`]).
+    /// A failed rollback poisons and quarantines the mesh.
+    pub(crate) fn pp_window_restore(
+        &mut self,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+        retain: bool,
+    ) -> Result<(), BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_window_restore_detached(&mut mesh, gpus, window, retain);
+        self.pp = Some(mesh);
+        result
+    }
+
+    fn pp_window_restore_detached(
+        &mut self,
+        mesh: &mut Qwen4PpMesh,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+        retain: bool,
+    ) -> Result<(), BundleError> {
+        mesh.require_ready(gpus)?;
+        let (checkpoint, target, head) = {
+            let record = mesh
+                .windows
+                .require(window, &[WindowPhase::Open, WindowPhase::Retained])
+                .map_err(pp_error)?;
+            (
+                record.checkpoint.clone(),
+                record.target.clone(),
+                record.head,
+            )
+        };
+        let context = WindowCtx::live(
+            &target,
+            head,
+            if retain {
+                WindowRestore::Retain
+            } else {
+                WindowRestore::Consume
+            },
+            WindowFinalize::Commit,
+        );
+        let outcome = with_bindings(self, mesh, |bindings| {
+            bindings.set_window(context);
+            gpus.restore_mesh(&mut *bindings, &window.key, checkpoint)
+        })?;
+        match outcome {
+            Ok(()) => {
+                if !retain {
+                    mesh.windows.remove(window);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                mesh.windows.remove(window);
+                Err(lifecycle_failure(mesh, "restore", &error, error.poisoned()))
+            }
+        }
+    }
+
+    /// Keep the first `keep` rows (`1 + target_commit_accept_len`) of the
+    /// verified `block`: every band runs its own row-aware repair
+    /// (`rollback_verify_rows_retain_with`: its GDN recurrence prefix from its
+    /// own ticket and captured rows, conv history, QSA marks and, on the input
+    /// band, the PLE convolution rows its own forward normalized) through
+    /// `Gpus::repair_mesh_prefix`. No target replay. Refused BEFORE any
+    /// mutation unless the window was opened armed, `1 <= keep < block.len() <=
+    /// window.rows()`, every band's ring covers the block and every band sits
+    /// at the verify's end; after that a failing band poisons and quarantines
+    /// the mesh. Every local ticket stays active for the caller's finalize or
+    /// restore. The output head is not touched.
+    pub(crate) fn pp_window_repair_keep(
+        &mut self,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+        keep: usize,
+        block: &[u32],
+    ) -> Result<(), BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_window_repair_detached(&mut mesh, gpus, window, keep, block);
+        self.pp = Some(mesh);
+        result
+    }
+
+    fn pp_window_repair_detached(
+        &mut self,
+        mesh: &mut Qwen4PpMesh,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+        keep: usize,
+        block: &[u32],
+    ) -> Result<(), BundleError> {
+        mesh.require_ready(gpus)?;
+        let (target, head) = {
+            let record = mesh
+                .windows
+                .require(window, &[WindowPhase::Open])
+                .map_err(pp_error)?;
+            (record.target.clone(), record.head)
+        };
+        let bands: Vec<(usize, usize)> = mesh
+            .bands
+            .iter()
+            .chain(std::iter::once(&*self))
+            .map(|band| (band.state.row_capture_rows(), band.state.position))
+            .collect();
+        check_repair_request(window, keep, block.len(), &bands).map_err(pp_error)?;
+        let epoch = ForwardEpoch {
+            mesh_epoch: gpus.mesh.epoch(),
+            load_id: mesh.load_id,
+            request_id: mesh.request_id,
+            op_id: mesh.next_op,
+            route: MeshRoute::Verify,
+            start_position: window.start,
+            actual_rows: block.len(),
+            route_rows: block.len(),
+            policy_id: PP_POLICY_ID,
+        };
+        let context = WindowCtx::live(
+            &target,
+            head,
+            WindowRestore::Consume,
+            WindowFinalize::Commit,
+        );
+        let outcome = with_bindings(self, mesh, |bindings| {
+            bindings.set_window(context);
+            gpus.repair_mesh_prefix(&mut *bindings, &epoch, keep, block)
+        })?;
+        outcome.map_err(|message| {
+            // The bands hold mixed prefixes and no ticket reconciles them.
+            mesh.quarantine(message.clone());
+            pp_error(message)
+        })
+    }
+
+    fn pp_window_head_ticket(
+        &self,
+        window: &Qwen4PpWindow,
+    ) -> Result<MtpGpuStateSnapshot, BundleError> {
+        let mesh = self
+            .pp
+            .as_ref()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        mesh.windows
+            .require(window, &[WindowPhase::Open])
+            .map_err(pp_error)?
+            .head
+            .ok_or_else(|| pp_error("the window has no head ticket"))
+    }
+
+    /// [`Self::mtp_truncate_retain`] with the window's head ticket: keep the
+    /// head's first `keep` appended rows. Host-only.
+    pub(crate) fn pp_window_head_truncate_retain(
+        &mut self,
+        window: &Qwen4PpWindow,
+        keep: usize,
+    ) -> Result<(), BundleError> {
+        let head = self.pp_window_head_ticket(window)?;
+        self.mtp_truncate_retain(head, keep)
+    }
+
+    /// [`Self::mtp_restore_retain`] with the window's head ticket, on the
+    /// output device (the head half of a restore-and-replay finish).
+    pub(crate) fn pp_window_head_restore_retain(
+        &mut self,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+    ) -> Result<(), BundleError> {
+        let head = self.pp_window_head_ticket(window)?;
+        let gpu = self.pp_output_gpu(gpus)?;
+        self.mtp_restore_retain(gpu, head)
+    }
+
+    /// Whether `window` is still the live window: not finalized, restored
+    /// (consuming), released, superseded or reset.
+    pub(crate) fn pp_window_live(&self, window: &Qwen4PpWindow) -> bool {
+        self.pp.as_ref().is_some_and(|mesh| {
+            mesh.windows
+                .require(window, &[WindowPhase::Open, WindowPhase::Retained])
+                .is_ok()
+        })
+    }
+
+    /// Finish the window (frozen §3.3 step 7). Call only after EVERY fallible
+    /// head and pending-hidden GPU operation succeeded. Every band's and the
+    /// head's ticket is validated by `Gpus::finalize_mesh` for every owner
+    /// before any owner finalizes; it then commits (`retain == false`, tickets
+    /// consumed) or retains (`retain == true`: every local ticket stays
+    /// rollback-able for [`Self::pp_window_restore`]`(.., true)` until the next
+    /// open, a reset or [`Self::pp_window_release`]). A failed validation
+    /// rolls EVERY owner back through `restore_mesh` semantics (healthy owners
+    /// with still-valid tickets are restored, otherwise the mesh is poisoned
+    /// and quarantined) and kills the window; the caller does not restore.
+    pub(crate) fn pp_window_finalize(
+        &mut self,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+        retain: bool,
+    ) -> Result<(), BundleError> {
+        let mut mesh = self
+            .pp
+            .take()
+            .ok_or_else(|| pp_error("no pipeline mesh is attached"))?;
+        let result = self.pp_window_finalize_detached(&mut mesh, gpus, window, retain);
+        self.pp = Some(mesh);
+        result
+    }
+
+    fn pp_window_finalize_detached(
+        &mut self,
+        mesh: &mut Qwen4PpMesh,
+        gpus: &mut Gpus,
+        window: &Qwen4PpWindow,
+        retain: bool,
+    ) -> Result<(), BundleError> {
+        mesh.require_ready(gpus)?;
+        let (checkpoint, target, head) = {
+            let record = mesh
+                .windows
+                .require(window, &[WindowPhase::Open])
+                .map_err(pp_error)?;
+            (
+                record.checkpoint.clone(),
+                record.target.clone(),
+                record.head,
+            )
+        };
+        // The head finish, the ring repair and the pending-hidden copy enqueue
+        // device work after the verify epoch drained: complete it all before any
+        // ticket is validated or any owner's host-only transition runs. A device
+        // that cannot synchronize leaves the window's state unknown.
+        if let Err(message) = sync_all_devices(gpus) {
+            mesh.windows.remove(window);
+            mesh.quarantine(message.clone());
+            return Err(pp_error(message));
+        }
+        let context = WindowCtx::live(
+            &target,
+            head,
+            WindowRestore::Consume,
+            if retain {
+                WindowFinalize::Retain
+            } else {
+                WindowFinalize::Commit
+            },
+        );
+        let outcome = with_bindings(self, mesh, |bindings| {
+            bindings.set_window(context);
+            gpus.finalize_mesh(&mut *bindings, &window.key, checkpoint)
+        })?;
+        match outcome {
+            Ok(()) => {
+                if retain {
+                    mesh.windows.retain(window).map_err(pp_error)?;
+                } else {
+                    mesh.windows.remove(window);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                mesh.windows.remove(window);
+                Err(lifecycle_failure(
+                    mesh,
+                    "finalize",
+                    &error,
+                    error.poisoned(),
+                ))
+            }
+        }
+    }
+
+    /// Host-only release of a window (the aggregate `release_window`): every
+    /// local ticket that still validates is committed, one that no longer does
+    /// (a snapshot, reset or restore superseded it) is left alone. A handle that
+    /// is no longer live releases nothing.
+    pub(crate) fn pp_window_release(&mut self, window: &Qwen4PpWindow) {
+        let Some(mut mesh) = self.pp.take() else {
+            return;
+        };
+        if let Some(record) = mesh.windows.take(window) {
+            for (index, local) in record.target.iter().enumerate() {
+                let band = band_mut(&mut mesh.bands, self, index);
+                if band.validate_commit(*local).is_ok() {
+                    band.commit_validated(*local);
+                }
+            }
+            if let Some(head) = record.head {
+                if self.mtp_validate_commit(head).is_ok() {
+                    self.mtp_commit_validated(head);
+                }
+            }
+        }
+        self.pp = Some(mesh);
     }
 
     fn pp_forward_detached(
@@ -1050,13 +1966,49 @@ impl Qwen4Bundle {
         if tokens.is_empty() {
             return Err(pp_error("cannot process an empty token slice"));
         }
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| pp_error("wide hidden width overflows"))?;
         match request.route {
-            MeshRoute::Verify => return Err(pp_error("verify is not admitted")),
+            MeshRoute::Verify => {
+                if tokens.len() > mesh.chunk {
+                    return Err(pp_error("a verify block exceeds the canonical chunk"));
+                }
+                if request.rows != Qwen4OutputRows::All
+                    || request.logits.is_none()
+                    || request.wide.is_none()
+                {
+                    return Err(pp_error(
+                        "a verify needs all-row logits and a wide hidden capture",
+                    ));
+                }
+            }
             MeshRoute::Decode if tokens.len() != 1 => {
                 return Err(pp_error("a decode step is exactly one token"));
             }
             _ => {}
         }
+        if let Some(wide) = request.wide {
+            let elements = tokens
+                .len()
+                .checked_mul(width)
+                .ok_or_else(|| pp_error("wide hidden capture shape overflows"))?;
+            if wide.dtype != rdna_compute::DType::F32 || wide.numel() < elements {
+                return Err(pp_error(
+                    "wide hidden capture must be F32 with room for every row",
+                ));
+            }
+        }
+        let arming: Vec<(bool, usize)> = mesh
+            .bands
+            .iter()
+            .chain(std::iter::once(&*self))
+            .map(|band| (band.state.row_capture_armed, band.state.row_capture_rows()))
+            .collect();
+        check_epoch_arming(&arming, request.route == MeshRoute::Verify, tokens.len())
+            .map_err(pp_error)?;
         if tokens.iter().any(|&token| token as usize >= vocab) {
             return Err(pp_error("token id is outside the embedding vocabulary"));
         }
@@ -1181,6 +2133,7 @@ impl Qwen4Bundle {
                 rows: Qwen4OutputRows::Final,
                 route: MeshRoute::Decode,
                 session: None,
+                wide: None,
             },
         )?;
         Ok(token)
@@ -1262,6 +2215,8 @@ impl Qwen4Bundle {
         // Nothing of an earlier, uncommitted request may publish.
         mesh.sessions.abort();
         mesh.committable = None;
+        // A new prefill supersedes any open or retained MTP window.
+        mesh.windows.clear();
         let route = SessionRoute::Ar;
         if sessions {
             self.pp_sync_session_policy(mesh);
@@ -1291,6 +2246,7 @@ impl Qwen4Bundle {
                 rows: Qwen4OutputRows::Final,
                 route: MeshRoute::Prefill,
                 session: run.as_ref(),
+                wide: None,
             },
         );
         match &result {
@@ -1475,6 +2431,12 @@ impl Qwen4Bundle {
         prompt: &[u32],
         route: SessionRoute,
     ) -> usize {
+        if route != SessionRoute::Ar {
+            eprintln!(
+                "  qwen4 topology.pp: MTP-route session caches are not supported; cold start"
+            );
+            return 0;
+        }
         if !mesh.sessions_enabled
             || self.turn_snapshots_active()
             || mesh.require_ready(gpus).is_err()
@@ -1633,6 +2595,12 @@ impl Qwen4Bundle {
         // Uncommitted candidates belong to the request that just ended.
         mesh.sessions.abort();
         mesh.committable = None;
+        // Every outstanding window's tickets died with the bands' state.
+        mesh.windows.clear();
+        self.state.row_capture_armed = false;
+        for band in &mut mesh.bands {
+            band.state.row_capture_armed = false;
+        }
         Ok(())
     }
 
@@ -2178,5 +3146,317 @@ mod attach_policy_tests {
             turn_snapshots_refusal(2),
             "qwen4: pipeline parallelism (topology.pp = 2) does not support session snapshots (HIPFIRE_QWEN4_TURN_SNAPSHOTS); drop the option or set topology.pp = 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::mesh_bindings::window_ticket;
+    use hipfire_runtime::multi_gpu::executor::{
+        checkpoint_all, finalize_all, restore_all, MeshCheckpointCallbacks, MeshCheckpointId,
+    };
+
+    type Store = WindowStore<u32, u8>;
+
+    fn mesh() -> DeviceMesh {
+        DeviceMesh::rect(&[(DimKind::Pp, 3)]).unwrap()
+    }
+
+    fn key(mesh: &DeviceMesh, window: u64) -> MeshCheckpointKey {
+        MeshCheckpointKey {
+            mesh_epoch: mesh.epoch(),
+            load_gen: 7,
+            reset_gen: 0,
+            request_gen: 1,
+            window_gen: window,
+        }
+    }
+
+    fn ticket(key: MeshCheckpointKey, with_head: bool, armed: bool) -> Qwen4PpWindow {
+        Qwen4PpWindow {
+            key,
+            start: 100,
+            rows: 5,
+            bands: 3,
+            with_head,
+            armed,
+        }
+    }
+
+    fn checkpoint(key: &MeshCheckpointKey, with_head: bool) -> MeshCheckpoint {
+        MeshCheckpoint {
+            per_owner: (0..3).map(|owner| window_ticket(key, owner)).collect(),
+            head: with_head.then(|| window_ticket(key, 3)),
+        }
+    }
+
+    fn open(store: &mut Store, mesh: &DeviceMesh, with_head: bool) -> Qwen4PpWindow {
+        let generation = store.begin().unwrap();
+        let key = key(mesh, generation);
+        let window = ticket(key, with_head, true);
+        store
+            .install(
+                window,
+                checkpoint(&key, with_head),
+                vec![1, 2, 3],
+                with_head.then_some(9),
+            )
+            .unwrap();
+        window
+    }
+
+    #[test]
+    fn a_window_is_live_until_finalized_and_never_twice() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let window = open(&mut store, &mesh, true);
+        assert!(store.require(&window, &[WindowPhase::Open]).is_ok());
+        assert!(store.require(&window, &[WindowPhase::Retained]).is_err());
+        assert!(store.remove(&window));
+        // A repeated finalize, restore or release finds nothing.
+        assert!(store.require(&window, &[WindowPhase::Open]).is_err());
+        assert!(!store.remove(&window));
+    }
+
+    #[test]
+    fn a_second_window_cannot_open_over_an_open_one() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let _first = open(&mut store, &mesh, false);
+        assert!(store.begin().is_err());
+    }
+
+    #[test]
+    fn superseding_a_retained_window_invalidates_its_handle() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let first = open(&mut store, &mesh, true);
+        store.retain(&first).unwrap();
+        assert!(store.require(&first, &[WindowPhase::Open]).is_err());
+        assert!(store
+            .require(&first, &[WindowPhase::Open, WindowPhase::Retained])
+            .is_ok());
+        // Retaining twice is not a transition.
+        assert!(store.retain(&first).is_err());
+        let second = open(&mut store, &mesh, true);
+        assert_ne!(first, second);
+        assert!(store
+            .require(&first, &[WindowPhase::Open, WindowPhase::Retained])
+            .is_err());
+        assert!(store.take(&first).is_none());
+        assert!(store.require(&second, &[WindowPhase::Open]).is_ok());
+    }
+
+    #[test]
+    fn handles_are_unique_per_window_and_reset_clears_them() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let first = open(&mut store, &mesh, true);
+        store.clear();
+        assert!(store.require(&first, &[WindowPhase::Open]).is_err());
+        let second = open(&mut store, &mesh, true);
+        assert_ne!(first.key.window_gen, second.key.window_gen);
+        assert!(store.require(&first, &[WindowPhase::Open]).is_err());
+    }
+
+    #[test]
+    fn install_refuses_mismatched_tickets() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let generation = store.begin().unwrap();
+        let key = key(&mesh, generation);
+        // Head promised, none captured.
+        assert!(store
+            .install(
+                ticket(key, true, false),
+                checkpoint(&key, true),
+                vec![1, 2, 3],
+                None
+            )
+            .is_err());
+        // Wrong band count.
+        assert!(store
+            .install(
+                ticket(key, false, false),
+                checkpoint(&key, false),
+                vec![1, 2],
+                None
+            )
+            .is_err());
+        // Tickets issued for another window of the mesh.
+        let other = self::key(&mesh, generation + 1);
+        assert!(store
+            .install(
+                ticket(key, false, false),
+                checkpoint(&other, false),
+                vec![1, 2, 3],
+                None
+            )
+            .is_err());
+        assert!(store.live.is_none());
+    }
+
+    #[test]
+    fn arming_needs_two_rows_and_every_ring() {
+        assert!(arm_decision([5, 5, 5], 5));
+        assert!(arm_decision([8, 5, 9], 5));
+        assert!(!arm_decision([8, 4, 9], 5));
+        assert!(!arm_decision([8, 8], 1));
+        assert!(!arm_decision([0, 0], 2));
+    }
+
+    #[test]
+    fn only_a_covered_multi_row_verify_may_run_armed() {
+        let ok = [(true, 5), (true, 6), (true, 5)];
+        assert!(check_epoch_arming(&ok, true, 5).is_ok());
+        assert!(check_epoch_arming(&ok, true, 6).is_err());
+        assert!(check_epoch_arming(&ok, true, 1).is_err());
+        assert!(check_epoch_arming(&ok, false, 5).is_err());
+        // Bands disagreeing on arming.
+        assert!(check_epoch_arming(&[(true, 5), (false, 5)], true, 5).is_err());
+        // Unarmed forwards of any route and size.
+        let off = [(false, 0), (false, 0)];
+        assert!(check_epoch_arming(&off, false, 1536).is_ok());
+        assert!(check_epoch_arming(&off, true, 1).is_ok());
+    }
+
+    #[test]
+    fn repair_needs_an_armed_window_ring_cover_and_every_band_at_the_end() {
+        let mesh = mesh();
+        let armed = ticket(key(&mesh, 1), true, true);
+        let at_end = [(5, 105), (5, 105), (6, 105)];
+        assert!(check_repair_request(&armed, 2, 5, &at_end).is_ok());
+        // A shorter (pruned) block of an armed window.
+        let short = [(5, 103), (5, 103), (5, 103)];
+        assert!(check_repair_request(&armed, 1, 3, &short).is_ok());
+        assert!(check_repair_request(&armed, 0, 5, &at_end).is_err());
+        assert!(check_repair_request(&armed, 5, 5, &at_end).is_err());
+        assert!(check_repair_request(&armed, 2, 6, &at_end).is_err());
+        assert!(check_repair_request(&armed, 2, 5, &[(5, 105), (4, 105), (5, 105)]).is_err());
+        assert!(check_repair_request(&armed, 2, 5, &[(5, 105), (5, 104), (5, 105)]).is_err());
+        assert!(check_repair_request(&armed, 2, 5, &at_end[..2]).is_err());
+        let unarmed = ticket(key(&mesh, 1), true, false);
+        assert!(check_repair_request(&unarmed, 2, 5, &at_end).is_err());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        Checkpoint(usize),
+        Restore(usize),
+        Validate(usize),
+        Finalize(usize),
+    }
+
+    /// A fake owner set minting the adapter's own tickets and logging order.
+    struct Fake {
+        log: Vec<Event>,
+        fail_validate: Option<usize>,
+    }
+
+    impl MeshCheckpointCallbacks for Fake {
+        fn checkpoint_rank(
+            &mut self,
+            owner: usize,
+            key: &MeshCheckpointKey,
+        ) -> Result<MeshCheckpointId, String> {
+            self.log.push(Event::Checkpoint(owner));
+            Ok(window_ticket(key, owner))
+        }
+        fn restore_rank(
+            &mut self,
+            owner: usize,
+            _: &MeshCheckpointKey,
+            _: MeshCheckpointId,
+        ) -> Result<(), String> {
+            self.log.push(Event::Restore(owner));
+            Ok(())
+        }
+        fn validate_finalize_rank(
+            &mut self,
+            owner: usize,
+            _: &MeshCheckpointKey,
+            _: MeshCheckpointId,
+        ) -> Result<(), String> {
+            self.log.push(Event::Validate(owner));
+            if self.fail_validate == Some(owner) {
+                return Err("superseded".to_string());
+            }
+            Ok(())
+        }
+        fn finalize_rank(&mut self, owner: usize, _: &MeshCheckpointKey, _: MeshCheckpointId) {
+            self.log.push(Event::Finalize(owner));
+        }
+    }
+
+    #[test]
+    fn prepare_snapshots_bands_then_head_and_finalize_validates_all_first() {
+        let mesh = mesh();
+        let key = key(&mesh, 1);
+        let mut fake = Fake {
+            log: Vec::new(),
+            fail_validate: None,
+        };
+        let aggregate = checkpoint_all(&mut fake, &key, 3, true).unwrap();
+        assert_eq!(aggregate, checkpoint(&key, true));
+        finalize_all(&mut fake, &key, aggregate).unwrap();
+        use Event::*;
+        assert_eq!(
+            fake.log,
+            [
+                Checkpoint(0),
+                Checkpoint(1),
+                Checkpoint(2),
+                Checkpoint(3),
+                Validate(0),
+                Validate(1),
+                Validate(2),
+                Validate(3),
+                Finalize(0),
+                Finalize(1),
+                Finalize(2),
+                Finalize(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rejected_finalize_finalizes_nothing_and_restores_every_owner() {
+        let mesh = mesh();
+        let key = key(&mesh, 1);
+        let mut fake = Fake {
+            log: Vec::new(),
+            fail_validate: Some(1),
+        };
+        let aggregate = checkpoint(&key, true);
+        assert!(finalize_all(&mut fake, &key, aggregate).is_err());
+        use Event::*;
+        assert_eq!(
+            fake.log,
+            [
+                Validate(0),
+                Validate(1),
+                Validate(2),
+                Validate(3),
+                Restore(3),
+                Restore(2),
+                Restore(1),
+                Restore(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ticket_of_another_window_is_refused_before_any_callback() {
+        let mesh = mesh();
+        let stale = checkpoint(&key(&mesh, 1), true);
+        let live = key(&mesh, 2);
+        let mut fake = Fake {
+            log: Vec::new(),
+            fail_validate: None,
+        };
+        assert!(finalize_all(&mut fake, &live, stale.clone()).is_err());
+        assert!(restore_all(&mut fake, &live, stale).is_err());
+        assert!(fake.log.is_empty());
     }
 }

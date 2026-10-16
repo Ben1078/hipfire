@@ -4,8 +4,10 @@
 //! Borrowed Qwen4 band bindings for the generic, Gpus-owned executor.
 
 use crate::bundle::Qwen4Bundle;
-use crate::gpu_forward::{Qwen4GpuForward, Qwen4MeshHead, Qwen4MeshLayout};
+use crate::gpu_forward::{Qwen4GpuForward, Qwen4MeshHead, Qwen4MeshLayout, Qwen4OutputRows};
+use crate::mtp_gpu::MtpGpuStateSnapshot;
 use crate::program::QWEN4_STREAMS_RESOURCE;
+use crate::state::Qwen4StateSnapshot;
 use crate::weights::Qwen4BandScope;
 use crate::Qwen4Config;
 use hipfire_dispatch::pipeline::step_graph::OpId;
@@ -15,11 +17,99 @@ use hipfire_runtime::multi_gpu::executor::{
 };
 use hipfire_runtime::multi_gpu::transport::EdgeDescriptor;
 use hipfire_runtime::session_cache::{SessionPieceKey, SessionRoute};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 type Result<T, E = String> = std::result::Result<T, E>;
-const TRANSACTIONS_REFUSED: &str =
-    "Qwen4 topology.pp does not support checkpoint or repair transactions yet";
+
+/// The ticket of owner `owner` (a trunk band, or the output head at
+/// `owner == bands`) for the aggregate window `key`: the window generation is
+/// its family-opaque local value. Never a local `Qwen4StateSnapshot`.
+pub(crate) fn window_ticket(key: &MeshCheckpointKey, owner: usize) -> MeshCheckpointId {
+    MeshCheckpointId::issue(*key, owner, key.window_gen)
+}
+
+/// Pure check that `ticket` is `owner`'s ticket of the aggregate window `key`.
+pub(crate) fn check_window_ticket(
+    ticket: &MeshCheckpointId,
+    owner: usize,
+    key: &MeshCheckpointKey,
+) -> Result<()> {
+    if ticket.owner() != owner || ticket.key() != *key || ticket.local() != key.window_gen {
+        return Err(format!(
+            "Qwen4 window ticket for owner {owner} is not this window's (stale, foreign or misowned)"
+        ));
+    }
+    Ok(())
+}
+
+/// How a window restore treats the local arena entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowRestore {
+    /// Roll back and consume the entry (the local `restore`).
+    Consume,
+    /// Roll back and keep the entry active (the local `restore_retain`).
+    Retain,
+}
+
+/// How a validated window finalizes its local arena entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowFinalize {
+    /// Consume the entries (the local `commit_validated`).
+    Commit,
+    /// Keep them active and rollback-able (the local `retain_validated`).
+    Retain,
+}
+
+/// The per-band local tickets and modes an adapter's window callbacks work
+/// against. The adapter is rebuilt per call, so the owner of the tickets
+/// (the mesh holder) lends them in and takes them back; local tickets never
+/// leave the holder otherwise.
+#[derive(Clone, Debug)]
+pub(crate) struct WindowCtx {
+    pub(crate) restore: WindowRestore,
+    pub(crate) finalize: WindowFinalize,
+    pub(crate) target: Vec<Option<Qwen4StateSnapshot>>,
+    pub(crate) head: Option<MtpGpuStateSnapshot>,
+}
+
+impl WindowCtx {
+    /// An empty context a checkpoint fills, one slot per band.
+    pub(crate) fn checkpoint(bands: usize) -> Self {
+        Self {
+            restore: WindowRestore::Consume,
+            finalize: WindowFinalize::Commit,
+            target: vec![None; bands],
+            head: None,
+        }
+    }
+
+    /// A live window's tickets with the transition modes of the coming call.
+    pub(crate) fn live(
+        target: &[Qwen4StateSnapshot],
+        head: Option<MtpGpuStateSnapshot>,
+        restore: WindowRestore,
+        finalize: WindowFinalize,
+    ) -> Self {
+        Self {
+            restore,
+            finalize,
+            target: target.iter().copied().map(Some).collect(),
+            head,
+        }
+    }
+
+    /// The captured target tickets, one per band; `None` unless every band
+    /// captured.
+    pub(crate) fn into_target(
+        self,
+    ) -> Option<(Vec<Qwen4StateSnapshot>, Option<MtpGpuStateSnapshot>)> {
+        let head = self.head;
+        self.target
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .map(|target| (target, head))
+    }
+}
 
 /// The checkpoint window of a session piece at prefix length `prefix`: every
 /// owner's piece of one boundary shares it, and it names the current mesh,
@@ -98,10 +188,12 @@ pub struct Qwen4MeshBindings<'a> {
     tokens: &'a [u32],
     edge_epochs: Vec<u64>,
     head: Option<Qwen4MeshHead<'a>>,
+    wide: Option<&'a GpuTensor>,
     prepared: Option<ForwardEpoch>,
     ran: [bool; 8],
     layouts: [Option<Qwen4MeshLayout>; 8],
     session: Option<SessionCtx<'a>>,
+    window: Option<WindowCtx>,
 }
 
 fn streams_bytes(rows: usize, branches: usize, hidden: usize, dtype_bytes: usize) -> Result<usize> {
@@ -165,9 +257,15 @@ impl<'a> Qwen4MeshBindings<'a> {
             {
                 return Err("Qwen4 mesh weight and state ownership disagree".into());
             }
-            if rank.bundle.ep.is_some() || rank.bundle.lanes.is_some() || rank.bundle.mtp.is_some()
+            // Only the output band may hold the MTP head; no band takes EP or lanes.
+            if rank.bundle.ep.is_some()
+                || rank.bundle.lanes.is_some()
+                || (rank.bundle.mtp.is_some() && !scope.output)
             {
-                return Err("Qwen4 topology.pp does not admit EP, lanes or native MTP".into());
+                return Err(
+                    "Qwen4 topology.pp does not admit EP, lanes or an MTP head off the output band"
+                        .into(),
+                );
             }
         }
         Ok(Self {
@@ -175,10 +273,12 @@ impl<'a> Qwen4MeshBindings<'a> {
             tokens: &[],
             edge_epochs: Vec::new(),
             head: None,
+            wide: None,
             prepared: None,
             ran: [false; 8],
             layouts: [None; 8],
             session: None,
+            window: None,
         })
     }
 
@@ -208,6 +308,25 @@ impl<'a> Qwen4MeshBindings<'a> {
     pub fn set_head(&mut self, head: Option<Qwen4MeshHead<'a>>) {
         self.head = head;
         self.prepared = None;
+    }
+
+    /// The final pre-collapse wide hidden of this epoch's rows (F32,
+    /// `hc_count * hidden` per row, exactly this epoch's sub-view); only the
+    /// output band writes it. `None` captures nothing.
+    pub fn set_wide_capture(&mut self, wide: Option<&'a GpuTensor>) {
+        self.wide = wide;
+        self.prepared = None;
+    }
+
+    /// Lend the window's local tickets and transition modes to this adapter's
+    /// checkpoint, restore, repair and finalize callbacks.
+    pub(crate) fn set_window(&mut self, window: WindowCtx) {
+        self.window = Some(window);
+    }
+
+    /// Take the window context back (after a checkpoint, the captured tickets).
+    pub(crate) fn take_window(&mut self) -> Option<WindowCtx> {
+        self.window.take()
     }
 
     pub fn ranks(&self) -> &[Qwen4RankBand<'a>] {
@@ -272,9 +391,6 @@ impl<'a> Qwen4MeshBindings<'a> {
 impl MeshStepBindings for Qwen4MeshBindings<'_> {
     fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
-        if epoch.route == MeshRoute::Verify {
-            return Err("Qwen4 topology.pp does not support verify windows yet".into());
-        }
         if epoch.actual_rows == 0
             || epoch.route_rows < epoch.actual_rows
             || self.tokens.len() != epoch.actual_rows
@@ -337,6 +453,50 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
                 return Err("Qwen4 mesh argmax output has invalid dtype or capacity".into());
             }
         }
+        let verify = epoch.route == MeshRoute::Verify;
+        if verify
+            && (epoch.route_rows != epoch.actual_rows
+                || self.wide.is_none()
+                || self
+                    .head
+                    .as_ref()
+                    .is_none_or(|head| head.rows != Qwen4OutputRows::All))
+        {
+            return Err(
+                "a Qwen4 mesh verify routes its actual rows and needs all-row logits and a wide capture"
+                    .into(),
+            );
+        }
+        if let Some(wide) = self.wide {
+            let elements = epoch
+                .actual_rows
+                .checked_mul(config.hc_count)
+                .and_then(|n| n.checked_mul(config.hidden_size))
+                .ok_or("Qwen4 wide capture shape overflows")?;
+            if wide.dtype != rdna_compute::DType::F32 || wide.numel() < elements {
+                return Err("Qwen4 wide hidden capture has invalid dtype or capacity".into());
+            }
+        }
+        // Every band arms its row capture or none does, and only a verify of
+        // at least two rows the ring covers may be armed (an armed snapshot
+        // skips the GDN copies, so a one-row armed forward is unrecoverable).
+        let armed = self.ranks[0].bundle.state.row_capture_armed;
+        if self
+            .ranks
+            .iter()
+            .any(|rank| rank.bundle.state.row_capture_armed != armed)
+            || (armed
+                && (!verify
+                    || epoch.actual_rows < 2
+                    || self
+                        .ranks
+                        .iter()
+                        .any(|rank| rank.bundle.state.row_capture_rows() < epoch.actual_rows)))
+        {
+            return Err(
+                "Qwen4 mesh bands disagree on, or cannot honor, the armed row capture".into(),
+            );
+        }
         self.ran.fill(false);
         self.prepared = Some(*epoch);
         Ok(())
@@ -360,7 +520,8 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
                 "Qwen4 mesh band must run exactly once with its full declared op range".into(),
             );
         }
-        let head = if rank.bundle.weights.band_scope().output {
+        let output = rank.bundle.weights.band_scope().output;
+        let head = if output {
             self.head.as_ref().map(|head| Qwen4MeshHead {
                 logits: head.logits,
                 top1: head.top1,
@@ -369,6 +530,8 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
         } else {
             None
         };
+        // Only the output band owns the final pre-collapse streams.
+        let wide = if output { self.wide } else { None };
         rank.forward
             .forward_mesh_chunk(
                 rank.bundle,
@@ -377,6 +540,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
                 epoch.route_rows,
                 epoch.route,
                 head,
+                wide,
             )
             .map_err(|error| error.to_string())?;
         self.ran[owner] = true;
@@ -440,6 +604,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
     fn reset_rank(&mut self, owner: usize, gpu: &mut Gpu, _epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
         self.session = None;
+        self.window = None;
         let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen4 mesh rank")?;
         rank.forward.set_ple_lookahead(&[]);
         drop(rank.forward.ple_ahead.take());
@@ -452,13 +617,52 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
 
     fn repair_prefix_rank(
         &mut self,
-        _: usize,
-        _: &mut Gpu,
-        _: &ForwardEpoch,
-        _: usize,
-        _: &[u32],
+        owner: usize,
+        gpu: &mut Gpu,
+        epoch: &ForwardEpoch,
+        keep: usize,
+        tokens: &[u32],
     ) -> Result<()> {
-        Err(TRANSACTIONS_REFUSED.into())
+        let window = self
+            .window
+            .as_ref()
+            .ok_or("Qwen4 window transaction is not bound")?;
+        let local = window
+            .target
+            .get(owner)
+            .copied()
+            .flatten()
+            .ok_or("Qwen4 band has no window ticket to repair from")?;
+        let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen4 mesh rank")?;
+        let end = epoch
+            .start_position
+            .checked_add(tokens.len())
+            .ok_or("Qwen4 repair position overflows")?;
+        if epoch.route != MeshRoute::Verify
+            || epoch.actual_rows != tokens.len()
+            || keep == 0
+            || keep >= tokens.len()
+            || rank.bundle.state.position != end
+        {
+            return Err(format!(
+                "Qwen4 band {owner} cannot keep {keep} of the {} verified rows ending at {}",
+                tokens.len(),
+                rank.bundle.state.position
+            ));
+        }
+        // This band's own row-aware repair: its GDN recurrence prefix, conv
+        // history and QSA marks from its own ticket and captured rows, and (on
+        // the input band, the only one with a PLE history) the PLE
+        // convolution input rows its own forward normalized for the block.
+        rank.bundle
+            .rollback_verify_rows_retain_with(
+                gpu,
+                local,
+                keep,
+                tokens,
+                &rank.forward.scratch.ple_normed,
+            )
+            .map_err(|error| format!("Qwen4 band {owner} row repair: {error}"))
     }
     fn capture_session_rank(
         &mut self,
@@ -543,31 +747,158 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
     }
     fn checkpoint_rank(
         &mut self,
-        _: usize,
-        _: &mut Gpu,
-        _: &MeshCheckpointKey,
+        owner: usize,
+        gpu: &mut Gpu,
+        key: &MeshCheckpointKey,
     ) -> Result<MeshCheckpointId> {
-        Err(TRANSACTIONS_REFUSED.into())
+        let window = self
+            .window
+            .as_mut()
+            .ok_or("Qwen4 window transaction is not bound")?;
+        let bands = self.ranks.len();
+        if owner < bands {
+            let slot = window
+                .target
+                .get_mut(owner)
+                .ok_or("Qwen4 window has no slot for this band")?;
+            if slot.is_some() {
+                return Err(format!("Qwen4 band {owner} already holds a window ticket"));
+            }
+            // The row capture is armed (or not) uniformly by the caller before
+            // any band snapshots: an armed snapshot skips the GDN copies.
+            *slot = Some(
+                self.ranks[owner]
+                    .bundle
+                    .snapshot(gpu)
+                    .map_err(|error| format!("Qwen4 band {owner} window snapshot: {error}"))?,
+            );
+        } else if owner == bands {
+            if window.head.is_some() {
+                return Err("Qwen4 window already holds a head ticket".into());
+            }
+            let output = &mut self.ranks[bands - 1];
+            if !output.bundle.weights.band_scope().output {
+                return Err("Qwen4 MTP head ticket needs the output band".into());
+            }
+            window.head = Some(
+                output
+                    .bundle
+                    .mtp_snapshot(gpu)
+                    .map_err(|error| format!("Qwen4 head window snapshot: {error}"))?,
+            );
+        } else {
+            return Err("Qwen4 window owner is outside the mesh".into());
+        }
+        Ok(window_ticket(key, owner))
     }
     fn restore_rank(
         &mut self,
-        _: usize,
-        _: &mut Gpu,
-        _: &MeshCheckpointKey,
-        _: MeshCheckpointId,
+        owner: usize,
+        gpu: &mut Gpu,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
     ) -> Result<()> {
-        Err(TRANSACTIONS_REFUSED.into())
+        check_window_ticket(&ticket, owner, key)?;
+        let window = self
+            .window
+            .as_ref()
+            .ok_or("Qwen4 window transaction is not bound")?;
+        let retain = window.restore == WindowRestore::Retain;
+        let bands = self.ranks.len();
+        if owner < bands {
+            let local = window
+                .target
+                .get(owner)
+                .copied()
+                .flatten()
+                .ok_or("Qwen4 band has no window ticket to restore")?;
+            let bundle = &mut *self.ranks[owner].bundle;
+            let restored = if retain {
+                bundle.restore_retain(gpu, local)
+            } else {
+                bundle.restore(gpu, local)
+            };
+            restored.map_err(|error| format!("Qwen4 band {owner} window restore: {error}"))
+        } else if owner == bands {
+            let head = window
+                .head
+                .ok_or("Qwen4 window has no head ticket to restore")?;
+            let bundle = &mut *self.ranks[bands - 1].bundle;
+            let restored = if retain {
+                bundle.mtp_restore_retain(gpu, head)
+            } else {
+                bundle.mtp_restore(gpu, head)
+            };
+            restored.map_err(|error| format!("Qwen4 head window restore: {error}"))
+        } else {
+            Err("Qwen4 window owner is outside the mesh".into())
+        }
     }
     fn validate_finalize_rank(
         &mut self,
-        _: usize,
-        _: &MeshCheckpointKey,
-        _: MeshCheckpointId,
+        owner: usize,
+        key: &MeshCheckpointKey,
+        ticket: MeshCheckpointId,
     ) -> Result<()> {
-        Err(TRANSACTIONS_REFUSED.into())
+        check_window_ticket(&ticket, owner, key)?;
+        let window = self
+            .window
+            .as_ref()
+            .ok_or("Qwen4 window transaction is not bound")?;
+        let bands = self.ranks.len();
+        if owner < bands {
+            let local = window
+                .target
+                .get(owner)
+                .copied()
+                .flatten()
+                .ok_or("Qwen4 band has no window ticket to validate")?;
+            self.ranks[owner]
+                .bundle
+                .validate_commit(local)
+                .map_err(|error| format!("Qwen4 band {owner} window ticket: {error}"))
+        } else if owner == bands {
+            let head = window
+                .head
+                .ok_or("Qwen4 window has no head ticket to validate")?;
+            self.ranks[bands - 1]
+                .bundle
+                .mtp_validate_commit(head)
+                .map_err(|error| format!("Qwen4 head window ticket: {error}"))
+        } else {
+            Err("Qwen4 window owner is outside the mesh".into())
+        }
     }
-    fn finalize_rank(&mut self, _: usize, _: &MeshCheckpointKey, _: MeshCheckpointId) {
-        panic!("{TRANSACTIONS_REFUSED}: finalize called without a valid checkpoint");
+    fn finalize_rank(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId) {
+        // Host-only and infallible: `validate_finalize_rank` already vetted this
+        // ticket and its local ticket; anything unexpected is left untouched.
+        if check_window_ticket(&ticket, owner, key).is_err() {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let retain = window.finalize == WindowFinalize::Retain;
+        let bands = self.ranks.len();
+        if owner < bands {
+            if let Some(local) = window.target.get(owner).copied().flatten() {
+                let bundle = &mut *self.ranks[owner].bundle;
+                if retain {
+                    bundle.retain_target_validated(local);
+                } else {
+                    bundle.commit_validated(local);
+                }
+            }
+        } else if owner == bands {
+            if let Some(head) = window.head {
+                let bundle = &mut *self.ranks[bands - 1].bundle;
+                if retain {
+                    bundle.mtp_retain_validated(head);
+                } else {
+                    bundle.mtp_commit_validated(head);
+                }
+            }
+        }
     }
 }
 
@@ -677,5 +1008,64 @@ mod session_tests {
         reloaded.load_id += 1;
         assert!(check_session_ticket(&ticket, 0, &reloaded, 4096).is_err());
         assert!(check_session_ticket(&ticket, 0, &epoch(&other, 3), 4096).is_err());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+
+    fn key(mesh: &DeviceMesh, window: u64) -> MeshCheckpointKey {
+        MeshCheckpointKey {
+            mesh_epoch: mesh.epoch(),
+            load_gen: 7,
+            reset_gen: 0,
+            request_gen: 3,
+            window_gen: window,
+        }
+    }
+
+    #[test]
+    fn window_tickets_name_their_owner_and_window() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let key = key(&mesh, 5);
+        let band = window_ticket(&key, 0);
+        let output = window_ticket(&key, 1);
+        let head = window_ticket(&key, 2);
+        assert_eq!((band.owner(), output.owner(), head.owner()), (0, 1, 2));
+        assert!(check_window_ticket(&band, 0, &key).is_ok());
+        assert!(check_window_ticket(&head, 2, &key).is_ok());
+        // Never another owner's ticket (no rank-zero broadcast, no head/trunk mix-up).
+        assert!(check_window_ticket(&band, 1, &key).is_err());
+        assert!(check_window_ticket(&head, 1, &key).is_err());
+    }
+
+    #[test]
+    fn stale_foreign_and_reloaded_window_tickets_are_refused() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let other = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let key = key(&mesh, 5);
+        let ticket = window_ticket(&key, 0);
+        assert!(check_window_ticket(&ticket, 0, &self::key(&mesh, 6)).is_err());
+        assert!(check_window_ticket(&ticket, 0, &self::key(&other, 5)).is_err());
+        let mut reloaded = key;
+        reloaded.load_gen += 1;
+        assert!(check_window_ticket(&ticket, 0, &reloaded).is_err());
+        let mut next_request = key;
+        next_request.request_gen += 1;
+        assert!(check_window_ticket(&ticket, 0, &next_request).is_err());
+        // A session piece's ticket (local = prefix) is not a window ticket.
+        let piece = MeshCheckpointId::issue(key, 0, 4096);
+        assert!(check_window_ticket(&piece, 0, &key).is_err());
+    }
+
+    #[test]
+    fn window_context_collects_one_ticket_per_band() {
+        let ctx = WindowCtx::checkpoint(3);
+        assert_eq!(ctx.restore, WindowRestore::Consume);
+        assert_eq!(ctx.finalize, WindowFinalize::Commit);
+        // Nothing captured: no complete ticket set.
+        assert!(ctx.into_target().is_none());
     }
 }

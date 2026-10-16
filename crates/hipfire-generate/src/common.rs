@@ -306,6 +306,73 @@ fn qwen4_pp_owns_reset(pp: usize, active_qwen4_mesh: bool) -> bool {
     pp > 1 && active_qwen4_mesh
 }
 
+/// Only the admitted Qwen4 native drafter may participate in a mesh reset.
+/// A speculator's display name is not an ownership proof.
+fn qwen4_pp_reset_drafter(
+    drafter: Option<&mut dyn Any>,
+) -> Result<&mut hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter, String> {
+    drafter
+        .and_then(|drafter| drafter.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+        .ok_or_else(|| {
+            "qwen4 topology.pp reset found a speculator other than native Qwen4 MTP".into()
+        })
+}
+
+fn qwen4_pp_reset_owners(
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    spec: Option<&mut dyn Speculator>,
+    has_checkpoints: bool,
+) -> Result<(), String> {
+    if has_checkpoints {
+        return Err("qwen4 topology.pp reset found checkpoint state excluded by admission".into());
+    }
+    // Resolve the drafter before any GPU operation; foreign speculative state
+    // cannot be reset through the output owner's native-MTP entry.
+    let drafter = match spec {
+        Some(spec) => Some(qwen4_pp_reset_drafter(spec.drafter_any_mut())?),
+        None => None,
+    };
+    bundle.pp_reset(gpus).map_err(|error| error.to_string())?;
+    if let Some(drafter) = drafter {
+        drafter.pp_mtp_reset(gpus, bundle)?;
+    }
+    Ok(())
+}
+
+/// Live-slot PP rollback: target and native drafter use the same admitted
+/// hardware owner, never the daemon's otherwise unused control handle.
+pub fn production_fail_closed_rollback_live_pp(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> RollbackEpilogue {
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    asst_turn_cache.clear();
+    let result = match slot
+        .as_any_mut()
+        .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    {
+        Some(bundle) if bundle.pp_mesh_active() => qwen4_pp_reset_owners(
+            bundle,
+            gpus,
+            Some(spec),
+            !prefill_checkpoints.is_empty() || !dflash_checkpoints.is_empty(),
+        ),
+        _ => Err("qwen4 topology.pp reset is missing its admitted target bundle".into()),
+    };
+    RollbackEpilogue {
+        rolled_back: result.is_ok(),
+        context: result.err(),
+    }
+}
+
 /// Qwen4's band adapter resets every model GPU through the `LoadedModel`
 /// hardware owner. Its all-band reset is already drained; neither a daemon
 /// root reset nor the legacy Qwen3.5 DN reset applies to that route.
@@ -319,20 +386,24 @@ fn qwen4_pp_rollback(m: &mut LoadedModel) -> Option<RollbackEpilogue> {
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     m.asst_turn_cache.clear();
-    let unexpected_spec = m.speculator.is_some()
-        || !m.prefill_checkpoints.is_empty()
-        || !m.dflash_checkpoints.is_empty();
-    let result = match m.qwen4_mesh_mut() {
-        Some((bundle, gpus)) => bundle.pp_reset(gpus).map_err(|error| error.to_string()),
-        None => Err("qwen4 topology.pp reset is missing its admitted Gpus owner".into()),
+    let has_checkpoints = !m.prefill_checkpoints.is_empty() || !m.dflash_checkpoints.is_empty();
+    let result = match (
+        m.state.as_deref_mut().and_then(|state| {
+            (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }),
+        m.pp_gpus.as_mut(),
+    ) {
+        (Some(bundle), Some(gpus)) => qwen4_pp_reset_owners(
+            bundle,
+            gpus,
+            m.speculator
+                .as_mut()
+                .map(|spec| &mut **spec as &mut dyn Speculator),
+            has_checkpoints,
+        ),
+        _ => Err("qwen4 topology.pp reset is missing its admitted Gpus owner".into()),
     };
-    let context = match result {
-        Err(error) => Some(error.to_string()),
-        Ok(()) if unexpected_spec => {
-            Some("qwen4 topology.pp reset found speculative state excluded by admission".into())
-        }
-        Ok(()) => None,
-    };
+    let context = result.err();
     Some(RollbackEpilogue {
         rolled_back: context.is_none(),
         context,
@@ -2065,6 +2136,16 @@ pub fn token_logprob_fields(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen4_pp_reset_dispatch_accepts_only_the_native_drafter_type() {
+        use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
+        let mut native = Qwen4MtpDrafter::new(3, 128, None);
+        assert!(super::qwen4_pp_reset_drafter(Some(&mut native)).is_ok());
+        let mut foreign = String::from("mtp");
+        assert!(super::qwen4_pp_reset_drafter(Some(&mut foreign)).is_err());
+        assert!(super::qwen4_pp_reset_drafter(None).is_err());
+    }
+
     #[test]
     fn qwen4_pp_reset_dispatch_excludes_legacy_and_single() {
         assert!(super::qwen4_pp_owns_reset(2, true));

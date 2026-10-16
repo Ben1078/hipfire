@@ -31,19 +31,19 @@
 //! [`LaneCostModel`] instead of wall clocks (see its docs).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
+use crate::lane::Qwen4LaneStore;
 use crate::lane::{LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState};
 use crate::lane_exec::{LaneDraft, LaneRoute};
-use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot};
+use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
     accept_native_greedy, batched_depth, draft_accept_estimate, draft_pairing,
-    finish_native_window, mtp_prefill_chunk,
-    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, observe_agreement, Agreement, DraftPairing, FloorRoute,
-    MtpFloor, NativeFinish, NativeWindow, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY, MTP_AGREEMENT_PRIOR,
-    MTP_MAX_DEPTH, MTP_ROW_WORTH, WindowStats,
+    finish_native_window, mtp_prefill_chunk, mtp_prefill_chunk_needs_pick,
+    mtp_reuse_prefill_ids_enabled, mtp_skip_intermediate_pick_enabled, observe_agreement,
+    Agreement, DraftPairing, FloorRoute, HeadTicket, MtpFloor, NativeFinish, NativeWindow,
+    Qwen4Ops, TargetTicket, WindowStats, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY,
+    MTP_AGREEMENT_PRIOR, MTP_MAX_DEPTH, MTP_ROW_WORTH,
 };
-use crate::lane::Qwen4LaneStore;
-use crate::state::Qwen4StateSnapshot;
+
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
 use rdna_compute::{Gpu, GpuTensor};
@@ -367,9 +367,10 @@ pub(crate) struct PendingWindow {
     /// The drafts budget (clamped to the lane's `K`) the floor observes.
     pub budget: usize,
     /// The head ticket taken before the draft steps (`Batched`).
-    pub head_ticket: Option<MtpGpuStateSnapshot>,
-    /// The target ticket taken before the verify forward (`Batched`).
-    pub target_ticket: Option<Qwen4StateSnapshot>,
+    pub head_ticket: Option<HeadTicket>,
+    /// The target ticket taken before the verify forward (`Batched`). Lanes
+    /// run on one card: always [`TargetTicket::Local`].
+    pub target_ticket: Option<TargetTicket>,
     /// Set by the forward once the window is finished; consumed by commit.
     pub outcome: Option<MtpWindow>,
 }
@@ -483,7 +484,7 @@ pub(crate) fn draft_lanes(
         ))
         .map_err(|e| format!("draft_step: head snapshot of {epoch:?}: {e}"))?;
         if let Some(window) = spec.window.as_mut() {
-            window.head_ticket = Some(ticket);
+            window.head_ticket = Some(HeadTicket::Local(ticket));
         }
         drafting.push(Drafting {
             lane: index,
@@ -692,7 +693,7 @@ pub(crate) fn finish_lane_window(
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
         finish_native_window(
             b,
-            gpu,
+            &mut Qwen4Ops::Single(&mut *gpu),
             NativeFinish {
                 position,
                 block: &block,
@@ -702,7 +703,7 @@ pub(crate) fn finish_lane_window(
                 mtp_ticket,
                 pending_hidden,
                 verify_hidden: &verify_hidden,
-                ple_normed: &ple_normed,
+                ple_normed: Some(&ple_normed),
                 retain: false,
             },
             None,
@@ -816,7 +817,7 @@ pub(crate) fn prefill_tile(
         b.poll_npu_trunk(gpu)?;
         mtp_prefill_chunk(
             b,
-            gpu,
+            &mut Qwen4Ops::Single(&mut *gpu),
             tokens,
             start,
             needs_pick,

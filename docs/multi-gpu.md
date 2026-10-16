@@ -653,6 +653,7 @@ string or a blanket “always refuse at load.”
 | Qwen3.5 **safetensors directory** + `pp>1` | Error: `qwen35: safetensors + pp>1 unsupported` |
 | Qwen3.5 / 3.6 **VL HFQ** + `pp>1` | **Not a hard refuse.** `load_qwen35_pp` is the text HFQ loader only — vision weights are **not** loaded on that path, so VL artifacts **silently become text-only** under PP. Serve real VL at `pp=1`. |
 | `bench_prefill` / multi-GPU EP | Daemon refuses bench_prefill when `pp>1` or EP is active |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted for greedy requests (see [Flash-Next `topology.pp > 1`: native MTP](#flash-next-topologypp--1-native-mtp)); sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree/lanes stay refused |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
@@ -660,6 +661,75 @@ arch other than gfx1100/gfx1201, mixed arches, too few devices, missing peer
 access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redline,
 `HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
+
+### Flash-Next `topology.pp > 1`: native MTP
+
+Native MTP on the host-staged Flash-Next mesh is explicit opt-in
+(`speculation.mtp = on` / `--spec mtp`); `auto` and `off` keep AR under PP.
+Only the output band (physical card 0) drafts, samples and decides; every band
+runs the same verify block `[seed, drafts...]` with identical actual and route
+rows. The aggregate window transaction prepares every band, repairs partial
+rejections per band, finishes the output head, then finalizes every owner.
+Its exactness contract is the Single native-MTP result: tokens, window records
+and canonical state including the MTP head. CPU tests do not establish GPU
+parity; qualify each hardware cell with the three-way oracle below.
+There is one generation loop: the daemon's `generate_spec` calls the native
+drafter's mesh entries with the model's `Gpus` (prefill, window step, forced
+advance, terminal-prefix repair, reset); Single and EP take the unchanged entries.
+
+- Sampled requests, token penalties, DFlash/DSpark/n-gram/DDTree and lanes are
+  not run on the mesh MTP route (sampled and penalized requests stay on AR; the
+  n-gram modifier is off). A speculative request that reaches the mesh entry
+  with any of them, or with KV eviction or a checkpoint resume, is refused with
+  a validation error before any state mutation.
+- MTP sessions are not distributed: a native-MTP request on the mesh never
+  reuses a session snapshot and publishes none.
+- The retained terminal/stop-prefix repair keeps its restore-and-replay
+  behaviour on every band; a request whose repair the mesh does not take exactly
+  resets and re-prefills instead of continuing on inexact state.
+
+Exactness oracle (`fn_ep_oracle --spec mtp`, feature `lab`). Every arm of a
+comparison must run the same route/depth/floor policy, so pin it identically:
+`HIPFIRE_MTP_AR_FLOOR=0` (the floor is timed), `HIPFIRE_MTP_INCREMENTAL=0`
+(forces the batched native route at full K), `HIPFIRE_MTP_NGRAM=off` with
+`--ngram off`, `--temp 0`, and `HIPFIRE_GRAPH=0`. The PP arm requires greedy
+requests, no `--ngram on` (the mesh drafter has no n-gram pool; `meta.spec.ngram`
+records the effective `false`) and a timing-independent policy
+(`HIPFIRE_MTP_AR_FLOOR=0` or a forced `HIPFIRE_MTP_INCREMENTAL`), and refuses
+otherwise. PP2 below uses
+`HIPFIRE_PP_LAYERS=24,24`, so the cut-safe Single arm cuts before layer 24:
+
+```bash
+# Build under the pinned target dir (no GPU needed to build):
+#   ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/home/kaden/qcal/release-0.4.3/target-pp-mesh \
+#     cargo build --release -p hipfire-loader --features lab --example fn_ep_oracle
+BIN=/home/kaden/qcal/release-0.4.3/target-pp-mesh/release/examples/fn_ep_oracle
+CMP=/home/kaden/qcal/release-0.4.3/ep-host-notes/g0/g0_compare.py
+# CARD0 = the output owner (visible device 0); CARD1 = the stage-0 card, the same exact arch.
+# $MODEL, $P1, $P2, $OUT, $CARD0, $CARD1 are placeholders. The prompts plus --tokens must fit
+# --max-seq (prompt tokens + 64 <= 1024 here; raise --max-seq, or pass
+# --truncate-prompt-tokens N, for longer prompts).
+export HIPFIRE_GRAPH=0 HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off
+COMMON=(--model "$MODEL" --max-seq 1024 --tokens 64 --spec mtp --temp 0 --ngram off
+        --state-every 8 --skip-model-hash --canonical-state
+        --prompt-file "$P1" --prompt-file "$P2")
+# Single MTP (uncut), on the card the PP2 arm uses as its output owner
+HIPFIRE_DEVICES="$CARD0" "$BIN" "${COMMON[@]}" --out "$OUT/single" --arm single
+# cut-safe Single MTP, same card
+HIPFIRE_DEVICES="$CARD0" HIPFIRE_QWEN4_CUT_LAYERS=24 "$BIN" "${COMMON[@]}" --out "$OUT/cut" --arm cut
+# PP2 MTP: the first listed device is the output owner and runs the LAST band; the loader orders the
+# stages itself (stage 0 on the second device), so list CARD0 first
+HIPFIRE_DEVICES="$CARD0,$CARD1" HIPFIRE_PP_LAYERS=24,24 "$BIN" "${COMMON[@]}" --pp 2 --out "$OUT/pp2" --arm pp2
+python3 "$CMP" "$OUT/single" "$OUT/cut"
+python3 "$CMP" "$OUT/single" "$OUT/pp2"
+python3 "$CMP" "$OUT/cut" "$OUT/pp2"
+```
+
+Without `--canonical-state` the Single and cut-safe arms keep their per-rank
+record format (the uncut/cut pair above compares as before); the PP arm then
+writes one record per band, the MTP head rows on the output band's record.
+`meta.json` of a PP arm records the placement (`band_counts`, `rank_order`,
+`edge_transports`, `output_owner`) and `numerical_policy`.
 
 Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit
 `speculation = "mtp"` (`speculation.mtp = on`, `--spec mtp`) takes the spec route.

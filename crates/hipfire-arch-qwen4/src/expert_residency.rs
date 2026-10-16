@@ -878,6 +878,9 @@ pub struct BandCensus {
     /// The band's forward scratch by role: the per-stage shared copy is an
     /// explicit duplicate across ranks, the rest is owned once.
     pub forward: ForwardCensus,
+    /// Native MTP reserves of this band (all zero when the load is AR): the
+    /// output band's head and request buffers, every band's row capture.
+    pub mtp: NativeMtpCensus,
 }
 
 impl BandCensus {
@@ -1023,8 +1026,36 @@ pub fn band_census(
     chunk_rows: usize,
     mode: Qwen4ForwardScratchMode,
 ) -> Result<BandCensus, String> {
+    band_census_native_mtp(
+        config, weights, bytes_of, scope, format, context, chunk_rows, mode, None,
+    )
+}
+
+/// [`band_census`] for a load whose native MTP is `mtp` (`None` = AR, every
+/// MTP reserve zero; the output band still counts the head's weights, which
+/// the band loads whether or not the head attaches). The weight terms are the
+/// same entries either way; `mtp` adds [`BandCensus::mtp`] by
+/// [`native_mtp_census_scope`].
+#[allow(clippy::too_many_arguments)]
+pub fn band_census_native_mtp(
+    config: &Qwen4Config,
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    scope: &Qwen4BandScope,
+    format: crate::Qwen4StateFormat,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+    mtp: Option<&NativeMtpCensusInputs>,
+) -> Result<BandCensus, String> {
     scope.validate(config)?;
     let weights_census = band_weight_census(weights, &bytes_of, scope)?;
+    let mtp = match mtp {
+        Some(inputs) => {
+            native_mtp_census_scope(config, weights, context, chunk_rows, inputs, scope)?
+        }
+        None => NativeMtpCensus::default(),
+    };
     Ok(BandCensus {
         band: scope.band.clone(),
         input: scope.input,
@@ -1038,6 +1069,130 @@ pub fn band_census(
         f16_shadow_bytes: f16_shadow_bytes_scope(weights, config.num_hidden_layers, scope)?,
         state: state_census_scope(config, format, context, chunk_rows, mode, scope)?,
         forward: forward_census_scope(config, chunk_rows, mode, scope)?,
+        mtp,
+    })
+}
+
+/// The native MTP request of a load, as the census sizes it: the resolved
+/// values the Single load passes to `mtp_spec::native_mtp_device_bytes`
+/// (the head dtype comes from the manifest's language head).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeMtpCensusInputs {
+    /// Draft window K (the request sizes `K.clamp(1, 10) + 1` rows).
+    pub max_k: usize,
+    /// The GDN storage format of the verify-row capture where the route
+    /// captures rows (`mtp_spec::native_mtp_row_capture`), else `None`.
+    pub row_capture: Option<crate::GdnStateFormat>,
+    /// Whether the request allocates the batched prompt-fill scratch
+    /// (`mtp_spec::native_mtp_fill_scratch`).
+    pub batched_fill: bool,
+}
+
+/// One band's native MTP reserve terms. [`Self::reserve`] of the `Single`
+/// scope is exactly `mtp_spec::native_mtp_device_bytes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeMtpCensus {
+    /// What the attached head keeps (`Qwen4MtpGpu`): output band only.
+    pub head_resident: u64,
+    /// The draft head's build scratch, released at attach: output band only.
+    pub head_build_scratch: u64,
+    /// What the first speculative request keeps beyond the capture: the
+    /// verify (wide-capture) hidden rows, the pending and row hidden carries
+    /// and the prompt-fill scratch (`native_mtp_request_bytes` without row
+    /// capture): output band only.
+    pub request: u64,
+    /// This band's own GDN verify-row capture (ring, inputs, output block and
+    /// pointer table for its GDN layers): every band, never the whole model's
+    /// charged once per rank.
+    pub row_capture: u64,
+}
+
+impl NativeMtpCensus {
+    /// Bytes the band reserves for native MTP: the resident head plus the
+    /// larger of its build scratch (released at attach) and what the first
+    /// request allocates after it; a band without the head reserves its row
+    /// capture alone. Checked.
+    pub fn reserve(&self) -> Result<u64, String> {
+        let overflow = || "native MTP band reserve overflows".to_string();
+        let request = self
+            .request
+            .checked_add(self.row_capture)
+            .ok_or_else(overflow)?;
+        self.head_resident
+            .checked_add(self.head_build_scratch.max(request))
+            .ok_or_else(overflow)
+    }
+}
+
+/// The native MTP reserve of one pipeline band (`Single` = the whole model).
+///
+/// Every band charges the row capture of its OWN GDN layers
+/// (`Qwen4State::row_capture_bytes_scoped`, `K.clamp(1, 10) + 1` rows): each
+/// band arms capture before its target snapshot. The output band, which owns
+/// the head and the request buffers, additionally charges
+/// `Qwen4MtpGpu::device_bytes` and `native_mtp_request_bytes` WITHOUT capture
+/// (the capture is band-scoped here, not the whole model's), so the `Single`
+/// scope equals `native_mtp_device_bytes` and no rank pays the full-model
+/// capture. `context` is the census context, as for the head's QSA arenas.
+pub fn native_mtp_census_scope(
+    config: &Qwen4Config,
+    weights: &[WeightEntry],
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mtp: &NativeMtpCensusInputs,
+    scope: &Qwen4BandScope,
+) -> Result<NativeMtpCensus, String> {
+    scope.validate(config)?;
+    if config.mtp.is_none() {
+        return Err(format!(
+            "native MTP census for profile {}, which has no MTP head",
+            config.profile.id()
+        ));
+    }
+    let overflow = |what: &str| format!("native MTP census {what} overflows");
+    let gdn_layers = scope
+        .band
+        .clone()
+        .filter(|&layer| {
+            config.layer_types.get(layer) == Some(&crate::config::LayerType::LinearAttention)
+        })
+        .count();
+    let row_capture = match mtp.row_capture {
+        Some(gdn) => crate::state::Qwen4State::row_capture_bytes_scoped(
+            config,
+            gdn,
+            mtp.max_k.clamp(1, 10) + 1,
+            gdn_layers,
+        )
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| overflow("row capture"))?,
+        None => 0,
+    };
+    if !scope.output {
+        return Ok(NativeMtpCensus {
+            row_capture,
+            ..NativeMtpCensus::default()
+        });
+    }
+    let head_dtype = language_head_dtype(weights)
+        .ok_or_else(|| "native MTP census: manifest has no language head".to_string())?;
+    let (resident, scratch) =
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)
+            .ok_or_else(|| overflow("head"))?;
+    let request = crate::mtp_spec::native_mtp_request_bytes(
+        config,
+        context.max_seq,
+        chunk_rows,
+        mtp.max_k,
+        None,
+        mtp.batched_fill,
+    )
+    .ok_or_else(|| overflow("request"))?;
+    Ok(NativeMtpCensus {
+        head_resident: u64::try_from(resident).map_err(|_| overflow("head"))?,
+        head_build_scratch: u64::try_from(scratch).map_err(|_| overflow("head scratch"))?,
+        request,
+        row_capture,
     })
 }
 
@@ -3331,6 +3486,206 @@ mod tests {
                 assert!(ranks[last].non_expert_bytes > middle.non_expert_bytes);
             }
         }
+    }
+
+    #[test]
+    fn native_mtp_single_scope_census_is_the_single_load_formula() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let head = language_head_dtype(weights).expect("language head");
+        let single = Qwen4BandScope::single(&config);
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        for gdn in [
+            None,
+            Some(crate::GdnStateFormat::Q8),
+            Some(crate::GdnStateFormat::F32),
+        ] {
+            for batched_fill in [false, true] {
+                for max_k in [1usize, 3, 10, 64] {
+                    let inputs = NativeMtpCensusInputs {
+                        max_k,
+                        row_capture: gdn,
+                        batched_fill,
+                    };
+                    let census =
+                        native_mtp_census_scope(&config, weights, &context, 256, &inputs, &single)
+                            .expect("single census");
+                    assert_eq!(
+                        census.reserve().ok(),
+                        crate::mtp_spec::native_mtp_device_bytes(
+                            &config,
+                            &context,
+                            256,
+                            max_k,
+                            head,
+                            gdn,
+                            batched_fill,
+                        ),
+                        "gdn {gdn:?} fill {batched_fill} K {max_k}"
+                    );
+                    assert!(census.head_resident > 0 && census.request > 0);
+                    assert_eq!(census.row_capture > 0, gdn.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_mtp_pp_bands_charge_their_own_capture_and_only_the_output_the_head() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let gdn = crate::GdnStateFormat::Q8;
+        let inputs = NativeMtpCensusInputs {
+            max_k: 3,
+            row_capture: Some(gdn),
+            batched_fill: true,
+        };
+        let whole = native_mtp_census_scope(
+            &config,
+            weights,
+            &context,
+            256,
+            &inputs,
+            &Qwen4BandScope::single(&config),
+        )
+        .unwrap();
+        for counts in [&[24usize, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let scopes = band_scopes(&config, counts);
+            for scope in &scopes {
+                let census =
+                    native_mtp_census_scope(&config, weights, &context, 256, &inputs, scope)
+                        .unwrap();
+                let gdn_layers = scope
+                    .band
+                    .clone()
+                    .filter(|&layer| {
+                        config.layer_types[layer] == crate::config::LayerType::LinearAttention
+                    })
+                    .count();
+                // Every band: the capture of its own GDN layers, four rows.
+                assert!(gdn_layers > 0);
+                assert_eq!(
+                    census.row_capture,
+                    crate::state::Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, gdn_layers)
+                        .unwrap() as u64,
+                    "{counts:?} {:?}",
+                    scope.band
+                );
+                // No band is charged the whole model's capture.
+                assert!(census.row_capture < whole.row_capture, "{counts:?}");
+                if scope.output {
+                    // The head and the request buffers once, on the output band.
+                    assert_eq!(census.head_resident, whole.head_resident);
+                    assert_eq!(census.head_build_scratch, whole.head_build_scratch);
+                    assert_eq!(census.request, whole.request);
+                    assert_eq!(
+                        census.reserve().unwrap(),
+                        census.head_resident
+                            + census
+                                .head_build_scratch
+                                .max(census.request + census.row_capture)
+                    );
+                } else {
+                    assert_eq!(
+                        (
+                            census.head_resident,
+                            census.head_build_scratch,
+                            census.request
+                        ),
+                        (0, 0, 0)
+                    );
+                    assert_eq!(census.reserve().unwrap(), census.row_capture);
+                }
+            }
+            // Row capture off (a GPU without the few-row GDN route): no band
+            // charges it, the output band keeps the head and the request.
+            let off = NativeMtpCensusInputs {
+                row_capture: None,
+                ..inputs
+            };
+            for scope in &scopes {
+                let census =
+                    native_mtp_census_scope(&config, weights, &context, 256, &off, scope).unwrap();
+                assert_eq!(census.row_capture, 0);
+                assert_eq!(census.reserve().unwrap() > 0, scope.output);
+            }
+        }
+    }
+
+    #[test]
+    fn band_census_adds_only_the_mtp_terms_and_ar_has_none() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let inputs = NativeMtpCensusInputs {
+            max_k: 3,
+            row_capture: Some(crate::GdnStateFormat::Q8),
+            batched_fill: false,
+        };
+        for scope in band_scopes(&config, &[24, 24]) {
+            let ar = census_of(&config, weights, &scope);
+            assert_eq!(ar.mtp, NativeMtpCensus::default());
+            // The head's weights are loaded (and counted) on the output band
+            // whether or not the head attaches.
+            assert_eq!(ar.routed_mtp_bytes > 0, scope.output);
+            let with = band_census_native_mtp(
+                &config,
+                weights,
+                element_bytes,
+                &scope,
+                target_state_format(),
+                &context,
+                256,
+                Full,
+                Some(&inputs),
+            )
+            .unwrap();
+            assert_eq!(
+                with.mtp,
+                native_mtp_census_scope(&config, weights, &context, 256, &inputs, &scope).unwrap()
+            );
+            assert!(with.mtp.reserve().unwrap() > 0);
+            assert_eq!(
+                BandCensus {
+                    mtp: NativeMtpCensus::default(),
+                    ..with
+                },
+                ar
+            );
+        }
+    }
+
+    #[test]
+    fn native_mtp_census_refuses_a_profile_without_a_head() {
+        use crate::config::Qwen4FfnConfig;
+        let headless = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            true,
+            false,
+        );
+        let inputs = NativeMtpCensusInputs {
+            max_k: 3,
+            row_capture: None,
+            batched_fill: false,
+        };
+        let error = native_mtp_census_scope(
+            &headless,
+            &[],
+            &crate::Qwen4ContextCommit::legacy(64),
+            8,
+            &inputs,
+            &Qwen4BandScope::single(&headless),
+        )
+        .unwrap_err();
+        assert!(error.contains("no MTP head"), "{error}");
     }
 
     #[test]

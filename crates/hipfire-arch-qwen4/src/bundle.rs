@@ -53,6 +53,7 @@ pub(crate) use session_pair::PairSessionStage;
 #[path = "bundle/pp.rs"]
 mod pp;
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
+pub use pp::Qwen4PpWindow;
 use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1143,7 +1144,13 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         rows: usize,
     ) -> Result<(), BundleError> {
-        self.ep_refuse("speculative decoding (spec hidden rows)")?;
+        // The root-only spec hidden allocation is the output band's under PP
+        // (the caller passes the output device); only EP has no such owner.
+        if self.ep.is_some() {
+            return Err(BundleError::Forward(
+                "speculative decoding (spec hidden rows) is unsupported under qwen4 EP".to_string(),
+            ));
+        }
         if rows == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 spec hidden capacity is zero".to_string(),
@@ -3025,6 +3032,11 @@ impl Qwen4Bundle {
         route: SessionRoute,
         reused: usize,
     ) -> Result<(), String> {
+        if route != SessionRoute::Ar {
+            return Err(
+                "qwen4 topology.pp: MTP-route session snapshots are not supported".to_string(),
+            );
+        }
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
         self.with_session(|session, bundle| {
@@ -3675,6 +3687,21 @@ impl Qwen4Bundle {
 
     pub(crate) fn commit_validated(&mut self, snapshot: Qwen4StateSnapshot) {
         self.state.commit_validated(snapshot);
+    }
+
+    /// [`Self::commit_validated`] that keeps the arena entry active and
+    /// rollback-able instead (`SessionState::retain_validated` of the local
+    /// ticket): the target half of [`Self::retain_window`] for one band of
+    /// an aggregate window.
+    pub(crate) fn retain_target_validated(&mut self, snapshot: Qwen4StateSnapshot) {
+        self.state.retain_validated(snapshot);
+    }
+
+    /// The head half of [`Self::retain_window`], for an aggregate window.
+    pub(crate) fn mtp_retain_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.retain_validated(snapshot);
+        }
     }
 
     /// Keep a committed window's two tickets rollback-able ([`Self::restore_retain`]
