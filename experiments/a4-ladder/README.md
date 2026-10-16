@@ -20,14 +20,17 @@ the closed-think template adds 12 tokens so the daemon must report `prompt_token
 ```
 python3 experiments/a4-ladder/product_runner.py baseline|abba --cli target/release/hipfire --daemon target/release/daemon \
   --model <canonical model> --prompt512 experiments/a4-ladder/prompts/product-pp512.txt \
-  --prompt8192 experiments/a4-ladder/prompts/product-pp8192.txt --out <new dir>   # abba: --candidates 4,8 --blocks 2
+  --prompt8192 experiments/a4-ladder/prompts/product-pp8192.txt --out <new dir>   # abba: --candidates 8,4 --blocks 2
 python3 experiments/a4-ladder/product_runner.py summary <out>
 ```
 
 `baseline` runs only unset C2 at 512 and 8192 (one process each); exit 4 if pp8192 is outside 4590..5610
-tok/s (+-10% of ~5100) so the parent can explain before ABBA. `abba` runs, per candidate and length,
-`--blocks` (default 2) palindromic `C2 cand cand C2` blocks = 4 fresh processes per arm per comparison
-length, block-major. Both require `FABRIC_JOB` and stop at `--budget-secs` (1740).
+tok/s (+-10% of ~5100) so the parent can explain before ABBA. `abba` runs, per length, `--blocks`
+(default 2) shared-control palindromic blocks `C2 C8 C4 C4 C8 C2` (`--candidates 8,4` sets the order;
+general form `C2 c1..cn cn..c1 C2`): 4 fresh processes per arm per length, 2 lengths x 2 blocks x 6 =
+24 processes in one hold, block-major. The C2 rows are recorded once as `comparison='shared'` and used
+as the control of both the C8 and C4 pairs (each pair is an ABBA subsequence; no duplicate physical
+runs). Both modes require `FABRIC_JOB` and stop at `--budget-secs` (1740).
 
 Metric: per process, `samples.prefill` sample 0 is discarded (the Hello/16 warmup does not JIT the
 long-prompt shapes), value = median of the last 5 (`prefill_tok_s` = daemon prefill_tokens / prefill_s);

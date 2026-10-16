@@ -14,8 +14,10 @@ HIPFIRE_G12_A4_CANDIDATES (unset == default C2, or 4 / 8).
 
 Modes
   baseline  unset-C2 only, one process per length (512 and 8192); parent approves before ABBA
-  abba      per candidate (4, 8) and length: --blocks palindromic ABBA blocks (A = unset C2,
-            B = candidate) = 4 fresh processes per arm per comparison length at --blocks 2
+  abba      shared-control palindromic blocks per length: C2 c1 c2 c2 c1 C2 (--candidates 8,4 =>
+            C2 C8 C4 C4 C8 C2); --blocks 2 => 4 fresh processes per arm per length, 24 in total.
+            Control rows are comparison='shared' (one physical run set); each candidate/C2 pair is
+            an ABBA subsequence of the block
   summary   recompute summary.json from an existing <out>/raw.jsonl + manifest.json
 
 baseline/abba refuse to run unless FABRIC_JOB is set (launched by fabric-run.sh inside the
@@ -265,7 +267,7 @@ def summarize(rows, manifest):
     for length in manifest['lengths']:
         for comp in manifest.get('candidates', []):
             cand = 'c' + comp
-            crs = [r for r in good if (r['length'], r['comparison'], r['arm']) == (length, comp, 'c2')]
+            crs = [r for r in good if (r['length'], r['comparison'], r['arm']) == (length, 'shared', 'c2')]
             xrs = [r for r in good if (r['length'], r['comparison'], r['arm']) == (length, comp, cand)]
             blocks = sorted({r['block'] for r in crs} & {r['block'] for r in xrs})
             detail, ratios, selfr = [], [], []
@@ -279,7 +281,7 @@ def summarize(rows, manifest):
                     selfr.append(cb[-1]['proc_median_tok_s'] / cb[0]['proc_median_tok_s'])
                 detail.append({'block': b, 'control_procs': len(cb), 'candidate_procs': len(xb),
                                'control_geomean_tok_s': c, 'candidate_geomean_tok_s': x, 'ratio': x / c})
-            e = {'length': length, 'control': 'c2', 'candidate': cand, 'blocks': detail,
+            e = {'length': length, 'control': 'c2', 'control_comparison': 'shared', 'candidate': cand, 'blocks': detail,
                  'control_procs': len(crs), 'candidate_procs': len(xrs)}
             if ratios:
                 gm = geomean(ratios)
@@ -329,12 +331,12 @@ def build_schedule(mode, candidates, lengths, blocks):
         return [{'seq': i, 'comparison': 'baseline', 'block': 1, 'pos': 0, 'length': L, 'arm': 'c2'}
                 for i, L in enumerate(lengths)]
     sched = []
-    for block in range(1, blocks + 1):  # block-major: every comparison has block 1 before any has block 2
+    for block in range(1, blocks + 1):  # block-major: every length/arm has block 1 before any has block 2
         for L in lengths:
-            for c in candidates:
-                for pos, arm in enumerate(('c2', 'c' + c, 'c' + c, 'c2')):
-                    sched.append({'seq': len(sched), 'comparison': c, 'block': block, 'pos': pos,
-                                  'length': L, 'arm': arm})
+            seq = ['c2'] + ['c' + c for c in candidates] + ['c' + c for c in reversed(candidates)] + ['c2']
+            for pos, arm in enumerate(seq):
+                sched.append({'seq': len(sched), 'comparison': 'shared' if arm == 'c2' else arm[1:], 'block': block,
+                              'pos': pos, 'length': L, 'arm': arm})
     return sched
 
 
@@ -355,7 +357,9 @@ def cmd_run(a):
     lengths = [512, 8192]
     candidates = [c.strip() for c in a.candidates.split(',') if c.strip()] if mode == 'abba' else []
     if any(c not in ('4', '8') for c in candidates) or (mode == 'abba' and not candidates):
-        die('--candidates must be a subset of 4,8')
+        die('--candidates must be a distinct subset of 4,8')
+    if len(set(candidates)) != len(candidates):
+        die('--candidates must not repeat a value')
     if mode == 'abba' and a.blocks < 1:
         die('--blocks must be >= 1')
     a.expect_tokens = {512: a.tokens512, 8192: a.tokens8192}
@@ -538,8 +542,8 @@ def main():
         p.add_argument('--proc-timeout-secs', type=float, default=420.0)
         p.add_argument('--keep-going', action='store_true')
         if name == 'abba':
-            p.add_argument('--candidates', default='4,8')
-            p.add_argument('--blocks', type=int, default=2, help='ABBA blocks per candidate and length')
+            p.add_argument('--candidates', default='8,4', help='arm order inside each palindromic block')
+            p.add_argument('--blocks', type=int, default=2, help='palindromic shared-control blocks per length')
         else:
             p.set_defaults(blocks=1, candidates='')
         p.set_defaults(fn=cmd_run)
