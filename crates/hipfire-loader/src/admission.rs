@@ -1899,12 +1899,14 @@ pub(crate) fn qwen4_pp_option_refusal(
 }
 
 /// Explicit environment/config requests the Qwen4 PP route does not run:
-/// host-mapped band layers, the expert hotset, expert staging, session
-/// snapshots (turn snapshots, the session-cache disk tier) and the NPU trunk
-/// (`npu` is the already resolved mode for the rank architecture). Unset
-/// values are accepted: the PP route never enables any of them, and attaches no
-/// session cache whatever `memory.session_cache_bytes` holds. `pp <= 1` never
-/// refuses.
+/// host-mapped band layers, the expert hotset, expert staging, turn snapshots
+/// (`HIPFIRE_QWEN4_TURN_SNAPSHOTS=1`), the session-cache disk tier and the NPU
+/// trunk (`npu` is the already resolved mode for the rank architecture).
+/// Unset values are accepted: the PP route never enables any of them. The
+/// in-memory session cache is not refused: every band attaches its own
+/// (`memory.session_cache_bytes`, opportunistic and uncharged exactly as in
+/// Single; only the disk tier and turn snapshots stay refused). `pp <= 1`
+/// never refuses.
 pub(crate) fn qwen4_pp_env_refusal(
     pp: usize,
     env: &dyn Fn(&str) -> Option<String>,

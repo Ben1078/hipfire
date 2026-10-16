@@ -34,8 +34,8 @@ use hipfire_runtime::sampler::{
     apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
 use hipfire_runtime::session_cache::{
-    stride_boundaries, SessionCache, SessionDriver, SessionRoute, SessionState, SnapshotParts,
-    StateLayout,
+    stride_boundaries, SessionCache, SessionDriver, SessionPieceKey, SessionRoute, SessionState,
+    SnapshotParts, StateLayout,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -53,7 +53,7 @@ pub(crate) use session_pair::PairSessionStage;
 #[path = "bundle/pp.rs"]
 mod pp;
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
-use pp::Qwen4PpMesh;
+use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -210,6 +210,12 @@ pub struct Qwen4Bundle {
     /// Band state and generic execution plans. This bundle is the output band;
     /// callers borrow the sole hardware owner, `LoadedModel::pp_gpus`.
     pub(crate) pp: Option<Box<Qwen4PpMesh>>,
+    /// This bundle's band identity under an attached PP mesh (index/count, layer
+    /// range, complete placement, devices, mesh and load epoch, canonical
+    /// chunk). Stamped on every band, root included, at attach so the session
+    /// scope and boundary chunk never depend on the taken forward or the
+    /// detached mesh; `None` outside PP.
+    pub(crate) pp_band: Option<Qwen4PpBandMeta>,
     /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
@@ -293,8 +299,60 @@ pub fn session_snapshot_bytes(
     u64::try_from(total).ok()
 }
 
+/// Host-only session settings every PP band must share with the root: they shape
+/// the boundary schedule (tail split, message ends), so they are part of each
+/// band's scope and the root's values are authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PpSessionPolicy {
+    pub(crate) turn_snapshots: bool,
+    pub(crate) tail_snapshot: bool,
+    pub(crate) tail_snapshot_min_gap: usize,
+    pub(crate) tail_snapshot_min_prompt: usize,
+    pub(crate) turn_end_token: Option<u32>,
+}
+
+impl PpSessionPolicy {
+    /// The schedule-relevant suffix of a PP band's scope. `turn_snapshots` is
+    /// already carried by the base scope's `/turns`.
+    fn scope_tag(&self) -> String {
+        let token = self
+            .turn_end_token
+            .map_or_else(|| "-".to_string(), |token| token.to_string());
+        format!(
+            "/tail{}:{}:{}/te{token}",
+            u8::from(self.tail_snapshot),
+            self.tail_snapshot_min_gap,
+            self.tail_snapshot_min_prompt
+        )
+    }
+}
+
+/// The session-cache scope of one bundle. Single (`band == None`) is exactly the
+/// historical string; a PP band appends its band identity (index/count, layers,
+/// complete placement, devices, mesh and load epoch) and the shared schedule
+/// policy, so no two bands, placements, devices, meshes or loads alias.
+pub(crate) fn session_scope(
+    route: SessionRoute,
+    chunk: usize,
+    format: Qwen4StateFormat,
+    turns: bool,
+    band: Option<(&Qwen4PpBandMeta, PpSessionPolicy)>,
+) -> String {
+    // Message-end snapshots split prefill off the plain chunk schedule, so
+    // they never share a domain with chunk-only ones.
+    let turns = if turns { "/turns" } else { "" };
+    let mut scope = format!("qwen4/{route:?}/chunk{chunk}/{format:?}{turns}");
+    if let Some((band, policy)) = band {
+        scope.push_str(&band.scope_tag());
+        scope.push_str(&policy.scope_tag());
+    }
+    scope
+}
+
 impl SessionState for Qwen4Bundle {
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
+        // An attached root is not a band: its aggregate scope is the mesh
+        // record. Detached (inside mesh callbacks) it is the band's own.
         if self.pp.is_some() {
             return None;
         }
@@ -302,16 +360,14 @@ impl SessionState for Qwen4Bundle {
         if route == SessionRoute::Mtp && self.mtp.is_none() {
             return None;
         }
-        // Message-end snapshots split prefill off the plain chunk schedule, so
-        // they never share a domain with chunk-only ones.
-        let turns = if self.turn_snapshots_active() {
-            "/turns"
-        } else {
-            ""
-        };
-        Some(format!(
-            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}",
-            self.state_format
+        Some(session_scope(
+            route,
+            chunk,
+            self.state_format,
+            self.turn_snapshots_active(),
+            self.pp_band
+                .as_ref()
+                .map(|band| (band, self.pp_session_policy())),
         ))
     }
 
@@ -725,6 +781,7 @@ impl Qwen4Bundle {
             lanes: None,
             ep: None,
             pp: None,
+            pp_band: None,
             trunk_overlay: None,
             npu_model_index: None,
         })
@@ -1161,6 +1218,7 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
+            .or_else(|| self.pp_band.as_ref().map(|band| band.chunk()))
     }
 
     pub(crate) fn npu_trunk_pipelined(&self) -> bool {
@@ -1287,6 +1345,12 @@ impl Qwen4Bundle {
     /// at assembly). Changing it changes the snapshot scope, so call it before
     /// the first prefill that fills the cache.
     pub fn set_turn_snapshots(&mut self, on: bool) {
+        // Message-end snapshots stay refused under topology.pp (the aggregate
+        // record pins cold chunk pieces only).
+        if let Some(mesh) = self.pp.as_ref().filter(|_| on) {
+            eprintln!("  {}", pp::turn_snapshots_refusal(mesh.stages()));
+            return;
+        }
         let set = |bundle: &mut Self| {
             bundle.turn_snapshots = on;
             Ok(())
@@ -2788,6 +2852,11 @@ impl Qwen4Bundle {
     /// published snapshots are demoted to disk instead of dropped. No-op
     /// without a cache.
     pub fn session_clear(&mut self, gpu: &mut Gpu) {
+        // Under an attached PP mesh `pp_session_clear` releases the aggregate
+        // pins before any band's cache frees its snapshots.
+        if self.pp.is_some() {
+            return;
+        }
         if self.ep.is_some() {
             return self.ep_session_clear(gpu);
         }
@@ -2904,6 +2973,128 @@ impl Qwen4Bundle {
         self.with_session(|session, bundle| session.at_boundary(gpu, bundle, prefix))
             .unwrap_or(Ok(()))
             .map_err(BundleError::Forward)
+    }
+
+    /// The host-only schedule settings of this bundle (the root's are the
+    /// authoritative copy every PP band adopts).
+    pub(crate) fn pp_session_policy(&self) -> PpSessionPolicy {
+        PpSessionPolicy {
+            turn_snapshots: self.turn_snapshots,
+            tail_snapshot: self.tail_snapshot,
+            tail_snapshot_min_gap: self.tail_snapshot_min_gap,
+            tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
+            turn_end_token: self.turn_end_token,
+        }
+    }
+
+    /// Adopt the root's schedule settings so every band's scope and boundaries
+    /// match; called at every plan and prefill begin.
+    pub(crate) fn pp_adopt_session_policy(&mut self, policy: PpSessionPolicy) {
+        self.turn_snapshots = policy.turn_snapshots;
+        self.tail_snapshot = policy.tail_snapshot;
+        self.tail_snapshot_min_gap = policy.tail_snapshot_min_gap;
+        self.tail_snapshot_min_prompt = policy.tail_snapshot_min_prompt;
+        self.turn_end_token = policy.turn_end_token;
+    }
+
+    /// Whether `piece` is a published pool snapshot of this band (pure,
+    /// host-only: no pin, no GPU).
+    pub(crate) fn pp_session_piece_resident(&self, piece: &SessionPieceKey) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.piece_resident(piece))
+    }
+
+    /// This band's pool key of `prefix` on `route` under its current scope.
+    pub(crate) fn pp_session_piece_key(
+        &self,
+        prefix: &[u32],
+        route: SessionRoute,
+    ) -> Option<SessionPieceKey> {
+        self.session.as_ref()?.piece_key(self, prefix, route)
+    }
+
+    /// Cold-start (`reused == 0`) or restore this band's snapshot of the
+    /// aggregate record's prefix and arm its boundaries. Never continues a
+    /// live state ([`SessionDriver::begin_snapshot`]). Runs on the band's own
+    /// `gpu`, detached from the mesh.
+    pub(crate) fn pp_session_begin(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+    ) -> Result<(), String> {
+        // A lookahead left by an aborted request names another prompt's rows.
+        self.set_ple_lookahead(&[]);
+        self.with_session(|session, bundle| {
+            session.begin_snapshot(gpu, bundle, prompt, route, reused)
+        })
+        .unwrap_or_else(|| Err("qwen4 topology.pp band has no session cache".to_string()))
+    }
+
+    /// Capture this band at `position` of `prompt` (enqueued on its own stream
+    /// after its forward work, pending until the aggregate commit) and name the
+    /// pool piece it will publish.
+    pub(crate) fn pp_session_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        position: usize,
+    ) -> Result<Option<SessionPieceKey>, String> {
+        let prefix = prompt
+            .get(..position)
+            .ok_or("qwen4 topology.pp session boundary exceeds the prompt")?;
+        self.session_at_boundary(gpu, prefix)
+            .map_err(|error| error.to_string())?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or("qwen4 topology.pp band has no session cache")?;
+        let route = session
+            .turn_route()
+            .ok_or("qwen4 topology.pp session boundary has no prefill in flight")?;
+        Ok(session.piece_key(&*self, prefix, route))
+    }
+
+    /// The boundaries this band's armed turn has yet to report and its lineage
+    /// split row; `None` without a session cache.
+    pub(crate) fn pp_session_schedule(&self) -> Option<(Vec<usize>, Option<usize>)> {
+        let session = self.session.as_ref()?;
+        Some((session.turn_boundaries(), session.turn_lineage()))
+    }
+
+    /// Replace this band's armed schedule with the root's canonical one.
+    pub(crate) fn pp_session_set_schedule(
+        &mut self,
+        boundaries: Vec<usize>,
+        lineage: Option<usize>,
+    ) -> Result<(), String> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| "qwen4 topology.pp band has no session cache".to_string())?
+            .set_boundaries(boundaries, lineage)
+    }
+
+    /// Drop this band's live state and every uncommitted capture. Only after
+    /// the device was drained (mesh reset).
+    pub(crate) fn pp_session_abort(&mut self, gpu: &mut Gpu) {
+        if let Some(session) = self.session.as_mut() {
+            session.abort(gpu);
+        }
+    }
+
+    /// Commit this band's pending captures (host only), keeping the live state
+    /// when `consumed` is given and extends the turn ([`SessionDriver::commit_live`]).
+    pub(crate) fn pp_session_commit_local(&mut self, consumed: Option<&[u32]>) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        match consumed {
+            Some(consumed) => session.commit_live(&*self, consumed),
+            None => session.commit(),
+        }
+        self.session = Some(session);
     }
 
     /// AR prefill of the full canonical `prompt`, keeping only the final
@@ -3649,10 +3840,18 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_cache_attached(&self) -> bool {
-        self.session.is_some()
+        match self.pp.as_ref() {
+            Some(mesh) => mesh.sessions_enabled(),
+            None => self.session.is_some(),
+        }
     }
 
     fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+        // Under an attached PP mesh only the aggregate record plans
+        // (`pp_session_plan`); a root-only plan would restore one band.
+        if self.pp.is_some() {
+            return 0;
+        }
         if self.ep.is_some() {
             return self.ep_session_plan(prompt, route);
         }
@@ -3662,6 +3861,11 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_commit(&mut self) {
+        // The aggregate publication is `pp_session_commit`; committing the root
+        // alone would publish a partial record.
+        if self.pp.is_some() {
+            return;
+        }
         if self.ep.is_some() {
             return self.ep_session_commit(None);
         }
@@ -3677,6 +3881,9 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     /// decode lineage); the snapshots just published stay cold-exact because a
     /// live turn captures none unless message-end snapshots are active.
     fn session_commit_live(&mut self, consumed: &[u32]) {
+        if self.pp.is_some() {
+            return;
+        }
         if self.ep.is_some() {
             return self.ep_session_commit(Some(consumed));
         }

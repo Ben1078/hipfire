@@ -302,6 +302,18 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_QWEN4_CACHE_QUALITY_OUT` | unset | Oracle/diagnostic only. Absolute path of a JSONL file that `hipfire_arch_qwen4::cache_quality::cache_quality_event` appends to (one compact JSON line per event, flushed per line; the variable is read once; unset or empty disables capture, a relative path warns and disables it). It is the opt-in production ID capture sink consumed by `quality_driver.py`; no daemon or generate code path calls it in this tree. |
 | `HIPFIRE_CQ_SESSION_BUDGET_BYTES` | unset: unbounded | Oracle only: `u64` byte budget of the `SessionCache` the `qwen4_parity --mode cache-quality` hit-vs-cold logits oracle builds (reference parity of the session cache; also honours `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Not read by the daemon. |
 
+For Flash-Next/Qwen4 pipeline parallelism, `memory.session_cache_bytes` is an
+independent opportunistic device-cache budget **per band**, not a mesh-wide
+reservation. Captures retain the same free-memory/context-growth guards as
+Single. Every band captures its own state at the root's common prefill
+boundaries; only client-committed, all-band snapshots are reusable. Aggregate
+records hold pins on every local piece, are scoped to placement and mesh/load
+epoch, and a missing piece makes the whole record a cold miss. The bounded
+aggregate index retains at most 64 records. Resident-only lineage/tail snapshots
+do not enter that index because their row streams depend on mutable live state.
+Disk-tier caching, `HIPFIRE_QWEN4_TURN_SNAPSHOTS=1`, and MTP sessions remain
+refused under PP; Single and EP session behavior is unchanged.
+
 ### Embedding (arch 17)
 
 | Variable | Default / sense | Notes |

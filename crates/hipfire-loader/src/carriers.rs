@@ -993,12 +993,28 @@ pub struct Qwen4RankShared {
     pub max_k: usize,
 }
 
-/// Rank 0's tokenizer and chat template, from which the session cache's cache
-/// domain is derived. Only the rank that serves requests' session cache takes
-/// one (`Some`); peers pass `None` and attach no session cache.
+/// The source model's tokenizer and chat template, from which a session
+/// cache's cache domain is derived. Single and expert-parallel loads hand one
+/// only to the rank that serves requests' session cache (peers pass `None`
+/// and attach none; EP peers align to rank 0's cache afterwards). A
+/// `topology.pp` load hands every band its own copy of the same seed, so each
+/// band attaches its own cache (no disk tier) and all bands share the model,
+/// tokenizer, template and PLE identity.
+#[derive(Clone, Copy)]
 pub struct Qwen4SessionSeed<'a> {
     pub tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
     pub chat_template: Option<&'a str>,
+}
+
+/// The disk tier a session cache attaches: `Some((dir, bytes))` for a Single
+/// or EP rank load, never for a `topology.pp` band (`band`; PP admission also
+/// refuses `memory.session_cache_disk_bytes`).
+fn qwen4_session_disk_tier(
+    band: bool,
+    dir: std::path::PathBuf,
+    bytes: u64,
+) -> Option<(std::path::PathBuf, u64)> {
+    (!band).then_some((dir, bytes))
 }
 
 /// One loaded rank.
@@ -1514,8 +1530,9 @@ pub fn load_qwen4_rank(
 /// only its [`Qwen4BandScope`]: the admitted artifact is projected through
 /// `Qwen4HfqmArtifact::for_band`, the manifest fulfills only the band's
 /// resources on `gpu`, and the bundle is assembled with
-/// `assemble_band_with_ple_rows`. Every routed expert of the band is
-/// resident (no host-mapped layers, hot set, MTP head, session cache or
+/// `assemble_band_with_ple_rows`. A band attaches its own session cache from
+/// `session`, with no disk tier. Every routed expert of the band is
+/// resident (no host-mapped layers, hot set, MTP head or
 /// automatic context), and the forward scratch plan is the one chosen from
 /// the full manifest so every band agrees.
 fn load_qwen4_rank_scoped(
@@ -1541,17 +1558,18 @@ fn load_qwen4_rank_scoped(
         }
     }
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
+    // A band carries a session cache (`session`) like a Single load; the
+    // other Single-only features stay refused.
     if band.is_some()
         && (ep.is_some()
             || expert_vram_layers.is_some()
-            || session.is_some()
             || shared.native_mtp
             || shared.sequence.is_some()
             || gpu.is_uma())
     {
         return Err(
-            "qwen4: a topology.pp band load admits no expert parallelism, MTP head, session \
-             cache, automatic context or unified memory"
+            "qwen4: a topology.pp band load admits no expert parallelism, MTP head, \
+             automatic context or unified memory"
                 .into(),
         );
     }
@@ -2705,22 +2723,30 @@ fn load_qwen4_rank_scoped(
             chunk,
         )
         .unwrap_or(0);
-        bundle.attach_session_cache(
-            hipfire_runtime::session_cache::SessionCache::new(session_domain, session_budget)
-                .with_disk(
-                    &hipfire_config::memory::session_cache_dir(),
-                    hipfire_config::memory::session_cache_disk_bytes(),
-                ),
-        );
+        let cache =
+            hipfire_runtime::session_cache::SessionCache::new(session_domain, session_budget);
+        // A PP band never attaches the disk tier (admission refuses it).
+        let cache = match qwen4_session_disk_tier(
+            band.is_some(),
+            hipfire_config::memory::session_cache_dir(),
+            hipfire_config::memory::session_cache_disk_bytes(),
+        ) {
+            Some((dir, bytes)) => cache.with_disk(&dir, bytes),
+            None => cache,
+        };
+        bundle.attach_session_cache(cache);
+        let band_tag = band.map_or_else(String::new, |scope| {
+            format!(" (PP band layers {:?})", scope.band)
+        });
         eprintln!(
-                "  qwen4 session cache: {} MiB budget, {} MiB per {chunk}-token snapshot; snapshots yield to context growth",
-                session_budget >> 20,
-                one >> 20
-            );
+            "  qwen4 session cache{band_tag}: {} MiB budget, {} MiB per {chunk}-token snapshot; snapshots yield to context growth",
+            session_budget >> 20,
+            one >> 20
+        );
         bundle.set_turn_end_token(seed.tokenizer.special_token_id("<|im_end|>"));
         if bundle.turn_snapshots_active() {
             eprintln!(
-                "  qwen4 session cache: message-end snapshots on (HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
+                "  qwen4 session cache{band_tag}: message-end snapshots on (HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
             );
         }
     }
@@ -3019,6 +3045,7 @@ fn load_qwen4_pp_bundle(
     admitted: &hipfire_runtime::mesh_placement::AdmittedMesh,
     placement: &hipfire_runtime::mesh_placement::BandPlacement,
     shared: &Qwen4RankShared,
+    session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
 ) -> Result<
     (
@@ -3105,6 +3132,14 @@ fn load_qwen4_pp_bundle(
         })
         .transpose()?
         .unwrap_or(0);
+        // The per-band session cache (`memory.session_cache_bytes` on every
+        // band, no disk tier) is deliberately not charged or reserved here,
+        // exactly as in the Single census (`qwen4_memory_admission`): it is
+        // opportunistic. Each cache lives on its own band's `Gpu`, so the
+        // bands' VRAM is independent and one band's snapshots never take
+        // another's room; the existing headroom (`reserve_bytes`) and the
+        // growth guards (snapshots yield to context growth) bound the
+        // allocation, so admission never depends on the cache budget.
         let reserve_bytes = crate::admission::QWEN4_MEMORY_HEADROOM_BYTES
             .checked_add(gather)
             .ok_or("qwen4: topology.pp reserve overflows")?;
@@ -3156,7 +3191,7 @@ fn load_qwen4_pp_bundle(
                 None,
                 shared,
                 None,
-                None,
+                session,
                 source,
                 Some(&scopes[stage]),
             )
@@ -3278,7 +3313,13 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         native_mtp: false,
         max_k: 1,
     };
-    let (bundle, gpus) = load_qwen4_pp_bundle(ctx.gpu, admitted, placement, &shared, src)?;
+    // Every band attaches its own session cache from the source model's
+    // tokenizer and template (the same seed the Single load takes).
+    let session = Some(Qwen4SessionSeed {
+        tokenizer: &meta.tokenizer,
+        chat_template: meta.chat_template.as_deref(),
+    });
+    let (bundle, gpus) = load_qwen4_pp_bundle(ctx.gpu, admitted, placement, &shared, session, src)?;
     let max_seq = ctx.max_seq;
     Ok(LoadedModel {
         state: Some(Box::new(bundle)),
@@ -6639,5 +6680,35 @@ mod qwen4_pp_load_tests {
         let (mut shuffled, shuffled_placement) = cell(2, "gfx1100");
         shuffled.ranks[0].logical = 1;
         refuses(&shuffled, &shuffled_placement, 2, 0, "gfx1100");
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_session_tests {
+    use super::qwen4_session_disk_tier;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_pp_band_never_attaches_the_disk_tier() {
+        assert_eq!(
+            qwen4_session_disk_tier(true, PathBuf::from("/cache"), 1 << 30),
+            None
+        );
+        assert_eq!(
+            qwen4_session_disk_tier(true, PathBuf::from("/cache"), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_single_or_ep_rank_keeps_its_disk_tier() {
+        assert_eq!(
+            qwen4_session_disk_tier(false, PathBuf::from("/cache"), 1 << 30),
+            Some((PathBuf::from("/cache"), 1 << 30))
+        );
+        assert_eq!(
+            qwen4_session_disk_tier(false, PathBuf::from("/cache"), 0),
+            Some((PathBuf::from("/cache"), 0))
+        );
     }
 }

@@ -14,11 +14,76 @@ use hipfire_runtime::multi_gpu::executor::{
     BoundaryIo, ForwardEpoch, MeshCheckpointId, MeshCheckpointKey, MeshRoute, MeshStepBindings,
 };
 use hipfire_runtime::multi_gpu::transport::EdgeDescriptor;
+use hipfire_runtime::session_cache::{SessionPieceKey, SessionRoute};
 use rdna_compute::Gpu;
 
 type Result<T, E = String> = std::result::Result<T, E>;
 const TRANSACTIONS_REFUSED: &str =
-    "Qwen4 topology.pp does not support checkpoint, repair or session transactions yet";
+    "Qwen4 topology.pp does not support checkpoint or repair transactions yet";
+
+/// The checkpoint window of a session piece at prefix length `prefix`: every
+/// owner's piece of one boundary shares it, and it names the current mesh,
+/// load and request (the epoch the capture or restore runs under).
+pub(crate) fn session_ticket_key(epoch: &ForwardEpoch, prefix: usize) -> MeshCheckpointKey {
+    MeshCheckpointKey {
+        mesh_epoch: epoch.mesh_epoch,
+        load_gen: epoch.load_id,
+        reset_gen: 0,
+        request_gen: epoch.request_id,
+        window_gen: prefix as u64,
+    }
+}
+
+/// A freshly minted ticket for `owner`'s session piece of `prefix` tokens.
+pub(crate) fn session_ticket(
+    epoch: &ForwardEpoch,
+    owner: usize,
+    prefix: usize,
+) -> MeshCheckpointId {
+    MeshCheckpointId::issue(session_ticket_key(epoch, prefix), owner, prefix as u64)
+}
+
+/// One fresh ticket per owner for the aggregate record's pieces, bound to the
+/// current request (never stored across requests).
+pub(crate) fn session_tickets(
+    epoch: &ForwardEpoch,
+    pieces: &[SessionPieceKey],
+) -> Vec<MeshCheckpointId> {
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(owner, piece)| session_ticket(epoch, owner, piece.prefix_len()))
+        .collect()
+}
+
+/// Pure check that `ticket` is `owner`'s piece of `prefix` for `epoch`.
+fn check_session_ticket(
+    ticket: &MeshCheckpointId,
+    owner: usize,
+    epoch: &ForwardEpoch,
+    prefix: usize,
+) -> Result<()> {
+    if ticket.owner() != owner
+        || ticket.key() != session_ticket_key(epoch, prefix)
+        || ticket.local() != prefix as u64
+    {
+        return Err(format!(
+            "Qwen4 session piece for owner {owner} is not the current request's piece of {prefix} tokens"
+        ));
+    }
+    Ok(())
+}
+
+/// Per-request session context of one adapter: the prompt every band
+/// captures/restores against, the aggregate record's pieces to restore, and
+/// the pool keys the captures name.
+struct SessionCtx<'a> {
+    prompt: &'a [u32],
+    route: SessionRoute,
+    restore: Vec<SessionPieceKey>,
+    restore_started: bool,
+    captured: Vec<Option<SessionPieceKey>>,
+}
 
 /// One rank's existing owners, borrowed for submission; never owns a GPU.
 pub struct Qwen4RankBand<'a> {
@@ -36,6 +101,7 @@ pub struct Qwen4MeshBindings<'a> {
     prepared: Option<ForwardEpoch>,
     ran: [bool; 8],
     layouts: [Option<Qwen4MeshLayout>; 8],
+    session: Option<SessionCtx<'a>>,
 }
 
 fn streams_bytes(rows: usize, branches: usize, hidden: usize, dtype_bytes: usize) -> Result<usize> {
@@ -112,6 +178,7 @@ impl<'a> Qwen4MeshBindings<'a> {
             prepared: None,
             ran: [false; 8],
             layouts: [None; 8],
+            session: None,
         })
     }
 
@@ -150,6 +217,48 @@ impl<'a> Qwen4MeshBindings<'a> {
     pub fn ranks_mut(&mut self) -> &mut [Qwen4RankBand<'a>] {
         self.prepared = None;
         &mut self.ranks
+    }
+
+    /// Bind the prompt (absolute positions) and route every session callback of
+    /// this adapter works against. Resets any earlier capture/restore state.
+    pub fn set_session(&mut self, prompt: &'a [u32], route: SessionRoute) {
+        self.session = Some(SessionCtx {
+            prompt,
+            route,
+            restore: Vec::new(),
+            restore_started: false,
+            captured: vec![None; self.ranks.len()],
+        });
+    }
+
+    /// The aggregate record's pieces, one per owner, a restore applies.
+    pub fn set_session_restore(&mut self, pieces: Vec<SessionPieceKey>) -> Result<()> {
+        if pieces.len() != self.ranks.len() {
+            return Err("Qwen4 session record does not have one piece per band".into());
+        }
+        self.session
+            .as_mut()
+            .ok_or("Qwen4 session prompt is not bound")?
+            .restore = pieces;
+        Ok(())
+    }
+
+    /// Whether any owner began restoring (a failure after that point leaves
+    /// mixed state; before it nothing changed).
+    pub fn session_restore_started(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.restore_started)
+    }
+
+    /// The pool keys the last capture named, one slot per owner (`None` where
+    /// a band had no cold piece to name), clearing them.
+    pub fn take_session_captures(&mut self) -> Vec<Option<SessionPieceKey>> {
+        let owners = self.ranks.len();
+        self.session
+            .as_mut()
+            .map(|session| std::mem::replace(&mut session.captured, vec![None; owners]))
+            .unwrap_or_default()
     }
 
     fn require_prepared(&self, epoch: &ForwardEpoch) -> Result<()> {
@@ -330,10 +439,15 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
 
     fn reset_rank(&mut self, owner: usize, gpu: &mut Gpu, _epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
+        self.session = None;
         let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen4 mesh rank")?;
         rank.forward.set_ple_lookahead(&[]);
         drop(rank.forward.ple_ahead.take());
-        rank.bundle.reset(gpu).map_err(|error| error.to_string())
+        rank.bundle.reset(gpu).map_err(|error| error.to_string())?;
+        // The mesh is drained: the band's uncommitted captures and live state
+        // go. Published pieces (pinned by aggregate records) stay valid.
+        rank.bundle.pp_session_abort(gpu);
+        Ok(())
     }
 
     fn repair_prefix_rank(
@@ -348,28 +462,84 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
     }
     fn capture_session_rank(
         &mut self,
-        _: usize,
-        _: &mut Gpu,
-        _: &ForwardEpoch,
+        owner: usize,
+        gpu: &mut Gpu,
+        epoch: &ForwardEpoch,
     ) -> Result<MeshCheckpointId> {
-        Err(TRANSACTIONS_REFUSED.into())
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("Qwen4 session prompt is not bound")?;
+        let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen4 mesh rank")?;
+        // The epoch is the last submitted tile: its rows end at the boundary.
+        let position = epoch
+            .start_position
+            .checked_add(epoch.actual_rows)
+            .ok_or("Qwen4 session boundary overflows")?;
+        if rank.bundle.state.position != position {
+            return Err(format!(
+                "Qwen4 band {owner} is at {} but the session boundary is {position}",
+                rank.bundle.state.position
+            ));
+        }
+        let key = rank
+            .bundle
+            .pp_session_capture(gpu, session.prompt, position)?;
+        *session
+            .captured
+            .get_mut(owner)
+            .ok_or("unknown Qwen4 mesh rank")? = key;
+        Ok(session_ticket(epoch, owner, position))
     }
     fn probe_session_rank(
         &mut self,
-        _: usize,
-        _: &ForwardEpoch,
-        _: MeshCheckpointId,
+        owner: usize,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
     ) -> Result<()> {
-        Err(TRANSACTIONS_REFUSED.into())
+        let session = self
+            .session
+            .as_ref()
+            .ok_or("Qwen4 session prompt is not bound")?;
+        let key = session
+            .restore
+            .get(owner)
+            .ok_or("Qwen4 session record has no piece for this band")?;
+        check_session_ticket(&piece, owner, epoch, key.prefix_len())?;
+        let rank = self.ranks.get(owner).ok_or("unknown Qwen4 mesh rank")?;
+        if !rank.bundle.pp_session_piece_resident(key) {
+            return Err(format!(
+                "Qwen4 band {owner} no longer holds its session piece (evicted)"
+            ));
+        }
+        Ok(())
     }
     fn restore_session_rank(
         &mut self,
-        _: usize,
-        _: &mut Gpu,
-        _: &ForwardEpoch,
-        _: MeshCheckpointId,
+        owner: usize,
+        gpu: &mut Gpu,
+        epoch: &ForwardEpoch,
+        piece: MeshCheckpointId,
     ) -> Result<()> {
-        Err(TRANSACTIONS_REFUSED.into())
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("Qwen4 session prompt is not bound")?;
+        let prefix = session
+            .restore
+            .get(owner)
+            .ok_or("Qwen4 session record has no piece for this band")?
+            .prefix_len();
+        check_session_ticket(&piece, owner, epoch, prefix)?;
+        let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen4 mesh rank")?;
+        session.restore_started = true;
+        // Request-local PLE work of the discarded state must not publish into
+        // the restored one; the forward is borrowed here, the bundle's row
+        // store epoch is invalidated by its own restore.
+        rank.forward.set_ple_lookahead(&[]);
+        drop(rank.forward.ple_ahead.take());
+        rank.bundle
+            .pp_session_begin(gpu, session.prompt, session.route, prefix)
     }
     fn checkpoint_rank(
         &mut self,
@@ -452,5 +622,60 @@ mod tests {
         assert!(validate_scopes(&config, &bands).is_err());
         assert!(validate_scopes(&config, &scopes(&[24, 23])).is_err());
         assert!(validate_scopes(&config, &scopes(&[48])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+
+    fn epoch(mesh: &DeviceMesh, request: u64) -> ForwardEpoch {
+        ForwardEpoch {
+            mesh_epoch: mesh.epoch(),
+            load_id: 7,
+            request_id: request,
+            op_id: 1,
+            route: MeshRoute::Prefill,
+            start_position: 0,
+            actual_rows: 1,
+            route_rows: 1,
+            policy_id: 1,
+        }
+    }
+
+    fn mesh() -> DeviceMesh {
+        DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap()
+    }
+
+    #[test]
+    fn session_tickets_are_minted_per_owner_for_the_current_request() {
+        let mesh = mesh();
+        let epoch = epoch(&mesh, 3);
+        let a = session_ticket(&epoch, 0, 4096);
+        let b = session_ticket(&epoch, 1, 4096);
+        // One shared window, distinct owners.
+        assert_eq!(a.key(), b.key());
+        assert_eq!((a.owner(), b.owner()), (0, 1));
+        assert_eq!(a.local(), 4096);
+        assert!(check_session_ticket(&a, 0, &epoch, 4096).is_ok());
+        assert!(check_session_ticket(&b, 1, &epoch, 4096).is_ok());
+    }
+
+    #[test]
+    fn stale_foreign_and_misowned_session_tickets_are_refused() {
+        let mesh = mesh();
+        let other = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let now = epoch(&mesh, 3);
+        let ticket = session_ticket(&now, 0, 4096);
+        // Another owner's ticket, another prefix, a later request, another
+        // load and another mesh generation are all refused.
+        assert!(check_session_ticket(&ticket, 1, &now, 4096).is_err());
+        assert!(check_session_ticket(&ticket, 0, &now, 8192).is_err());
+        assert!(check_session_ticket(&ticket, 0, &epoch(&mesh, 4), 4096).is_err());
+        let mut reloaded = now;
+        reloaded.load_id += 1;
+        assert!(check_session_ticket(&ticket, 0, &reloaded, 4096).is_err());
+        assert!(check_session_ticket(&ticket, 0, &epoch(&other, 3), 4096).is_err());
     }
 }

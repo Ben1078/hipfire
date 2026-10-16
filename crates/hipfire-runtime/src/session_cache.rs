@@ -167,6 +167,31 @@ enum SnapshotLocation {
 /// `(scoped domain, boundary, prefix fingerprint)`, the pool's key.
 type Key = (CacheDomain, u64, u64);
 
+/// Opaque handle of one published pool snapshot (one band's piece of a mesh
+/// session): the cache domain scoped by the architecture, the prefix length
+/// and the prefix fingerprint. Built only by [`SessionDriver::piece_key`], so
+/// it names exactly the entry [`SessionCache::plan`] and `restore` look up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPieceKey(Key);
+
+impl SessionPieceKey {
+    /// Length of the prefix the piece covers.
+    pub fn prefix_len(&self) -> usize {
+        self.0 .1 as usize
+    }
+
+    /// Whether the piece covers exactly `prefix` (same length and
+    /// fingerprint; the domain is the owning driver's).
+    pub fn matches_prefix(&self, prefix: &[u32]) -> bool {
+        self.prefix_len() == prefix.len() && self.0 .2 == prefix_fingerprint(prefix)
+    }
+
+    /// Whether both pieces cover the same prefix (length and fingerprint).
+    fn same_prefix(&self, other: &Self) -> bool {
+        self.0 .1 == other.0 .1 && self.0 .2 == other.0 .2
+    }
+}
+
 /// Rows `[from, to)` of one row stream held by a snapshot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Segment {
@@ -366,7 +391,7 @@ fn saturating_total(bytes: impl IntoIterator<Item = u64>) -> u64 {
 /// clamped to `MemAvailable` minus `CmaFree` plus TTM's page pool); `None`
 /// when the free-memory query itself fails. A caller allocates only right
 /// after `Some(true)`.
-fn memory_fits(gpu: &mut Gpu, need: u64, growth: u64) -> Option<bool> {
+fn memory_fits(gpu: &Gpu, need: u64, growth: u64) -> Option<bool> {
     let (free, _) = gpu.device_mem_info().ok()?;
     let uma = gpu.is_uma();
     let mem_total = if uma {
@@ -1088,6 +1113,63 @@ impl SessionCache {
         self.turn.as_ref()?.lineage
     }
 
+    /// Boundaries still pending in the armed turn, ascending; empty without a
+    /// turn.
+    fn pending_boundaries(&self) -> Vec<usize> {
+        self.turn
+            .as_ref()
+            .map(|turn| turn.boundaries.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Replace the armed turn's boundary schedule and lineage split with a
+    /// schedule computed elsewhere. Nothing changes on error. Without an armed
+    /// turn only the empty schedule is accepted.
+    fn override_boundaries(
+        &mut self,
+        boundaries: Vec<usize>,
+        lineage: Option<usize>,
+    ) -> Result<(), String> {
+        let Some(turn) = self.turn.as_mut() else {
+            return if boundaries.is_empty() && lineage.is_none() {
+                Ok(())
+            } else {
+                Err("session cache: no prefill in progress to set boundaries on".to_string())
+            };
+        };
+        if boundaries.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(format!(
+                "session cache: boundaries {boundaries:?} are not strictly increasing"
+            ));
+        }
+        if let Some(&first) = boundaries.first() {
+            if first <= turn.start {
+                return Err(format!(
+                    "session cache: boundary {first} is not above the turn start {}",
+                    turn.start
+                ));
+            }
+        }
+        if let Some(&last) = boundaries.last() {
+            if last > turn.end {
+                return Err(format!(
+                    "session cache: boundary {last} exceeds the turn end {}",
+                    turn.end
+                ));
+            }
+        }
+        if let Some(split) = lineage {
+            if !(turn.start < split && split < turn.end) || !boundaries.contains(&split) {
+                return Err(format!(
+                    "session cache: lineage split {split} is not an interior boundary of {boundaries:?}"
+                ));
+            }
+        }
+        turn.boundaries = boundaries.into();
+        turn.lineage = lineage;
+        Ok(())
+    }
+
     /// The live state reached `prefix.len()`, the boundary
     /// [`Self::next_boundary`] returned; capture it (pending until commit) as
     /// a delta over the deepest snapshot of a shorter prefix still present,
@@ -1638,6 +1720,142 @@ impl SessionDriver {
         self.cache.turn_lineage()
     }
 
+    /// Boundaries the running prefill has yet to report, ascending (the
+    /// whole schedule right after [`Self::begin`]); empty when none is armed.
+    pub fn turn_boundaries(&self) -> Vec<usize> {
+        self.cache.pending_boundaries()
+    }
+
+    /// Replace the boundary schedule and lineage split [`Self::begin`] armed
+    /// with one computed once elsewhere (a mesh root's canonical schedule that
+    /// every band consumes). Call it right after `begin`. `boundaries` must be
+    /// strictly increasing, above the turn's start and at most its end;
+    /// `lineage` must be an interior boundary among them. Nothing changes on
+    /// error. A driver whose turn armed no schedule (a live continuation that
+    /// does not capture) accepts only the empty schedule.
+    pub fn set_boundaries(
+        &mut self,
+        boundaries: Vec<usize>,
+        lineage: Option<usize>,
+    ) -> Result<(), String> {
+        self.cache.override_boundaries(boundaries, lineage)
+    }
+
+    /// Start a prefill that restores the `reused`-token snapshot (or cold
+    /// starts for 0) and never continues the live state, whatever
+    /// [`Self::plan`] would say: [`Self::begin`] takes the live path when the
+    /// live position equals `reused`, but that state descends from decode and
+    /// is not the canonical snapshot. Clears the live state and any turn, then
+    /// runs [`SessionCache::begin`]; the turn is armed only on success.
+    pub fn begin_snapshot(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+    ) -> Result<(), String> {
+        self.live = None;
+        self.turn = None;
+        self.cache.begin(gpu, state, prompt, route, reused)?;
+        self.turn = Some((prompt.to_vec(), route));
+        Ok(())
+    }
+
+    /// Abandon the request in flight after the owners were drained: forget
+    /// the live state, retire every resident (their rows no longer back
+    /// anything) and free the displaced and uncommitted pending snapshots, so
+    /// a reset never leaves a pending capture. Published pool snapshots stay.
+    pub fn abort(&mut self, gpu: &mut Gpu) {
+        self.live = None;
+        self.turn = None;
+        self.cache.live_state_reset();
+        self.cache.start_turn(gpu);
+    }
+
+    /// Whether `need` more device bytes would break the memory guard now
+    /// (a failed free-memory query does not count): the caller should
+    /// release snapshots, see [`Self::release_for`].
+    pub fn needs_release(&self, gpu: &Gpu, need: u64) -> bool {
+        memory_fits(gpu, need, 0) == Some(false)
+    }
+
+    /// Stamp the cache domain's `model_load_epoch` with `epoch`, so keys of
+    /// this driver never alias those of another load. Host-only; call it once
+    /// at initial attach on a fresh driver: later calls would orphan existing
+    /// snapshots (including disk-tier entries, which are indexed by domain).
+    ///
+    /// # Errors
+    /// When the driver is not fresh: it holds snapshots, pending captures,
+    /// residents, a live state, a turn in flight or a disk tier. Nothing
+    /// changes then.
+    pub fn bind_load_epoch(&mut self, epoch: u64) -> Result<(), String> {
+        let cache = &self.cache;
+        let fresh = cache.pool.is_empty()
+            && cache.pending.is_empty()
+            && cache.release.is_empty()
+            && cache.release_bufs.is_empty()
+            && cache.children.is_empty()
+            && cache.resident.is_none()
+            && cache.resident_pending.is_none()
+            && cache.tail.is_none()
+            && cache.tail_pending.is_none()
+            && cache.turn.is_none()
+            && cache.disk.is_none()
+            && self.live.is_none()
+            && self.turn.is_none();
+        if !fresh {
+            return Err(
+                "session cache: load epoch can only be bound on a fresh driver".to_string(),
+            );
+        }
+        self.cache.domain.model_load_epoch = epoch;
+        Ok(())
+    }
+
+    /// The pool key of the snapshot of `prefix` on `route` under `state`'s
+    /// scope, in exactly this cache's domain. `None` when `prefix` is empty or
+    /// the route has no snapshot scope.
+    pub fn piece_key(
+        &self,
+        state: &dyn SessionState,
+        prefix: &[u32],
+        route: SessionRoute,
+    ) -> Option<SessionPieceKey> {
+        if prefix.is_empty() {
+            return None;
+        }
+        let scope = state.snapshot_scope(route)?;
+        Some(SessionPieceKey((
+            self.cache.domain.scoped(&scope),
+            prefix.len() as u64,
+            prefix_fingerprint(prefix),
+        )))
+    }
+
+    /// Whether the piece is a published device-pool snapshot. Pending,
+    /// resident-only and disk-only snapshots are not pieces.
+    pub fn piece_resident(&self, key: &SessionPieceKey) -> bool {
+        self.cache.pool.contains(&key.0 .0, key.0 .1, key.0 .2)
+    }
+
+    /// Pin the piece against eviction (one pin per call, counted with the
+    /// children refcount). Refuses, changing nothing, unless the piece is
+    /// resident in the pool.
+    pub fn pin_piece(&mut self, key: &SessionPieceKey) -> bool {
+        if !self.piece_resident(key) {
+            return false;
+        }
+        self.cache.link(&key.0);
+        true
+    }
+
+    /// Release one pin taken by [`Self::pin_piece`]; the last release makes
+    /// the piece evictable again.
+    pub fn unpin_piece(&mut self, key: &SessionPieceKey) {
+        self.cache.unlink(&key.0);
+    }
+
     /// The route of the request in flight.
     pub fn turn_route(&self) -> Option<SessionRoute> {
         self.turn.as_ref().map(|(_, route)| *route)
@@ -1705,6 +1923,256 @@ impl SessionDriver {
         self.live = None;
         self.turn = None;
         self.cache.clear(gpu);
+    }
+}
+
+/// Most published [`MeshSessionRecord`]s a [`MeshSessionCache`] holds.
+pub const MESH_SESSION_MAX_RECORDS: usize = 64;
+
+/// Pin every driver's piece, all or nothing. `pieces[i]` belongs to
+/// `drivers[i]`. Residency of all pieces is probed first; if any pin then
+/// fails, the pins this call took are released. Returns whether all are
+/// pinned.
+pub fn probe_and_pin_pieces(
+    drivers: &mut [&mut SessionDriver],
+    pieces: &[SessionPieceKey],
+) -> bool {
+    if drivers.is_empty()
+        || drivers.len() != pieces.len()
+        || !drivers
+            .iter()
+            .zip(pieces)
+            .all(|(driver, piece)| driver.piece_resident(piece))
+    {
+        return false;
+    }
+    for i in 0..pieces.len() {
+        if !drivers[i].pin_piece(&pieces[i]) {
+            for j in 0..i {
+                drivers[j].unpin_piece(&pieces[j]);
+            }
+            return false;
+        }
+    }
+    true
+}
+
+/// Release one pin per piece taken by [`probe_and_pin_pieces`].
+pub fn unpin_pieces(drivers: &mut [&mut SessionDriver], pieces: &[SessionPieceKey]) {
+    for (driver, piece) in drivers.iter_mut().zip(pieces) {
+        driver.unpin_piece(piece);
+    }
+}
+
+/// One mesh session: each band's piece of the one prefix every band
+/// captured. The prefix length and fingerprint live in the piece keys (all
+/// pieces cover the same prefix), so a record copies no tokens and holds no
+/// device buffer.
+#[derive(Clone, Debug)]
+pub struct MeshSessionRecord {
+    pub route: SessionRoute,
+    /// In owner order: `pieces[i]` is band `i`'s snapshot of the prefix.
+    pub pieces: Vec<SessionPieceKey>,
+}
+
+/// Aggregate index over the per-band caches of one mesh. A published record
+/// pins every band's piece for its whole lifetime, so a piece never leaves a
+/// band's pool while a record references it; a record whose piece is gone
+/// anyway (a driver cleared outside the mesh) is dropped at the next
+/// [`Self::plan`].
+///
+/// Only the record index is bounded, to [`MESH_SESSION_MAX_RECORDS`]; the
+/// pieces stay opportunistic pool snapshots allocated like the single-device
+/// cache's, so pins can make a full band pool refuse new captures
+/// ([`Self::evict_oldest`] frees pins under memory pressure). Every method
+/// taking `drivers` expects the same bands in the same order for the whole
+/// life of the cache.
+#[derive(Default)]
+pub struct MeshSessionCache {
+    staged: Vec<MeshSessionRecord>,
+    records: VecDeque<MeshSessionRecord>,
+    /// The record the last [`Self::plan`] chose, by route and root piece.
+    planned: Option<(SessionRoute, SessionPieceKey)>,
+}
+
+impl MeshSessionCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Published records, oldest first.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Candidates awaiting [`Self::publish`].
+    pub fn staged_len(&self) -> usize {
+        self.staged.len()
+    }
+
+    /// Stage a candidate captured at one boundary of the request in flight.
+    /// It holds no pin and is invisible to [`Self::plan`] until published.
+    pub fn stage(&mut self, record: MeshSessionRecord) {
+        self.staged.push(record);
+    }
+
+    /// Drop every staged candidate (the request aborted, was cancelled or
+    /// failed). Published records are untouched.
+    pub fn abort(&mut self) {
+        self.staged.clear();
+    }
+
+    /// Commit every driver's pending snapshots (without touching its live
+    /// state or turn), then publish each staged candidate whose pieces cover
+    /// one non-empty prefix and are all resident and all pinned; any other
+    /// candidate is dropped and leaves no pin. A published record replaces an
+    /// older one of the same route and prefix, and the oldest records are
+    /// released beyond [`MESH_SESSION_MAX_RECORDS`]. Returns the number
+    /// published.
+    pub fn publish(&mut self, drivers: &mut [&mut SessionDriver]) -> usize {
+        for driver in drivers.iter_mut() {
+            driver.cache.commit();
+        }
+        let mut published = 0;
+        for record in std::mem::take(&mut self.staged) {
+            let Some(root) = record.pieces.first() else {
+                continue;
+            };
+            let uniform =
+                root.prefix_len() > 0 && record.pieces.iter().all(|piece| piece.same_prefix(root));
+            if !uniform || !probe_and_pin_pieces(drivers, &record.pieces) {
+                continue;
+            }
+            let mut kept = VecDeque::with_capacity(self.records.len() + 1);
+            for old in std::mem::take(&mut self.records) {
+                if old.route == record.route
+                    && old
+                        .pieces
+                        .first()
+                        .is_some_and(|piece| piece.same_prefix(root))
+                {
+                    unpin_pieces(drivers, &old.pieces);
+                } else {
+                    kept.push_back(old);
+                }
+            }
+            self.records = kept;
+            while self.records.len() >= MESH_SESSION_MAX_RECORDS {
+                if let Some(old) = self.records.pop_front() {
+                    unpin_pieces(drivers, &old.pieces);
+                }
+            }
+            self.records.push_back(record);
+            published += 1;
+        }
+        published
+    }
+
+    /// Longest published prefix of `prompt` on `route` that is strictly
+    /// shorter than the prompt (so prefill computes at least the last
+    /// token); 0 on a miss. Records with a piece no longer resident are
+    /// dropped and their pins released. The winning record keeps its pins
+    /// (they stay valid for the restore) and is returned by
+    /// [`Self::planned`] until it is released or replaced by the next plan.
+    pub fn plan(
+        &mut self,
+        drivers: &mut [&mut SessionDriver],
+        prompt: &[u32],
+        route: SessionRoute,
+    ) -> usize {
+        self.planned = None;
+        let mut best = 0;
+        let mut best_key = None;
+        // Fingerprints of `prompt` prefixes already hashed, by length.
+        let mut hashed: Vec<(usize, u64)> = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.records.len());
+        for record in std::mem::take(&mut self.records) {
+            let root = record.pieces.first().filter(|_| {
+                record.pieces.len() == drivers.len()
+                    && drivers
+                        .iter()
+                        .zip(&record.pieces)
+                        .all(|(driver, piece)| driver.piece_resident(piece))
+            });
+            let Some(root) = root else {
+                unpin_pieces(drivers, &record.pieces);
+                continue;
+            };
+            let len = root.prefix_len();
+            if record.route == route && len > best && len < prompt.len() {
+                let fingerprint = match hashed.iter().find(|(hashed, _)| *hashed == len) {
+                    Some(&(_, fingerprint)) => fingerprint,
+                    None => {
+                        let fingerprint = prefix_fingerprint(&prompt[..len]);
+                        hashed.push((len, fingerprint));
+                        fingerprint
+                    }
+                };
+                if root.0 .2 == fingerprint {
+                    best = len;
+                    best_key = Some((record.route, root.clone()));
+                }
+            }
+            kept.push_back(record);
+        }
+        self.records = kept;
+        self.planned = best_key;
+        best
+    }
+
+    /// The record the last [`Self::plan`] chose, with its prefix length, while
+    /// it is still published (its pins are live); `None` after a miss or
+    /// once it was released.
+    pub fn planned(&self) -> Option<(usize, &MeshSessionRecord)> {
+        let (route, key) = self.planned.as_ref()?;
+        self.records
+            .iter()
+            .find(|record| record.route == *route && record.pieces.first() == Some(key))
+            .map(|record| (key.prefix_len(), record))
+    }
+
+    /// Drop the planned record and release its pins (the restore was
+    /// abandoned or failed). Returns whether a record was released.
+    pub fn release_plan(&mut self, drivers: &mut [&mut SessionDriver]) -> bool {
+        let Some((route, key)) = self.planned.take() else {
+            return false;
+        };
+        let Some(at) = self
+            .records
+            .iter()
+            .position(|record| record.route == route && record.pieces.first() == Some(&key))
+        else {
+            return false;
+        };
+        if let Some(record) = self.records.remove(at) {
+            unpin_pieces(drivers, &record.pieces);
+        }
+        true
+    }
+
+    /// Release every band's pins of the oldest published record (before any
+    /// band frees snapshots under memory pressure). Returns whether a record
+    /// was released.
+    pub fn evict_oldest(&mut self, drivers: &mut [&mut SessionDriver]) -> bool {
+        let Some(old) = self.records.pop_front() else {
+            return false;
+        };
+        unpin_pieces(drivers, &old.pieces);
+        true
+    }
+
+    /// Release every record's pins and drop the staged candidates. Call it
+    /// before clearing the drivers.
+    pub fn clear(&mut self, drivers: &mut [&mut SessionDriver]) {
+        self.staged.clear();
+        self.planned = None;
+        for record in std::mem::take(&mut self.records) {
+            unpin_pieces(drivers, &record.pieces);
+        }
     }
 }
 
@@ -2791,5 +3259,496 @@ mod tests {
         assert_eq!(driver.plan(&toy, &continuation, AR), 0);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    /// A CPU-only state that only names its snapshot scope.
+    struct ScopeOnly(&'static str);
+
+    impl SessionState for ScopeOnly {
+        fn snapshot_scope(&self, _route: SessionRoute) -> Option<String> {
+            Some(self.0.to_string())
+        }
+        fn snapshot_boundaries(&self, _: &[u32], _: usize, _: usize) -> Vec<usize> {
+            Vec::new()
+        }
+        fn snapshot_parts(
+            &mut self,
+            _: SessionRoute,
+            _: usize,
+        ) -> Result<SnapshotParts<'_>, String> {
+            Err("scope only".into())
+        }
+        fn restore_parts(
+            &mut self,
+            _: &mut Gpu,
+            _: SessionRoute,
+            _: &[u8],
+        ) -> Result<StateLayout<'_>, String> {
+            Err("scope only".into())
+        }
+        fn finish_restore(&mut self, _: &mut Gpu, _: SessionRoute, _: &[u8]) -> Result<(), String> {
+            Err("scope only".into())
+        }
+        fn live_position(&self, _: SessionRoute) -> Option<usize> {
+            None
+        }
+        fn growth_reserve_bytes(&self, _: &Gpu, _: usize) -> u64 {
+            0
+        }
+        fn reset(&mut self, _: &mut Gpu) -> Result<(), String> {
+            Err("scope only".into())
+        }
+    }
+
+    const BAND: SessionRoute = SessionRoute::Ar;
+
+    fn band_driver() -> SessionDriver {
+        SessionDriver::new(SessionCache::new(domain(), 1 << 20))
+    }
+
+    fn piece(driver: &SessionDriver, prefix: &[u32]) -> SessionPieceKey {
+        driver.piece_key(&ScopeOnly("band"), prefix, BAND).unwrap()
+    }
+
+    /// A pool snapshot with a harmless disk location: it owns no device
+    /// buffer, so nothing needs freeing.
+    fn fixture(parent: Option<Key>) -> StoredSnapshot {
+        StoredSnapshot {
+            location: SnapshotLocation::Disk {
+                path: PathBuf::new(),
+                file_bytes: 1,
+            },
+            parent,
+            fixed_bytes: Vec::new(),
+            segments: Vec::new(),
+            meta: Vec::new(),
+            bytes: 1,
+        }
+    }
+
+    /// Publish `key` into the pool of `driver`, as a child of `parent` when
+    /// given (linked like a captured delta).
+    fn seed(driver: &mut SessionDriver, key: &SessionPieceKey, parent: Option<&SessionPieceKey>) {
+        if let Some(parent) = parent {
+            driver.cache.link(&parent.0);
+        }
+        let (domain, p, fp) = key.0.clone();
+        let (id, displaced) = driver.cache.pool.insert_unaligned(
+            domain,
+            p,
+            fp,
+            fixture(parent.map(|parent| parent.0.clone())),
+        );
+        assert!(id != CheckpointId::NONE);
+        assert!(displaced.is_empty());
+    }
+
+    fn evict(driver: &mut SessionDriver, key: &SessionPieceKey) {
+        assert!(driver
+            .cache
+            .pool
+            .evict(&key.0 .0, key.0 .1, key.0 .2)
+            .is_some());
+    }
+
+    fn pinned(driver: &SessionDriver, key: &SessionPieceKey) -> bool {
+        driver.cache.pool.is_pinned(&key.0 .0, key.0 .1, key.0 .2)
+    }
+
+    fn mesh_record(pieces: Vec<SessionPieceKey>) -> MeshSessionRecord {
+        MeshSessionRecord {
+            route: BAND,
+            pieces,
+        }
+    }
+
+    /// Two bands with `prefix` seeded in both pools.
+    fn two_bands(prefix: &[u32]) -> (SessionDriver, SessionDriver, Vec<SessionPieceKey>) {
+        let (mut a, mut b) = (band_driver(), band_driver());
+        let pieces = vec![piece(&a, prefix), piece(&b, prefix)];
+        seed(&mut a, &pieces[0], None);
+        seed(&mut b, &pieces[1], None);
+        (a, b, pieces)
+    }
+
+    #[test]
+    fn piece_key_names_exactly_the_cache_domain_scope() {
+        let driver = band_driver();
+        let prefix = [1, 2, 3];
+        let key = driver.piece_key(&ScopeOnly("band"), &prefix, BAND).unwrap();
+        assert_eq!(key.prefix_len(), 3);
+        assert_eq!(
+            key.0,
+            (
+                driver.cache.domain.scoped("band"),
+                3,
+                prefix_fingerprint(&prefix)
+            )
+        );
+        assert!(key.matches_prefix(&prefix));
+        assert!(!key.matches_prefix(&[1, 2, 4]));
+        assert!(!key.matches_prefix(&[1, 2]));
+        assert_eq!(key.clone(), key);
+        assert_ne!(
+            driver
+                .piece_key(&ScopeOnly("other"), &prefix, BAND)
+                .unwrap(),
+            key
+        );
+        assert_ne!(piece(&driver, &[1, 2, 4]), key);
+        assert!(driver.piece_key(&ScopeOnly("band"), &[], BAND).is_none());
+    }
+
+    #[test]
+    fn load_epoch_binds_the_domain_of_a_fresh_driver_only() {
+        let mut driver = band_driver();
+        let before = piece(&driver, &[1, 2]);
+        driver.bind_load_epoch(7).unwrap();
+        assert_eq!(driver.cache.domain.model_load_epoch, 7);
+        assert_ne!(piece(&driver, &[1, 2]), before);
+        // A pooled snapshot makes the driver non-fresh: refused, unchanged.
+        let key = piece(&driver, &[1, 2]);
+        seed(&mut driver, &key, None);
+        assert!(driver.bind_load_epoch(8).is_err());
+        assert_eq!(driver.cache.domain.model_load_epoch, 7);
+        // So do a pending capture and a live state.
+        let mut pending = band_driver();
+        let key = piece(&pending, &[1, 2]);
+        pending.cache.pending.push((key.0.clone(), fixture(None)));
+        assert!(pending.bind_load_epoch(8).is_err());
+        assert_eq!(pending.cache.domain.model_load_epoch, 1);
+        let mut live = band_driver();
+        live.live = Some(LiveRecord {
+            tokens: vec![1, 2],
+            route: BAND,
+        });
+        assert!(live.bind_load_epoch(8).is_err());
+        assert_eq!(live.cache.domain.model_load_epoch, 1);
+    }
+
+    #[test]
+    fn set_boundaries_overrides_the_armed_schedule_or_changes_nothing() {
+        let mut driver = band_driver();
+        // No turn: only the empty schedule is accepted.
+        assert!(driver.set_boundaries(Vec::new(), None).is_ok());
+        assert!(driver.set_boundaries(vec![4], None).is_err());
+        driver.cache.turn = Some(Turn {
+            domain: domain(),
+            route: BAND,
+            boundaries: VecDeque::from([8, 16]),
+            lineage: None,
+            pool_capture: true,
+            start: 2,
+            end: 20,
+        });
+        assert_eq!(driver.turn_boundaries(), vec![8, 16]);
+        driver.set_boundaries(vec![4, 12, 20], Some(12)).unwrap();
+        assert_eq!(driver.turn_boundaries(), vec![4, 12, 20]);
+        assert_eq!(driver.turn_lineage(), Some(12));
+        assert_eq!(driver.next_boundary(), Some(4));
+        for (boundaries, lineage) in [
+            (vec![4, 4], None),
+            (vec![8, 4], None),
+            (vec![2, 8], None),
+            (vec![8, 21], None),
+            (vec![4, 12], Some(8)),
+            (vec![4, 12], Some(20)),
+            (vec![4, 20], Some(20)),
+            (vec![4, 12], Some(2)),
+        ] {
+            assert!(driver.set_boundaries(boundaries, lineage).is_err());
+            assert_eq!(driver.turn_boundaries(), vec![4, 12, 20]);
+            assert_eq!(driver.turn_lineage(), Some(12));
+        }
+        driver.set_boundaries(Vec::new(), None).unwrap();
+        assert!(driver.turn_boundaries().is_empty());
+        assert_eq!(driver.turn_lineage(), None);
+    }
+
+    #[test]
+    fn pin_piece_needs_a_pool_snapshot_and_counts_pins() {
+        let mut driver = band_driver();
+        let key = piece(&driver, &[1, 2, 3]);
+        assert!(!driver.piece_resident(&key));
+        assert!(!driver.pin_piece(&key));
+        assert!(driver.cache.children.is_empty());
+        seed(&mut driver, &key, None);
+        assert!(driver.piece_resident(&key));
+        assert!(driver.pin_piece(&key));
+        assert!(driver.pin_piece(&key));
+        assert!(pinned(&driver, &key));
+        driver.unpin_piece(&key);
+        assert!(pinned(&driver, &key));
+        driver.unpin_piece(&key);
+        assert!(!pinned(&driver, &key));
+        assert!(driver.cache.children.is_empty());
+        assert!(driver.cache.pool.pop_lru().is_some());
+    }
+
+    #[test]
+    fn an_unpublished_piece_is_never_pinnable() {
+        let mut driver = band_driver();
+        let key = piece(&driver, &[1, 2, 3]);
+        driver.cache.pending.push((key.0.clone(), fixture(None)));
+        assert!(!driver.piece_resident(&key));
+        assert!(!driver.pin_piece(&key));
+        assert!(driver.cache.children.is_empty());
+    }
+
+    #[test]
+    fn publish_commits_pending_and_plans_the_longest_strict_prefix() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        // A deeper piece is still pending on both bands.
+        let deep = [1, 2, 3, 4];
+        let deep_pieces = vec![piece(&a, &deep), piece(&b, &deep)];
+        a.cache
+            .pending
+            .push((deep_pieces[0].0.clone(), fixture(None)));
+        b.cache
+            .pending
+            .push((deep_pieces[1].0.clone(), fixture(None)));
+        let mut mesh = MeshSessionCache::new();
+        mesh.stage(mesh_record(pieces));
+        mesh.stage(mesh_record(deep_pieces.clone()));
+        assert_eq!(mesh.staged_len(), 2);
+        let mut bands = [&mut a, &mut b];
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3, 4, 5], BAND), 0);
+        assert_eq!(mesh.publish(&mut bands), 2);
+        assert_eq!((mesh.len(), mesh.staged_len()), (2, 0));
+        assert!(bands[0].cache.pending.is_empty() && bands[1].cache.pending.is_empty());
+        assert!(bands[0].piece_resident(&deep_pieces[0]));
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3, 4, 5], BAND), 4);
+        // Strictly shorter than the prompt.
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3, 4], BAND), 2);
+        assert_eq!(mesh.plan(&mut bands, &[1, 2], BAND), 0);
+        assert_eq!(mesh.plan(&mut bands, &[1, 9, 3, 4, 5], BAND), 0);
+        assert_eq!(
+            mesh.plan(&mut bands, &[1, 2, 3, 4, 5], SessionRoute::Mtp),
+            0
+        );
+        assert!(pinned(bands[0], &deep_pieces[0]) && pinned(bands[1], &deep_pieces[1]));
+    }
+
+    #[test]
+    fn abort_drops_staged_candidates_and_keeps_published_records() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        mesh.stage(mesh_record(pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 1);
+        mesh.stage(mesh_record(pieces.clone()));
+        mesh.abort();
+        assert_eq!((mesh.len(), mesh.staged_len()), (1, 0));
+        assert_eq!(mesh.publish(&mut bands), 0);
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3], BAND), 2);
+        // The aborted candidate took no pin.
+        assert_eq!(bands[0].cache.children[&pieces[0].0], 1);
+    }
+
+    #[test]
+    fn a_missing_or_inconsistent_piece_drops_the_candidate_and_leaves_no_pin() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let gone = piece(&b, &[1, 2, 3]);
+        let first = piece(&a, &[1, 2, 3]);
+        seed(&mut a, &first, None);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        mesh.stage(mesh_record(vec![first.clone(), gone]));
+        mesh.stage(mesh_record(pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 1);
+        assert_eq!(mesh.len(), 1);
+        assert!(!pinned(bands[0], &first));
+        assert_eq!(bands[0].cache.children.len(), 1);
+        assert!(bands[1].cache.pool.pop_lru().is_none());
+        // Pieces of different prefixes, a different owner count and an empty
+        // record are refused as well.
+        mesh.stage(mesh_record(vec![pieces[0].clone(), first.clone()]));
+        mesh.stage(mesh_record(vec![pieces[0].clone()]));
+        mesh.stage(mesh_record(Vec::new()));
+        assert_eq!(mesh.publish(&mut bands), 0);
+        assert!(!pinned(bands[0], &first));
+        assert_eq!(bands[0].cache.children.len(), 1);
+    }
+
+    #[test]
+    fn probing_pins_all_or_nothing() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let absent = piece(&b, &[1, 2, 3]);
+        let first = piece(&a, &[1, 2, 3]);
+        seed(&mut a, &first, None);
+        let mut bands = [&mut a, &mut b];
+        assert!(!probe_and_pin_pieces(&mut bands, &[first.clone(), absent]));
+        assert!(!pinned(bands[0], &first));
+        assert!(bands[0].cache.children.is_empty() && bands[1].cache.children.is_empty());
+        assert!(!probe_and_pin_pieces(&mut bands, &pieces[..1]));
+        assert!(probe_and_pin_pieces(&mut bands, &pieces));
+        assert!(pinned(bands[0], &pieces[0]) && pinned(bands[1], &pieces[1]));
+        unpin_pieces(&mut bands, &pieces);
+        assert!(!pinned(bands[0], &pieces[0]) && !pinned(bands[1], &pieces[1]));
+        assert!(bands[0].cache.children.is_empty() && bands[1].cache.children.is_empty());
+    }
+
+    #[test]
+    fn an_evicted_piece_invalidates_its_record_on_every_band() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        mesh.stage(mesh_record(pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 1);
+        // A pinned piece is never an LRU victim.
+        assert!(bands[0].cache.pool.pop_lru().is_none());
+        assert!(bands[1].cache.pool.pop_lru().is_none());
+        // One band loses its piece outside the pins.
+        evict(bands[1], &pieces[1]);
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3], BAND), 0);
+        assert!(mesh.is_empty());
+        // The surviving band's pin was released with the record.
+        assert!(!pinned(bands[0], &pieces[0]));
+        assert!(bands[0].cache.children.is_empty() && bands[1].cache.children.is_empty());
+        assert!(bands[0].cache.pool.pop_lru().is_some());
+    }
+
+    #[test]
+    fn evict_oldest_releases_every_band_pin_of_the_oldest_record() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let newer = [1, 2, 3];
+        let newer_pieces = vec![piece(&a, &newer), piece(&b, &newer)];
+        seed(&mut a, &newer_pieces[0], None);
+        seed(&mut b, &newer_pieces[1], None);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        assert!(!mesh.evict_oldest(&mut bands));
+        mesh.stage(mesh_record(pieces.clone()));
+        mesh.stage(mesh_record(newer_pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 2);
+        assert!(mesh.evict_oldest(&mut bands));
+        assert_eq!(mesh.len(), 1);
+        assert!(!pinned(bands[0], &pieces[0]) && !pinned(bands[1], &pieces[1]));
+        assert!(pinned(bands[0], &newer_pieces[0]) && pinned(bands[1], &newer_pieces[1]));
+        // The released pieces are now LRU victims on every band.
+        assert!(bands[0].cache.pool.pop_lru().is_some());
+        assert!(bands[1].cache.pool.pop_lru().is_some());
+        assert!(mesh.evict_oldest(&mut bands));
+        assert!(!mesh.evict_oldest(&mut bands));
+        assert!(bands[0].cache.children.is_empty() && bands[1].cache.children.is_empty());
+    }
+
+    #[test]
+    fn records_cap_at_the_bound_and_release_the_oldest() {
+        let (mut a, mut b) = (band_driver(), band_driver());
+        let mut mesh = MeshSessionCache::new();
+        let mut all = Vec::new();
+        for len in 1..=MESH_SESSION_MAX_RECORDS + 1 {
+            let prefix = vec![5; len];
+            let pieces = vec![piece(&a, &prefix), piece(&b, &prefix)];
+            seed(&mut a, &pieces[0], None);
+            seed(&mut b, &pieces[1], None);
+            mesh.stage(mesh_record(pieces.clone()));
+            all.push(pieces);
+            let mut bands = [&mut a, &mut b];
+            assert_eq!(mesh.publish(&mut bands), 1);
+            assert!(mesh.len() <= MESH_SESSION_MAX_RECORDS);
+        }
+        assert_eq!(mesh.len(), MESH_SESSION_MAX_RECORDS);
+        let mut bands = [&mut a, &mut b];
+        let long = vec![5; MESH_SESSION_MAX_RECORDS + 3];
+        assert_eq!(
+            mesh.plan(&mut bands, &long, BAND),
+            MESH_SESSION_MAX_RECORDS + 1
+        );
+        let oldest = &all[0];
+        assert!(!pinned(bands[0], &oldest[0]) && !pinned(bands[1], &oldest[1]));
+        assert!(!bands[0].cache.children.contains_key(&oldest[0].0));
+        let newest = all.last().unwrap();
+        assert!(pinned(bands[0], &newest[0]) && pinned(bands[1], &newest[1]));
+        assert_eq!(bands[0].cache.children.len(), MESH_SESSION_MAX_RECORDS);
+    }
+
+    #[test]
+    fn republishing_a_prefix_replaces_the_record_without_leaking_pins() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        for _ in 0..3 {
+            mesh.stage(mesh_record(pieces.clone()));
+            assert_eq!(mesh.publish(&mut bands), 1);
+            assert_eq!(mesh.len(), 1);
+            assert_eq!(bands[0].cache.children[&pieces[0].0], 1);
+        }
+    }
+
+    #[test]
+    fn shared_children_refcount_keeps_a_parent_pinned_until_both_release() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        // A child snapshot on band a that names the record's piece as parent.
+        let child = piece(&a, &[1, 2, 3, 4]);
+        seed(&mut a, &child, Some(&pieces[0]));
+        assert_eq!(a.cache.children[&pieces[0].0], 1);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        mesh.stage(mesh_record(pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 1);
+        assert_eq!(bands[0].cache.children[&pieces[0].0], 2);
+        // The record releases its pin; the child still holds the parent.
+        mesh.clear(&mut bands);
+        assert!(mesh.is_empty());
+        assert_eq!(bands[0].cache.children[&pieces[0].0], 1);
+        assert!(pinned(bands[0], &pieces[0]));
+        assert!(!pinned(bands[1], &pieces[1]));
+        // Dropping the child (as `drop_snapshot` does) unpins the parent.
+        bands[0].cache.unlink(&pieces[0].0);
+        assert!(!pinned(bands[0], &pieces[0]));
+        assert!(bands[0].cache.children.is_empty());
+    }
+
+    #[test]
+    fn clear_releases_published_pins_and_staged_candidates() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        mesh.stage(mesh_record(pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 1);
+        mesh.stage(mesh_record(pieces.clone()));
+        mesh.clear(&mut bands);
+        assert_eq!((mesh.len(), mesh.staged_len()), (0, 0));
+        assert!(bands[0].cache.children.is_empty() && bands[1].cache.children.is_empty());
+        assert!(!pinned(bands[0], &pieces[0]) && !pinned(bands[1], &pieces[1]));
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3], BAND), 0);
+    }
+
+    #[test]
+    fn planned_record_is_selectable_and_releasable() {
+        let (mut a, mut b, pieces) = two_bands(&[1, 2]);
+        let deep = [1, 2, 3];
+        let deep_pieces = vec![piece(&a, &deep), piece(&b, &deep)];
+        seed(&mut a, &deep_pieces[0], None);
+        seed(&mut b, &deep_pieces[1], None);
+        let mut mesh = MeshSessionCache::new();
+        let mut bands = [&mut a, &mut b];
+        assert!(mesh.planned().is_none());
+        assert!(!mesh.release_plan(&mut bands));
+        mesh.stage(mesh_record(pieces.clone()));
+        mesh.stage(mesh_record(deep_pieces.clone()));
+        assert_eq!(mesh.publish(&mut bands), 2);
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3, 4], BAND), 3);
+        let (len, chosen) = mesh.planned().unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(chosen.pieces, deep_pieces);
+        // A miss clears the plan; the next plan selects again.
+        assert_eq!(mesh.plan(&mut bands, &[9, 9, 9], BAND), 0);
+        assert!(mesh.planned().is_none());
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3, 4], BAND), 3);
+        // Releasing drops only the chosen record and its pins.
+        assert!(mesh.release_plan(&mut bands));
+        assert!(mesh.planned().is_none());
+        assert_eq!(mesh.len(), 1);
+        assert!(!pinned(bands[0], &deep_pieces[0]) && !pinned(bands[1], &deep_pieces[1]));
+        assert!(pinned(bands[0], &pieces[0]) && pinned(bands[1], &pieces[1]));
+        assert!(!mesh.release_plan(&mut bands));
+        // A planned record that is evicted afterwards is no longer planned.
+        assert_eq!(mesh.plan(&mut bands, &[1, 2, 3], BAND), 2);
+        assert!(mesh.planned().is_some());
+        assert!(mesh.evict_oldest(&mut bands));
+        assert!(mesh.planned().is_none());
     }
 }

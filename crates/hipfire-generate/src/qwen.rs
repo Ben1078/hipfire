@@ -2387,22 +2387,88 @@ pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bo
     env_disabled || native_qwen4_mtp
 }
 
+/// Where a Qwen4 session entry (plan, commit) runs, from whether the bundle's
+/// pipeline-parallel mesh is active and whether the model owns its `Gpus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Qwen4SessionTarget {
+    /// The ordinary bundle entry (Single and expert-parallel).
+    Root,
+    /// The mesh entry, run against the model's `Gpus`.
+    Mesh,
+    /// An active mesh without `Gpus`: the root bundle must not act alone (it
+    /// holds one band's cache only), so the entry is skipped.
+    Unreachable,
+}
+
+fn qwen4_session_target(pp_mesh_active: bool, has_gpus: bool) -> Qwen4SessionTarget {
+    match (pp_mesh_active, has_gpus) {
+        (false, _) => Qwen4SessionTarget::Root,
+        (true, true) => Qwen4SessionTarget::Mesh,
+        (true, false) => Qwen4SessionTarget::Unreachable,
+    }
+}
+
+/// The session reuse (tokens of `prompt` restored from the cache or the live
+/// state) a Qwen4 request plans. A pipeline-parallel model plans through the
+/// mesh with its `Gpus` for the AR route; native MTP never reuses a session
+/// under a mesh, and a mesh without `Gpus` plans no reuse. Disjoint field
+/// borrows, as [`qwen4_bundle_and_mesh`].
+fn plan_qwen4_session(model: &mut LoadedModel, prompt: &[u32], route: SessionRoute) -> usize {
+    let LoadedModel { state, pp_gpus, .. } = model;
+    let Some(state) = state.as_deref_mut() else {
+        return 0;
+    };
+    if let Some(bundle) =
+        (&mut *state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    {
+        if bundle.pp_mesh_active() {
+            return match (
+                qwen4_session_target(true, pp_gpus.is_some()),
+                route,
+                pp_gpus.as_mut(),
+            ) {
+                (Qwen4SessionTarget::Mesh, SessionRoute::Ar, Some(gpus)) => {
+                    bundle.pp_session_plan(gpus, prompt, route)
+                }
+                _ => 0,
+            };
+        }
+    }
+    state.session_plan(prompt, route)
+}
+
 /// Publishes pending Qwen4 session snapshots after a committed terminal and
 /// keeps the live state for an in-conversation continuation.
 /// `conversation_tokens` is the consumed host history (prompt plus emitted
 /// tokens, empty after an unrepaired terminal); the bundle validates it
 /// against its device state. Takes the fields, not the whole model, so the
-/// borrows stay disjoint. No-op for other families.
+/// borrows stay disjoint. A pipeline-parallel model commits every band
+/// through the mesh with its `Gpus`; an active mesh without `Gpus` commits
+/// nothing (the root alone would publish a partial record). No-op for other
+/// families.
 fn commit_qwen4_session(model: &mut LoadedModel) {
-    if model.qwen4().is_some() {
-        let LoadedModel {
-            state,
-            conversation_tokens,
-            ..
-        } = model;
-        if let Some(state) = state.as_deref_mut() {
-            state.session_commit_live(conversation_tokens);
+    let LoadedModel {
+        state,
+        pp_gpus,
+        conversation_tokens,
+        ..
+    } = model;
+    let Some(state) = state.as_deref_mut() else {
+        return;
+    };
+    let Some(bundle) =
+        (&mut *state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+    else {
+        return;
+    };
+    match qwen4_session_target(bundle.pp_mesh_active(), pp_gpus.is_some()) {
+        Qwen4SessionTarget::Root => state.session_commit_live(conversation_tokens),
+        Qwen4SessionTarget::Mesh => {
+            if let Some(gpus) = pp_gpus.as_mut() {
+                bundle.pp_session_commit_live(gpus, conversation_tokens);
+            }
         }
+        Qwen4SessionTarget::Unreachable => {}
     }
 }
 
@@ -3409,12 +3475,15 @@ pub fn generate_dflash(
     // longest of the live state (this conversation's previous turn) and a
     // cold-exact session snapshot.
     if qwen4_native_mtp {
-        let start = m
-            .state
-            .as_deref()
-            .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Mtp))
-            .unwrap_or(0);
-        trace_qwen4_session_plan(SessionRoute::Mtp, &m.conversation_tokens, &prompt_tokens, start);
+        // Native MTP never reuses a session under pipeline parallelism (MTP
+        // itself is refused there); `plan_qwen4_session` returns 0 for a mesh.
+        let start = plan_qwen4_session(m, &prompt_tokens, SessionRoute::Mtp);
+        trace_qwen4_session_plan(
+            SessionRoute::Mtp,
+            &m.conversation_tokens,
+            &prompt_tokens,
+            start,
+        );
         prefill_start = start;
         prefill_tokens = prompt_tokens[start..].to_vec();
         cache_hit = start > 0;
@@ -9571,12 +9640,13 @@ pub fn generate_qwen4_ar(
 
     // Plan a durable whole-chunk session snapshot against the canonical render.
     // Prefill restores into the live buffers, then runs the remaining suffix.
-    let reused = m
-        .state
-        .as_deref()
-        .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Ar))
-        .unwrap_or(0);
-    trace_qwen4_session_plan(SessionRoute::Ar, &m.conversation_tokens, &prompt_tokens, reused);
+    let reused = plan_qwen4_session(m, &prompt_tokens, SessionRoute::Ar);
+    trace_qwen4_session_plan(
+        SessionRoute::Ar,
+        &m.conversation_tokens,
+        &prompt_tokens,
+        reused,
+    );
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -9696,4 +9766,28 @@ fn qwen4_bundle_and_mesh(
         (state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
     })?;
     Some((bundle, model.pp_gpus.as_mut()))
+}
+
+#[cfg(test)]
+mod qwen4_session_target_tests {
+    use super::{qwen4_session_target, Qwen4SessionTarget};
+
+    #[test]
+    fn single_and_ep_use_the_root_entry() {
+        assert_eq!(qwen4_session_target(false, false), Qwen4SessionTarget::Root);
+        assert_eq!(qwen4_session_target(false, true), Qwen4SessionTarget::Root);
+    }
+
+    #[test]
+    fn an_active_mesh_reaches_the_mesh_entry_with_gpus() {
+        assert_eq!(qwen4_session_target(true, true), Qwen4SessionTarget::Mesh);
+    }
+
+    #[test]
+    fn an_active_mesh_without_gpus_never_acts_on_the_root_alone() {
+        assert_eq!(
+            qwen4_session_target(true, false),
+            Qwen4SessionTarget::Unreachable
+        );
+    }
 }
