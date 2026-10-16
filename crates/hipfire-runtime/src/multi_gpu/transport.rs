@@ -12,7 +12,7 @@
 
 use crate::mesh_placement::EdgeTransport;
 use hip_bridge::{
-    DeviceBuffer, Event, HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING,
+    DeviceBuffer, Event, MemoryType, HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING,
     HIP_EVENT_RELEASE_TO_SYSTEM, HIP_HOST_MALLOC_MAPPED,
 };
 use rdna_compute::{Gpu, GpuTensor};
@@ -347,7 +347,7 @@ impl EdgeLease {
         )?;
         let attributes = hip(gpu.hip.pointer_get_attributes(&view.buf))?;
         if attributes.device != gpu.device_id
-            || attributes.mem_type != 1
+            || MemoryType::from_raw(attributes.mem_type) != Some(MemoryType::Device)
             || attributes.is_managed != 0
         {
             return Err(
