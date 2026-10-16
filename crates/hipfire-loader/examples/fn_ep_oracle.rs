@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! fn_ep_oracle: Flash-Next expert-parallel exactness oracle (lab).
+//! fn_ep_oracle: Flash-Next Single, expert-parallel and pipeline-parallel exactness oracle (lab).
 //!
 //! Loads a Qwen4 model through `hipfire_loader::load_model` exactly as the
 //! daemon does (EP comes from `topology.ep` / the S1 env var, not from a flag
@@ -29,8 +29,16 @@
 //!     [--state-steps 1,64,256] [--save-logits-steps 5,6] \
 //!     [--moe-dump-positions 0,1] [--perturb-rank R --perturb-step S] \
 //!     [--kv-mode M] [--state-quant Q] [--skip-model-hash] \
-//!     [--truncate-prompt-tokens N] [--chunk-dump LAYERS|default]
+//!     [--truncate-prompt-tokens N] [--chunk-dump LAYERS|default] [--canonical-state]
 //! ```
+//!
+//! `--canonical-state` emits one sorted logical ownership projection per snapshot
+//! (the union of all PP bands, with exactly one owner per key), and saves every
+//! output logits row. Without it, existing Single/EP state and logits formats
+//! are unchanged. The PP arm is selected by `topology.pp > 1`, with
+//! `HIPFIRE_PP_LAYERS` supplying band counts; `--arm` is only a record label.
+//! PP uses explicit mesh prefill/decode/reset and output-owner logits, never EP
+//! mirrors. Native MTP/speculation and perturbation are not admitted with PP.
 //!
 //! `--moe-dump-positions` labels decode forwards 0-based (`position-<P>` under
 //! `HIPFIRE_MOE_DUMP_DIR`); with the dump enabled exactly one prompt is
@@ -54,12 +62,14 @@
 //! window routes on every arm (`HIPFIRE_MTP_AR_FLOOR=0`; the floor is timed).
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
-use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig, Speculator};
+use hipfire_arch_qwen4::config::LayerType;
 use hipfire_dispatch::pipeline::moe_dump;
+use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig, Speculator};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -162,6 +172,7 @@ struct Args {
     kv_mode: Option<String>,
     state_quant: Option<String>,
     skip_model_hash: bool,
+    canonical_state: bool,
     truncate_prompt_tokens: Option<usize>,
     /// `--chunk-dump LAYERS|default`: digest the prefill chunks of these layers
     /// (`hipfire_arch_qwen4::chunk_dump`).
@@ -206,6 +217,7 @@ fn parse_args() -> R<Args> {
     let mut kv_mode = None;
     let mut state_quant = None;
     let mut skip_model_hash = false;
+    let mut canonical_state = false;
     let mut truncate_prompt_tokens = None;
     let mut chunk_dump: Option<String> = None;
     let mut spec_mtp = false;
@@ -233,6 +245,25 @@ fn parse_args() -> R<Args> {
             "--kv-mode" => kv_mode = Some(value("--kv-mode")?),
             "--state-quant" => state_quant = Some(value("--state-quant")?),
             "--skip-model-hash" => skip_model_hash = true,
+            "--canonical-state" => canonical_state = true,
+            "--help" | "-h" => {
+                println!(
+                    "fn_ep_oracle --model M.mq4 --prompt-file P [--prompt-file P ...] \
+                     --max-seq N --tokens N --out DIR --arm LABEL\n\
+                     [--canonical-state] [--state-steps 0,1,64,256] \
+                     [--save-logits-steps 5,6] [--kv-mode M] [--state-quant Q]\n\
+                     [--truncate-prompt-tokens N] [--skip-model-hash] \
+                     [--chunk-dump LAYERS|default] [--moe-dump-positions 0,1]\n\
+                     [--perturb-rank R --perturb-step S] [--spec off|mtp] \
+                     [--temp T --top-p P --top-k K --seed S --ngram auto|on|off --state-every N]\n\
+                     --canonical-state: sorted absolute-layer state keys; save every logits row.\n\
+                     PP arm: topology.pp=N and HIPFIRE_PP_LAYERS=<comma-separated band counts>.\n\
+                     Single cut-safe: HIPFIRE_QWEN4_CUT_LAYERS=<comma-separated band starts>.\n\
+                     PP forwards/reset use the mesh and logits use its output owner. \
+                     PP does not admit --spec mtp or --perturb-*."
+                );
+                std::process::exit(0);
+            }
             "--truncate-prompt-tokens" => {
                 truncate_prompt_tokens = Some(value("--truncate-prompt-tokens")?.parse::<usize>().map_err(e)?)
             }
@@ -283,6 +314,7 @@ fn parse_args() -> R<Args> {
         kv_mode,
         state_quant,
         skip_model_hash,
+        canonical_state,
         truncate_prompt_tokens,
         chunk_dump,
         mtp: spec_mtp.then_some(MtpArgs {
@@ -413,6 +445,104 @@ fn emit(file: &mut std::fs::File, record: &Value) -> R<()> {
     file.flush().map_err(e)
 }
 
+/// S5's whole-model canonical schema, without allocating a reference model.
+/// Capture families are optional, but when live must cover every GDN layer.
+fn canonical_rows(bundle: &Qwen4Bundle, digests: Vec<Vec<(String, String)>>) -> R<Vec<Value>> {
+    let mut union = BTreeMap::new();
+    for (rank, digest) in digests.into_iter().enumerate() {
+        for (key, value) in digest {
+            if union.insert(key.clone(), value).is_some() {
+                return Err(format!(
+                    "canonical state: duplicate key {key:?} on band {rank}"
+                ));
+            }
+        }
+    }
+    let capture = union.keys().any(|key| key.starts_with("row_capture["));
+    let mut expected: BTreeSet<String> =
+        ["ple_history.previous", "ple_history.eos", "hyper_feedback"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    if bundle.config.ple.is_some() {
+        expected.insert("ple_conv".into());
+    }
+    for (layer, kind) in bundle.config.layer_types.iter().enumerate() {
+        expected.insert(format!("layer[L{layer}].position"));
+        let (prefix, fields): (&str, &[&str]) = match kind {
+            LayerType::LinearAttention => ("gdn", &["live", "recurrent", "conv"]),
+            LayerType::FullAttention => (
+                "qsa",
+                &[
+                    "marks",
+                    "full_keys",
+                    "full_values",
+                    "raw_index_keys",
+                    "pooled_keys",
+                    "partial_keys",
+                    "partial_values",
+                    "selected_indices",
+                ],
+            ),
+        };
+        for field in fields {
+            expected.insert(format!("{prefix}[L{layer}].{field}"));
+        }
+        if capture && matches!(kind, LayerType::LinearAttention) {
+            for field in ["ring", "inputs", "recurrence"] {
+                expected.insert(format!("row_capture[L{layer}].{field}"));
+            }
+        }
+    }
+    let actual: BTreeSet<String> = union.keys().cloned().collect();
+    if actual != expected {
+        return Err(format!(
+            "canonical state: missing Single keys {:?}; unexpected keys {:?}",
+            expected.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&expected).collect::<Vec<_>>(),
+        ));
+    }
+    Ok(union
+        .into_iter()
+        .map(|(key, value)| json!([key, value]))
+        .collect())
+}
+
+fn pp_state_rows(bundle: &Qwen4Bundle, gpus: &mut Gpus, canonical: bool) -> R<Vec<Vec<Value>>> {
+    let states: Vec<_> = bundle
+        .pp_band_states()
+        .ok_or("PP mesh has no band states")?
+        .collect();
+    if states.len() != gpus.devices.len() {
+        return Err("PP state/device band counts disagree".into());
+    }
+    let digests = states
+        .into_iter()
+        .zip(&mut gpus.devices)
+        .map(|(state, gpu)| {
+            gpu.bind_thread().map_err(e)?;
+            if canonical {
+                state.canonical_digest_rows(gpu).map_err(e)
+            } else {
+                state.debug_digest(gpu).map_err(e)
+            }
+        })
+        .collect::<R<Vec<_>>>()?;
+    if canonical {
+        Ok(vec![canonical_rows(bundle, digests)?])
+    } else {
+        Ok(digests
+            .into_iter()
+            .map(|digest| {
+                digest
+                    .into_iter()
+                    .map(|(key, value)| json!([key, value]))
+                    .collect()
+            })
+            .collect())
+    }
+}
+
 /// One `--spec mtp` prompt.
 struct MtpRun<'a> {
     prompt_index: usize,
@@ -420,21 +550,37 @@ struct MtpRun<'a> {
     tokens: usize,
     state_every: usize,
     ranks: usize,
+    canonical_state: bool,
 }
 
 /// Rank `rank`'s state digest rows: `Qwen4State::debug_digest` (trunk) then
 /// the SHA-256 of every resident MTP head byte family (`mtp.<name>`).
-fn mtp_state_rows(bundle: &mut Qwen4Bundle, gpu: &mut Gpu, rank: usize) -> R<Vec<Value>> {
+fn mtp_state_rows(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    rank: usize,
+    canonical: bool,
+) -> R<Vec<Value>> {
     let rows = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu| -> R<Vec<Value>> {
-        let mut rows: Vec<Value> = bundle
-            .state
-            .debug_digest(gpu)
-            .map_err(e)?
-            .into_iter()
-            .map(|(name, value)| json!([name, value]))
-            .collect();
+        let mut rows: Vec<Value> = if canonical {
+            canonical_rows(
+                bundle,
+                vec![bundle.state.canonical_digest_rows(gpu).map_err(e)?],
+            )?
+        } else {
+            bundle
+                .state
+                .debug_digest(gpu)
+                .map_err(e)?
+                .into_iter()
+                .map(|(name, value)| json!([name, value]))
+                .collect()
+        };
         for (name, bytes) in bundle.lab_resident_head_items(gpu)? {
             rows.push(json!([format!("mtp.{name}"), sha256_hex(&bytes)]));
+        }
+        if canonical {
+            rows.sort_by(|a, b| a[0].as_str().cmp(&b[0].as_str()));
         }
         Ok(rows)
     };
@@ -472,22 +618,23 @@ fn mtp_prompt(
     let mut position = ids.len();
     let mut seed = first;
     let mut emitted = vec![first];
-    let digest = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu, window: usize, sinks: &mut Sinks| -> R<()> {
-        for rank in 0..run.ranks {
-            let rows = mtp_state_rows(bundle, gpu, rank)?;
-            emit(
-                &mut sinks.state,
-                &json!({
-                    "kind": "state",
-                    "prompt": run.prompt_index,
-                    "step": window,
-                    "rank": rank,
-                    "digest": rows,
-                }),
-            )?;
-        }
-        Ok(())
-    };
+    let digest =
+        |bundle: &mut Qwen4Bundle, gpu: &mut Gpu, window: usize, sinks: &mut Sinks| -> R<()> {
+            for rank in 0..run.ranks {
+                let rows = mtp_state_rows(bundle, gpu, rank, run.canonical_state)?;
+                emit(
+                    &mut sinks.state,
+                    &json!({
+                        "kind": "state",
+                        "prompt": run.prompt_index,
+                        "step": window,
+                        "rank": rank,
+                        "digest": rows,
+                    }),
+                )?;
+            }
+            Ok(())
+        };
     emit(
         &mut sinks.logits,
         &json!({
@@ -607,6 +754,13 @@ fn run() -> R<()> {
         spec_cfg,
         &mut gpu,
     )?;
+    let pp = model.pp;
+    if pp > 1 && args.mtp.is_some() {
+        return Err("PP oracle does not admit --spec mtp or speculative forwards".into());
+    }
+    if pp > 1 && args.perturb.is_some() {
+        return Err("PP oracle does not admit --perturb-*".into());
+    }
 
     let prompts = {
         let tokenizer = model
@@ -644,21 +798,54 @@ fn run() -> R<()> {
             hipfire_config::mtp_ngram_enabled_for_arch(hipfire_arch_qwen4::ARCH_ID, &gpu.arch)
         })
     });
-    let bundle = model
-        .qwen4_mut()
-        .ok_or("loaded model is not a Qwen4 (Flash-Next) bundle")?;
-    let ranks = bundle.ranks();
+    let (bundle, mut pp_gpus) = if pp > 1 {
+        let (bundle, gpus) = model
+            .qwen4_mesh_mut()
+            .ok_or("PP oracle requires a Qwen4 bundle with caller-owned pp_gpus")?;
+        if !bundle.pp_mesh_active() {
+            return Err("PP oracle requires an active Qwen4 PP mesh".into());
+        }
+        (bundle, Some(gpus))
+    } else {
+        (
+            model
+                .qwen4_mut()
+                .ok_or("loaded model is not a Qwen4 (Flash-Next) bundle")?,
+            None,
+        )
+    };
+    let ranks = pp_gpus
+        .as_ref()
+        .map_or_else(|| bundle.ranks(), |gpus| gpus.devices.len());
     if let Some((rank, _)) = args.perturb {
         if rank >= ranks {
-            return Err(format!("--perturb-rank {rank} but the bundle has {ranks} rank(s)"));
+            return Err(format!(
+                "--perturb-rank {rank} but the bundle has {ranks} rank(s)"
+            ));
         }
     }
     let vocab = bundle.config.vocab_size;
+    gpu.bind_thread().map_err(e)?;
     let logits = gpu.zeros(&[vocab], DType::F32).map_err(e)?;
 
-    let mut devices = vec![device_info(&gpu)];
-    for rank in 1..ranks {
-        devices.push(bundle.with_rank_mut(&mut gpu, rank, |_, peer, _| Ok(device_info(peer)))?);
+    let mut devices = Vec::new();
+    if let Some(gpus) = pp_gpus.as_ref() {
+        let owner = gpus
+            .mesh_output_owner()
+            .ok_or("PP mesh has no output owner")?;
+        if gpus.devices.get(owner).map(|owner| owner.device_id) != Some(gpu.device_id) {
+            return Err("PP output owner is not the daemon logits device".into());
+        }
+        devices.extend(gpus.devices.iter().enumerate().map(|(rank, gpu)| {
+            let mut info = device_info(gpu);
+            info["rank"] = json!(rank);
+            info
+        }));
+    } else {
+        devices.push(device_info(&gpu));
+        for rank in 1..ranks {
+            devices.push(bundle.with_rank_mut(&mut gpu, rank, |_, peer, _| Ok(device_info(peer)))?);
+        }
     }
 
     let model_sha = if args.skip_model_hash {
@@ -721,6 +908,48 @@ fn run() -> R<()> {
             "state_every": mtp.state_every,
         })),
     });
+    if args.canonical_state {
+        meta["canonical_state"] = json!(true);
+    }
+    if let Some(gpus) = pp_gpus.as_ref() {
+        let band_counts: Vec<_> = bundle
+            .pp_band_states()
+            .ok_or("PP mesh has no states")?
+            .map(|state| state.scope_map().band().len())
+            .collect();
+        let edges: Vec<_> = (0..ranks - 1).map(|src| (src, src + 1)).collect();
+        // Production admission has no pre-side-effect peer qualification;
+        // resolve the same policy here (auto/host => host-mapped, peer refuses).
+        let policy = hipfire_loader::admission::parse_mesh_transport(
+            hipfire_config::developer_var(hipfire_loader::admission::MESH_TRANSPORT_ENV)
+                .ok()
+                .as_deref(),
+        )?;
+        let transports = hipfire_runtime::mesh_placement::resolve_edge_transports(
+            policy,
+            &|_, _| false,
+            &edges,
+        )?;
+        let mut edge_meta = Vec::new();
+        for edge in transports {
+            let epoch = gpus
+                .mesh_edge_epoch(hipfire_runtime::multi_gpu::transport::EdgeId {
+                    src_device: edge.src,
+                    dst_device: edge.dst,
+                })
+                .filter(|epoch| *epoch != 0)
+                .ok_or("PP edge has no live transport lease")?;
+            edge_meta.push(json!({
+                "src": edge.src, "dst": edge.dst, "transport": edge.transport.to_string(),
+                "epoch": epoch,
+            }));
+        }
+        meta["pp"] = json!(pp);
+        meta["band_counts"] = json!(band_counts);
+        meta["rank_order"] = meta["devices"].clone();
+        meta["edge_transports"] = json!(edge_meta);
+        meta["output_owner"] = json!(gpus.mesh_output_owner());
+    }
     let write_meta = |meta: &Value| -> R<()> {
         std::fs::write(args.out.join("meta.json"), serde_json::to_vec_pretty(meta).map_err(e)?)
             .map_err(e)
@@ -756,14 +985,29 @@ fn run() -> R<()> {
                 tokens: args.tokens,
                 state_every: mtp.state_every,
                 ranks,
+                canonical_state: args.canonical_state,
             };
-            steps_run.push(mtp_prompt(&mut gpu, bundle, speculator.as_mut(), request, &run, &mut sinks)?);
+            steps_run.push(mtp_prompt(
+                &mut gpu,
+                bundle,
+                speculator.as_mut(),
+                request,
+                &run,
+                &mut sinks,
+            )?);
             continue;
         }
-        bundle.reset(&mut gpu).map_err(e)?;
-        bundle
-            .prefill_final(&mut gpu, &prompt.ids, 0, &logits)
-            .map_err(e)?;
+        if let Some(gpus) = pp_gpus.as_deref_mut() {
+            // Cold PP prefill resets every band and uses the canonical tile schedule.
+            bundle
+                .pp_prefill_final(gpus, &prompt.ids, 0, &logits)
+                .map_err(e)?;
+        } else {
+            bundle.reset(&mut gpu).map_err(e)?;
+            bundle
+                .prefill_final(&mut gpu, &prompt.ids, 0, &logits)
+                .map_err(e)?;
+        }
         let mut completed = 0usize;
         for step in 0..=args.tokens {
             let token = if step == 0 {
@@ -785,14 +1029,19 @@ fn run() -> R<()> {
                         ));
                     }
                 }
-                Some(
+                Some(if let Some(gpus) = pp_gpus.as_deref_mut() {
+                    bundle
+                        .pp_forward_token_or_argmax(gpus, None, &logits)
+                        .map_err(e)?
+                } else {
                     bundle
                         .forward_token_or_argmax(&mut gpu, None, &logits)
-                        .map_err(e)?,
-                )
+                        .map_err(e)?
+                })
             };
             completed = step;
 
+            gpu.bind_thread().map_err(e)?;
             let rank0 = tensor_bytes(&gpu, &logits)?;
             let rank0_sha = sha256_hex(&rank0);
             let mut record = json!({
@@ -803,15 +1052,16 @@ fn run() -> R<()> {
                 "position": bundle.state.position,
                 "logits_sha256": rank0_sha,
             });
-            if ranks > 1 {
+            if pp_gpus.is_none() && ranks > 1 {
                 let mut rank_sha = vec![rank0_sha.clone()];
                 for rank in 1..ranks {
-                    let peer_bytes = bundle.with_rank_mut(&mut gpu, rank, |_, peer_gpu, mirrors| {
-                        let mirror = mirrors
-                            .logits()
-                            .ok_or_else(|| format!("rank {rank} has no logits mirror"))?;
-                        tensor_bytes(peer_gpu, mirror)
-                    })?;
+                    let peer_bytes =
+                        bundle.with_rank_mut(&mut gpu, rank, |_, peer_gpu, mirrors| {
+                            let mirror = mirrors
+                                .logits()
+                                .ok_or_else(|| format!("rank {rank} has no logits mirror"))?;
+                            tensor_bytes(peer_gpu, mirror)
+                        })?;
                     rank_sha.push(sha256_hex(&peer_bytes));
                 }
                 if rank_sha.iter().any(|sha| *sha != rank0_sha) {
@@ -822,7 +1072,12 @@ fn run() -> R<()> {
                 record["rank_logits_sha256"] = json!(rank_sha);
             }
             emit(&mut sinks.logits, &record)?;
-            if step == 0 || args.state_steps.contains(&step) || args.save_logits_steps.contains(&step) {
+            if args.canonical_state
+                || pp_gpus.is_some()
+                || step == 0
+                || args.state_steps.contains(&step)
+                || args.save_logits_steps.contains(&step)
+            {
                 std::fs::write(
                     args.out.join(format!("logits-p{prompt_index}-s{step}.f32")),
                     &rank0,
@@ -831,18 +1086,38 @@ fn run() -> R<()> {
             }
 
             if args.state_steps.contains(&step) {
-                for rank in 0..ranks {
-                    let digest = if rank == 0 {
-                        bundle.state.debug_digest(&mut gpu).map_err(e)?
-                    } else {
-                        bundle.with_rank_mut(&mut gpu, rank, |peer, peer_gpu, _| {
-                            peer.state.debug_digest(peer_gpu).map_err(e)
-                        })?
-                    };
-                    let rows: Vec<Value> = digest
-                        .into_iter()
-                        .map(|(name, value)| json!([name, value]))
-                        .collect();
+                let rank_rows = if let Some(gpus) = pp_gpus.as_deref_mut() {
+                    pp_state_rows(bundle, gpus, args.canonical_state)?
+                } else {
+                    let mut rank_rows = Vec::new();
+                    for rank in 0..ranks {
+                        let rows = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu| -> R<Vec<Value>> {
+                            if args.canonical_state {
+                                canonical_rows(
+                                    bundle,
+                                    vec![bundle.state.canonical_digest_rows(gpu).map_err(e)?],
+                                )
+                            } else {
+                                Ok(bundle
+                                    .state
+                                    .debug_digest(gpu)
+                                    .map_err(e)?
+                                    .into_iter()
+                                    .map(|(name, value)| json!([name, value]))
+                                    .collect())
+                            }
+                        };
+                        rank_rows.push(if rank == 0 {
+                            rows(bundle, &mut gpu)?
+                        } else {
+                            bundle.with_rank_mut(&mut gpu, rank, |peer, peer_gpu, _| {
+                                rows(peer, peer_gpu)
+                            })?
+                        });
+                    }
+                    rank_rows
+                };
+                for (rank, rows) in rank_rows.into_iter().enumerate() {
                     emit(
                         &mut sinks.state,
                         &json!({
