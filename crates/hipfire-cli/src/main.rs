@@ -2853,7 +2853,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let host = config_string(&resolved, "serve.host")?;
     let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let endpoint = local_service_endpoint(&resolved, &host, port)?;
-    let force_local = run_should_force_local(&args);
+    // A resolved `topology.pp` above 1 (or one that cannot be read) must not be
+    // answered by a resident service that may hold a different topology; the
+    // local daemon load then applies it or refuses it by name.
+    let force_local = run_should_force_local(&args)
+        || config_u64(&resolved, "topology.pp").map_or(true, |pp| pp > 1);
     if !force_local && service_ready(&endpoint, Duration::from_millis(150)) {
         return run_via_http(
             &endpoint,
@@ -4538,7 +4542,9 @@ pub(crate) fn apply_kv_axis_overrides(
     Ok(())
 }
 
-/// Copy effective KV mode and backend fields from the validated loaded ACK.
+/// Copy effective KV mode, backend fields and the effective pipeline degree
+/// (`pp`, a number — distinct from `bench --pp` prompt sizes) from the
+/// validated loaded ACK.
 fn with_loaded_kv_backend_fields(
     mut report: serde_json::Value,
     loaded: &serde_json::Value,
@@ -4553,6 +4559,7 @@ fn with_loaded_kv_backend_fields(
         "kv_backend_legacy",
         "kv_backend_warning",
         "kv_mode",
+        "pp",
     ] {
         object.insert(
             key.to_owned(),
@@ -4732,6 +4739,13 @@ pub(crate) fn load_params(
     ) {
         let max_seq = config_u64(resolved, "memory.max_seq")?;
         params["max_seq"] = serde_json::json!(max_seq);
+    }
+    // Resolved `topology.pp` (global, per-model, env): forwarded as an explicit
+    // request when above 1, so serve's per-model resolution is not lost to its
+    // process-wide snapshot. Absent/1 leaves the daemon's `topology.pp`.
+    let pp = config_u64(resolved, "topology.pp")?;
+    if pp > 1 {
+        params["pp"] = serde_json::json!(pp);
     }
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?

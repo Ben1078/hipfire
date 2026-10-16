@@ -664,6 +664,40 @@ fn no_model_loaded_suffix(model_present: bool) -> &'static str {
     }
 }
 
+/// Pipeline degree of a load request: explicit `params.pp` > 1 wins, else
+/// `topology.pp` (`effective`, which also validates the configured value).
+/// The resolved degree is written back into `params.pp` so the weight-host
+/// envelope, slot caps and every later pp gate read one value. A refusal
+/// always names `topology.pp`.
+fn resolve_load_pp(
+    msg: &mut serde_json::Value,
+    effective: impl FnOnce(usize) -> Result<usize, String>,
+) -> Result<usize, String> {
+    let requested = msg
+        .get("params")
+        .and_then(|p| p.get("pp"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+    let pp = effective(requested).map_err(|error| {
+        if error.contains("topology.pp") {
+            format!("load refused: {error}")
+        } else {
+            format!("load refused: invalid topology.pp: {error}")
+        }
+    })?;
+    if pp != requested {
+        if let Some(object) = msg.as_object_mut() {
+            let params = object
+                .entry("params")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(params) = params.as_object_mut() {
+                params.insert("pp".to_owned(), serde_json::json!(pp));
+            }
+        }
+    }
+    Ok(pp)
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -1164,8 +1198,39 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg) {
-                    emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
+                // `params.pp` > 1 is explicit; otherwise `topology.pp` decides.
+                // Resolve once, before the weight-host envelope, slot caps and
+                // every pp gate below read the request.
+                let mut resolved_msg = msg.clone();
+                let load_pp = match resolve_load_pp(
+                    &mut resolved_msg,
+                    hipfire_config::topology::effective_pp,
+                ) {
+                    Ok(pp) => pp,
+                    Err(refusal) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &refusal,
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let msg = resolved_msg;
+                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg)
+                {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &refusal,
+                        "validation",
+                        false,
+                        false,
+                    );
                     let _ = stdout.flush();
                     continue;
                 }
@@ -1424,6 +1489,7 @@ fn main() {
                                 "kv_backend_legacy": slot_kv_diag.legacy,
                                 "kv_backend_warning": slot_kv_diag.warning,
                                 "kv_mode": slot_params.kv_mode_resolved,
+                                "pp": 1,
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1943,11 +2009,7 @@ fn main() {
                 // Gpus + *_multi paths and refuses VL / DFlash / CASK /
                 // PFlash at load time. v1 supports Qwen3.5 dense + MoE
                 // only — see load_model_pp for the arch_id check.
-                let pp = msg
-                    .get("params")
-                    .and_then(|p| p.get("pp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
+                let pp = load_pp;
                 // Expert-parallel degree (EP, task #26). tp>1 shards routed
                 // experts across ranks via load_model_ep. Mutually exclusive
                 // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
@@ -2512,12 +2574,13 @@ fn main() {
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                m.pp,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -2536,12 +2599,13 @@ fn main() {
                             );
                         } else {
                             let ack = format!(
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                m.pp,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -5183,6 +5247,38 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn load_pp_resolves_config_fallback_before_weight_host_refusal() {
+        let config_pp = |requested: usize| Ok(if requested > 1 { requested } else { 2 });
+        let mut msg = serde_json::json!({"type": "load", "params": {"tp": 1}});
+        assert_eq!(super::resolve_load_pp(&mut msg, config_pp), Ok(2));
+        assert_eq!(msg["params"]["pp"], 2);
+        assert!(super::weight_host_tenant::load_refusal(true, &msg)
+            .is_some_and(|refusal| refusal.contains("tp/pp > 1")));
+        let mut no_params = serde_json::json!({"type": "load"});
+        assert_eq!(super::resolve_load_pp(&mut no_params, config_pp), Ok(2));
+        assert_eq!(no_params["params"]["pp"], 2);
+        let mut explicit = serde_json::json!({"params": {"pp": 4}});
+        assert_eq!(super::resolve_load_pp(&mut explicit, config_pp), Ok(4));
+        assert_eq!(explicit["params"]["pp"], 4);
+        let mut single = serde_json::json!({"params": {}});
+        assert_eq!(super::resolve_load_pp(&mut single, |_| Ok(1)), Ok(1));
+        assert!(single["params"].get("pp").is_none());
+    }
+
+    #[test]
+    fn load_pp_invalid_config_names_topology_pp() {
+        let mut msg = serde_json::json!({"params": {}});
+        let error = super::resolve_load_pp(&mut msg, |_| {
+            Err("\"9\" is not a valid pipeline degree".to_owned())
+        })
+        .unwrap_err();
+        assert!(error.contains("topology.pp"), "{error}");
+        let named = super::resolve_load_pp(&mut msg, |_| Err("topology.pp = \"9\"".to_owned()))
+            .unwrap_err();
+        assert!(named.contains("topology.pp"), "{named}");
+    }
+
     #[test]
     fn admitted_load_failure_names_missing_model_only_when_unload_first() {
         // Unload-first (single-device/pp, incl. Qwen4): prior already retired.

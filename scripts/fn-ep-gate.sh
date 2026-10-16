@@ -3,11 +3,14 @@
 # gfx1100 (7900 XTX) or gfx1201 (R9700) cards. Run it from a hipfire checkout; it builds the
 # binaries, runs a reference (one card by default) and N cards (topology.ep = N) over the same prompts,
 # compares them byte for byte, times decode/prefill, and writes a receipt you can send back.
+# With --mode pp the same gate qualifies Flash-Next pipeline parallelism (pp = N layer bands, one per card, HC
+# streams over host-mapped staging, the output card last): a reference and PP-N run the same prompts through
+# fn_ep_oracle --pp N --canonical-state and are compared byte for byte (see "PP mode" below).
 #
 #   scripts/fn-ep-gate.sh [options] MODEL.mq4 [N] [OUT_DIR]
 #
 #   MODEL.mq4    Flash-Next mq4-xts model file (REQUIRED)
-#   N            EP degree, 2..=8 (default: length of --devices, else every visible card of the chosen arch, at most 8)
+#   N            EP degree (--mode pp: pipeline degree), 2..=8 (default: length of --devices, else every visible card of the chosen arch, at most 8)
 #   OUT_DIR      output directory (default: ./fn-ep-gate-<UTC timestamp>)
 #
 # Run the arms inside whole-card fabric holds: automatic expert placement can fill each card.
@@ -32,6 +35,15 @@
 #                       experts; EP4 on 24 GB cards keeps every expert layer in VRAM). The reference then
 #                       runs EP-R on the first R cards (HIPFIRE_DEVICES = first R entries of the card
 #                       list) as arm `ref-epR`, and the EP-N arm is compared against it byte for byte.
+#   --mode ep|pp        gate to run (default ep). pp = Flash-Next pipeline parallelism, see "PP mode" below.
+#   --pp-layers COUNTS  (pp) N comma-separated layer counts, band 0 first, exported as HIPFIRE_PP_LAYERS to the PP-N
+#                       arm (default: the uniform split; the PLE layer is pinned to band 0). A PP-R reference
+#                       (--ref-ranks R > 1) always runs the uniform split: independent bands.
+#   --transport auto|host  (pp) HIPFIRE_MESH_TRANSPORT of the PP arms (default host; auto resolves to host-mapped
+#                       staging; peer edges are refused by the loader)
+#   --mtp               (pp) add the native-MTP exactness pair (`--spec mtp --temp 0 --ngram off` with the pinned
+#                       policy HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off); the AR pair
+#                       always runs
 #   --no-isolate        keep your own HOME / HIPFIRE_HOME (default: a private one per arm under OUT_DIR
 #                       holding only `topology.ep`, so your config cannot change the arms)
 #   --target-dir DIR    cargo target dir
@@ -56,6 +68,26 @@
 # A failed EP load (missing peer access, out of VRAM, ...) is recorded in the receipt with the
 # stderr tail; the script never exits without writing receipt.json. Exit status: 0 = byte-exact PASS,
 # 1 = mismatch or an arm failed, 2 = environment / usage problem (not enough cards, build failed).
+#
+# PP mode (--mode pp): N is the pipeline degree (2..=8). The first entry of HIPFIRE_DEVICES / --devices is the
+# output card and runs the LAST band (ranks 0..N-1 are the list entries 2..N, then entry 1). Arms, all with
+# topology.ep = 1 and --canonical-state: `single` (--ref-ranks 1: one card, pp = 1, experts host-mapped by default)
+# or `ref-ppR` (PP-R on the first R cards, uniform bands, HIPFIRE_TOPOLOGY_PP=R, --pp R) as the reference, and
+# `ppN` (HIPFIRE_TOPOLOGY_PP=N, --pp N, HIPFIRE_PP_LAYERS, HIPFIRE_MESH_TRANSPORT). Any cut-safe band split is bitwise
+# equal to one uncut card, so PP-R is a valid reference when one card would need more pinned host RAM than the host
+# has. With --mtp the arms `single-mtp` (`ref-ppR-mtp`) and `ppN-mtp` also run. The arms clear inherited
+# HIPFIRE_PP_LAYERS / HIPFIRE_MESH_TRANSPORT / HIPFIRE_TOPOLOGY_PP / HIPFIRE_MTP_* and the expert-placement variables
+# the loader refuses under pp (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS, _EXPERT_HOTSET, _EXPERT_STAGE, _TURN_SNAPSHOTS).
+# Comparison: OUT_DIR/pp_compare.py (it reuses the helpers of scripts/fn_ep_compare.py, which itself needs EP rank
+# mirrors). Only when both metas carry canonical_state and ranks == pp are `ranks` not compared; then meta
+# (completed, tokens, max_seq, spec, steps_run, prompts, state_steps, vocab), every logits/window/tokens/state
+# record and every raw logits dump must be identical, and each arm's meta.json must record the requested pp and
+# placement (band counts, output-last rank order matching the card list, host-mapped edges, pinned env).
+# Speed: the same `hipfire bench` cells with HIPFIRE_TOPOLOGY_PP=pp and topology.pp = pp in the arm's private
+# home (the bench's own --pp is its prompt-size list and is not used). Every cell's bench JSON must carry numeric
+# `pp` and `loaded.pp` equal to the arm's pipeline degree (1 for the single-card reference), or the cell fails
+# and the gate cannot PASS. Receipt: the EP structure plus mode, pp, bands, transport,
+# per-arm placement metadata, the ranks mapped output-last (PCI id, arch, link speed/width) and host RAM.
 
 set -euo pipefail
 
@@ -69,6 +101,7 @@ LONG_PROMPT_TOKENS=4400
 
 MODEL="" N="" OUT="" ARCH=""
 REF_RANKS=1
+MODE=ep PP_LAYERS="" TRANSPORT=host MTP=0 PP_OPTS=""
 TOKENS=128 MAX_SEQ=8192 STATE_STEPS="1,64,128" REPS=3
 SKIP_BUILD=0 SKIP_SPEED=0 SKIP_SHA=0 NO_ISOLATE=0
 ARM_TIMEOUT=${FN_EP_GATE_ARM_TIMEOUT:-7200}
@@ -98,6 +131,10 @@ while (($#)); do
     --skip-model-sha) SKIP_SHA=1; shift ;;
     --ref-ranks) [[ $# -ge 2 ]] || die "$1 needs a value"; REF_RANKS=$2; shift 2 ;;
     --no-isolate) NO_ISOLATE=1; shift ;;
+    --mode) [[ $# -ge 2 ]] || die "$1 needs a value"; MODE=$2; shift 2 ;;
+    --pp-layers) [[ $# -ge 2 ]] || die "$1 needs a value"; PP_LAYERS=${2// /}; PP_OPTS+=" --pp-layers"; shift 2 ;;
+    --transport) [[ $# -ge 2 ]] || die "$1 needs a value"; TRANSPORT=$2; PP_OPTS+=" --transport"; shift 2 ;;
+    --mtp) MTP=1; PP_OPTS+=" --mtp"; shift ;;
     --) shift; POS+=("$@"); break ;;
     -*) die "unknown option $1 (try --help)" ;;
     *) POS+=("$1"); shift ;;
@@ -121,6 +158,13 @@ fi
 [[ $REF_RANKS =~ ^[0-9]+$ ]] || die "--ref-ranks must be an integer"
 [[ $REF_RANKS =~ ^0*([1-7])$ ]] || die "--ref-ranks must be in 1..7 and less than N"
 REF_RANKS=${BASH_REMATCH[1]}
+[[ $MODE == ep || $MODE == pp ]] || die "--mode must be ep or pp"
+if [[ $MODE == ep ]]; then
+  [[ -z $PP_OPTS ]] || die "${PP_OPTS# } need --mode pp"
+else
+  [[ $TRANSPORT == auto || $TRANSPORT == host ]] || die "--transport must be auto or host (peer edges are refused by the loader)"
+  [[ -z $PP_LAYERS || $PP_LAYERS =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || die "--pp-layers must be comma-separated positive layer counts (for example 9,8,8,8,8,7)"
+fi
 ((REPS >= 1)) || die "--reps must be >= 1"
 [[ -f $SHORT_PROMPT && -f $LONG_PROMPT && -f $COMPARE ]] || die "scripts/fn-ep-gate-prompts or fn_ep_compare.py missing next to this script"
 command -v python3 >/dev/null || die "python3 is required"
@@ -146,6 +190,8 @@ BUILD_RC="" ORACLE_RC_SINGLE="" ORACLE_RC_EP="" COMPARE_STATE="not run"
 FINAL_RC=""
 STARTED=$(date -u +%FT%TZ)
 RECEIPT_DONE=0
+MTP_STATE="not run" SPEED_FAIL=0 PP_ANY_ERR=0 PP_ANY_FAIL=0 PAIR_RC=0 PAIR_STATE=""
+PP_PINNED_MTP=(HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off)
 
 # ------------------------------------------------------------------ receipt
 write_receipt() {
@@ -155,7 +201,9 @@ write_receipt() {
     GATE_REASON=$REASON GATE_STARTED=$STARTED GATE_REPS=$REPS GATE_TOKENS=$TOKENS GATE_MAX_SEQ=$MAX_SEQ \
     GATE_STATE_STEPS=$STATE_STEPS GATE_BUILD_RC=$BUILD_RC GATE_COMPARE_STATE=$COMPARE_STATE \
     GATE_SKIP_SPEED=$SKIP_SPEED GATE_NO_ISOLATE=$NO_ISOLATE GATE_EXTRA_ENV=$EXTRA_ENV \
-    GATE_LONG_TOKENS=$LONG_PROMPT_TOKENS GATE_REF_RANKS=$REF_RANKS GATE_REF_ARM=$REF_ARM
+    GATE_LONG_TOKENS=$LONG_PROMPT_TOKENS GATE_REF_RANKS=$REF_RANKS GATE_REF_ARM=$REF_ARM \
+    GATE_MODE=$MODE GATE_TARGET_ARM=$MODE$N GATE_PP_LAYERS=$PP_LAYERS GATE_TRANSPORT=$TRANSPORT GATE_MTP=$MTP \
+    GATE_MTP_STATE=$MTP_STATE GATE_SPEED_FAIL=$SPEED_FAIL
   python3 - <<'PY' || echo "fn-ep-gate: WARNING: receipt writer failed" >&2
 import json, os, re, statistics, datetime
 
@@ -164,6 +212,10 @@ out = E["GATE_OUT"]
 n = int(E["GATE_N"]) if E.get("GATE_N", "").isdigit() else None
 ref_ranks = int(E["GATE_REF_RANKS"]) if E.get("GATE_REF_RANKS", "").isdigit() else 1
 ref_arm = E.get("GATE_REF_ARM") or "single"
+mode = E.get("GATE_MODE") or "ep"
+mtp = E.get("GATE_MTP") == "1"
+target_arm = "%s%d" % (mode, n) if n else mode
+arm_names = [ref_arm, target_arm] + ([ref_arm + "-mtp", target_arm + "-mtp"] if mtp else [])
 
 
 def rd(path):
@@ -268,8 +320,10 @@ env = {
     "model": rd(out + "/env/model.txt"),
     "cards_all": cards,
 }
-link_table = [
-    {
+ordered = (chosen[1:] + chosen[:1]) if mode == "pp" else chosen
+link_table = []
+for rank, c in enumerate(ordered):
+    row = {
         "rank": rank,
         "index": c["index"],
         "bdf": c["bdf"],
@@ -281,8 +335,11 @@ link_table = [
         "max_link_width": c.get("max_link_width"),
         "pci_chain": c.get("pci_chain"),
     }
-    for rank, c in enumerate(chosen)
-]
+    if mode == "pp":
+        # PP rank r is HIPFIRE_DEVICES entry (r + 1) mod N: the output card (entry 0) is the last rank.
+        row["hipfire_device_position"] = chosen.index(c)
+        row["role"] = "output card (last band)" if rank == len(ordered) - 1 else "band %d" % rank
+    link_table.append(row)
 p2p = None
 if chosen:
     p2p = [
@@ -294,7 +351,7 @@ if chosen:
     ]
 
 arms = {}
-for arm in (ref_arm, "ep%d" % n if n else "ep"):
+for arm in arm_names:
     rec = "%s/oracle/%s-receipt" % (out, arm)
     if not os.path.isdir(rec):
         continue
@@ -312,12 +369,31 @@ for arm in (ref_arm, "ep%d" % n if n else "ep"):
         "vram_peak_mib_per_card": peaks(rec + "/vram.txt", None),
         "failure": None if rc == 0 else {"kind": classify(rc, err), "stderr_tail": err},
     }
+    if mode == "pp":
+        arms[arm].update({
+            "pp": meta.get("pp", 1) if meta else None,
+            "canonical_state": meta and meta.get("canonical_state"),
+            "band_counts": meta and meta.get("band_counts"),
+            "rank_order": meta and meta.get("rank_order"),
+            "edge_transports": meta and meta.get("edge_transports"),
+            "output_owner": meta and meta.get("output_owner"),
+            "numerical_policy": meta and meta.get("numerical_policy"),
+            "spec": meta and meta.get("spec"),
+            "meta": meta,
+        })
 
 compare = {"state": E.get("GATE_COMPARE_STATE")}
 cj = rdj(out + "/compare.json")
 if cj:
     compare.update({"verdict": cj.get("verdict"), "summary": cj.get("summary"), "first_mismatch": cj.get("first_mismatch"),
                     "families": cj.get("families"), "json": "compare.json", "text": "compare.txt"})
+compare_mtp = None
+if mtp:
+    compare_mtp = {"state": E.get("GATE_MTP_STATE")}
+    cmj = rdj(out + "/compare-mtp.json")
+    if cmj:
+        compare_mtp.update({"verdict": cmj.get("verdict"), "summary": cmj.get("summary"), "first_mismatch": cmj.get("first_mismatch"),
+                            "families": cmj.get("families"), "json": "compare-mtp.json", "text": "compare-mtp.txt"})
 
 speed = {}
 sdir = out + "/speed"
@@ -342,6 +418,8 @@ if os.path.isdir(sdir):
                     "raw": "speed/%s/%s-%d.json" % (arm, cell, rep),
                     "stderr_tail": None if rc == 0 else tail(base + ".stderr", 25),
                 })
+                if mode == "pp":
+                    runs[-1]["effective_pp"] = (rd(base + ".pp") or "").strip() or None
             key = "decode_tok_s" if cell == "decode" else "prefill_tok_s"
             vals = [r[key] for r in runs if r["rc"] == 0 and r[key] is not None]
             cells[cell] = {"runs": runs, "metric": key, "median": statistics.median(vals) if vals else None, "n_ok": len(vals)}
@@ -375,6 +453,45 @@ receipt = {
     "compare": compare,
     "speed": speed,
 }
+if mode == "pp":
+    _tmeta = (arms.get(target_arm) or {}).get("meta") or {}
+    _counts = _tmeta.get("band_counts") or []
+    _by_pci = {str(r["bdf"]).lower(): r for r in link_table}
+    ranks_out = []
+    for row in (_tmeta.get("rank_order") or []):
+        link = _by_pci.get(str(row.get("pci_bus_id") or "").lower(), {})
+        rk = row.get("rank")
+        ranks_out.append({
+            "rank": rk, "device_id": row.get("device_id"), "arch": row.get("arch"), "pci_bus_id": row.get("pci_bus_id"),
+            "layers": _counts[rk] if isinstance(rk, int) and 0 <= rk < len(_counts) else None,
+            "output_owner": rk == _tmeta.get("output_owner"),
+            "hipfire_device_position": link.get("hipfire_device_position"),
+            "link_speed": link.get("link_speed"), "link_width": link.get("link_width"),
+            "max_link_speed": link.get("max_link_speed"), "max_link_width": link.get("max_link_width"),
+        })
+    _mem = re.search(r"MemTotal:\s+(\d+) kB", env.get("meminfo") or "")
+    receipt["mode"] = "pp"
+    receipt["pp"] = n
+    receipt["bands"] = {arm: (arms.get(arm) or {}).get("band_counts") for arm in arm_names}
+    receipt["transport"] = {
+        "requested": E.get("GATE_TRANSPORT"),
+        "edges": {arm: (arms.get(arm) or {}).get("edge_transports") for arm in arm_names},
+    }
+    receipt["ranks_output_last"] = ranks_out or link_table
+    receipt["host_ram_mib"] = int(_mem.group(1)) // 1024 if _mem else None
+    receipt["config"].update({
+        "mode": "pp", "pp": n, "ref_pp": ref_ranks, "target_arm": target_arm,
+        "pp_layers_requested": E.get("GATE_PP_LAYERS") or None,
+        "transport_requested": E.get("GATE_TRANSPORT"),
+        "mtp": mtp,
+        "mtp_pinned_env": "HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off; oracle --spec mtp --temp 0 --ngram off" if mtp else None,
+        "oracle_arms_env": "HIPFIRE_GRAPH=0; every arm runs fn_ep_oracle --canonical-state and exports HIPFIRE_TOPOLOGY_PP (1 for a single-card reference); PP arms add --pp and HIPFIRE_MESH_TRANSPORT (and HIPFIRE_PP_LAYERS on the PP-N arm only)",
+        "speed_arms_env": "default graph setting; every arm exports HIPFIRE_TOPOLOGY_PP and topology.pp in the private home (1 for a single-card reference)",
+        "p2p_links_order": "HIPFIRE_DEVICES position",
+    })
+    receipt["speed_pp_assertion_failed"] = E.get("GATE_SPEED_FAIL") == "1"
+    if mtp:
+        receipt["compare_mtp"] = compare_mtp
 with open(out + "/receipt.json", "w", encoding="utf-8") as handle:
     json.dump(receipt, handle, indent=2)
     handle.write("\n")
@@ -382,13 +499,20 @@ with open(out + "/receipt.json", "w", encoding="utf-8") as handle:
 # ------------------------------------------------------------- summary.txt
 lines = []
 lines.append("fn-ep-gate: %s%s" % (receipt["verdict"], " (%s)" % receipt["reason"] if receipt["reason"] else ""))
-if ref_ranks == 1:
-    lines.append("arch=%s  N=%s  hipfire devices (single=first, EP=all): %s" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
+if mode == "pp":
+    lines.append("mode=pp  arch=%s  pp=%s  hipfire devices (reference=first %d, output card first): %s" % (E.get("GATE_ARCH"), n, ref_ranks, E.get("GATE_DEVS")))
+    lines.append("transport=%s  requested bands=%s  reference: %s" % (
+        E.get("GATE_TRANSPORT"), E.get("GATE_PP_LAYERS") or "uniform",
+        "one card (host-mapped experts by default)" if ref_ranks == 1 else "PP%d on the first %d cards, uniform bands" % (ref_ranks, ref_ranks)))
+    lines.append("ref_ranks=%d  mtp exactness pair: %s" % (ref_ranks, "on" if mtp else "off"))
 else:
-    lines.append("arch=%s  N=%s  hipfire devices (reference=first %d, EP=all): %s" % (E.get("GATE_ARCH"), n, ref_ranks, E.get("GATE_DEVS")))
-    lines.append("reference: EP%d on the first %d cards (one card = --ref-ranks 1)" % (ref_ranks, ref_ranks))
-lines.append("ref_ranks=%d" % ref_ranks)
-lines.append("Note: EP-N ≡ one card is established separately by our gates.")
+    if ref_ranks == 1:
+        lines.append("arch=%s  N=%s  hipfire devices (single=first, EP=all): %s" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
+    else:
+        lines.append("arch=%s  N=%s  hipfire devices (reference=first %d, EP=all): %s" % (E.get("GATE_ARCH"), n, ref_ranks, E.get("GATE_DEVS")))
+        lines.append("reference: EP%d on the first %d cards (one card = --ref-ranks 1)" % (ref_ranks, ref_ranks))
+    lines.append("ref_ranks=%d" % ref_ranks)
+    lines.append("Note: EP-N ≡ one card is established separately by our gates.")
 lines.append("model: %s" % E.get("GATE_MODEL"))
 git = (env["git"] or "").strip().splitlines()
 lines.append("build: %s" % (git[0] if git else "unknown"))
@@ -403,6 +527,14 @@ for row in link_table:
         row["rank"], row["index"], row["bdf"], row["arch"], row["vram_total_mib"],
         row["link_speed"], row["link_width"], row["max_link_speed"], row["max_link_width"]))
 lines.append("")
+if mode == "pp":
+    for arm in arm_names:
+        info = arms.get(arm) or {}
+        if info.get("meta"):
+            lines.append("placement %-11s pp=%s bands=%s output_owner=%s edges=%s" % (
+                arm, info.get("pp"), info.get("band_counts"), info.get("output_owner"),
+                ",".join("%s>%s:%s" % (e.get("src"), e.get("dst"), e.get("transport")) for e in (info.get("edge_transports") or [])) or "none"))
+    lines.append("")
 for arm, info in arms.items():
     status = "ok" if info["rc"] == 0 else "FAILED rc=%s (%s)" % (info["rc"], (info["failure"] or {}).get("kind"))
     lines.append("arm %-7s %s  %ss  vram peak MiB/card: %s" % (arm, status, info["seconds"], info["vram_peak_mib_per_card"]))
@@ -412,6 +544,10 @@ lines.append("")
 lines.append("compare: %s" % (compare.get("summary") or compare.get("state")))
 if compare.get("first_mismatch"):
     lines.append("    first mismatch: %s" % compare["first_mismatch"].get("message"))
+if compare_mtp is not None:
+    lines.append("compare (mtp): %s" % (compare_mtp.get("summary") or compare_mtp.get("state")))
+    if compare_mtp.get("first_mismatch"):
+        lines.append("    first mismatch: %s" % compare_mtp["first_mismatch"].get("message"))
 lines.append("")
 if speed:
     lines.append("speed (median of fresh processes, tok/s)       decode   prefill(4,400-token prompt)")
@@ -427,7 +563,7 @@ if speed:
             fmt(d), rel(d, base_d) if arm != ref_arm else "", fmt(p), rel(p, base_p) if arm != ref_arm else "",
             "   [%s]" % cells["skipped"] if cells.get("skipped") else ""))
 lines.append("")
-lines.append("Send back: receipt.json, summary.txt, compare.txt, gate.log (and the oracle/*-receipt dirs on a failure).")
+lines.append("Send back: receipt.json, summary.txt, %s, gate.log (and the oracle/*-receipt dirs on a failure)." % ("compare*.txt" if mode == "pp" else "compare.txt"))
 with open(out + "/summary.txt", "w", encoding="utf-8") as handle:
     handle.write("\n".join(lines) + "\n")
 PY
@@ -697,9 +833,17 @@ PY
   else
     local _devs
     IFS=, read -r -a _devs <<<"$DEVS"
-    REF_ARM=ref-ep$REF_RANKS
+    REF_ARM=ref-$MODE$REF_RANKS
     REF_DEVS=$(IFS=,; echo "${_devs[*]:0:REF_RANKS}")
-    log "reference arm $REF_ARM: ep=$REF_RANKS devices=$REF_DEVS"
+    log "reference arm $REF_ARM: $MODE=$REF_RANKS devices=$REF_DEVS"
+  fi
+  if [[ $MODE == pp && -n $PP_LAYERS ]]; then
+    local _counts
+    IFS=, read -r -a _counts <<<"$PP_LAYERS"
+    if ((${#_counts[@]} != N)); then
+      REASON="--pp-layers lists ${#_counts[@]} entries, expected N=$N"; VERDICT=ERROR; FINAL_RC=2
+      die "$REASON"
+    fi
   fi
 }
 
@@ -744,17 +888,37 @@ build_all() {
 # --------------------------------------------------------------- arm helpers
 ARM_ENV=()
 arm_env() {
-  local arm=$1 ep=$2 devs=$3
+  local arm=$1 ep=$2 devs=$3 pp=${4:-0} mtp=${5:-0} layers=${6:-}
   # ROCR_VISIBLE_DEVICES: dropped only when the card list came from our own KFD selection; a list the
   # caller supplied (--devices) or inherited (a scheduler's HIPFIRE_DEVICES) leaves ROCR_VISIBLE_DEVICES alone.
-  local unset_rocr=()
+  local unset_rocr=() unset_pp=()
   [[ $DEVS_SOURCE != kfd ]] || unset_rocr=(-u ROCR_VISIBLE_DEVICES)
-  ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP ${unset_rocr[@]+"${unset_rocr[@]}"}
+  # PP mode: everything an arm pins, and every placement variable the loader refuses under pp, is cleared first so
+  # an inherited value cannot leak into (or break) an arm.
+  if [[ $MODE == pp ]]; then
+    unset_pp=(-u HIPFIRE_PP_LAYERS -u HIPFIRE_MESH_TRANSPORT -u HIPFIRE_TOPOLOGY_PP
+      -u HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS -u HIPFIRE_QWEN4_EXPERT_HOTSET -u HIPFIRE_QWEN4_EXPERT_STAGE
+      -u HIPFIRE_QWEN4_TURN_SNAPSHOTS -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
+  fi
+  ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP ${unset_rocr[@]+"${unset_rocr[@]}"} ${unset_pp[@]+"${unset_pp[@]}"}
     "HIPFIRE_DEVICES=$devs" "HIPFIRE_TOPOLOGY_EP=$ep" HIPFIRE_NO_REGISTRY_FETCH=1 "HIPFIRE_DAEMON_BIN=$DAEMON")
+  if [[ $MODE == pp ]]; then
+    # Every PP-mode arm, the single-card reference included, pins its degree so an inherited topology.pp cannot leak in.
+    ((pp >= 1)) || pp=1
+    ARM_ENV+=("HIPFIRE_TOPOLOGY_PP=$pp")
+    if ((pp > 1)); then
+      ARM_ENV+=("HIPFIRE_MESH_TRANSPORT=$TRANSPORT")
+      [[ -z $layers ]] || ARM_ENV+=("HIPFIRE_PP_LAYERS=$layers")
+    fi
+  fi
   if ((NO_ISOLATE == 0)); then
     local home=$OUT/home-$arm
     mkdir -p "$home/.hipfire"
-    printf '[topology]\nep = %s\n' "$ep" > "$home/.hipfire/config.toml"
+    if [[ $MODE == pp ]]; then
+      printf '[topology]\nep = %s\npp = %s\n' "$ep" "$pp" > "$home/.hipfire/config.toml"
+    else
+      printf '[topology]\nep = %s\n' "$ep" > "$home/.hipfire/config.toml"
+    fi
     ARM_ENV+=("HOME=$home" "HIPFIRE_HOME=$home/.hipfire")
   fi
   [[ -n ${HIPFIRE_KERNEL_CACHE:-} ]] || ARM_ENV+=("HIPFIRE_KERNEL_CACHE=$OUT/kcache")
@@ -763,6 +927,8 @@ arm_env() {
     local extra=($EXTRA_ENV)
     ARM_ENV+=("${extra[@]}")
   fi
+  # The native-MTP policy is pinned last so EXTRA_ENV cannot change the window schedule of an exactness arm.
+  ((mtp == 0)) || ARM_ENV+=("${PP_PINNED_MTP[@]}")
 }
 
 start_vram_sampler() {
@@ -785,20 +951,27 @@ stop_vram_sampler() {
 }
 
 run_oracle_arm() {
-  local arm=$1 ep=$2 devs=$3 count=$4
+  local arm=$1 ep=$2 devs=$3 count=$4 pp=${5:-0} mtp=${6:-0} layers=${7:-}
   local rec=$OUT/oracle/$arm-receipt out=$OUT/oracle/$arm rc=0
   rm -rf "$rec" "$out"
   mkdir -p "$rec"
-  arm_env "$arm" "$ep" "$devs"
+  arm_env "$arm" "$ep" "$devs" "$pp" "$mtp" "$layers"
+  local oracle_extra=()
+  if [[ $MODE == pp ]]; then
+    oracle_extra+=(--canonical-state)
+    ((pp <= 1)) || oracle_extra+=(--pp "$pp")
+    ((mtp == 0)) || oracle_extra+=(--spec mtp --temp 0 --ngram off)
+  fi
   local cmd=("${ARM_ENV[@]}" HIPFIRE_GRAPH=0 timeout -k 30 "$ARM_TIMEOUT" "$ORACLE"
     --model "$MODEL" --max-seq "$MAX_SEQ" --out "$out" --arm "$arm"
     --prompt-file "$SHORT_PROMPT" --prompt-file "$LONG_PROMPT" --truncate-prompt-tokens "$LONG_PROMPT_TOKENS"
-    --tokens "$TOKENS" --state-steps "$STATE_STEPS" --skip-model-hash)
+    --tokens "$TOKENS" --state-steps "$STATE_STEPS" --skip-model-hash ${oracle_extra[@]+"${oracle_extra[@]}"})
   printf '%q ' "${cmd[@]}" > "$rec/command.txt"
   echo >> "$rec/command.txt"
   date -u +%FT%TZ > "$rec/start.txt"
   start_vram_sampler "$rec/vram.txt" "$count"
   log "oracle arm $arm: ep=$ep devices=$devs"
+  [[ $MODE != pp ]] || log "oracle arm $arm: pp=$pp mtp=$mtp layers=${layers:-uniform}"
   "${cmd[@]}" > "$rec/stdout.txt" 2> "$rec/stderr.txt" || rc=$?
   stop_vram_sampler
   date -u +%FT%TZ > "$rec/end.txt"
@@ -812,16 +985,28 @@ run_oracle_arm() {
 }
 
 run_bench_cell() {
-  local arm=$1 ep=$2 devs=$3 cell=$4 rep=$5 prompt=$6 max_tokens=$7
+  local arm=$1 ep=$2 devs=$3 cell=$4 rep=$5 prompt=$6 max_tokens=$7 pp=${8:-0} layers=${9:-}
   local dir=$OUT/speed/$arm base rc=0
   mkdir -p "$dir"
   base=$dir/$cell-$rep
-  arm_env "$arm" "$ep" "$devs"
+  arm_env "$arm" "$ep" "$devs" "$pp" 0 "$layers"
   local cmd=("${ARM_ENV[@]}" timeout -k 30 "$BENCH_TIMEOUT" "$HIPFIRE" bench "$MODEL"
     --spec off --max-seq "$MAX_SEQ" --runs 1 --max-tokens "$max_tokens" --prompt-file "$prompt" -j)
   printf '%q ' "${cmd[@]}" > "$base.cmd"
   echo >> "$base.cmd"
   "${cmd[@]}" > "$base.json" 2> "$base.stderr" || rc=$?
+  if [[ $MODE == pp ]] && ((rc == 0)); then
+    # The cell only counts when the bench's daemon really loaded the requested pipeline degree.
+    local want=$pp
+    ((want >= 1)) || want=1
+    if ! python3 "$OUT/pp_bench_check.py" "$base.json" "$want" > "$base.pp" 2>&1; then
+      rc=97
+      cat "$base.pp" >> "$base.stderr"
+      SPEED_FAIL=1
+    fi
+  fi
+  # A failed cell (bench error or pp mismatch) must keep the PP gate from passing.
+  [[ $MODE != pp ]] || ((rc == 0)) || SPEED_FAIL=1
   echo "$rc" > "$base.rc"
   log "bench $arm $cell rep $rep: rc=$rc"
   return 0
@@ -832,6 +1017,392 @@ oracle_arm_ok() {
   [[ $(cat "$OUT/oracle/$arm-receipt/rc.txt" 2>/dev/null || echo x) == 0 ]] && [[ -f $OUT/oracle/$arm/meta.json ]]
 }
 
+# ---------------------------------------------------------------- PP mode helpers
+write_pp_helpers() {
+  cat > "$OUT/pp_compare.py" <<'PPCMP'
+#!/usr/bin/env python3
+"""PP comparator written by fn-ep-gate.sh --mode pp (stdlib only).
+
+    pp_compare.py REF_DIR PP_DIR --base fn_ep_compare.py --ref-pp R --pp N --ref-bdfs LIST --bdfs LIST --arch ARCH
+                  [--layers COUNTS] [--transport host|auto] [--mtp 0|1] [--json OUT.json]
+
+Both directories are fn_ep_oracle --canonical-state outputs (reference: pp = 1 or PP-R; target: PP-N). The
+existing comparator (fn_ep_compare.py) requires EP rank mirrors and cannot read window/tokens records, so this
+PP-only comparator imports its Verdict / read_jsonl / read_meta / raw-logits helpers and compares, as
+ep-host-notes/g0/g0_compare.py does:
+  * meta: the `ranks` field is ignored only when both metas carry canonical_state == true and ranks == pp
+    (default 1); completed, tokens, max_seq, spec, steps_run, prompts, state_steps and vocab must be equal;
+  * every ordered record of logits.jsonl and state.jsonl, field for field (logits, window, tokens, state);
+  * the .f32 dump set and every dump byte for byte;
+and asserts each arm's meta.json records the requested pp and placement. Exit 0 PASS, 1 FAIL, 2 usage."""
+import argparse
+import filecmp
+import importlib.util
+import json
+import os
+import re
+import sys
+
+MTP_PINNED = {"HIPFIRE_MTP_AR_FLOOR": "0", "HIPFIRE_MTP_INCREMENTAL": "0", "HIPFIRE_MTP_NGRAM": "off"}
+
+
+def load_base(path):
+    spec = importlib.util.spec_from_file_location("fn_ep_compare", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def pci(value):
+    return str(value or "").lower()
+
+
+def expected_env(pp, layers, transport, mtp):
+    env = {
+        "HIPFIRE_PP_LAYERS": layers or None,
+        "HIPFIRE_TOPOLOGY_PP": str(pp),
+        "HIPFIRE_MESH_TRANSPORT": transport if pp > 1 else None,
+    }
+    for key, value in MTP_PINNED.items():
+        env[key] = value if mtp else None
+    return env
+
+
+def check_arm(v, label, meta, pp, bdfs, arch, layers, transport, mtp):
+    def check(ok, text):
+        v.checked("placement")
+        if not ok:
+            v.fail("placement", "%s: %s" % (label, text))
+
+    check(meta.get("canonical_state") is True, "meta.canonical_state is %r, expected true" % (meta.get("canonical_state"),))
+    check(meta.get("pp", 1) == pp, "meta.pp is %r, requested %d" % (meta.get("pp", 1), pp))
+    check(meta.get("ranks") == pp, "meta.ranks is %r, requested %d" % (meta.get("ranks"), pp))
+    devices = meta.get("devices") or []
+    check(len(devices) == pp, "meta.devices lists %d device(s), requested %d" % (len(devices), pp))
+    check(all(d.get("arch") == arch for d in devices), "meta.devices archs %r, expected %s" % ([d.get("arch") for d in devices], arch))
+    env = meta.get("env") or {}
+    for key, want in expected_env(pp, layers, transport, mtp).items():
+        check(env.get(key) == want, "meta.env %s is %r, expected %r" % (key, env.get(key), want))
+    check(bool(mtp) == (meta.get("spec") is not None), "meta.spec is %r, MTP arm expected %s" % (meta.get("spec"), bool(mtp)))
+    if pp == 1:
+        check(meta.get("placement") is None, "a pp = 1 arm recorded a placement: %r" % (meta.get("placement"),))
+        check(bool(devices) and pci(devices[0].get("pci_bus_id")) == pci(bdfs[0]),
+              "device 0 is %r, expected card %s" % ((devices[0].get("pci_bus_id") if devices else None), bdfs[0]))
+        return
+    placement = meta.get("placement")
+    check(isinstance(placement, dict), "meta.placement missing")
+    if not isinstance(placement, dict):
+        return
+    for key in ("pp", "band_counts", "rank_order", "edge_transports", "output_owner"):
+        check(meta.get(key) == placement.get(key), "meta.%s %r differs from meta.placement.%s %r" % (key, meta.get(key), key, placement.get(key)))
+    check(placement.get("pp") == pp, "placement.pp is %r, requested %d" % (placement.get("pp"), pp))
+    counts = placement.get("band_counts")
+    check(isinstance(counts, list) and len(counts) == pp and all(isinstance(c, int) and c > 0 for c in counts),
+          "band_counts %r is not %d positive counts" % (counts, pp))
+    if layers:
+        check(counts == [int(x) for x in layers.split(",")], "band_counts %r != requested --pp-layers %s" % (counts, layers))
+    if isinstance(counts, list) and counts and all(isinstance(c, int) for c in counts):
+        if not layers:
+            check(max(counts) - min(counts) <= 1, "default band_counts %r is not the uniform split" % (counts,))
+        check(counts[0] >= 2, "band_counts %r: band 0 holds fewer than 2 layers (the PLE layer lives in band 0)" % (counts,))
+    order = placement.get("rank_order") or []
+    check(len(order) == pp, "rank_order lists %d rank(s), requested %d" % (len(order), pp))
+    check([d.get("rank") for d in order] == list(range(pp)), "rank_order ranks %r" % ([d.get("rank") for d in order],))
+    expected_order = [pci(b) for b in bdfs[1:] + bdfs[:1]]
+    check([pci(d.get("pci_bus_id")) for d in order] == expected_order,
+          "rank_order PCI ids %r != output-last rotation of the card list %r" % ([pci(d.get("pci_bus_id")) for d in order], expected_order))
+    check(placement.get("output_owner") == pp - 1, "output_owner is %r, expected the last rank %d" % (placement.get("output_owner"), pp - 1))
+    check(bool(order) and pci(order[-1].get("pci_bus_id")) == pci(bdfs[0]),
+          "the last rank is %r, expected card 0 %s" % ((order[-1].get("pci_bus_id") if order else None), bdfs[0]))
+    check(order == [dict(d, rank=i) for i, d in enumerate(devices)], "rank_order differs from devices")
+    edges = placement.get("edge_transports") or []
+    check(len(edges) == pp - 1, "edge_transports lists %d edge(s), expected %d" % (len(edges), pp - 1))
+    for i, edge in enumerate(edges):
+        check(edge.get("src") == i and edge.get("dst") == i + 1, "edge %d is %r>%r, expected %d>%d" % (i, edge.get("src"), edge.get("dst"), i, i + 1))
+        check(edge.get("transport") == "host-mapped", "edge %d transport is %r, expected host-mapped" % (i, edge.get("transport")))
+        check(isinstance(edge.get("epoch"), int) and edge.get("epoch") > 0, "edge %d has no live transport lease epoch" % i)
+    check(isinstance(meta.get("numerical_policy"), str) and bool(meta.get("numerical_policy")), "meta.numerical_policy missing")
+
+
+def compare_records(base, v, family, ref_dir, tgt_dir, name):
+    try:
+        a = base.read_jsonl(os.path.join(ref_dir, name))
+        b = base.read_jsonl(os.path.join(tgt_dir, name))
+    except (OSError, ValueError) as error:
+        v.checked("record_set")
+        v.fail("record_set", "cannot read %s: %s" % (name, error))
+        return 0
+    v.checked("record_set")
+    if len(a) != len(b):
+        v.fail("record_set", "%s: %d vs %d records" % (name, len(a), len(b)))
+    if not a:
+        v.fail("record_set", "reference %s has no records" % name)
+    for i, (x, y) in enumerate(zip(a, b)):
+        v.checked(family)
+        if x != y:
+            diff = sorted(k for k in set(x) | set(y) if x.get(k) != y.get(k))
+            text = "%s record %d (kind %s prompt %s step %s window %s): fields %s differ" % (
+                name, i, x.get("kind"), x.get("prompt"), x.get("step"), x.get("window"), diff)
+            detail = {"record": i, "fields": diff}
+            if x.get("kind") == "logits" and isinstance(x.get("prompt"), int) and isinstance(x.get("step"), int):
+                detail["raw"] = base.raw_logits_report(ref_dir, tgt_dir, x["prompt"], x["step"])
+            v.fail(family, text, **detail)
+    return len(a)
+
+
+def compare(base, args):
+    v = base.Verdict(args.max_report)
+    try:
+        ref_meta, tgt_meta = base.read_meta(args.ref_dir), base.read_meta(args.tgt_dir)
+    except ValueError as error:
+        v.fail("identity", "meta.json unreadable: %s" % error)
+        return v, {}
+    for label, meta in (("reference", ref_meta), ("PP", tgt_meta)):
+        v.checked("identity")
+        if meta is None:
+            v.fail("identity", "%s arm: meta.json missing" % label)
+        elif meta.get("completed") is not True:
+            v.fail("identity", "%s arm: meta.json says the run did not complete" % label)
+    if ref_meta is None or tgt_meta is None:
+        return v, {}
+    canonical_mesh = all(m.get("canonical_state") is True and m.get("ranks") == m.get("pp", 1) for m in (ref_meta, tgt_meta))
+    keys = ("completed", "tokens", "max_seq", "spec", "steps_run", "prompts", "state_steps", "vocab")
+    if not canonical_mesh:
+        keys += ("ranks",)
+    for key in keys:
+        v.checked("identity")
+        if ref_meta.get(key) != tgt_meta.get(key):
+            v.fail("identity", "meta.%s differs: reference %r vs PP %r" % (key, ref_meta.get(key), tgt_meta.get(key)))
+    sha_ref, sha_tgt = ref_meta.get("model_sha256"), tgt_meta.get("model_sha256")
+    v.checked("identity")
+    if sha_ref and sha_tgt and sha_ref != sha_tgt:
+        v.fail("identity", "model sha256 differs: %s vs %s" % (sha_ref, sha_tgt))
+    ref_bdfs = [b for b in args.ref_bdfs.split(",") if b]
+    tgt_bdfs = [b for b in args.bdfs.split(",") if b]
+    check_arm(v, "reference", ref_meta, args.ref_pp, ref_bdfs, args.arch, None, args.transport, args.mtp)
+    check_arm(v, "PP", tgt_meta, args.pp, tgt_bdfs, args.arch, args.layers or None, args.transport, args.mtp)
+    if args.ref_pp > 1:
+        v.checked("placement")
+        ref_counts, tgt_counts = ref_meta.get("band_counts"), tgt_meta.get("band_counts")
+        if isinstance(ref_counts, list) and isinstance(tgt_counts, list) and sum(ref_counts) != sum(tgt_counts):
+            v.fail("placement", "band counts cover %d layers on the reference but %d on the PP arm" % (sum(ref_counts), sum(tgt_counts)))
+        v.checked("placement")
+        if ref_meta.get("numerical_policy") != tgt_meta.get("numerical_policy"):
+            v.fail("placement", "numerical_policy differs: %r vs %r" % (ref_meta.get("numerical_policy"), tgt_meta.get("numerical_policy")))
+    logits_records = compare_records(base, v, "logits", args.ref_dir, args.tgt_dir, "logits.jsonl")
+    state_records = compare_records(base, v, "state", args.ref_dir, args.tgt_dir, "state.jsonl")
+    dumps_a = sorted(f for f in os.listdir(args.ref_dir) if f.endswith(".f32"))
+    dumps_b = sorted(f for f in os.listdir(args.tgt_dir) if f.endswith(".f32"))
+    v.checked("raw_dumps")
+    if dumps_a != dumps_b:
+        v.fail("raw_dumps", "raw logits dump sets differ (only in reference %s, only in PP %s)" % (
+            sorted(set(dumps_a) - set(dumps_b))[:3], sorted(set(dumps_b) - set(dumps_a))[:3]))
+    if not dumps_a and not args.mtp:
+        v.checked("raw_dumps")
+        v.fail("raw_dumps", "the reference saved no raw logits dumps (--canonical-state saves every output logits row)")
+    for name in sorted(set(dumps_a) & set(dumps_b)):
+        v.checked("raw_dumps")
+        if not filecmp.cmp(os.path.join(args.ref_dir, name), os.path.join(args.tgt_dir, name), shallow=False):
+            found = re.match(r"logits-p(\d+)-s(\d+)\.f32$", name)
+            detail = {"dump": name}
+            if found:
+                detail["raw"] = base.raw_logits_report(args.ref_dir, args.tgt_dir, int(found.group(1)), int(found.group(2)))
+            v.fail("raw_dumps", "raw dump %s differs" % name, **detail)
+    shape = {"mode": "pp", "pp": args.pp, "ref_pp": args.ref_pp, "mtp": bool(args.mtp), "canonical_mesh": canonical_mesh,
+             "logits_records": logits_records, "state_records": state_records, "raw_dumps": len(dumps_a)}
+    return v, shape
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("ref_dir")
+    parser.add_argument("tgt_dir")
+    parser.add_argument("--base", required=True, help="path of fn_ep_compare.py")
+    parser.add_argument("--ref-pp", type=int, required=True)
+    parser.add_argument("--pp", type=int, required=True)
+    parser.add_argument("--ref-bdfs", required=True)
+    parser.add_argument("--bdfs", required=True)
+    parser.add_argument("--arch", required=True)
+    parser.add_argument("--layers", default="")
+    parser.add_argument("--transport", default="host")
+    parser.add_argument("--mtp", type=int, default=0)
+    parser.add_argument("--json", default=None)
+    parser.add_argument("--max-report", type=int, default=50)
+    args = parser.parse_args(argv)
+    if args.pp < 2 or args.ref_pp < 1 or args.ref_pp >= args.pp:
+        print("need 1 <= --ref-pp < --pp and --pp >= 2", file=sys.stderr)
+        return 2
+    for d in (args.ref_dir, args.tgt_dir):
+        if not os.path.isdir(d):
+            print("not a directory: %s" % d, file=sys.stderr)
+            return 2
+    base = load_base(args.base)
+    v, shape = compare(base, args)
+    for name, fam in sorted(v.families.items()):
+        print("%s %-10s checked=%d failed=%d" % ("PASS" if not fam["failed"] else "FAIL", name, fam["checked"], fam["failed"]))
+    if v.first is not None:
+        print("first mismatch [%s]: %s" % (v.first["check"], v.first["message"]))
+        if v.first.get("raw"):
+            print("     " + v.first["raw"])
+    if v.ok:
+        ref_name = "single" if args.ref_pp == 1 else "PP%d reference" % args.ref_pp
+        line = ("PASS pp_compare%s: PP%d == %s, %s logits/window records, %s state records, %s raw logits dumps "
+                "byte-identical (full-record equality, canonical state)" % (
+                    " (mtp)" if args.mtp else "", args.pp, ref_name, shape.get("logits_records"), shape.get("state_records"), shape.get("raw_dumps")))
+    else:
+        failed = ", ".join("%s=%d" % (k, f["failed"]) for k, f in sorted(v.families.items()) if f["failed"])
+        line = "FAIL pp_compare%s: %d failing check(s) [%s]; first: %s" % (
+            " (mtp)" if args.mtp else "", sum(f["failed"] for f in v.families.values()), failed, v.first["message"])
+    print(line)
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as handle:
+            json.dump({
+                "verdict": "PASS" if v.ok else "FAIL",
+                "summary": line,
+                "reference": os.path.abspath(args.ref_dir),
+                "target": os.path.abspath(args.tgt_dir),
+                "shape": shape,
+                "families": v.families,
+                "first_mismatch": v.first,
+                "mismatches": v.mismatches,
+            }, handle, indent=2)
+            handle.write("\n")
+    return 0 if v.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+PPCMP
+  cat > "$OUT/pp_bench_check.py" <<'PPCHK'
+#!/usr/bin/env python3
+"""pp_bench_check.py BENCH.json WANT_PP: did the bench's daemon load the requested pipeline degree?
+
+`hipfire bench --json` reports the daemon's effective pipeline degree twice: top-level `pp` and `loaded.pp` (both
+integers, from the daemon's loaded ack). Both must be present and equal WANT_PP (1 for a single-card arm).
+Exit 0 ok, 1 not (missing field, mismatch or unreadable JSON)."""
+import json
+import sys
+
+
+def doc_of(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return {}
+    for start in (0, text.find("{")):
+        if start < 0:
+            continue
+        try:
+            return json.loads(text[start:])
+        except ValueError:
+            continue
+    return {}
+
+
+def as_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def main():
+    doc = doc_of(sys.argv[1])
+    want = int(sys.argv[2])
+    top = as_int(doc.get("pp")) if isinstance(doc, dict) else None
+    loaded_doc = doc.get("loaded") if isinstance(doc, dict) else None
+    loaded = as_int(loaded_doc.get("pp")) if isinstance(loaded_doc, dict) else None
+    print("want_pp=%d pp=%s loaded.pp=%s" % (want, top, loaded))
+    if top != want or loaded != want:
+        print("pp_bench_check: the bench did not report pp=%d in both `pp` and `loaded.pp` (single-GPU, a different degree, or no pp field)" % want)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PPCHK
+}
+
+# One exactness pair: run pp_compare.py, record the state and the verdict contribution.
+pp_eval_pair() {
+  local label=$1 ref=$2 tgt=$3 rpp=$4 tpp=$5 mtp=$6 suffix=$7 what
+  if ((rpp == 1)); then what="the single card"; else what="the PP$rpp reference"; fi
+  PAIR_RC=0
+  if oracle_arm_ok "$ref" && oracle_arm_ok "$tgt"; then
+    local ref_bdfs tgt_bdfs
+    ref_bdfs=$(IFS=,; echo "${BDFS[*]:0:rpp}")
+    tgt_bdfs=$(IFS=,; echo "${BDFS[*]:0:tpp}")
+    python3 "$OUT/pp_compare.py" "$OUT/oracle/$ref" "$OUT/oracle/$tgt" --base "$COMPARE" \
+      --ref-pp "$rpp" --pp "$tpp" --ref-bdfs "$ref_bdfs" --bdfs "$tgt_bdfs" --arch "$ARCH" \
+      --layers "$PP_LAYERS" --transport "$TRANSPORT" --mtp "$mtp" \
+      --json "$OUT/compare$suffix.json" > "$OUT/compare$suffix.txt" 2>&1 || PAIR_RC=$?
+    sed 's/^/    /' "$OUT/compare$suffix.txt"
+    if ((PAIR_RC == 0)); then
+      PAIR_STATE=PASS
+    elif ((PAIR_RC == 1)); then
+      PAIR_STATE=FAIL; PP_ANY_FAIL=1
+      REASON+="${REASON:+; }$label: PP$tpp output differs from $what"
+    else
+      PAIR_STATE="comparator error rc=$PAIR_RC"; PP_ANY_ERR=1
+      REASON+="${REASON:+; }$label: pp_compare.py failed to run"
+    fi
+  else
+    PP_ANY_ERR=1
+    PAIR_STATE="no comparison"
+    oracle_arm_ok "$ref" || PAIR_STATE="$ref arm failed"
+    oracle_arm_ok "$tgt" || PAIR_STATE="$tgt arm failed (see oracle/$tgt-receipt/stderr.txt)"
+    REASON+="${REASON:+; }$label: $PAIR_STATE; no comparison"
+  fi
+}
+
+run_pp_gate() {
+  write_pp_helpers
+  local ref_mtp=$REF_ARM-mtp tgt_mtp=$EPARM-mtp
+  run_oracle_arm "$REF_ARM" 1 "$REF_DEVS" "$REF_RANKS" "$REF_RANKS" 0 ""
+  run_oracle_arm "$EPARM" 1 "$DEVS" "$N" "$N" 0 "$PP_LAYERS"
+  if ((MTP)); then
+    run_oracle_arm "$ref_mtp" 1 "$REF_DEVS" "$REF_RANKS" "$REF_RANKS" 1 ""
+    run_oracle_arm "$tgt_mtp" 1 "$DEVS" "$N" "$N" 1 "$PP_LAYERS"
+  fi
+
+  # (d) compare
+  pp_eval_pair ar "$REF_ARM" "$EPARM" "$REF_RANKS" "$N" 0 ""
+  COMPARE_STATE=$PAIR_STATE
+  if ((MTP)); then
+    pp_eval_pair mtp "$ref_mtp" "$tgt_mtp" "$REF_RANKS" "$N" 1 "-mtp"
+    MTP_STATE=$PAIR_STATE
+  fi
+  if ((PP_ANY_ERR)); then
+    VERDICT=ERROR
+  elif ((PP_ANY_FAIL)); then
+    VERDICT=FAIL
+  else
+    VERDICT=PASS
+  fi
+
+  # (e) speed cells, A/B interleaved per repetition (autoregressive, spec off)
+  if ((SKIP_SPEED)); then
+    log "speed cells skipped"
+  else
+    local tgt_speed=1
+    if ! oracle_arm_ok "$EPARM"; then
+      tgt_speed=0
+      mkdir -p "$OUT/speed/$EPARM"
+      echo "skipped: the $EPARM oracle arm failed to load/run" > "$OUT/speed/$EPARM/SKIPPED.txt"
+    fi
+    local rep
+    for ((rep = 1; rep <= REPS; rep++)); do
+      run_bench_cell "$REF_ARM" 1 "$REF_DEVS" decode "$rep" "$SHORT_PROMPT" 128 "$REF_RANKS"
+      ((tgt_speed == 0)) || run_bench_cell "$EPARM" 1 "$DEVS" decode "$rep" "$SHORT_PROMPT" 128 "$N" "$PP_LAYERS"
+      run_bench_cell "$REF_ARM" 1 "$REF_DEVS" prefill "$rep" "$LONG_PROMPT" 1 "$REF_RANKS"
+      ((tgt_speed == 0)) || run_bench_cell "$EPARM" 1 "$DEVS" prefill "$rep" "$LONG_PROMPT" 1 "$N" "$PP_LAYERS"
+    done
+    if ((SPEED_FAIL)) && [[ $VERDICT == PASS ]]; then
+      VERDICT=FAIL
+      REASON="a speed cell failed or did not run with the requested pp (see speed/*/*.rc, *.pp, *.stderr)"
+    fi
+  fi
+}
+
 # ------------------------------------------------------------------------ run
 log "output directory: $OUT"
 collect_env
@@ -839,47 +1410,51 @@ select_cards
 hash_model
 build_all
 
-EPARM=ep$N
-run_oracle_arm "$REF_ARM" "$REF_RANKS" "$REF_DEVS" "$REF_RANKS"
-run_oracle_arm "$EPARM" "$N" "$DEVS" "$N"
+EPARM=$MODE$N
+if [[ $MODE == pp ]]; then
+  run_pp_gate
+else
+  run_oracle_arm "$REF_ARM" "$REF_RANKS" "$REF_DEVS" "$REF_RANKS"
+  run_oracle_arm "$EPARM" "$N" "$DEVS" "$N"
 
-# (d) compare
-if oracle_arm_ok "$REF_ARM" && oracle_arm_ok "$EPARM"; then
-  crc=0
-  python3 "$COMPARE" "$OUT/oracle/$REF_ARM" "$OUT/oracle/$EPARM" --expect-ranks "$N" --ref-ranks "$REF_RANKS" \
-    --json "$OUT/compare.json" > "$OUT/compare.txt" 2>&1 || crc=$?
-  sed 's/^/    /' "$OUT/compare.txt"
-  if ((crc == 0)); then
-    VERDICT=PASS; COMPARE_STATE="PASS"
-  elif ((crc == 1)); then
-    VERDICT=FAIL; COMPARE_STATE="FAIL"
-    if ((REF_RANKS == 1)); then REASON="EP$N output differs from the single card"; else REASON="EP$N output differs from the EP$REF_RANKS reference"; fi
+  # (d) compare
+  if oracle_arm_ok "$REF_ARM" && oracle_arm_ok "$EPARM"; then
+    crc=0
+    python3 "$COMPARE" "$OUT/oracle/$REF_ARM" "$OUT/oracle/$EPARM" --expect-ranks "$N" --ref-ranks "$REF_RANKS" \
+      --json "$OUT/compare.json" > "$OUT/compare.txt" 2>&1 || crc=$?
+    sed 's/^/    /' "$OUT/compare.txt"
+    if ((crc == 0)); then
+      VERDICT=PASS; COMPARE_STATE="PASS"
+    elif ((crc == 1)); then
+      VERDICT=FAIL; COMPARE_STATE="FAIL"
+      if ((REF_RANKS == 1)); then REASON="EP$N output differs from the single card"; else REASON="EP$N output differs from the EP$REF_RANKS reference"; fi
+    else
+      VERDICT=ERROR; COMPARE_STATE="comparator error rc=$crc"; REASON="fn_ep_compare.py failed to run"
+    fi
   else
-    VERDICT=ERROR; COMPARE_STATE="comparator error rc=$crc"; REASON="fn_ep_compare.py failed to run"
+    VERDICT=ERROR
+    oracle_arm_ok "$REF_ARM" || COMPARE_STATE="$REF_ARM arm failed"
+    oracle_arm_ok "$EPARM" || COMPARE_STATE="$EPARM arm failed (see oracle/$EPARM-receipt/stderr.txt)"
+    REASON="$COMPARE_STATE; no comparison"
   fi
-else
-  VERDICT=ERROR
-  oracle_arm_ok "$REF_ARM" || COMPARE_STATE="$REF_ARM arm failed"
-  oracle_arm_ok "$EPARM" || COMPARE_STATE="$EPARM arm failed (see oracle/$EPARM-receipt/stderr.txt)"
-  REASON="$COMPARE_STATE; no comparison"
-fi
 
-# (e) speed cells, A/B interleaved per repetition
-if ((SKIP_SPEED)); then
-  log "speed cells skipped"
-else
-  EP_SPEED=1
-  if ! oracle_arm_ok "$EPARM"; then
-    EP_SPEED=0
-    mkdir -p "$OUT/speed/$EPARM"
-    echo "skipped: the $EPARM oracle arm failed to load/run" > "$OUT/speed/$EPARM/SKIPPED.txt"
+  # (e) speed cells, A/B interleaved per repetition
+  if ((SKIP_SPEED)); then
+    log "speed cells skipped"
+  else
+    EP_SPEED=1
+    if ! oracle_arm_ok "$EPARM"; then
+      EP_SPEED=0
+      mkdir -p "$OUT/speed/$EPARM"
+      echo "skipped: the $EPARM oracle arm failed to load/run" > "$OUT/speed/$EPARM/SKIPPED.txt"
+    fi
+    for ((rep = 1; rep <= REPS; rep++)); do
+      run_bench_cell "$REF_ARM" "$REF_RANKS" "$REF_DEVS" decode "$rep" "$SHORT_PROMPT" 128
+      ((EP_SPEED == 0)) || run_bench_cell "$EPARM" "$N" "$DEVS" decode "$rep" "$SHORT_PROMPT" 128
+      run_bench_cell "$REF_ARM" "$REF_RANKS" "$REF_DEVS" prefill "$rep" "$LONG_PROMPT" 1
+      ((EP_SPEED == 0)) || run_bench_cell "$EPARM" "$N" "$DEVS" prefill "$rep" "$LONG_PROMPT" 1
+    done
   fi
-  for ((rep = 1; rep <= REPS; rep++)); do
-    run_bench_cell "$REF_ARM" "$REF_RANKS" "$REF_DEVS" decode "$rep" "$SHORT_PROMPT" 128
-    ((EP_SPEED == 0)) || run_bench_cell "$EPARM" "$N" "$DEVS" decode "$rep" "$SHORT_PROMPT" 128
-    run_bench_cell "$REF_ARM" "$REF_RANKS" "$REF_DEVS" prefill "$rep" "$LONG_PROMPT" 1
-    ((EP_SPEED == 0)) || run_bench_cell "$EPARM" "$N" "$DEVS" prefill "$rep" "$LONG_PROMPT" 1
-  done
 fi
 
 # (f) receipt

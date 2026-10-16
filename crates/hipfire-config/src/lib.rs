@@ -2241,6 +2241,18 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_TOPOLOGY_EP"),
         "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1100 or gfx1201: 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous gfx1100 or gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
     ),
+    field!(
+        "topology.pp",
+        "pp",
+        Hardware,
+        ModelLoad,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 8 },
+        false,
+        true,
+        Some("HIPFIRE_TOPOLOGY_PP"),
+        "Pipeline-parallel degree: 1 (default, single device) or 2..=8. Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or Qwen4 expert parallelism."
+    ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
         "uniform_vram_tolerance_gb",
@@ -7542,7 +7554,8 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
 }
 
 /// Device topology policy: expert-parallel degree (`topology.ep`, compat env
-/// `HIPFIRE_TOPOLOGY_EP`) and the Qwen4 kill switch `HIPFIRE_QWEN4_EP=0`.
+/// `HIPFIRE_TOPOLOGY_EP`), the Qwen4 kill switch `HIPFIRE_QWEN4_EP=0`, and
+/// pipeline-parallel degree (`topology.pp`, compat env `HIPFIRE_TOPOLOGY_PP`).
 /// Pure and GPU-independent; the loader resolves the degree once, before any
 /// teardown or allocation.
 pub mod topology {
@@ -7556,6 +7569,10 @@ pub mod topology {
     /// Largest expert-parallel degree the schema admits. Experts shard
     /// `e % N`, so uneven splits (e.g. 512 over 6 ranks) are admitted.
     pub const EP_MAX_DEGREE: usize = 8;
+    /// Compatibility spelling of `topology.pp`.
+    pub const PP_ENV: &str = "HIPFIRE_TOPOLOGY_PP";
+    /// Largest pipeline-parallel degree the schema admits.
+    pub const PP_MAX_DEGREE: usize = 8;
 
     /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
     /// integer outside `1..=`[`EP_MAX_DEGREE`] is a refusal naming the range.
@@ -7602,6 +7619,42 @@ pub mod topology {
         )
     }
 
+    /// Pure parser behind [`pp`]: unset or empty is 1 (the default); an
+    /// integer outside `1..=`[`PP_MAX_DEGREE`] is a refusal naming the range.
+    pub fn parse_pp(raw: Option<&str>) -> Result<usize, String> {
+        let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(1);
+        };
+        match raw.parse::<usize>() {
+            Ok(n) if (1..=PP_MAX_DEGREE).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "topology.pp = {raw:?} is not a valid pipeline-parallel degree (allowed: integers 1..=8)"
+            )),
+        }
+    }
+
+    /// Effective pipeline-parallel degree from raw inputs: an explicit
+    /// request `requested > 1` wins and the configured value is not read;
+    /// otherwise (`requested` 0 or 1) `topology.pp` applies.
+    pub fn resolve_pp(requested: usize, configured: Option<&str>) -> Result<usize, String> {
+        if requested > 1 {
+            return Ok(requested);
+        }
+        parse_pp(configured)
+    }
+
+    /// Configured `topology.pp` from the process snapshot.
+    pub fn pp() -> Result<usize, String> {
+        parse_pp(process_value(PP_ENV).as_deref())
+    }
+
+    /// Effective pipeline-parallel degree for a load request of `requested`:
+    /// the request when it is above 1, else `topology.pp` from the process
+    /// snapshot.
+    pub fn effective_pp(requested: usize) -> Result<usize, String> {
+        resolve_pp(requested, process_value(PP_ENV).as_deref())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -7646,6 +7699,71 @@ pub mod topology {
                 .find(|field| field.key == "topology.ep")
                 .expect("topology.ep is in the schema");
             assert_eq!(field.env_compat, Some(EP_ENV));
+            assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
+            for n in 1..=8 {
+                assert!(field.validate(&crate::ConfigValue::Integer(n)).is_ok());
+            }
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(9)).is_err());
+            assert!(matches!(
+                field.parse_cli("2"),
+                Ok(crate::ConfigValue::Integer(2))
+            ));
+            assert!(matches!(field.default, crate::DefaultValue::Integer(1)));
+        }
+
+        #[test]
+        fn parse_pp_defaults_and_allowed_set() {
+            assert_eq!(parse_pp(None), Ok(1));
+            assert_eq!(parse_pp(Some("")), Ok(1));
+            assert_eq!(parse_pp(Some("   ")), Ok(1));
+            assert_eq!(parse_pp(Some("1")), Ok(1));
+            assert_eq!(parse_pp(Some(" 2 ")), Ok(2));
+            for n in 1..=8usize {
+                assert_eq!(parse_pp(Some(&n.to_string())), Ok(n));
+            }
+            for bad in ["0", "9", "16", "-1", "two", "2.0"] {
+                let err = parse_pp(Some(bad)).unwrap_err();
+                assert!(
+                    err.contains("topology.pp") && err.contains("1..=8"),
+                    "{bad}: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn resolve_pp_explicit_request_above_one_wins_over_config() {
+            assert_eq!(resolve_pp(2, Some("4")), Ok(2));
+            assert_eq!(resolve_pp(3, None), Ok(3));
+            assert_eq!(resolve_pp(8, Some("2")), Ok(8));
+            // An explicit request makes the configured value moot, even an invalid one.
+            assert_eq!(resolve_pp(2, Some("9")), Ok(2));
+            assert_eq!(resolve_pp(2, Some("two")), Ok(2));
+        }
+
+        #[test]
+        fn resolve_pp_request_one_or_zero_defers_to_config() {
+            for requested in [0usize, 1] {
+                assert_eq!(resolve_pp(requested, None), Ok(1));
+                assert_eq!(resolve_pp(requested, Some("")), Ok(1));
+                assert_eq!(resolve_pp(requested, Some("4")), Ok(4));
+                assert_eq!(resolve_pp(requested, Some(" 8 ")), Ok(8));
+                let err = resolve_pp(requested, Some("9")).unwrap_err();
+                assert!(
+                    err.contains("topology.pp") && err.contains("1..=8"),
+                    "{err}"
+                );
+                assert!(resolve_pp(requested, Some("0")).is_err());
+            }
+        }
+
+        #[test]
+        fn pp_schema_field_validates_range_and_defaults_to_one() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.pp")
+                .expect("topology.pp is in the schema");
+            assert_eq!(field.env_compat, Some(PP_ENV));
             assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
             for n in 1..=8 {
                 assert!(field.validate(&crate::ConfigValue::Integer(n)).is_ok());

@@ -9,25 +9,28 @@ Bring-up narrative is historical:
 | Field | Value |
 |---|---|
 | Inventory date | 2026-10-13 |
-| Audited source ref | `c7a732ad5b921706519cdba30fdb43a7e62aa2d4` (`origin/beta`) |
-| Page state | **shipped / ref-pinned** for source-wired multi-device behavior (see [`INDEX.md`](INDEX.md)); the [Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13) tables are **measured** (fixture-bound, dated, not promises); the appendix tables are **historical** only |
+| Historical audited source ref | `c7a732ad5b921706519cdba30fdb43a7e62aa2d4` (`origin/beta`); excludes the Unreleased Flash-Next PP route below |
+| Page state | Existing routes are **shipped / ref-pinned** (see [`INDEX.md`](INDEX.md)); Flash-Next host-staged PP is **Unreleased / opt-in**, with no hardware qualification claimed here. The [Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13) tables are **measured** (fixture-bound, dated, not promises); appendix tables are **historical** only |
 | Orchestration | `crates/hipfire-runtime/src/multi_gpu.rs` |
-| PP load path | `crates/hipfire-loader/src/carriers.rs` (`load_qwen35_pp`) |
+| Generic PP load path | `crates/hipfire-loader/src/carriers.rs` (`load_qwen35_pp`) |
+| Flash-Next PP admission and refusals | `crates/hipfire-loader/src/admission.rs` (`qwen4_pp_option_refusal`, `qwen4_pp_env_refusal`, `admit_qwen4_pp_mesh`) |
 | Daemon load / refusals | `crates/hipfire-daemon/src/main.rs` |
 | Supporting multi-GPU script | [`scripts/pp-gate.sh`](../scripts/pp-gate.sh) (not a VALIDATION selector minimum route) |
 | Admissions | [`admissions.yml`](admissions.yml) — schema v2, exactly one single-GPU retained-PM4 record; no multi-GPU records (fail closed; none inferred) |
 
 ## Modes
 
-Three multi-device routes exist. PP and `tp` are **mutually exclusive** at load
-(`tp > 1 && pp > 1` → error); Flash-Next expert parallelism (`topology.ep`)
-cannot be combined with either (`pp` or `tp` ≠ 1 is refused when `ep > 1`).
+Four multi-device routes exist. Generic PP and `tp` are **mutually exclusive** at
+load (`tp > 1 && pp > 1` → error); Flash-Next expert parallelism (`topology.ep`)
+cannot be combined with either (`pp` or `tp` ≠ 1 is refused when `ep > 1`), and
+Flash-Next pipeline parallelism (`topology.pp`) needs `tp = ep = 1`.
 
 | Mode | Load knob | What it does | Source-wired runtime surface (audited ref) |
 |---|---|---|---|
-| **Pipeline parallel (PP)** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; residual stream crosses bands via `boundary_copy` | Qwen3.5 / 3.6 **HFQ** only (`arch_id` 5 dense, 6 MoE/A3B) via `load_qwen35_pp` |
+| **Pipeline parallel (PP), generic** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; the residual stream crosses bands via `boundary_copy`, a peer memcpy. The route is built on peer access (P2P) between the cards; hipfire has no host-staged edge service for it | Qwen3.5 / 3.6 **HFQ** only (`arch_id` 5 dense, 6 MoE/A3B) via `load_qwen35_pp` |
 | **Expert parallel (EP / `tp`)** | `params.tp`, or CLI `hipfire serve --tp N` → `HIPFIRE_TP` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9) via `load_model_ep` |
 | **Flash-Next expert parallel (EP, N = 2..=8)** | config `topology.ep` (`hipfire config set topology.ep N`; env `HIPFIRE_TOPOLOGY_EP`; default `1`, allowed `1..=8`; `HIPFIRE_QWEN4_EP=0` forces `1`). **Not `--tp`.** | Routed experts shard by id (`e % N`; an N that does not divide 512 gives uneven per-rank counts); every rank holds the whole trunk and runs the unchanged single-device program on its own worker thread; a copy-only owner exchange feeds the unchanged slot-order combine. **Opt-in, experimental.** | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on N = 2..=8 homogeneous cards of one exact arch, **gfx1100** (7900 XTX) or **gfx1201** (R9700), every directed card pair peer-accessible (Qwen4 carrier, `load_qwen4_rank`; admission in `crates/hipfire-loader/src/admission.rs`) |
+| **Flash-Next pipeline parallel (PP, N = 2..=8), host-staged** | config `topology.pp` (`hipfire config set topology.pp N`; env `HIPFIRE_TOPOLOGY_PP`; default `1`, allowed `1..=8`) or daemon load `params.pp`. No load-time `--pp` flag; **not `--tp`.** | Contiguous **layer bands**, one per card, every band fully VRAM-resident; the hyper-connection (HC) streams cross each band edge through pinned host memory, so no peer access is needed. The output card (physical card 0) runs the last logical band. **Opt-in, experimental.** See [Flash-Next pipeline parallelism (host-staged)](#flash-next-pipeline-parallelism-host-staged) | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on N = 2..=8 homogeneous cards of one exact arch, **gfx1100** (7900 XTX) or **gfx1201** (R9700), with `tp = ep = 1` (admission in `crates/hipfire-loader/src/admission.rs`, `admit_qwen4_pp_mesh`) |
 
 `pp = 1`, `tp = 1` and `ep = 1` are single-GPU. Behavior matches the pre-multi-GPU paths.
 
@@ -41,6 +44,11 @@ apply only once `topology.ep` is set to a value in `2..=8`. The measured and
 exactness evidence on this page was taken on exact gfx1201 R9700s at EP2 and
 EP4; it is not evidence for gfx1100 or for other rank counts.
 
+Flash-Next PP is opt-in and experimental in the same way (`topology.pp` defaults
+to `1`; lifecycle status in [`CONFIG.md`](CONFIG.md)). This page records no
+measurement and no hardware qualification of it; the way to produce that
+evidence on your own box is the [PP mode of `scripts/fn-ep-gate.sh`](#qualify-a-box-fn-ep-gate-mode-pp).
+
 **PP is not tensor-parallel serving.** It does not give multi-user throughput.
 It is a **capacity** tool: fit larger context / larger HFQ weights by splitting
 layers. **No speedup is promised** for models that already fit on one card;
@@ -52,21 +60,28 @@ sequential PP=2 (see [Appendix A](#appendix-a-historical-pp-evidence-immutable))
 | Model / situation | Cards | Use | Why |
 |---|---|---|---|
 | Qwen3.8 Flash-Next (Qwen4) | 2..=8 cards of one exact arch, gfx1100 or gfx1201 | **EP** (`topology.ep` = N) | Experts are what does not fit one card. On 32 GB gfx1201 at 32K context EP2 keeps 30 of 49 routed layers in VRAM per rank (19 host-mapped) and EP4 keeps all 49, and EP2 prefill is measured faster than one card ([Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)). For 24 GB gfx1100 cards see the [per-rank fit arithmetic](#flash-next-ep-per-rank-expert-fit); gfx1100 and N > 4 have no measurement on this page. |
+| Qwen3.8 Flash-Next (Qwen4) on 2..=8 cards of one exact arch **without peer access** between the cards (or where bands are wanted instead of expert sharding) | 2..=8 | **PP, host-staged** (`topology.pp` = N) | EP refuses a missing peer pair; PP stages each band edge's HC streams through pinned host memory and never needs P2P. Every band keeps all its routed experts resident, so the split must fit each card ([budget](#flash-next-pipeline-parallelism-host-staged)); one request's decode visits the bands in order. No measured numbers on this page. |
 | MiniMax-M2, DeepSeek V4 Flash | 2+ | **EP via `--tp N`** | The `load_model_ep` route above; no admission, no measured numbers on this page. |
 | Dense Qwen 27B-class that fits one card (registry weights: 11.78 GB for `qwen3.8:27b-mq3-xt`, [`MODELS.md`](MODELS.md); the historical probe in Appendix A shows about 15.5 GB for the mq4 27B proxy) | 2+ | **One model per card** (one daemon per card, each pinned by `hardware.devices`; the per-card lock makes two daemons asking for `gfx1201` get different cards) or **batched serving** on one card ([`SERVE.md`](SERVE.md) continuous batching) rather than splitting | Splitting a model that already fits adds cross-card traffic and, under PP, a sequential decode penalty; it does not buy multi-user throughput. |
-| Qwen3.5 / 3.6 HFQ that does not fit one card at the wanted context | 2+ | **PP** (`params.pp`) | PP is a **capacity** tool, not a speedup: historical PP=2 decode measured about two thirds of single-card decode on short prompts (Appendix A). |
+| Qwen3.5 / 3.6 HFQ that does not fit one card at the wanted context | 2+ (peer access between the cards) | **PP** (`params.pp`, generic route) | PP is a **capacity** tool, not a speedup: historical PP=2 decode measured about two thirds of single-card decode on short prompts (Appendix A). The generic route moves the residual with a peer memcpy; without peer access it is not a qualified configuration. |
 
 **CLI note:** the shipped CLI forwards **`tp`** (`HIPFIRE_TP` / `--tp`) on serve
 load messages; that is the knob for MiniMax-M2 / DeepSeek V4 Flash. **Do not
 pass `--tp` for Flash-Next:** with `topology.ep > 1` a load with `tp` ≠ 1 is
-refused (`cannot combine with pipeline/tensor parallelism`); use
-`topology.ep`. **`params.pp` is not a first-class CLI flag today** — set it on a
-raw daemon JSONL `load` (or any client that builds that message). Examples and
-`scripts/pp-gate.sh` do this directly.
+refused (`cannot combine with pipeline/tensor parallelism`); use `topology.ep`
+for expert parallelism and `topology.pp` for pipeline parallelism. There is **no
+load-time `--pp` flag** on `hipfire run`, `serve` or `bench` (`hipfire bench --pp`
+is the comma list of prompt sizes for `--matrix`, not a pipeline degree). A pipeline degree comes from the
+`topology.pp` config key (env `HIPFIRE_TOPOLOGY_PP`), which `run`, `serve` and
+`bench` honor, or from `params.pp` on a raw daemon JSONL `load` (an explicit
+`params.pp` above `1` wins over the configured value). Generic Qwen3.5 / 3.6 PP
+examples and `scripts/pp-gate.sh` set `params.pp` directly.
 
-## Topology (PP)
+## Topology (generic Qwen3.5 / 3.6 PP)
 
-Source of truth: `Gpus` in `multi_gpu.rs`.
+Source of truth: `Gpus` in `multi_gpu.rs`. This section describes the generic
+Qwen3.5 / 3.6 route; Flash-Next PP has its own placement, transport and budget
+rules in [Flash-Next pipeline parallelism (host-staged)](#flash-next-pipeline-parallelism-host-staged).
 
 1. **Device pick** — `hardware.devices` lists physical cards in logical order
    (see [Device selection](#device-selection)). Startup resolves it from the
@@ -80,21 +95,27 @@ Source of truth: `Gpus` in `multi_gpu.rs`.
      equal `pp`, sum must equal `n_layers`). Skips the uniform free-VRAM delta
      check; still enforces arch match unless overridden.
 3. **Placement convention (Variant 2)** — `output_device = last` device holds
-   `output_norm + lm_head`. Device 0 holds the embedding side of the split.
-4. **Boundary traffic** — at each band edge, `boundary_copy` moves the residual
-   (`hipMemcpyPeerAsync` when peer access is up; otherwise HIP host-staging).
-   Caller waits with `wait_boundary`.
+   `output_norm + lm_head`. Device 0 holds the embedding side of the split
+   (generic route; Flash-Next PP puts the output card first in the device list
+   and runs the last band on it).
+4. **Boundary traffic** — at each band edge, `boundary_copy` issues a peer
+   memcpy (`hipMemcpyPeerAsync`); the caller waits with `wait_boundary`. The
+   route is built and validated on peer access. The source comment that HIP
+   "transparently host-stages" a pair without peer access describes driver
+   behaviour, not a hipfire-owned or admitted path; do not rely on it. Only
+   Flash-Next PP has an admitted host-staged edge service.
 5. **Peer access** — `enable_peer_all` must run **after** weights/KV/scratch that
-   need peer maps are allocated. Incomplete peer matrix → host-staging fallback
-   (slower, still correct). Partial pair failure does not abort capable pairs.
+   need peer maps are allocated. Treat a full peer matrix as a requirement of
+   this route: `enable_peer_all` returns `false` for an incomplete matrix and
+   the load is not blocked, but the copies then ride on an unqualified driver
+   fallback. Partial pair failure does not abort capable pairs.
 6. **Preflight**
    - Default: **exact `Gpu.arch` string match** across devices
      (`d.arch != arch0` in `preflight_vram` / `multi_gpu.rs`). This is not a
      loose “family” compare.
    - Free-VRAM delta ≤ `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` (default **2.0**) for
      `init_uniform` / `init_tp` only.
-   - `HIPFIRE_ALLOW_MIXED_ARCH=1` opts into mixed-arch pairs (JIT per arch;
-     peer may host-stage).
+   - `HIPFIRE_ALLOW_MIXED_ARCH=1` opts into mixed-arch pairs (JIT per arch).
 7. **Threading** — HIP work is **single-threaded** for the daemon lifetime.
    `bind_thread` before peer enable and before device-bound work. No rayon/tokio
    HIP callers in v1.
@@ -114,8 +135,9 @@ rocm-smi --showtoponuma
 rocm-smi --showtopoaccess
 ```
 
-A full `True` peer-access matrix is ideal. Missing peer access does not block
-load; copies fall back to host staging.
+A full `True` peer-access matrix is required by the generic PP and `tp` routes
+and by Flash-Next EP (EP refuses a missing pair). Flash-Next PP does not need it:
+its default edges are host-staged and never enable peer access.
 
 ### Device selection
 
@@ -252,7 +274,7 @@ or performance validation.
 
 ## Launch and config
 
-### PP load (daemon JSONL)
+### PP load (daemon JSONL, generic Qwen3.5 / 3.6)
 
 ```json
 {"type":"load","model":"/path/to/qwen3.5-9b.mq4","params":{"max_seq":16384,"pp":2}}
@@ -305,7 +327,7 @@ load is refused (naming `topology.ep` or the missing requirement) when `pp` or
 `tp` is not `1`, when `ep` is above 8, when device 0 is not gfx1100 or gfx1201,
 when the ranks are not one arch (a mixed gfx1100/gfx1201 set is refused:
 `requires the same architecture on every rank`), when fewer than `ep` devices
-are visible, or when a directed card pair is not peer-accessible. There is no
+are visible, or when a directed card pair is not peer-accessible. EP has no
 host-staged fallback for a missing peer pair; the load refuses. EP also refuses
 DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters, CASK, PFlash,
 lane batching and the retained Redline default, and
@@ -417,7 +439,7 @@ tile pull in owner-routed prefill) is peer-to-peer copies between the cards, so
 exchange bandwidth is whatever the card-to-card links give. Consumer boards
 commonly hang cards off chipset lanes or PCIe switches and run some slots at
 x4 or x8; that lowers the exchange bandwidth, and every rank waits for the
-slowest link. There is no host-staged fallback: if any directed card pair is
+slowest link. EP has no host-staged fallback: if any directed card pair is
 not peer-accessible, the load refuses. The community gate below records each
 card's PCIe link speed and width and the P2P topology in its receipt.
 
@@ -591,6 +613,10 @@ first mismatch, and every speed run with its raw JSON. Exit status: 0 for a
 byte-exact PASS, 1 for a mismatch or a failed arm, 2 for an environment or
 usage problem. It is supporting manual evidence, not a
 [`VALIDATION.md`](VALIDATION.md) selector route.
+
+`--mode pp` runs the same gate for Flash-Next pipeline parallelism; see
+[Qualify a box](#qualify-a-box-fn-ep-gate-mode-pp).
+
 `crates/hipfire-runtime/examples/ep_transport_oracle.rs` (feature `lab`) is a
 separate no-model synthetic oracle for the row-gather and tile launchers. Without
 `--devices` it runs every rank on one device at N = 2..=8. With `--devices 0,1[,..]`
@@ -603,8 +629,10 @@ coherency across bank reuse and a read-before-publish negative control (`xrows`,
 `xtiles`, `xctl`), and times EP exchange shapes and pipeline boundary hops against P2P
 (`xtime`, `xhop`). `--transport host|peer|both` (default from
 `HIPFIRE_QWEN4_EP_TRANSPORT`, `auto` = host when any device pair lacks peer access);
-the host transport never enables peer access. It is transport evidence only: no product
-route uses host staging yet.
+the host transport never enables peer access. It is harness evidence for EP exchange
+shapes only: no Flash-Next EP route uses host staging. The product host-staged route
+is [Flash-Next pipeline parallelism](#flash-next-pipeline-parallelism-host-staged),
+which has its own edge service.
 
 
 ### Environment (operator-facing)
@@ -616,12 +644,14 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `hardware.devices` | Persistent device list (index, `gfxNNNN`, `GPU-<uuid>`, PCI address); resolved to physical cards, reserved, lowered to ROCr selectors plus HIP logical `0..N-1` |
 | `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` | Expert one-shot filters when `hardware.devices` is unset; compatible pairs are normalized and ambiguous pairs fail closed |
 | `HIPFIRE_DEVICES` / `HIPFIRE_DEVICE` | Compatibility aliases for `hardware.devices` |
-| `HIPFIRE_PP_LAYERS` | Explicit per-device layer counts for PP |
+| `HIPFIRE_PP_LAYERS` | Per-band layer counts in logical band order, for generic PP and Flash-Next PP (Flash-Next also needs the first band to hold at least 2 layers) |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | `init_uniform` / `init_tp` free-VRAM delta |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
 | `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
 | `HIPFIRE_TOPOLOGY_EP` | Flash-Next EP degree (`topology.ep`, default `1`, allowed `1..=8`); **not** `--tp` |
+| `HIPFIRE_TOPOLOGY_PP` | Pipeline degree (`topology.pp`, default `1`, allowed `1..=8`; an explicit `params.pp` above `1` wins); the Flash-Next PP route takes `2..=8`. **No load-time `--pp` flag** |
+| `HIPFIRE_MESH_TRANSPORT` | Developer-only, Flash-Next PP: how band edges move HC streams: `auto` (default, host-staged), `host` or `peer` (refused) |
 | `HIPFIRE_QWEN4_EP` | `0` forces Flash-Next `topology.ep = 1` (developer kill switch) |
 | `HIPFIRE_EMULATE_GPUS` | Developer-only logical rank aliasing (integer `>=2`); also maps Flash-Next EP rank `r` to physical device `r % count` (see [emulation](#flash-next-qwen4-ep-under-emulation)) |
 | `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers (gfx1201 at 2..=4 ranks only; other arches and larger N keep the exact static split); on under EP, exact `0` disables |
@@ -629,8 +659,8 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP: long-prefill expert staging (gfx1201 only); on when owner-routed prefill is admitted, exact `0` disables |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
-| `HIPFIRE_PP_PFLASH=1` | **Experimental** — accept PFlash compose with `pp>1` (not a product default; not route-certified) |
-| `HIPFIRE_PP_DFLASH=1` | **Experimental** — accept DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text) |
+| `HIPFIRE_PP_PFLASH=1` | **Experimental, generic Qwen3.5 / 3.6 PP only** — the daemon accepts PFlash compose with `pp>1` (not a product default; not route-certified). Flash-Next PP still refuses PFlash |
+| `HIPFIRE_PP_DFLASH=1` | **Experimental, generic Qwen3.5 / 3.6 PP only** — the daemon accepts a DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text). Flash-Next PP still refuses DFlash |
 
 Test-only: `HIPFIRE_HAVE_2_GPU`, `HIPFIRE_PP_PARITY_MODEL` (pp_parity harness).
 
@@ -644,16 +674,19 @@ string or a blanket “always refuse at load.”
 | Condition | Behavior |
 |---|---|
 | `tp > 1` and `pp > 1` | Error: mutually exclusive |
-| DFlash `draft` set and `HIPFIRE_PP_DFLASH` unset | Error: DFlash requires `pp=1` |
-| DFlash `draft` set and `HIPFIRE_PP_DFLASH=1` | **Experimental exception:** load may accept; cross-card speculative generate is **not** fully implemented (daemon message states PR2–4 of the hetero PFlash/DFlash plan are incomplete). Not an admission. |
-| CASK / TriAttention sidecar set | Error: requires `pp=1` |
-| PFlash drafter / mode on and `HIPFIRE_PP_PFLASH` unset | Error: PFlash requires `pp=1` |
-| PFlash on and `HIPFIRE_PP_PFLASH=1` | **Experimental exception:** opt-in only; not a product default and not route-certified performance. |
+| DFlash `draft` set and `HIPFIRE_PP_DFLASH` unset | Error: DFlash requires `pp=1` (daemon, any arch) |
+| DFlash `draft` set and `HIPFIRE_PP_DFLASH=1` | **Experimental exception, generic Qwen3.5 / 3.6 route only:** load may accept; cross-card speculative generate is **not** fully implemented (daemon message states PR2–4 of the hetero PFlash/DFlash plan are incomplete). Not an admission. Flash-Next PP still refuses a draft: `does not support DFlash` |
+| CASK / TriAttention sidecar set | Error: requires `pp=1` (daemon); Flash-Next PP also names it: `does not support CASK` |
+| PFlash drafter / mode on and `HIPFIRE_PP_PFLASH` unset | Error: PFlash requires `pp=1` (daemon, any arch) |
+| PFlash on and `HIPFIRE_PP_PFLASH=1` | **Experimental exception, generic Qwen3.5 / 3.6 route only:** opt-in only; not a product default and not route-certified performance. Flash-Next PP still refuses PFlash: `does not support PFlash` |
 | Non-PP carriers at `pp>1` | Carrier-specific error strings (not one universal quote). Examples at the audited ref: `qwen2: pipeline-parallel (pp>1) unsupported`; `llama:` / `dots_ocr:` / `deepseek4:` / `minimax:` / `lfm2moe:` `pipeline-parallel (pp>1) unsupported` on HFQ (and distinct `safetensors + pp>1 unsupported` on dirs); **`cohere2moe: pp>1 unsupported via registry`** (different wording). |
 | Qwen3.5 **safetensors directory** + `pp>1` | Error: `qwen35: safetensors + pp>1 unsupported` |
 | Qwen3.5 / 3.6 **VL HFQ** + `pp>1` | **Not a hard refuse.** `load_qwen35_pp` is the text HFQ loader only — vision weights are **not** loaded on that path, so VL artifacts **silently become text-only** under PP. Serve real VL at `pp=1`. |
-| `bench_prefill` / multi-GPU EP | Daemon refuses bench_prefill when `pp>1` or EP is active |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted for greedy requests (see [Flash-Next `topology.pp > 1`: native MTP](#flash-next-topologypp--1-native-mtp)); sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree/lanes stay refused |
+| `bench_prefill` / multi-GPU EP or PP | Daemon refuses `bench_prefill` (the synthetic `hipfire bench --matrix` prefill rows) when `pp>1` or EP is active: `bench_prefill requires a single-GPU model (pp=1, non-EP)`. Time PP with a real prompt (`hipfire bench --prompt-file`) |
+| Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
+| Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
+| Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree/lanes stay refused |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
@@ -662,74 +695,214 @@ access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redli
 `HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
-### Flash-Next `topology.pp > 1`: native MTP
+### Flash-Next pipeline parallelism (host-staged)
 
-Native MTP on the host-staged Flash-Next mesh is explicit opt-in
-(`speculation.mtp = on` / `--spec mtp`); `auto` and `off` keep AR under PP.
-Only the output band (physical card 0) drafts, samples and decides; every band
-runs the same verify block `[seed, drafts...]` with identical actual and route
-rows. The aggregate window transaction prepares every band, repairs partial
-rejections per band, finishes the output head, then finalizes every owner.
-Its exactness contract is the Single native-MTP result: tokens, window records
-and canonical state including the MTP head. CPU tests do not establish GPU
-parity; qualify each hardware cell with the three-way oracle below.
-There is one generation loop: the daemon's `generate_spec` calls the native
-drafter's mesh entries with the model's `Gpus` (prefill, window step, forced
-advance, terminal-prefix repair, reset); Single and EP take the unchanged entries.
+Flash-Next (Qwen3.8 Flash-Next, Qwen4, `arch_id` 16) can run as a **pipeline**
+of layer bands, one band per card, over 2..=8 cards of one exact arch (gfx1100 or
+gfx1201). It is for boxes where the cards have no peer access to each other, or
+where the trunk plus every routed expert has to be spread over several cards'
+VRAM. It is opt-in and experimental.
 
-- Sampled requests, token penalties, DFlash/DSpark/n-gram/DDTree and lanes are
-  not run on the mesh MTP route (sampled and penalized requests stay on AR; the
-  n-gram modifier is off). A speculative request that reaches the mesh entry
-  with any of them, or with KV eviction or a checkpoint resume, is refused with
-  a validation error before any state mutation.
-- MTP sessions are not distributed: a native-MTP request on the mesh never
-  reuses a session snapshot and publishes none.
-- The retained terminal/stop-prefix repair keeps its restore-and-replay
-  behaviour on every band; a request whose repair the mesh does not take exactly
-  resets and re-prefills instead of continuing on inexact state.
+#### What it is
 
-Exactness oracle (`fn_ep_oracle --spec mtp`, feature `lab`). Every arm of a
-comparison must run the same route/depth/floor policy, so pin it identically:
-`HIPFIRE_MTP_AR_FLOOR=0` (the floor is timed), `HIPFIRE_MTP_INCREMENTAL=0`
-(forces the batched native route at full K), `HIPFIRE_MTP_NGRAM=off` with
-`--ngram off`, `--temp 0`, and `HIPFIRE_GRAPH=0`. The PP arm requires greedy
-requests, no `--ngram on` (the mesh drafter has no n-gram pool; `meta.spec.ngram`
-records the effective `false`) and a timing-independent policy
-(`HIPFIRE_MTP_AR_FLOOR=0` or a forced `HIPFIRE_MTP_INCREMENTAL`), and refuses
-otherwise. PP2 below uses
-`HIPFIRE_PP_LAYERS=24,24`, so the cut-safe Single arm cuts before layer 24:
+- The trunk layers are cut into `N` contiguous **bands**, one per card. Each band
+  keeps every routed expert of its layers resident in its card's VRAM: there are
+  no host-mapped experts, no expert hotset and no expert staging under PP.
+- The model's hyper-connection (HC) residual streams cross each band edge through
+  **pinned host memory** (two host banks per edge). No peer access is enabled or
+  needed.
+- The **output card is card 0**, the first entry of `hardware.devices`. It runs
+  the **last logical band** together with `output_norm`, `lm_head`, the sampler
+  and the native MTP head, so logits and tokens come out of card 0. The other
+  cards run the earlier bands in the order they follow it in the list. With
+  devices `0,1,2,3,4,5` and `N = 6` the bands run on cards 1, 2, 3, 4, 5, 0 (with
+  `N = 2`, cards 1 then 0); the input band (embedding side, the PLE rows) is on
+  the second listed card.
+- `topology.pp = 1` (the default) leaves single-card loads, `topology.ep` and `tp`
+  untouched.
 
-```bash
-# Build under the pinned target dir (no GPU needed to build):
-#   ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CARGO_TARGET_DIR=/home/kaden/qcal/release-0.4.3/target-pp-mesh \
-#     cargo build --release -p hipfire-loader --features lab --example fn_ep_oracle
-BIN=/home/kaden/qcal/release-0.4.3/target-pp-mesh/release/examples/fn_ep_oracle
-CMP=/home/kaden/qcal/release-0.4.3/ep-host-notes/g0/g0_compare.py
-# CARD0 = the output owner (visible device 0); CARD1 = the stage-0 card, the same exact arch.
-# $MODEL, $P1, $P2, $OUT, $CARD0, $CARD1 are placeholders. The prompts plus --tokens must fit
-# --max-seq (prompt tokens + 64 <= 1024 here; raise --max-seq, or pass
-# --truncate-prompt-tokens N, for longer prompts).
-export HIPFIRE_GRAPH=0 HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_NGRAM=off
-COMMON=(--model "$MODEL" --max-seq 1024 --tokens 64 --spec mtp --temp 0 --ngram off
-        --state-every 8 --skip-model-hash --canonical-state
-        --prompt-file "$P1" --prompt-file "$P2")
-# Single MTP (uncut), on the card the PP2 arm uses as its output owner
-HIPFIRE_DEVICES="$CARD0" "$BIN" "${COMMON[@]}" --out "$OUT/single" --arm single
-# cut-safe Single MTP, same card
-HIPFIRE_DEVICES="$CARD0" HIPFIRE_QWEN4_CUT_LAYERS=24 "$BIN" "${COMMON[@]}" --out "$OUT/cut" --arm cut
-# PP2 MTP: the first listed device is the output owner and runs the LAST band; the loader orders the
-# stages itself (stage 0 on the second device), so list CARD0 first
-HIPFIRE_DEVICES="$CARD0,$CARD1" HIPFIRE_PP_LAYERS=24,24 "$BIN" "${COMMON[@]}" --pp 2 --out "$OUT/pp2" --arm pp2
-python3 "$CMP" "$OUT/single" "$OUT/cut"
-python3 "$CMP" "$OUT/single" "$OUT/pp2"
-python3 "$CMP" "$OUT/cut" "$OUT/pp2"
+#### Enable it
+
+CLI, with the config key or its env spelling (there is no load-time `--pp` flag):
+
+```sh
+# six cards of ONE arch; the first entry is the output card and runs the last band
+hipfire config set hardware.devices 0,1,2,3,4,5      # or HIPFIRE_DEVICES=…
+hipfire config set topology.pp 6                      # or HIPFIRE_TOPOLOGY_PP=6; 1..=8
+export HIPFIRE_PP_LAYERS=9,8,8,8,8,7                  # optional, see below
+hipfire serve qwen3.8:flash-next
+# optional: native MTP is opt-in under PP, `auto` stays AR
+hipfire serve qwen3.8:flash-next --spec mtp
 ```
 
-Without `--canonical-state` the Single and cut-safe arms keep their per-rank
-record format (the uncut/cut pair above compares as before); the PP arm then
-writes one record per band, the MTP head rows on the output band's record.
-`meta.json` of a PP arm records the placement (`band_counts`, `rank_order`,
-`edge_transports`, `output_owner`) and `numerical_policy`.
+Daemon: `params.pp` on the load message (an explicit value above `1` wins over
+`topology.pp`):
+
+```json
+{"type":"load","model":"/path/to/qwen3.8-flash-next.mq4","params":{"pp":6}}
+```
+
+The first `pp` visible cards become the ranks. A load needs `pp` in `2..=8`,
+`tp = ep = 1`, and cards that are discrete GPUs of one exact arch. Unified-memory
+cards and `HIPFIRE_EMULATE_GPUS` aliasing are refused.
+
+#### Band placement: `HIPFIRE_PP_LAYERS`
+
+- `HIPFIRE_PP_LAYERS=a,b,…` lists layer counts in **logical band order**: the
+  first count is band 0 (the first layers), the last count is the output band
+  on card 0. It is not the card order. The list needs `pp` entries, no zero entry
+  and a sum equal to the trunk's layer count (48 for Flash-Next).
+- Unset (or empty) gives the **uniform** split: `layers / N` per band, the
+  remainder going to the first bands (`N = 5` on 48 layers: 10, 10, 10, 9, 9).
+- The PLE layer is layer 1, so **band 0 must hold at least 2 layers**; the same
+  rule applies to a uniform split and to an explicit list.
+- Example for six 24 GB cards and the mq4-xts model: `9,8,8,8,8,7`, so card 0
+  (the output card, which also carries `lm_head`, the logits and the MTP head)
+  runs the 7-layer last band. It is the split the qualification gate below
+  takes as its target; it is an input, not a measured result, and whether it fits
+  is decided by the per-band budget below.
+
+#### Transport: `HIPFIRE_MESH_TRANSPORT`
+
+Developer-only, read once at admission. The choice is made per directed edge
+before any allocation or peer enable; there is no runtime fallback.
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default, or unset) | Host-staged edges. Admission has no byte-qualification evidence for peer edges, so `auto` resolves to host-mapped |
+| `host` | Host-staged edges, explicitly: two pinned host banks per edge, peer access is never enabled |
+| `peer` | Refused at admission: `Peer edges for Qwen4 PP need an admission-time qualification step (HIPFIRE_MESH_TRANSPORT=peer refused: …); … use auto or host` |
+| anything else | Refused: `HIPFIRE_MESH_TRANSPORT="…" is not one of auto, peer, host` |
+
+An edge's payload is at most `rows × HC streams × hidden × 4` bytes at the
+canonical prefill chunk (the F32 worst case; BF16 halves it), staged in two pinned
+host banks per edge, so a host needs that much pinned RAM per edge on top of
+whatever else it pins.
+
+#### Per-band memory budget
+
+Every band is **all-resident**. Before any allocation, admission adds up, per
+rank, the band's weights, the F16 shadows, the QSA context, the request state,
+the forward scratch, the native MTP terms and the reserve, and compares the sum
+with that card's free VRAM. With explicit native MTP the output band also charges
+the head and its request buffers and every band charges its row capture. A card
+that is short refuses the load, naming every failing rank and its shortfall:
+
+```text
+qwen4: pipeline parallelism (topology.pp = 6): band does not fit device memory: rank 3 (layers 25..33) needs … bytes (… weights + … F16 shadows + … QSA context + … state + … forward scratch + … native MTP + … reserve) but … bytes are free (short by …); rebalance HIPFIRE_PP_LAYERS or lower memory.max_seq (host-mapped band layers are not admitted)
+```
+
+There is no spill to host-mapped experts: rebalance `HIPFIRE_PP_LAYERS` or lower
+`memory.max_seq`. The canonical prefill chunk is the same on every band; a band
+whose free VRAM cannot hold it refuses instead of shrinking it.
+
+#### What runs
+
+- **AR decode** and **pipelined prefill**: a prompt is cut into canonical chunks
+  that flow through the bands in order; only the last chunk computes the head.
+- **Per-band sessions**: every band attaches its own in-memory session cache
+  (`memory.session_cache_bytes`, an independent opportunistic budget per band, see
+  [`env-vars.md`](env-vars.md)); only client-committed all-band snapshots are
+  reused. The disk tier and message-end snapshots are refused. A load with native
+  MTP attaches no session cache (the output band logs
+  `qwen4 session cache: off under topology.pp with native MTP`); AR loads keep theirs.
+- **Greedy native MTP, explicit only**: `speculation.mtp = on` / `--spec mtp`.
+  `auto` and `off` stay AR under PP. The output band drafts, samples and decides;
+  every band runs the same verify block `[seed, drafts...]`, partial rejections
+  are repaired per band, and the output band finishes the head. Its exactness
+  contract is the single-card native-MTP result (tokens, window records, canonical
+  state including the MTP head); qualify each hardware cell with `--mtp` in the gate below.
+- **Sampled or penalized requests decode AR** on the mesh, not MTP. MTP sessions
+  are not distributed: a native-MTP request on the mesh never reuses a session
+  snapshot and publishes none. A speculative request that still reaches the mesh
+  with DFlash/DSpark/n-gram/DDTree, a sampled temperature, KV eviction or a
+  checkpoint resume is refused before any state changes.
+
+#### Refusals
+
+All of these fire at load, before any card is touched. The rows of the next table
+share one sentence: `qwen4: pipeline parallelism (topology.pp = N) does not support
+<subject>; drop the option or set topology.pp = 1`. Within the option rows and
+within the environment rows, the first match wins.
+
+| Subject | When |
+|---|---|
+| DFlash | a draft path or DFlash speculation is requested |
+| DSpark | DSpark speculation is requested |
+| n-gram drafting | n-gram drafting is requested |
+| DDTree | DDTree is requested |
+| adaptive KV | `kv_adaptive` is on |
+| an EAGLE drafter | a drafter model (`params.drafter`) is given |
+| CASK | a CASK / TriAttention sidecar is given |
+| PFlash | PFlash is requested |
+| an experts-per-token override | an experts-per-token override is given |
+| a non-Single compute placement | a compute placement other than `single` is given |
+| the MTP n-gram modifier (speculation.mtp_ngram = on; leave it auto or off) | native MTP is on and `speculation.mtp_ngram = on`; `auto` and `off` are accepted and build no n-gram pool |
+| host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) | the variable is set (any value) |
+| the expert hotset (`HIPFIRE_QWEN4_EXPERT_HOTSET`; set 0) | the variable is set to anything but `0`; unset is accepted and PP never applies a hotset |
+| expert staging (`HIPFIRE_QWEN4_EXPERT_STAGE`) | exactly `1`; unset or `0` is accepted |
+| session snapshots (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`) | exactly `1`; unset or any other value is accepted |
+| the session cache disk tier (`memory.session_cache_disk_bytes`; set 0) | the budget is above `0` |
+| the NPU trunk (`fusions.npu_trunk = on` or `emulate`) | the mode resolved for the cards' arch is `on` or `emulate`; `off` and `auto` are accepted |
+
+Mesh, rank, band and budget refusals use the prefix
+`qwen4: pipeline parallelism (topology.pp = N)`:
+
+- `is admitted for 2..=8 stages with tp = ep = 1 (tp=…, ep=…)`; `topology.ep` above
+  `1` is refused as `cannot combine with expert parallelism`.
+- `owns physical devices; HIPFIRE_EMULATE_GPUS aliasing is not admitted`.
+- `needs N visible devices, M visible (hardware.devices / HIPFIRE_DEVICES)`.
+- `needs a known PCI identity for every rank; rank R (device D) has none (KFD
+  topology unreadable)`.
+- `requires gfx1100 or gfx1201 on every rank; rank R is …`, `requires the same
+  architecture on every rank; rank 0 is …, rank R is …`, and `requires every rank
+  to match the primary device; ranks are …, device 0 is …`.
+- `HIPFIRE_MESH_TRANSPORT=peer` and unknown transport values (table above).
+- `HIPFIRE_PP_LAYERS parse: …`, `HIPFIRE_PP_LAYERS has K entries, expected pp=N`,
+  `HIPFIRE_PP_LAYERS sum=S != n_layers=L`, a zero entry (`each device must own ≥1
+  layer`), and a first band under two layers (`first PP band has … layers,
+  requires at least 2 (the PLE layer lives in the first band)`).
+- `band does not fit device memory: …` (the budget above).
+- The band loader also refuses a unified-memory card, an automatic context, a
+  trunk-overlay sidecar and a set `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`
+  (`qwen4: topology.pp does not admit … (host-mapped expert layers)`).
+
+Also refused under PP: lane batching, `bench_prefill`, and the daemon-level
+`tp > 1 && pp > 1` (`mutually exclusive`).
+
+#### Qualify a box: `fn-ep-gate` mode `pp`
+
+`scripts/fn-ep-gate.sh --mode pp` is the one-command PP gate. It takes the same
+`MODEL.mq4 [N] [OUT_DIR]` positionals and options as the EP gate (`--arch`,
+`--devices`, `--tokens`, `--reps`, …) plus:
+
+| Option | Meaning |
+|---|---|
+| `--mode ep\|pp` | `ep` (default) is the unchanged EP gate; `pp` runs pipeline parallelism |
+| `--pp-layers COUNTS` | band counts in logical band order, exported as `HIPFIRE_PP_LAYERS` |
+| `--transport auto\|host` | edge transport (`HIPFIRE_MESH_TRANSPORT`), default `host` |
+| `--ref-ranks R` | the reference arm is PP-R on the first R cards instead of one card (default `1`, one card with host-mapped experts). A cut-safe band split is designed to equal one uncut card byte for byte and the gate checks it, so PP-R is a valid reference when one card would need more pinned RAM than the host has |
+| `--mtp` | adds the native-MTP exactness arm under a fixed policy: `HIPFIRE_MTP_AR_FLOOR=0`, `HIPFIRE_MTP_INCREMENTAL=0`, `HIPFIRE_MTP_NGRAM=off`, oracle flags `--spec mtp --temp 0 --ngram off` |
+
+```sh
+# six cards of one arch, bands 9,8,8,8,8,7 (card 0 runs the last band); the reference
+# is PP-R on the first R cards, with R chosen so those bands fit their cards and the host RAM
+scripts/fn-ep-gate.sh --mode pp --pp-layers 9,8,8,8,8,7 --ref-ranks "$R" MODEL.mq4 6 OUT
+# the same, plus the explicit native-MTP exactness arm
+scripts/fn-ep-gate.sh --mode pp --pp-layers 9,8,8,8,8,7 --ref-ranks "$R" --mtp MODEL.mq4 6 OUT-mtp
+```
+
+The reference arm and the PP arm both run `fn_ep_oracle` with `--canonical-state`
+(`--pp N` for the PP arm, `--pp R` for a PP-R reference) over the committed
+prompts, and their records are compared byte for byte; each PP arm's `meta.json`
+must record the requested `pp` and placement. The speed cells run `hipfire bench
+--spec off` with `HIPFIRE_TOPOLOGY_PP=N` and check that the effective degree is
+`N` (decode tok/s and prefill tok/s at the gate's cell sizes, fresh processes per
+repetition). The receipt has the EP gate's structure plus `pp`, the bands, the
+transport, each rank's PCI id, arch and PCIe link speed and width
+(`/sys/bus/pci/devices/*/current_link_{speed,width}`) and the host RAM.
+
+### Dense Qwen3.5/3.6 TP: native MTP
 
 Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit
 `speculation = "mtp"` (`speculation.mtp = on`, `--spec mtp`) takes the spec route.
@@ -801,16 +974,22 @@ token. The first decode token after load runs direct and the second captures
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
 - No automatic VRAM-weighted split.
-- PP decode is sequential across bands (no async multi-band pipeline / per-band
-  graph capture as a documented product path).
-- Experimental `HIPFIRE_PP_*` flags are **not** admissions and are not
-  route-certified performance features.
+- Generic PP decode is sequential across bands (no async multi-band pipeline /
+  per-band graph capture as a documented product path); Flash-Next PP pipelines
+  prefill chunks across its bands.
+- `HIPFIRE_PP_PFLASH` / `HIPFIRE_PP_DFLASH` are experimental flags of the generic
+  Qwen3.5 / 3.6 route. They are **not** admissions, are not route-certified
+  performance features, and do not change what Flash-Next PP refuses.
 
 ## Memory budget
 
 Weights, KV, and scratch land on the devices that own each band. Last device
 also carries `output_norm + lm_head`. Per-card headroom depends on quant, KV
 mode, `max_seq`, and split.
+
+Flash-Next PP uses a per-band budget instead (all-resident bands, each card
+checked against its own free VRAM before allocation); see
+[Per-band memory budget](#per-band-memory-budget).
 
 **Reproduce on your hardware** (2+ visible GPUs, deltanet feature):
 
@@ -976,6 +1155,12 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 > above supersede any stronger claim language inside the retained body
 > (including “measured”, “Status: v1 feature-complete”, absolute speedup
 > wording, and gate-as-acceptance framing).
+>
+> The same applies to the host-staging fallback wording under “Verifying peer
+> access” and to the v1 limitation lists: the generic Qwen3.5 / 3.6 PP route is a
+> peer-memcpy route that needs peer access, and only Flash-Next PP has an
+> admitted host-staged edge service (see
+> [Flash-Next pipeline parallelism](#flash-next-pipeline-parallelism-host-staged)).
 >
 > **What the appendix tables are.** The July 2026 tables below (PP=2 VRAM
 > probe and PP=2 throughput baseline) were taken on 2× Radeon RX 7900 XTX
