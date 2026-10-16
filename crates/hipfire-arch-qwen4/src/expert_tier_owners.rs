@@ -258,6 +258,9 @@ pub struct ExpertTierBinding {
     /// staging; `None` when no host payload exists.
     host_cpu_range: Option<(usize, usize)>,
     generation: u64,
+    /// Raw SHA-256 (hex) of the hot-set sidecar, identity metadata bound once
+    /// by the loader after materialization.
+    hotset_sidecar_sha256: std::sync::OnceLock<String>,
     logical_digest: [u8; 32],
 }
 
@@ -309,6 +312,39 @@ impl ExpertTierLease {
 
     pub fn logical_digest(&self) -> [u8; 32] {
         self.binding.logical_digest
+    }
+
+    /// Record the raw SHA-256 (lowercase hex) of the hot-set sidecar this plan
+    /// was built from. The loader calls it once after `materialize`; it is
+    /// identity metadata only (never authorization) and never alters the
+    /// plan. Recording the same value again is accepted; a different value or a
+    /// malformed digest is refused.
+    pub fn bind_hotset_sidecar_sha256(&self, sha256_hex: &str) -> Result<(), String> {
+        if sha256_hex.len() != 64
+            || !sha256_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "hot-set sidecar digest must be 64 lowercase hex digits, got {sha256_hex:?}"
+            ));
+        }
+        let bound = self
+            .binding
+            .hotset_sidecar_sha256
+            .get_or_init(|| sha256_hex.to_string());
+        if bound == sha256_hex {
+            Ok(())
+        } else {
+            Err(format!(
+                "hot-set sidecar digest already bound to {bound}, refusing {sha256_hex}"
+            ))
+        }
+    }
+
+    /// The sidecar SHA-256 bound by [`Self::bind_hotset_sidecar_sha256`], if any.
+    pub fn hotset_sidecar_sha256(&self) -> Option<&str> {
+        self.binding.hotset_sidecar_sha256.get().map(String::as_str)
     }
 }
 
@@ -728,6 +764,7 @@ pub fn materialize<'src>(
         }
     }
     let binding = Arc::new(ExpertTierBinding {
+        hotset_sidecar_sha256: std::sync::OnceLock::new(),
         owner_ranges,
         host_cpu_range: owners
             .host
