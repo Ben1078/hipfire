@@ -1173,10 +1173,12 @@ fn expected_emitted_by_depth(agreement: &Agreement) -> [f32; MTP_WINDOW_COST.len
 ///
 /// The price of AR is `ar_us`, measured on this request, on this GPU, by one
 /// calibration token (the ordinary target-only forward, including a sampled
-/// draw).  Speculation is priced from this request's own windows by their
-/// realized decayed wall time per emitted token: a batched window under the
-/// depth (cap) it was routed at, the margin prune's shorter windows
-/// included, and the interleaved route.  The Halo cost table only orders
+/// draw; never the drafter's first, which pays one-time costs:
+/// [`Qwen4MtpDrafter::floor_observe_ar`]).  Speculation is priced from this
+/// request's own windows by their realized decayed wall time per emitted
+/// token: a batched window under the depth (cap) it was routed at, the
+/// margin prune's shorter windows included, and the interleaved route.  The
+/// Halo cost table only orders
 /// the options while fewer than [`MTP_FLOOR_PROBE_WINDOWS`] windows have
 /// been observed.  After that budget the AR verdict reads only measured
 /// options: the request retires, stickily, to head-free AR as soon as no
@@ -1507,9 +1509,10 @@ impl MtpFloor {
     }
 
     /// One finished ordinary AR token with wall time `us`.  The request's
-    /// first prices AR (an invalid timing prices it 0, which retires at the
-    /// probe budget); the tokens a would-be retirement asked for
-    /// ([`Self::retire_or_probe`]) re-price it by their mean and re-decide.
+    /// first observed one prices AR (an invalid timing prices it 0, which
+    /// retires at the probe budget); the tokens a would-be retirement asked
+    /// for ([`Self::retire_or_probe`]) re-price it by their mean and
+    /// re-decide.
     pub(crate) fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
         if !self.calibrated {
             self.calibrated = true;
@@ -3319,6 +3322,10 @@ pub struct Qwen4MtpDrafter {
     /// [`Self::floor_observe_native`]). Lives as long as the drafter, across
     /// requests.
     warm_depths: u16,
+    /// This drafter already timed a calibration-path AR token, so the
+    /// decode route's one-time work is done (see [`Self::floor_observe_ar`]).
+    /// Lives as long as the drafter, across requests.
+    warm_ar: bool,
     /// The last native window, priced for the floor only when the next
     /// window is planned (see [`Self::finish_floor_window`]).
     floor_pending: Option<FloorPending>,
@@ -3397,6 +3404,7 @@ impl Qwen4MtpDrafter {
             replay: Vec::new(),
             retained: None,
             warm_depths: 0,
+            warm_ar: false,
             floor_pending: None,
         }
     }
@@ -4079,22 +4087,7 @@ impl Qwen4MtpDrafter {
             gpu.hip
                 .device_synchronize()
                 .map_err(|error| format!("Qwen4 MTP AR calibration tail sync: {error}"))?;
-            // Only rank 0's clocks price the floor; a replica rank's floor is
-            // never consulted.
-            if !self.follower {
-                let event = if self.floor.calibrated {
-                    "ar_probe"
-                } else {
-                    "calibration"
-                };
-                self.floor.observe_calibration(us, &self.agreement);
-                if floor_trace_enabled() {
-                    eprintln!(
-                        "{}",
-                        self.floor.trace_line(&self.agreement, event, us, 1, 0)
-                    );
-                }
-            }
+            self.floor_observe_ar(us);
             self.stats.mtp_windows += 1;
             self.stats.floor_ar_windows += 1;
             self.stats.mtp_retired = self.floor.retired;
@@ -4354,6 +4347,42 @@ impl Qwen4MtpDrafter {
         Ok(())
     }
 
+    /// Observe one timed calibration-path AR token (the request's
+    /// calibration token or a retire probe; `us` from its forward to its
+    /// draw) for the floor; a replica rank's floor is never consulted.  The
+    /// drafter's first such token is not observed: it pays the decode
+    /// route's one-time kernel binds (on Halo the process's first decode
+    /// token cost 55.6 ms and the next request's 30.0 ms, about 140 ms in the
+    /// ags run whose depth collapsed, and 9.35 s once), and as the AR price
+    /// it would let every losing request keep drafting (nothing measured
+    /// costs as much per token) and price each extra draft at several real
+    /// rows ([`MTP_ROW_COST_PRIOR`] AR steps).  The floor still needs the
+    /// sample, so the next window is a calibration token again: one extra AR
+    /// token per drafter, the same rule as its first window at each depth
+    /// ([`Self::finish_floor_window`]).
+    fn floor_observe_ar(&mut self, us: f32) {
+        let first_use = !std::mem::replace(&mut self.warm_ar, true);
+        if self.follower {
+            return;
+        }
+        let event = if first_use {
+            "calibration_first_use"
+        } else if self.floor.calibrated {
+            "ar_probe"
+        } else {
+            "calibration"
+        };
+        if !first_use {
+            self.floor.observe_calibration(us, &self.agreement);
+        }
+        if floor_trace_enabled() {
+            eprintln!(
+                "{}",
+                self.floor.trace_line(&self.agreement, event, us, 1, 0)
+            );
+        }
+    }
+
     /// Count one finished native window that started at `start` and set its
     /// floor observation aside, unless `bypass` (a developer-forced route,
     /// `HIPFIRE_MTP_INCREMENTAL=0|1`, or `HIPFIRE_MTP_AR_FLOOR=0`) skips the
@@ -4464,12 +4493,13 @@ impl Qwen4MtpDrafter {
     }
 
     /// Whether the next window must be a timed AR token: the request's first
-    /// (the calibration token), or one of the AR probes a would-be retirement
-    /// takes ([`MtpFloor::with_retire_evidence`]).  False for a
+    /// (the calibration token; the first two on a drafter's first request,
+    /// [`Self::floor_observe_ar`]), or one of the AR probes a would-be
+    /// retirement takes ([`MtpFloor::with_retire_evidence`]).  False for a
     /// developer-forced route (`HIPFIRE_MTP_INCREMENTAL` `0|1`) and with the
     /// floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`), which bypass the floor.  A
     /// caller that composes an external drafter must not take over while this
-    /// is true: the calibration window must be the request's first and the
+    /// is true: the calibration windows must be the request's first and the
     /// probes consecutive.
     pub(crate) fn floor_needs_calibration(&self) -> bool {
         self.floor_enabled && self.floor.needs_ar_sample() && !Self::floor_forced()
@@ -11039,6 +11069,209 @@ mod tests {
             // An EP peer's replica runs the same lane.
             let replica = Qwen4MtpDrafter::new_replica(drafter.replica_params());
             assert_eq!(replica.copy_lane, copy);
+        }
+    }
+
+    /// What [`halo_floor_request`] measured from window `late` on.
+    #[derive(Debug)]
+    struct HaloFloorRun {
+        one_draft: usize,
+        native: usize,
+        tokens: f64,
+        us: f64,
+        /// The floor retired the request by its last window.
+        retired: bool,
+    }
+
+    /// One request through the drafter as `mtp_step` drives it (plan, route,
+    /// observe) with budget `k`, Halo's floor decay and n-gram disarmed: the
+    /// drafter's first AR token priced at `first_ar_us` and every later one
+    /// at [`HALO_AR_US`], each through [`Qwen4MtpDrafter::floor_observe_ar`];
+    /// `warm`, a drafter that already ran its first AR token, so this
+    /// request's calibration token is priced at `first_ar_us` (what beta did
+    /// with the process's first decode token).  A batched window costs
+    /// [`HALO_WINDOW_US`] of its drafts, accepting each draft while a draw
+    /// stays below `acceptance(window)`; the interleaved route one AR step
+    /// per emitted token.
+    fn halo_floor_request(
+        k: usize,
+        first_ar_us: f32,
+        warm: bool,
+        seed: u32,
+        windows: usize,
+        late: usize,
+        acceptance: impl Fn(usize) -> f32,
+    ) -> HaloFloorRun {
+        let mut drafter = Qwen4MtpDrafter::new(k, 32_768, None);
+        drafter.agreement_decay = MTP_AGREEMENT_DECAY_GFX1151;
+        drafter.warm_ar = warm;
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        drafter.floor_enabled = true;
+        let mut draws = Draws(seed.max(1));
+        let mut emitted = vec![0u32];
+        let mut ar_tokens = 0usize;
+        let mut run = HaloFloorRun {
+            one_draft: 0,
+            native: 0,
+            tokens: 0.0,
+            us: 0.0,
+            retired: false,
+        };
+        for w in 0..windows {
+            let plan = loop {
+                let plan = drafter
+                    .plan_window_with(&emitted, k, None, false)
+                    .expect("plan");
+                if plan.route != WindowRoute::ArCalibrate {
+                    break plan;
+                }
+                let us = if ar_tokens == 0 {
+                    first_ar_us
+                } else {
+                    HALO_AR_US
+                };
+                ar_tokens += 1;
+                drafter.floor_observe_ar(us);
+                emitted.push(0);
+                if w >= late {
+                    run.tokens += 1.0;
+                    run.us += f64::from(us);
+                }
+            };
+            let p = acceptance(w);
+            let (accepted, us) = match plan.route {
+                WindowRoute::Native { depth } => {
+                    let rows = if depth == 0 { plan.k } else { depth };
+                    let accepted = (0..rows).take_while(|_| draws.next() < p).count();
+                    let (drafts, us, route) = if depth == 0 {
+                        let us = HALO_AR_US * (accepted + 1) as f32;
+                        ((accepted + 1).min(plan.k), us, NativeWindow::Interleaved)
+                    } else {
+                        (depth, HALO_WINDOW_US[depth], NativeWindow::Batched)
+                    };
+                    let window = window(accepted, drafts);
+                    drafter.observe_agreement(&window);
+                    drafter.floor_observe_native(false, route, &window, us, plan.k);
+                    if w >= late {
+                        run.native += 1;
+                        run.one_draft += usize::from(depth == 1);
+                    }
+                    (accepted, us)
+                }
+                _ => (0, HALO_AR_US),
+            };
+            emitted.resize(emitted.len() + accepted + 1, 0);
+            if w >= late {
+                run.tokens += (accepted + 1) as f64;
+                run.us += f64::from(us);
+            }
+        }
+        run.retired = drafter.floor.retired;
+        run
+    }
+
+    /// The floor never prices AR from the drafter's first AR token (the
+    /// process's first decode token pays the decode route's one-time kernel
+    /// binds: Halo 55.6 ms against 30.0 ms, 9.35 s once): that token leaves
+    /// the floor uncalibrated and the next window calibrates again on the
+    /// real price.  The drafter's next request calibrates on its first token.
+    #[test]
+    fn floor_never_prices_ar_from_the_drafters_first_ar_token() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        let requests: [&[f32]; 2] = [&[9_353_409.0, HALO_AR_US], &[31_000.0]];
+        for (request, ar_tokens) in requests.into_iter().enumerate() {
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            drafter.floor_enabled = true;
+            for &us in ar_tokens {
+                let plan = drafter
+                    .plan_window_with(&[0], 3, None, false)
+                    .expect("plan");
+                assert_eq!(plan.route, WindowRoute::ArCalibrate, "request {request}");
+                drafter.floor_observe_ar(us);
+            }
+            assert!(drafter.floor.calibrated, "request {request}");
+            assert_eq!(drafter.floor.ar_us, ar_tokens[ar_tokens.len() - 1]);
+            let plan = drafter
+                .plan_window_with(&[0], 3, None, false)
+                .expect("plan");
+            assert!(
+                matches!(plan.route, WindowRoute::Native { .. }),
+                "request {request}: {:?}",
+                plan.route
+            );
+        }
+    }
+
+    /// Speculation that genuinely loses still retires to AR after an
+    /// inflated first decode token (4.7 AR tokens, the Halo ags run's
+    /// ~140 ms against ~30 ms): at 0.2 acceptance every Halo option costs
+    /// more per token than AR (one draft: 38.5 ms for 1.2 tokens against
+    /// 28.45 ms).  Priced from that token (beta: the same token as a warm
+    /// drafter's calibration), every option looks cheaper than AR and the
+    /// request drafts to its end.  At 0.72 acceptance it keeps drafting.
+    #[test]
+    fn losing_speculation_retires_after_an_inflated_first_ar_token() {
+        let first = 4.7 * HALO_AR_US;
+        for k in [7usize, 3] {
+            for seed in 1..=8u32 {
+                let seed = seed * 7919;
+                let fixed = halo_floor_request(k, first, false, seed, 200, 100, |_| 0.2);
+                assert!(
+                    fixed.retired && fixed.native == 0,
+                    "k={k} seed={seed}: {fixed:?}"
+                );
+                let beta = halo_floor_request(k, first, true, seed, 200, 100, |_| 0.2);
+                assert!(
+                    !beta.retired && beta.native == 100,
+                    "k={k} seed={seed}: {beta:?}"
+                );
+                let good = halo_floor_request(k, first, false, seed, 200, 100, |_| 0.72);
+                assert!(
+                    !good.retired && good.native == 100,
+                    "k={k} seed={seed}: {good:?}"
+                );
+            }
+        }
+    }
+
+    /// The Halo ags depth collapse and its root fix.  Priced from an
+    /// inflated first decode token (4.7 AR tokens), the cost fit's prior row
+    /// ([`MTP_ROW_COST_PRIOR`] AR steps) is several real rows: native
+    /// acceptance dips to 0.45 for 200 windows (the copy lane takes the
+    /// confident spans and leaves the native windows the rest) and
+    /// recovers to 0.72, and the floor keeps one draft after the recovery
+    /// (Halo ags: 625 native windows at one draft, 72% accepted).  Priced
+    /// from the drafter's second AR token it climbs back.  Budgets 7
+    /// (gfx1151's `auto`) and 3 (gfx1201's).
+    #[test]
+    fn inflated_first_ar_token_no_longer_locks_one_draft() {
+        let run = |k: usize, warm: bool| {
+            let (mut one_draft, mut native, mut tokens, mut us) = (0, 0, 0.0, 0.0);
+            for seed in 1..=16u32 {
+                let r = halo_floor_request(k, 4.7 * HALO_AR_US, warm, seed * 7919, 600, 450, |w| {
+                    if (100..300).contains(&w) {
+                        0.45
+                    } else {
+                        0.72
+                    }
+                });
+                one_draft += r.one_draft;
+                native += r.native;
+                tokens += r.tokens;
+                us += r.us;
+            }
+            (one_draft as f64 / native.max(1) as f64, tokens / us * 1e6)
+        };
+        for k in [7usize, 3] {
+            let (beta_share, beta_rate) = run(k, true);
+            let (fixed_share, fixed_rate) = run(k, false);
+            eprintln!("k={k} first AR token 4.7x: one-draft share / tok/s beta {beta_share:.3} {beta_rate:.2}, fixed {fixed_share:.3} {fixed_rate:.2}");
+            assert!(beta_share >= 0.5, "k={k}: beta locks: {beta_share}");
+            assert!(fixed_share <= 0.05, "k={k}: {fixed_share}");
+            assert!(
+                fixed_rate >= 1.05 * beta_rate,
+                "k={k}: {fixed_rate} vs {beta_rate}"
+            );
         }
     }
 }
