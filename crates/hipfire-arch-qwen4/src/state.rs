@@ -2797,6 +2797,54 @@ impl Qwen4State {
         self.session_layout(&marks)
     }
 
+    /// This state owns the whole trunk (no pipeline band).
+    pub(crate) fn is_whole_model(&self) -> bool {
+        self.map.is_single()
+    }
+
+    /// Strict host-only validation of a Flash-Next handoff target meta,
+    /// before any device or host mutation: shape, band tag, position (the
+    /// manifest's, `1..=max_seq_len`), PLE history ids below `vocab`, and per
+    /// QSA layer the committed-prompt invariants (`full = raw = position`,
+    /// `pooled = floor(position / compress)`, no live partial rows -- the
+    /// partial buffers are uncommitted scratch outside the session layout --
+    /// `selected <= position` and the layer position), each inside capacity.
+    pub(crate) fn validate_handoff_meta(
+        &self,
+        meta: &[u8],
+        position: usize,
+        vocab: usize,
+    ) -> Result<(), StateError> {
+        if !self.map.is_single() {
+            return Err(StateError::Config(
+                "handoff needs the whole-model state map".to_string(),
+            ));
+        }
+        let (pos, ple, marks) = self.parse_session_meta(meta)?;
+        if pos == 0 || pos != position || pos > self.max_seq_len || self.qsa_compress == 0 {
+            return Err(StateError::SnapshotLength);
+        }
+        if self.ple_conv.is_some() && ple.previous().iter().any(|&id| id as usize >= vocab) {
+            return Err(StateError::SnapshotShape);
+        }
+        if marks.len() != self.qsa.len() {
+            return Err(StateError::SnapshotShape);
+        }
+        for (mark, layer) in marks.iter().zip(&self.qsa) {
+            validate_qsa_mark(mark, &layer.mark_capacity())?;
+            if mark.partial_len != 0
+                || mark.full_len != pos
+                || mark.raw_len != pos
+                || mark.pooled_len != pos / self.qsa_compress
+                || mark.selected_len > pos
+                || mark.position != pos
+            {
+                return Err(StateError::SnapshotLength);
+            }
+        }
+        Ok(())
+    }
+
     /// Ready the live state for a session snapshot: map the context arenas
     /// to cover every row the snapshot holds and retire every speculative
     /// ticket (like a reset). Live buffers stay in place: the caller copies

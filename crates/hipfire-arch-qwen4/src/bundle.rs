@@ -176,7 +176,7 @@ pub struct Qwen4Bundle {
     /// conversation's committed live state (`attach_session_cache`); `None` =
     /// off. Message-end snapshots of a live continuation live in their own
     /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
-    session: Option<SessionDriver>,
+    pub(crate) session: Option<SessionDriver>,
     pub(crate) pair_session_stage: Option<PairSessionStage>,
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
@@ -199,6 +199,14 @@ pub struct Qwen4Bundle {
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
     pub(crate) npu_model_index: Option<Result<String, String>>,
+    /// Immutable Flash-Next handoff role and domain bound by the loader
+    /// (`bind_disagg`); `None` = no handoff (the default).
+    pub(crate) handoff_binding: Option<crate::disagg::HandoffBinding>,
+    /// `disagg-v1-<hex>` id of the handoff domain whose imported state this
+    /// bundle's live state descends from (consumer only, set by
+    /// `import_handoff`); `None` after any cold reset. The session-cache scope
+    /// carries it so ordinary snapshots never alias across the domain.
+    pub(crate) disagg_domain: Option<String>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -309,8 +317,10 @@ impl SessionState for Qwen4Bundle {
         let host = self.execution.as_ref()
             .map(Qwen4GpuForward::host_exec_identity).unwrap_or_default();
         let host = if host.is_empty() { String::new() } else { format!("/{host}") };
+        let disagg = self.disagg_domain.as_deref()
+            .map(|domain| format!("/{domain}")).unwrap_or_default();
         Some(format!(
-            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}{igpu}{host}",
+            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}{igpu}{host}{disagg}",
             self.state_format
         ))
     }
@@ -460,6 +470,7 @@ impl SessionState for Qwen4Bundle {
     }
 
     fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.disagg_domain = None;
         self.begin_npu_trunk_request(gpu)
             .map_err(|e| e.to_string())?;
         if let Some(stage) = &mut self.pair_session_stage {
@@ -688,6 +699,8 @@ impl Qwen4Bundle {
             ep: None,
             trunk_overlay: None,
             npu_model_index: None,
+            handoff_binding: None,
+            disagg_domain: None,
         })
     }
 
@@ -1231,6 +1244,14 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
+    }
+
+    /// Frozen identity of the host (CPU) arithmetic the attached forward
+    /// armed (empty when none, or when no forward is attached).
+    pub fn host_exec_identity(&self) -> String {
+        self.execution
+            .as_ref()
+            .map_or_else(String::new, Qwen4GpuForward::host_exec_identity)
     }
 
     pub(crate) fn npu_trunk_pipelined(&self) -> bool {
@@ -2628,7 +2649,7 @@ impl Qwen4Bundle {
         }
     }
 
-    fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
+    pub(crate) fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
         let Some(ple) = &self.ple else {
             return Ok(());
         };
@@ -2642,7 +2663,7 @@ impl Qwen4Bundle {
     /// Snapshot and commit preserve that epoch; reset and restore call
     /// `invalidate_ple_epoch` instead so work from the discarded state cannot
     /// publish after the state transition.
-    fn quiesce_ple(&self) -> Result<(), BundleError> {
+    pub(crate) fn quiesce_ple(&self) -> Result<(), BundleError> {
         let Some(ple) = &self.ple else {
             return Ok(());
         };
@@ -2665,6 +2686,8 @@ impl Qwen4Bundle {
         if let Some(stage) = &mut self.pair_session_stage {
             stage.position = None;
         }
+        // A cold prefill leaves any imported handoff domain.
+        self.disagg_domain = None;
         // `None` while the cache itself resets (it drives `self` then).
         if let Some(session) = self.session.as_mut() {
             session.forget_live();

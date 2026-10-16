@@ -2314,6 +2314,45 @@ impl Qwen4MtpGpu {
         Ok(())
     }
 
+    /// Strict host-only validation of a Flash-Next handoff MTP meta against
+    /// the target `position`, before any mutation, and the destination layout
+    /// of its bytes (no capacity mapping happens here). Checks the shape and
+    /// reserved word, the head mark (`position`, `full = raw = position`,
+    /// `pooled = floor(position / compress)`, `selected <= position`, inside
+    /// capacity) and the draft policy words (`full_steps` within the head's
+    /// `full_hold`, an `f32` margin that is not NaN).
+    pub(crate) fn handoff_layout_for_meta(
+        &self,
+        meta: &[u8],
+        position: usize,
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        if words[0] != 0 {
+            return Err(invalid("MTP handoff reserved word is not zero"));
+        }
+        let mark = self.state.parse_session_mark(&words[..MTP_SESSION_WORDS])?;
+        if position == 0
+            || mark.position != position
+            || mark.full_len != position
+            || mark.raw_len != position
+            || mark.pooled_len != position / self.state.compress
+            || mark.selected_len > position
+        {
+            return Err(invalid("MTP handoff mark does not match the target position"));
+        }
+        let policy = &words[MTP_SESSION_WORDS..];
+        u32::try_from(policy[0])
+            .ok()
+            .filter(|&steps| steps <= self.draft.full_hold())
+            .ok_or_else(|| invalid("MTP handoff draft policy full_steps is out of range"))?;
+        let margin_bits = u32::try_from(policy[1])
+            .map_err(|_| invalid("MTP handoff draft policy margin is not an f32"))?;
+        if f32::from_bits(margin_bits).is_nan() {
+            return Err(invalid("MTP handoff draft policy margin is NaN"));
+        }
+        Ok(self.state.session_layout(&mark))
+    }
+
     /// See [`MtpGpuState::context_growth_bytes`].
     pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
         self.state.context_growth_bytes(through)

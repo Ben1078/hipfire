@@ -6501,6 +6501,13 @@ impl Qwen4MtpDrafter {
             .map_err(|error| format!("Qwen4 MTP lab pending hidden download: {error}"))?;
         Ok(bytes)
     }
+
+    /// Lab correctness policy: pin the AR floor on or off after
+    /// `configure_request` (which re-reads `HIPFIRE_MTP_AR_FLOOR`), so the
+    /// timed floor cannot retire a request to AR and change the window route.
+    pub fn lab_set_floor_enabled(&mut self, enabled: bool) {
+        self.floor_enabled = enabled;
+    }
 }
 
 impl Qwen4MtpDrafter {

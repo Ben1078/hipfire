@@ -87,6 +87,10 @@ name = "qwen4_igpu_engine_parity"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_disagg_handoff"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_cpu_split_parity"
 required-features = ["lab"]
 

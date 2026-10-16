@@ -241,6 +241,12 @@ impl DraftHead {
         }
     }
 
+    /// Drafts that rank the whole vocabulary after an input id in
+    /// `[front, special)`: the upper bound of a valid request `full_steps`.
+    pub fn full_hold(&self) -> u32 {
+        self.full_hold
+    }
+
     pub fn set_request_state(&mut self, state: DraftHeadRequestState) {
         self.full_steps = state.full_steps;
         self.margin = state.margin;

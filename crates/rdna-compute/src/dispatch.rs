@@ -1331,6 +1331,12 @@ pub struct Gpu {
     /// Live keepalive leases per host-mapped owner (see `crate::host_lease`):
     /// the allocation is not freed while a strong clone exists.
     host_leases: HashMap<usize, std::sync::Weak<crate::host_lease::HostLeaseToken>>,
+    /// Borrowed second-device aliases of ANOTHER `Gpu`'s portable host-mapped
+    /// owners (`Gpu::adopt_host_mapped_view`), keyed by the alias base THIS
+    /// device was handed. One retained [`crate::HostMappedView`] clone per
+    /// adopted tensor keeps the owner from being freed; none of these is ever
+    /// passed to `hipHostFree`/`hipFree`. Never mixed into `host_mapped`.
+    host_adopted: HashMap<usize, Vec<crate::HostMappedView>>,
     /// The single pooled portable backing (`reserve_portable_host_pool`); the
     /// matching host-mapped uploads are aligned subviews of it.
     host_pool: Option<crate::host_lease::HostPool>,
@@ -2226,6 +2232,7 @@ impl Gpu {
             host_mapped_portable: false,
             host_portable: std::collections::HashSet::new(),
             host_leases: HashMap::new(),
+            host_adopted: HashMap::new(),
             host_pool: None,
             host_pooled: HashMap::new(),
             host_pool_sizes: HashMap::new(),
@@ -3343,7 +3350,18 @@ impl Gpu {
         if !tensor.buf.is_host_mapped() {
             return None;
         }
-        let host_ptr = *self.host_mapped.get(&(tensor.buf.as_ptr() as usize))?;
+        let key = tensor.buf.as_ptr() as usize;
+        if let Some(view) = self.adopted_view(key, tensor.buf.size()) {
+            // Safety: the retained lease keeps the owner's `hipHostMalloc`
+            // allocation alive and the view was bounds-checked against it at
+            // adoption (`HostMappedView::checked_adopt_len`); the bytes are an
+            // immutable shared weight backing.
+            let host_addr = view.host_addr()?;
+            return Some(unsafe {
+                std::slice::from_raw_parts(host_addr as *const u8, tensor.buf.size())
+            });
+        }
+        let host_ptr = *self.host_mapped.get(&key)?;
         // Safety: registered by `alloc_host_mapped_tensor` as a live
         // `hipHostMalloc` of `tensor.buf.size() + HOST_TAIL_PAD_BYTES` bytes,
         // freed exactly once on unload.
@@ -5658,6 +5676,23 @@ impl Gpu {
         // The runtime handles whose `Drop` would release live state.
         std::mem::forget(self.rocblas.take());
         std::mem::forget(std::mem::replace(&mut self.pool, crate::pool::GpuPool::new()));
+        // Borrowed aliases of other Gpus' owners: leak one extra lease clone per
+        // adopted tensor so the owner stays pinned forever even though the
+        // registry itself still drops with this `Gpu`.
+        for views in self.host_adopted.values() {
+            for view in views {
+                std::mem::forget(view.clone());
+            }
+        }
+    }
+
+    /// The retained owner view behind an adopted alias tensor (base `key`,
+    /// logical `len`).
+    fn adopted_view(&self, key: usize, len: usize) -> Option<&crate::HostMappedView> {
+        self.host_adopted
+            .get(&key)?
+            .iter()
+            .find(|view| view.len() == len)
     }
 
     /// The quarantine reason, if [`Self::quarantine`] ran.
@@ -5802,6 +5837,13 @@ impl Gpu {
     /// (`free_tensor`, unload) is refused.
     pub fn host_mapped_view(&mut self, tensor: &GpuTensor) -> HipResult<crate::HostMappedView> {
         let key = tensor.buf.as_ptr() as usize;
+        if tensor.buf.is_host_mapped() {
+            // An adopted alias hands back the SAME underlying owner view (clone of
+            // the retained one), so a CPU splice and the owner agree on the bytes.
+            if let Some(view) = self.adopted_view(key, tensor.buf.size()) {
+                return Ok(view.clone());
+            }
+        }
         if !tensor.buf.is_host_mapped() {
             return Err(HipError::new(0, "host_mapped_view: tensor is not host-mapped"));
         }
@@ -5835,6 +5877,8 @@ impl Gpu {
                     key: owner_key,
                     host_ptr: owner_host,
                     bytes: owner_len,
+                    // Reaching here proved the owner was allocated MAPPED|PORTABLE.
+                    portable: true,
                 });
                 self.host_leases.insert(owner_key, std::sync::Arc::downgrade(&token));
                 token
@@ -5892,6 +5936,96 @@ impl Gpu {
     pub fn host_mapped_count(&self) -> usize {
         // bind_thread: skip — pure length read, touches no device state.
         self.host_mapped.len()
+    }
+
+    /// Borrowed second-device alias tensors currently adopted on this `Gpu`
+    /// (`Gpu::adopt_host_mapped_view`) and not yet released. Zero after a clean
+    /// unload; nonzero means owners elsewhere are still pinned by this device.
+    pub fn host_adopted_count(&self) -> usize {
+        // bind_thread: skip — pure length read, touches no device state.
+        self.host_adopted.values().map(Vec::len).sum()
+    }
+
+    /// Adopt another `Gpu`'s immutable portable host-mapped weight `view` as a
+    /// non-owning tensor of THIS device: the device-specific alias of the owner
+    /// base is fetched with `hipHostGetDevicePointer(owner_host_base, 0)` while
+    /// this device is current and the view's byte offset is added, so no
+    /// interior pointer is passed to HIP. Fails closed on a non-portable owner,
+    /// an empty/out-of-bounds/overflowing extent, a shape that does not cover a
+    /// float view, a null/failed alias, or an owner that belongs to this `Gpu`.
+    ///
+    /// The returned tensor is host-mapped (`host_located`, `host_bytes` reads the
+    /// owner's bytes for CPU splice, `host_mapped_view` returns the same owner
+    /// view) but owns no allocation: this `Gpu` retains one clone of `view` per
+    /// adopted tensor, so the owner cannot be freed while it lives.
+    /// [`Self::free_tensor`] and unload bind this device, drain it
+    /// (`hipDeviceSynchronize`) and only then drop the clone, never calling
+    /// `hipHostFree`/`hipFree`. If the drain fails the `Gpu` is quarantined and
+    /// the clone is retained (leaked) instead of released under an in-flight read.
+    pub fn adopt_host_mapped_view(
+        &mut self,
+        view: &crate::HostMappedView,
+        shape: &[usize],
+        dtype: DType,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let fail = |reason: String| HipError::new(0, &format!("adopt_host_mapped_view: {reason}"));
+        let len = view.checked_adopt_len(shape, dtype).map_err(fail)?;
+        let base = view.owner_host_base();
+        let dev_base = match self.hip.host_get_device_pointer(base as *mut std::ffi::c_void, 0) {
+            Ok(ptr) if !ptr.is_null() => ptr as usize,
+            other => {
+                return Err(fail(format!(
+                    "hipHostGetDevicePointer of owner base {base:p} failed on device {} \
+                     ({other:?}); no host-pointer fallback",
+                    self.device_id
+                )));
+            }
+        };
+        let alias = dev_base
+            .checked_add(view.offset())
+            .filter(|alias| alias.checked_add(len).is_some())
+            .ok_or_else(|| fail("device alias plus extent overflows".to_string()))?;
+        if self.host_mapped.contains_key(&alias)
+            || self
+                .host_pool
+                .as_ref()
+                .is_some_and(|pool| pool.host_ptr == base as usize)
+        {
+            return Err(fail(format!(
+                "owner at {base:p} belongs to this Gpu; a borrowed alias would shadow it"
+            )));
+        }
+        self.host_adopted.entry(alias).or_default().push(view.clone());
+        Ok(GpuTensor {
+            // Safety: non-owning view of the owner's pinned bytes; the retained
+            // view clone keeps them allocated until `free_tensor`/unload.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(alias as *mut _, len) },
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// Prove this device drained before a borrowed alias drops its lease: bind it
+    /// and `hipDeviceSynchronize`. A failure quarantines the `Gpu`, which retains
+    /// (forgets) every adopted lease rather than releasing it under an in-flight
+    /// read.
+    fn drain_before_alias_release(&mut self, what: &str) -> HipResult<()> {
+        let drained = self
+            .bind_thread()
+            .and_then(|()| self.hip.device_synchronize());
+        if let Err(error) = drained {
+            self.quarantine(&format!(
+                "{what}: device drain failed before releasing borrowed host-mapped aliases ({error})"
+            ));
+            return Err(HipError::new(
+                error.code,
+                &format!(
+                    "{what}: device drain failed ({error}); borrowed host-mapped leases retained"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Allocate this GPU's bounded-wait error block (`crate::device_wait`)
@@ -6050,6 +6184,12 @@ impl Gpu {
         let mut first_error = None;
         if let Some(error) = self.quarantine_refusal("host-mapped release") {
             return Err(error);
+        }
+        // Borrowed aliases of other Gpus' owners release only after a proven
+        // drain, and never through hipHostFree.
+        if !self.host_adopted.is_empty() {
+            self.drain_before_alias_release("host-mapped release")?;
+            self.host_adopted.clear();
         }
         // Remove only on success, mirroring `release_registered_vmm`: draining
         // unconditionally would drop the sole record of a pointer whose
@@ -7059,6 +7199,15 @@ impl Gpu {
         // pinned system RAM, which is exactly what this guard exists to prevent
         // for VMM owners.
         let live_host = self.host_mapped.len();
+        let live_adopted = self.host_adopted_count();
+        if live_adopted != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "refusing cleanup while {live_adopted} borrowed host-mapped alias(es) remain; unload the active model first"
+                ),
+            ));
+        }
         if live_host != 0 {
             return Err(HipError::new(
                 0,
@@ -7459,6 +7608,31 @@ impl Gpu {
         }
         let key = tensor.buf.as_ptr() as usize;
         if tensor.buf.is_host_mapped() {
+            if self.host_adopted.contains_key(&key) {
+                // Borrowed alias: no allocation to free. Drain, then drop this
+                // tensor's retained owner lease (never hipHostFree/hipFree).
+                let len = tensor.buf.size();
+                let Some(position) = self
+                    .host_adopted
+                    .get(&key)
+                    .and_then(|views| views.iter().position(|view| view.len() == len))
+                else {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "borrowed host-mapped alias at 0x{key:x} has no retained lease of {len} bytes"
+                        ),
+                    ));
+                };
+                self.drain_before_alias_release("free_tensor")?;
+                if let Some(views) = self.host_adopted.get_mut(&key) {
+                    drop(views.remove(position));
+                    if views.is_empty() {
+                        self.host_adopted.remove(&key);
+                    }
+                }
+                return Ok(());
+            }
             // Host-mapped owners are never pooled: hipHostFree takes the host
             // pointer, and an offloaded weight is static (freed at unload), so
             // there is nothing to gain from reusing the mapping.
@@ -8812,6 +8986,7 @@ impl Drop for Gpu {
         if std::thread::panicking()
             && self.vmm_allocation_count() == 0
             && self.host_mapped.is_empty()
+            && self.host_adopted.is_empty()
         {
             return;
         }

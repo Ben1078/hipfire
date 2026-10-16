@@ -1613,6 +1613,111 @@ pub fn fulfill_manifest_from_payloads_ep<'a, F>(
 where
     F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
 {
+    fulfill_payloads_core(weights, mesh, n_layers, gpu, expected, ep, source, None)
+}
+
+/// [`fulfill_manifest_from_payloads`] with a resident-injection seam: for each
+/// entry that is not a local tie alias, `resident` runs BEFORE the payload
+/// `source`. `Ok(None)` falls through to the standard payload path (so a
+/// `resident` that always returns `None` is exactly
+/// [`fulfill_manifest_from_payloads`]). `Ok(Some(tensor))` transfers ownership
+/// of an already-resident tensor (e.g. a borrowed portable alias from
+/// `Gpu::adopt_host_mapped_view`, or a device copy) to the transaction. It is
+/// validated against the entry — logical shape, dtype constraint, exact payload
+/// extent, not an external-rows entry, residency (`HostMapped` entries need a
+/// host-mapped tensor this `Gpu` can read, `Resident` entries a device-located
+/// owning-class tensor) — stored with the standard projection, and released
+/// through `Gpu::free_tensor` on any rejection or later rollback. A rejected
+/// tensor is freed before the error returns. `resident` is handed the entry the
+/// payload `source` would see (a nonlocal tie reads its source identity), and
+/// owns artifact matching.
+pub fn fulfill_manifest_from_payloads_with_residents<'a, F, R>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    source: F,
+    mut resident: R,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+    R: FnMut(&mut Gpu, &WeightEntry) -> Result<Option<GpuTensor>, String>,
+{
+    fulfill_payloads_core(
+        weights,
+        mesh,
+        n_layers,
+        gpu,
+        expected,
+        None,
+        source,
+        Some(&mut resident),
+    )
+}
+
+type ResidentFn<'r> = dyn FnMut(&mut Gpu, &WeightEntry) -> Result<Option<GpuTensor>, String> + 'r;
+
+/// Check a callback-supplied resident against its manifest entry.
+fn validate_resident_tensor(
+    gpu: &Gpu,
+    entry: &WeightEntry,
+    tensor: &GpuTensor,
+    ep: Option<EpFulfill>,
+) -> Result<(), String> {
+    if entry.residency.is_external() {
+        return Err("external-rows entries are census-only and take no resident tensor".into());
+    }
+    if ep.is_some() && matches!(entry.policy, ShardPolicy::ExpertSharded { .. }) {
+        return Err("expert-parallel sharded entries upload compactly, not from a resident".into());
+    }
+    if tensor.shape != entry.logical_shape {
+        return Err(format!(
+            "tensor shape {:?} does not match manifest {:?}",
+            tensor.shape, entry.logical_shape
+        ));
+    }
+    if !entry.dtype_constraint.accepts(tensor.dtype) {
+        return Err(format!(
+            "tensor dtype {:?} violates constraint {:?}",
+            tensor.dtype, entry.dtype_constraint
+        ));
+    }
+    validate_payload_extent(&entry.logical_shape, tensor.dtype, tensor.buf.size())?;
+    match entry.residency {
+        WeightResidency::HostMapped => {
+            if !tensor.buf.is_host_mapped() || gpu.host_bytes(tensor).is_none() {
+                return Err(
+                    "host-mapped entry needs a host-mapped tensor with readable host bytes".into(),
+                );
+            }
+        }
+        WeightResidency::Resident => {
+            if tensor.buf.is_host_mapped() || tensor.buf.is_borrowed() {
+                return Err("device-resident entry needs an owning device tensor".into());
+            }
+        }
+        WeightResidency::ExternalRows { .. } => {
+            return Err("external-rows entries take no resident tensor".into());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fulfill_payloads_core<'a, F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    ep: Option<EpFulfill>,
+    source: F,
+    mut resident: Option<&mut ResidentFn<'_>>,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
     if let Some(error) = target_error(mesh) {
         return Err(error);
     }
@@ -1704,6 +1809,70 @@ where
                         store,
                         gpu,
                         fulfill_entry_error(entry, reason.to_string()),
+                    ));
+                }
+                continue;
+            }
+        }
+
+        if let Some(resident) = resident.as_deref_mut() {
+            // The resident source sees exactly the entry the payload source
+            // would (a nonlocal tie reads its source identity).
+            let resident_entry = fulfillment_source(entry);
+            let produced = match resident(gpu, &resident_entry) {
+                Ok(produced) => produced,
+                Err(reason) => {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, format!("resident source failed: {reason}")),
+                    ));
+                }
+            };
+            if let Some(tensor) = produced {
+                let verdict = validate_resident_tensor(gpu, entry, &tensor, ep).and_then(|()| {
+                    if store.contains(&entry.name, entry.layer, 0)
+                        || store.external_descriptor(&entry.name, entry.layer, 0).is_some()
+                    {
+                        Err("placement already fulfilled".to_string())
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(reason) = verdict {
+                    // The callback transferred ownership; release it before the
+                    // rollback so a rejected alias never keeps its lease.
+                    let mut error = fulfill_entry_error(
+                        entry,
+                        format!("resident tensor rejected: {reason}"),
+                    );
+                    if let Err(free) = gpu.free_tensor(tensor) {
+                        error
+                            .reason
+                            .push_str(&format!("; releasing the rejected resident failed: {free}"));
+                    }
+                    return Err(rollback_fulfill_error(store, gpu, error));
+                }
+                let dtype = tensor.dtype;
+                let projection = projection_for(entry, 0, 1, dtype);
+                if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, reason.to_string()),
+                    ));
+                }
+                if let ShardPolicy::Tied { source } = &entry.policy {
+                    store.aliases.insert(
+                        WeightPlacementKey::new(&entry.name, entry.layer, 0),
+                        source.clone(),
+                    );
+                }
+                if test_support::record_resident_upload() {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, "test fault injected after resident upload"),
                     ));
                 }
                 continue;

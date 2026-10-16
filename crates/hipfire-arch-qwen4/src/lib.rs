@@ -17,6 +17,11 @@ pub mod bundle;
 pub mod cache_quality;
 pub mod chunk_dump;
 pub mod config;
+/// Explicit, eager developer/lab sequence handoff; never used by ordinary loading.
+pub mod disagg;
+pub mod disagg_manifest;
+#[cfg(feature = "lab")]
+pub mod disagg_load;
 pub mod ep;
 pub mod expert_residency;
 /// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.

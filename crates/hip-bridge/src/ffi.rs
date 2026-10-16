@@ -3235,6 +3235,14 @@ impl PinnedHostBuffer {
         self.size
     }
 
+    /// Shared view of the initialized bytes. Valid only while no async copy
+    /// is outstanding (the caller drained every queued copy).
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: this owner holds `size` initialized bytes until Drop; the
+        // shared borrow excludes `as_bytes_mut`.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast(), self.size) }
+    }
+
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: this owner holds size initialized bytes until Drop. The
         // mutable borrow excludes other host access; GPU quiescence is the

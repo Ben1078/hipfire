@@ -85,7 +85,51 @@ fn host_exec_mode() -> HostExecMode {
             hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
         }
     });
-    *MODE
+    match HOST_EXEC_POLICY.with(std::cell::Cell::get) {
+        None => *MODE,
+        Some(HostExecPolicy::Gpu) => HostExecMode::Pcie,
+        // `Cpu` keeps a global passback (its dense-step split is a CPU mode
+        // too) and otherwise selects the plain CPU mode, whatever the global.
+        Some(HostExecPolicy::Cpu) => match *MODE {
+            HostExecMode::Passback => HostExecMode::Passback,
+            _ => HostExecMode::Cpu,
+        },
+    }
+}
+
+/// Per-load override of the process-wide `memory.offload_exec` snapshot, for a
+/// loader that assembles two bundles with different host execution in one
+/// process (disaggregated producer/consumer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostExecPolicy {
+    /// Pure GPU: no CPU step, CPU expert splice, tier split or iGPU engine,
+    /// whatever the global mode says.
+    Gpu,
+    /// CPU execution: the global passback mode if that is the global, else the
+    /// plain CPU mode (D1 whole-layer splice / D2 tier split), whatever the
+    /// global mode says.
+    Cpu,
+}
+
+thread_local! {
+    static HOST_EXEC_POLICY: std::cell::Cell<Option<HostExecPolicy>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with every host-exec predicate of this module (`cpu_exec_enabled`,
+/// `passback_enabled`, `igpu_exec_enabled`, `moe_cpu_experts_enabled`) answering
+/// for `policy` on the CURRENT thread; the previous scope is restored on return
+/// or unwind. Wrap bundle assembly and forward attachment: layers arm from these
+/// predicates once, at attach.
+pub fn with_host_exec_policy<R>(policy: HostExecPolicy, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<HostExecPolicy>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOST_EXEC_POLICY.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(HOST_EXEC_POLICY.with(|cell| cell.replace(Some(policy))));
+    f()
 }
 
 /// `memory.offload_exec` executes some or all of a spilled step host-side
@@ -115,14 +159,13 @@ pub fn igpu_exec_enabled() -> bool {
 /// decision; the loader additionally requires a host-placed packed layer with no
 /// AWQ sidecar, and records the armed sink on the layer weights.
 pub fn moe_cpu_experts_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        cpu_exec_enabled()
-            && hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
-                .ok()
-                .as_deref()
-                != Some("0")
+    static KILL_SWITCH: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
+            .ok()
+            .as_deref()
+            == Some("0")
     });
-    *ENABLED
+    cpu_exec_enabled() && !*KILL_SWITCH
 }
 
 /// The splice pool configuration. Knobs (both developer vars, read once when
