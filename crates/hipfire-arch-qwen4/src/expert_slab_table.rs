@@ -518,12 +518,22 @@ pub fn build_expert_slab_table(
     metadata: &ExpertSlabsV1,
     tensors: &[HfqTensorInfo],
 ) -> Result<ExpertSlabTable, ExpertSlabTableError> {
+    build_expert_slab_table_with_keep(metadata, tensors, None)
+}
+
+/// Build a fixed original-id table; excluded entries have zero-byte spans.
+pub fn build_expert_slab_table_with_keep(
+    metadata: &ExpertSlabsV1,
+    tensors: &[HfqTensorInfo],
+    keep: Option<&crate::ExpertKeep>,
+) -> Result<ExpertSlabTable, ExpertSlabTableError> {
     if metadata.version != 1
         || metadata.trunk_layers != TRUNK_LAYERS
         || metadata.experts_per_layer != EXPERTS_PER_LAYER
         || metadata.payload_order != PAYLOAD_ORDER
         || metadata.payload_alignment != PAYLOAD_ALIGNMENT
         || metadata.mtp_layout != MTP_LAYOUT
+        || keep.is_some_and(|keep| keep.n_experts() != EXPERTS || keep.n_layers() != LAYERS)
     {
         return Err(ExpertSlabTableError::MetadataMismatch {
             found: metadata.clone(),
@@ -534,17 +544,40 @@ pub fn build_expert_slab_table(
 
     let mut slabs = Vec::with_capacity(SLAB_COUNT);
     let mut counts = ExpertSlabCounts::default();
-    let mut previous_end = 0usize;
+    let mut previous_end = keep.map_or(0, |_| tensors.first().map_or(0, |info| info.data_offset));
+    let mut index = 0;
 
     for slab_index in 0..SLAB_COUNT {
         let gate_entry = ExpertEntryId::at(slab_index * 2);
         let down_entry = ExpertEntryId::at(slab_index * 2 + 1);
         let (layer, expert) = (gate_entry.layer, gate_entry.expert);
+        if keep.is_some_and(|keep| !keep.is_kept(layer, expert)) {
+            let offset = if slabs.is_empty() {
+                tensors.first().map_or(0, |info| info.data_offset)
+            } else {
+                previous_end
+            };
+            slabs.push(ExpertSlab {
+                format: ExpertFormat::Mq3I4,
+                gate_up: ExpertSlabSpan { offset, len: 0 },
+                down: ExpertSlabSpan { offset, len: 0 },
+            });
+            continue;
+        }
 
-        let gate = expect_entry(tensors, slab_index * 2)?;
+        let gate = if keep.is_none() {
+            expect_entry(tensors, index)?
+        } else {
+            expect_kept_entry(tensors, index, gate_entry)?
+        };
         check_shape(gate_entry, gate)?;
-        let down = expect_entry(tensors, slab_index * 2 + 1)?;
+        let down = if keep.is_none() {
+            expect_entry(tensors, index + 1)?
+        } else {
+            expect_kept_entry(tensors, index + 1, down_entry)?
+        };
         check_shape(down_entry, down)?;
+        index += 2;
 
         let format = ExpertFormat::from_pair(gate.quant_type, down.quant_type).ok_or(
             ExpertSlabTableError::InvalidPair {
@@ -558,7 +591,7 @@ pub fn build_expert_slab_table(
         let gate_up = check_projection(gate_entry, gate, gate.quant_type, gate_size)?;
         let down_span = check_projection(down_entry, down, down.quant_type, down_size)?;
 
-        if slab_index == 0 && alignment != 0 && gate_up.offset % alignment != 0 {
+        if index == 2 && alignment != 0 && gate_up.offset % alignment != 0 {
             return Err(ExpertSlabTableError::FirstSlabUnaligned {
                 offset: gate_up.offset,
                 alignment,
@@ -578,7 +611,7 @@ pub fn build_expert_slab_table(
         if gate_up.len.checked_add(down_span.len).is_none() {
             return Err(ExpertSlabTableError::SpanOverflow { layer, expert });
         }
-        if slab_index > 0 {
+        if index > 2 {
             if gate_up.offset < previous_end {
                 return Err(ExpertSlabTableError::SlabOverlap {
                     layer,
@@ -605,7 +638,7 @@ pub fn build_expert_slab_table(
         });
     }
 
-    for (index, info) in tensors.iter().enumerate().skip(ENTRY_COUNT) {
+    for (index, info) in tensors.iter().enumerate().skip(index) {
         if let Some(layer) = trunk_aggregate_layer(&info.name) {
             return Err(ExpertSlabTableError::AggregateTrunkExperts { index, layer });
         }
@@ -636,6 +669,18 @@ pub fn build_expert_slab_table(
     }
 
     Ok(ExpertSlabTable { slabs, counts })
+}
+
+fn expect_kept_entry(
+    tensors: &[HfqTensorInfo],
+    index: usize,
+    expected: ExpertEntryId,
+) -> Result<&HfqTensorInfo, ExpertSlabTableError> {
+    let info = tensors.get(index).ok_or(ExpertSlabTableError::MissingEntry { index, expected })?;
+    if parse_expert_entry_name(&info.name) != Some((expected.layer, expected.expert, expected.proj)) {
+        return Err(ExpertSlabTableError::MissingEntry { index, expected });
+    }
+    Ok(info)
 }
 
 /// A W3/W2 projection failed scale/code validation, or its payload was not
@@ -718,6 +763,9 @@ pub fn validate_expert_slab_scales<'a>(
     mut payload: impl FnMut(ExpertSlabSpan) -> Option<&'a [u8]>,
 ) -> Result<(), ExpertSlabScaleError> {
     for (slab_index, slab) in table.slabs.iter().enumerate() {
+        if slab.gate_up.len == 0 && slab.down.len == 0 {
+            continue;
+        }
         let Some((gate_profile, down_profile)) = mq_i4_profiles(slab.format) else {
             continue;
         };
@@ -801,6 +849,26 @@ mod tests {
     use super::*;
     use crate::expert_slabs::expert_entry_name;
     use hipfire_runtime::mq_i4::MqI4Codec;
+
+    #[test]
+    fn sparse_table_keeps_original_ids_without_payload() {
+        let keep = crate::ExpertKeep::new(512, vec![(16..32).collect(); 48], None, 10).unwrap();
+        let mut tensors = full_fn_headers(|_, _| ExpertFormat::Mq3I4);
+        tensors.retain(|info| parse_expert_entry_name(&info.name)
+            .map_or(true, |(l, e, _)| keep.is_kept(l, e)));
+        let mut cursor = 4096;
+        for info in &mut tensors {
+            info.data_offset = cursor;
+            cursor += info.data_size;
+        }
+        let metadata = crate::expert_slabs::ExpertSlabsV1::fn_v1();
+        let table = build_expert_slab_table_with_keep(&metadata, &tensors, Some(&keep)).unwrap();
+        assert_eq!(table.counts().w3, 48 * 16);
+        assert_eq!(table.slab(0, 0).unwrap().gate_up.len, 0);
+        assert_ne!(table.slab(0, 16).unwrap().gate_up.len, 0);
+        let plan = crate::expert_arena::ExpertArenaPlan::from_table(&table).unwrap();
+        assert_eq!(plan.physical_bytes(), (48 * 16 * ExpertFormat::Mq3I4.slab_bytes()) as u64);
+    }
 
     fn all_w3() -> Vec<HfqTensorInfo> {
         full_fn_headers(|_, _| ExpertFormat::Mq3I4)

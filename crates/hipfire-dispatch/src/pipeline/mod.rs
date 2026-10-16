@@ -380,6 +380,7 @@ mod qwen4_route_tests {
 
     fn policy(shared_down: DType) -> MoeRoutePolicy {
         MoeRoutePolicy {
+            expert_keep_mask: 0,
             capability: MoeRouteCapability::Qt44Qt53Grouped,
             geometry: MoeRouteGeometry {
                 experts: 512,
@@ -688,6 +689,7 @@ mod fp8_route_tests {
 
     fn fp8_policy() -> MoeRoutePolicy {
         MoeRoutePolicy {
+            expert_keep_mask: 0,
             capability: MoeRouteCapability::Fp8B128Grouped,
             geometry: MoeRouteGeometry {
                 experts: 512,
@@ -3634,7 +3636,13 @@ fn decode_route_gpu_stage(
       // the root-authoritative IDs (a per-rank re-ranking is exactly the
       // divergence this removes).
     if !skip_routing {
-        if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        let keep_mask = p.route_policy.map_or(0, |policy| policy.expert_keep_mask);
+        if keep_mask != 0 {
+            hip!(gpu.moe_router_softmax_top10_masked_f32(
+                p.router_logits, p.topk_indices, p.topk_weights, 1,
+                keep_mask, p.recipe.bf16_round_trip(),
+            ))?;
+        } else if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             hip!(gpu.moe_router_softmax_top10_f32(
                 p.router_logits,
                 p.topk_indices,

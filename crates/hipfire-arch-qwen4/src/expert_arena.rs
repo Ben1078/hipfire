@@ -74,9 +74,9 @@ impl ExpertArenaLayer {
         let w3 = self
             .experts
             .iter()
-            .filter(|expert| expert.format == ExpertFormat::Mq3I4)
+            .filter(|expert| expert.gate_up_offset != expert.down_offset && expert.format == ExpertFormat::Mq3I4)
             .count();
-        (self.experts.len() - w3, w3)
+        (self.experts.iter().filter(|expert| expert.gate_up_offset != expert.down_offset).count() - w3, w3)
     }
 }
 

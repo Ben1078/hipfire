@@ -2026,6 +2026,9 @@ pub fn load_qwen4_rank(
     } else {
         placement
     };
+    if config.expert_keep.is_some() && placement.is_some() {
+        return Err("qwen4.expert_keep artifacts require fully resident single-device expert payloads; host-mapped/streamed expert placement is not supported (unset HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS and ensure the kept payload fits)".into());
+    }
     // The agreed split must fit this rank: refuse before allocating.
     if let Some(layers) = expert_vram_layers {
         let (free, non_expert, layer_experts, reserve, ..) = auto_inputs()?;

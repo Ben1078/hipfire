@@ -701,6 +701,7 @@ pub struct Qwen4ManifestIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen4Manifest {
     pub identity: Qwen4ManifestIdentity,
+    pub expert_keep: Option<crate::ExpertKeep>,
     pub weights: Vec<WeightEntry>,
     pub state: Vec<StateEntry>,
     pub metadata: Vec<MetadataTensor>,
@@ -1318,6 +1319,15 @@ impl Qwen4Manifest {
         if let Some(ple) = ple {
             state.push(StateEntry::new(StateKind::Conv, ple.layer));
         }
+        if config.expert_keep.is_some() {
+            for entry in &mut weights {
+                if entry.name.ends_with(".experts.gate_up_proj") || entry.name.ends_with(".experts.down_proj") {
+                    if let Some(ids) = config.kept_expert_ids(entry.layer.unwrap_or(0), entry.name.starts_with("mtp.")) {
+                        entry.logical_shape[0] = ids.len();
+                    }
+                }
+            }
+        }
         if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = &recipe {
             apply_expert_arenas(&mut weights, arenas)?;
         }
@@ -1332,6 +1342,7 @@ impl Qwen4Manifest {
             recipe,
         };
         Ok(Self {
+            expert_keep: config.expert_keep.clone(),
             identity,
             weights,
             state,
@@ -1422,6 +1433,9 @@ impl Qwen4Manifest {
     /// unchanged, and a manifest that is never passed through here (ep = 1)
     /// stays byte-identical to the single-device declaration.
     pub fn with_expert_parallel(mut self, ep: Qwen4EpPlacement) -> Result<Self, WeightError> {
+        if self.expert_keep.is_some() {
+            return Err(WeightError::EpPlacement("qwen4.expert_keep artifacts do not support ExpertSharded/EP placement; use one device".into()));
+        }
         if self.identity.recipe.is_stock_fp8() {
             return Err(WeightError::EpPlacement(format!(
                 "the stock-FP8 recipe loads every routed expert fully resident on one device \
@@ -1487,6 +1501,9 @@ impl Qwen4Manifest {
         let refuse = |why: &str| {
             WeightError::Config(format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {why}"))
         };
+        if self.expert_keep.is_some() {
+            return Err(refuse("qwen4.expert_keep artifacts do not support expert-hotset/tier placement; use the single-device packed or slab arena route"));
+        }
         match &self.identity.recipe {
             Qwen4TierRecipe::FlashNextPacked { .. } => {}
             Qwen4TierRecipe::FlashNextSlab { .. } => {
@@ -3449,18 +3466,20 @@ fn build_ffn_refs(
             ..
         } => {
             let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
+            let payload_experts = config.kept_expert_ids(layer.unwrap_or(0), prefix.starts_with("mtp."))
+                .map_or(experts, <[u16]>::len);
             Ok(Qwen4FfnWeights::Moe(MoeWeights {
                 expert_arena: None,
                 experts_down: tr(
                     "experts.down_proj",
                     TensorRole::RoutedDown,
-                    vec![experts, hidden, intermediate],
+                    vec![payload_experts, hidden, intermediate],
                     ROUTED_DOWN_DTYPE,
                 )?,
                 experts_gate_up: tr(
                     "experts.gate_up_proj",
                     TensorRole::RoutedGateUp,
-                    vec![experts, 2 * intermediate, hidden],
+                    vec![payload_experts, 2 * intermediate, hidden],
                     ROUTED_GATE_UP_DTYPE,
                 )?,
                 expert_source_layout: ExpertSourceLayout::PackedFused {

@@ -230,6 +230,10 @@ pub(super) fn rebase_stage_entries(
 ) -> Result<Vec<u8>, String> {
     let mut table = Vec::with_capacity(entries.len() * std::mem::size_of::<u64>());
     for (expert, &entry) in entries.iter().enumerate() {
+        if entry == 0 {
+            table.extend_from_slice(&0usize.to_ne_bytes());
+            continue;
+        }
         let offset = entry
             .checked_sub(arena_base)
             .filter(|offset| *offset < arena_bytes)

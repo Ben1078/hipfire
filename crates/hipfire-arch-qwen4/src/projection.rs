@@ -52,6 +52,20 @@ pub(crate) struct ProjectionView {
 }
 
 impl ProjectionView {
+    /// Non-owning null descriptor for an original-id slot without payload.
+    pub(crate) fn absent(dtype: DType, m: usize, k: usize) -> Self {
+        Self {
+            tensor: GpuTensor {
+                // SAFETY: this descriptor owns no allocation and is never routed.
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), 0).alias() },
+                shape: vec![0],
+                dtype,
+            },
+            dtype, m, k,
+            row_stride: row_stride(dtype, k),
+            host_mapped: false,
+        }
+    }
     pub(crate) fn from_source(source: &GpuTensor, m: usize, k: usize) -> Self {
         Self {
             tensor: alias_tensor(source),
@@ -100,6 +114,14 @@ impl ProjectionView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_projection_has_no_bytes_or_dereferenceable_pointer() {
+        let view = ProjectionView::absent(DType::MQ3I4G128R256, 1280, 2560);
+        assert!(view.tensor.buf.as_ptr().is_null());
+        assert_eq!(view.tensor.buf.size(), 0);
+        assert_eq!(view.tensor.shape, [0]);
+    }
 
     /// A routed expert view is a `Borrowed` byte view, yet it must report the
     /// placement of its host-mapped owner — that is what selects the NT8

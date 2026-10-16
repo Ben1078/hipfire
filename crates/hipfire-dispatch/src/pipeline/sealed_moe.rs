@@ -563,6 +563,7 @@ pub struct ExpertMetadata {
     owner_rank: usize,
     local_slot: usize,
     resources: ExpertResources,
+    absent: bool,
 }
 
 impl ExpertMetadata {
@@ -621,6 +622,7 @@ impl ExpertMetadata {
             owner_rank,
             local_slot,
             resources,
+            absent: false,
         })
     }
 
@@ -639,6 +641,14 @@ impl ExpertMetadata {
     pub fn resources(&self) -> &ExpertResources {
         &self.resources
     }
+
+    /// Mark an original-id slot as carrying no resource bytes and never routable.
+    pub fn into_absent(mut self) -> Self {
+        self.absent = true;
+        self
+    }
+
+    pub fn is_absent(&self) -> bool { self.absent }
 }
 
 /// Canonical execution string for expert-parallel decode whose root routes
@@ -2369,7 +2379,13 @@ pub(super) fn produce_prefill_route<'a>(
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            if grouped {
+            let keep_mask = params.route_policy.map_or(0, |policy| policy.expert_keep_mask);
+            if keep_mask != 0 {
+                gpu.moe_router_softmax_top10_masked_f32(
+                    scores, params.topk_indices, params.topk_weights, params.batch_size,
+                    keep_mask, params.recipe.bf16_round_trip(),
+                ).map_err(|e| DispatchError::Hip(e.to_string()))?;
+            } else if grouped {
                 gpu.moe_router_softmax_top10_f32(
                     scores,
                     params.topk_indices,
@@ -4330,6 +4346,16 @@ fn bind_live_weight(
     index: usize,
     role: &str,
 ) -> Result<LiveWeightIdentity, DispatchError> {
+    if metadata.is_absent() {
+        if !weight.buf.buf.as_ptr().is_null() || weight.buf.buf.size() != 0 || weight.buf.shape.as_slice() != [0] {
+            return Err(invalid(format!("absent expert {index} {role} must have a null zero-byte view")));
+        }
+        return Ok(LiveWeightIdentity {
+            buffer: LiveTensorIdentity { ptr: 0, byte_capacity: 0, tail: 0,
+                shape: vec![0].into_boxed_slice(), dtype: weight.buf.dtype },
+            dtype: weight.dtype, m: weight.m, k: weight.k, row_stride: weight.row_stride,
+        });
+    }
     let (rows, cols, dtype, bytes) = expected_live_weight_geometry(metadata, gate_up, index, role)?;
 
     if weight.dtype != dtype {
@@ -4363,6 +4389,9 @@ fn live_weight_matches_metadata(
     index: usize,
     role: &str,
 ) -> bool {
+    if metadata.is_absent() {
+        return weight.buf.buf.as_ptr().is_null() && weight.buf.buf.size() == 0;
+    }
     let Ok((rows, cols, dtype, bytes)) =
         expected_live_weight_geometry(metadata, gate_up, index, role)
     else {

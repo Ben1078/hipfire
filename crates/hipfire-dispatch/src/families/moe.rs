@@ -263,6 +263,8 @@ pub struct MoeRoutePolicy {
     pub capability: MoeRouteCapability,
     pub geometry: MoeRouteGeometry,
     pub formats: MoeRouteFormats,
+    /// Load-owned device address of E512 u8 membership, zero for the legacy route.
+    pub expert_keep_mask: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -658,6 +658,8 @@ pub struct Qwen4Config {
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
     pub norm_topk_prob: bool,
+    /// Optional original-id routed-expert membership, validated against this geometry.
+    pub expert_keep: Option<crate::ExpertKeep>,
     pub output_gate_type: String,
 
     // Hyper-connections.
@@ -693,6 +695,12 @@ pub struct Qwen4Config {
 }
 
 impl Qwen4Config {
+    /// Payload slots are compact; router and pointer-table ids stay original.
+    pub(crate) fn kept_expert_ids(&self, layer: usize, mtp: bool) -> Option<&[u16]> {
+        self.expert_keep.as_ref().and_then(|keep| {
+            if mtp { keep.mtp_kept() } else { Some(keep.kept(layer)) }
+        })
+    }
     /// Parse an offline source/quantizer JSON input.
     ///
     /// This deliberately accepts either the HF metadata envelope or a raw
@@ -995,6 +1003,7 @@ impl Qwen4Config {
             moe_intermediate_size,
             shared_expert_intermediate_size: shared,
             norm_topk_prob,
+            expert_keep: crate::ExpertKeep::from_metadata(value)?,
             output_gate_type: optional_string(text, "output_gate_type")
                 .unwrap_or_else(|| "sigmoid".into()),
             hc_count: required_usize(text, "hc_count")?,
@@ -1031,6 +1040,21 @@ impl Qwen4Config {
         expect_str(&self.model_type, MODEL_TYPE, "model_type")?;
         expect_str(&self.text_model_type, TEXT_MODEL_TYPE, "text_model_type")?;
         expect_eq(self.dtype, SourceDType::BF16, "dtype")?;
+        if let Some(keep) = &self.expert_keep {
+            expect(keep.n_experts(), self.num_experts, "expert_keep.n_experts")?;
+            expect(keep.n_layers(), self.num_hidden_layers, "expert_keep.layers")?;
+            if !self.norm_topk_prob {
+                return Err("qwen4: expert_keep requires norm_topk_prob=true".into());
+            }
+            for layer in 0..keep.n_layers() {
+                if keep.kept(layer).len() < self.num_experts_per_tok {
+                    return Err(format!("qwen4: expert_keep layer {layer} has fewer than top_k experts"));
+                }
+            }
+            if keep.mtp_kept().is_some_and(|row| row.len() < self.num_experts_per_tok) {
+                return Err("qwen4: expert_keep MTP has fewer than top_k experts".into());
+            }
+        }
         match &self.profile {
             Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
                 self.validate_flash_next()?
@@ -2696,6 +2720,33 @@ fn expect_float(actual: f64, wanted: f64, field: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn expert_keep_admission_ragged_and_refusals() {
+        let mut metadata = fixture();
+        let layers: Vec<Vec<u16>> = (0..48).map(|l| (0..(16 + l * 496 / 47) as u16).collect()).collect();
+        let keep = crate::ExpertKeep::new(512, layers, None, 10).unwrap();
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] = keep.to_metadata_value();
+        let cfg = Qwen4Config::from_nested_value(&metadata).unwrap();
+        assert_eq!(cfg.num_experts, 512);
+        assert_eq!(cfg.expert_keep, Some(keep));
+        let manifest = crate::weights::Qwen4Manifest::build(&cfg).unwrap();
+        assert!(manifest.clone().with_expert_parallel(crate::weights::Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .unwrap_err().to_string().contains("expert_keep"));
+        assert!(manifest.check_expert_tiers().unwrap_err().to_string().contains("expert_keep"));
+        let gate_up = manifest.weights.iter().find(|entry| entry.name == "model.language_model.layers.0.mlp.experts.gate_up_proj").unwrap();
+        assert_eq!(gate_up.logical_shape[0], 16);
+        let last = manifest.weights.iter().find(|entry| entry.name == "model.language_model.layers.47.mlp.experts.gate_up_proj").unwrap();
+        assert_eq!(last.logical_shape[0], 512);
+        let mut short = vec![(0..16).collect(); 48];
+        short[4] = (0..9).collect();
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] =
+            crate::ExpertKeep::new(512, short, None, 1).unwrap().to_metadata_value();
+        assert!(Qwen4Config::from_nested_value(&metadata).unwrap_err().contains("top_k"));
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] =
+            crate::ExpertKeep::new(512, vec![(0..16).collect(); 47], None, 10).unwrap().to_metadata_value();
+        assert!(Qwen4Config::from_nested_value(&metadata).unwrap_err().contains("expert_keep.layers"));
+    }
 
     /// The AR-only profile is derived, never parsed: Flash-Next converts (the
     /// MTP head and its scalar mirrors cleared, geometry unchanged), it

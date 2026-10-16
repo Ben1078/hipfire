@@ -2979,6 +2979,9 @@ pub const MOE_TOPK_RENORM_TOP10_BATCHED_SRC: &str =
 /// source so widening the new grammar cannot change legacy dispatch.
 pub const MOE_ROUTER_SOFTMAX_TOP10_F32_SRC: &str =
     include_str!("../../../kernels/src/moe_router_softmax_top10_f32.hip");
+/// Separate pruned-router variant; incumbent source and cache keys stay unchanged.
+pub const MOE_ROUTER_SOFTMAX_TOP10_MASKED_F32_SRC: &str =
+    include_str!("../../../kernels/src/moe_router_softmax_top10_masked_f32.hip");
 /// Wave-per-token build of the router above (`HIPFIRE_QWEN4_ROUTER_FAST`,
 /// gfx1151 / gfx1201); byte-identical outputs.
 pub const MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC: &str =

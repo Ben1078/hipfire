@@ -609,6 +609,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "moe_unscatter_rotate128_f16",
         ]);
         add!("moe_router_softmax_top10_f32", kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_SRC, ["moe_router_softmax_top10_f32"]);
+        add!("moe_router_softmax_top10_masked_f32", kernels::MOE_ROUTER_SOFTMAX_TOP10_MASKED_F32_SRC, ["moe_router_softmax_top10_masked_f32"]);
         add!("moe_scatter_fused_top10", kernels::MOE_SCATTER_FUSED_TOP10_SRC, ["moe_scatter_fused_top10"]);
         add!("mq_rotate_x_128_v2", kernels::MQ_ROTATE_X_128_V2_SRC, ["mq_rotate_x_128_v2", "mq_rotate_x_128_v2_f16", "mq_rotate_x_128_v2_silu_bf16"]);
         add!("qwen4_gemv_bf16_xf32", kernels::QWEN4_GEMV_BF16_XF32_SRC, [
@@ -2134,8 +2135,9 @@ mod tests {
         // and the exact sampled-filter QSA module `qsa_filter_select`, plus the
         // portable BF16 rows8/rows16 QSA score module `qsa_bf16_scores`
         // and the Flash-Next expert-slab K1 lane-union planner `qwen4_slab_union_plan`
-        // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 154, "unexpected gfx1201 inventory size");
+        // and the separately registered pruned E512/top10 router are additional
+        // to P0's 92. Existing module digests above remain unchanged.
+        assert_eq!(registry.len(), count + 155, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

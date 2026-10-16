@@ -1909,6 +1909,43 @@ impl Gpu {
         result
     }
 
+    /// Fixed E512/top10 route with a load-owned 512-byte membership mask.
+    /// `keep` must remain device-readable until this stream finishes.
+    pub fn moe_router_softmax_top10_masked_f32(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        tokens: usize,
+        keep: usize,
+        round_logits: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let func = "moe_router_softmax_top10_masked_f32";
+        self.ensure_kernel(func, kernels::MOE_ROUTER_SOFTMAX_TOP10_MASKED_F32_SRC, func)?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let kp = keep as *mut c_void;
+        let round = i32::from(round_logits);
+        let mut params = [
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &round as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(func, [tokens as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(kp);
+            b.push_i32(round);
+            b
+        })
+    }
+
     /// Qwen4 indexed combine.  `expert_outputs` stays unweighted until this
     /// source-ordered fixed-ten reduction.  The source implementation visits
     /// the selected experts in ascending expert-index order, while preserving

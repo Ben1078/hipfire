@@ -315,7 +315,10 @@ fn expert_slab_plan(
         refuse_expert_slabs(metadata_json, tensors)?;
         return Ok(None);
     };
-    let table = build_expert_slab_table(&metadata, tensors)
+    let value: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: metadata: {error}")))?;
+    let keep = crate::ExpertKeep::from_metadata(&value).map_err(Qwen4ArtifactError::new)?;
+    let table = crate::expert_slab_table::build_expert_slab_table_with_keep(&metadata, tensors, keep.as_ref())
         .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
     let counts = table.counts();
     if counts.w2 != 0 {
@@ -1768,6 +1771,9 @@ pub fn hotset_aggregate_slabs(
     use crate::expert_slab_aggregate::{slabs_from_aggregate_mq4, AggregateLayer, AggregateProjection};
     use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
 
+    if config.expert_keep.is_some() {
+        return Err(hotset_refusal("qwen4.expert_keep artifacts do not support expert-hotset/tier placement"));
+    }
     hotset_source_preflight(hfq)?;
     if !matches!(config.profile, crate::config::Qwen4Profile::FlashNext) {
         return Err(hotset_refusal(format!(
@@ -2672,6 +2678,7 @@ mod tests {
     /// from a base whose other tensors are not under test.
     fn trimmed_manifest() -> Qwen4Manifest {
         Qwen4Manifest {
+            expert_keep: None,
             identity: Qwen4ManifestIdentity {
                 profile_id: "qwen3.8-flash-next".to_string(),
                 developer_only: false,
