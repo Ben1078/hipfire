@@ -1,10 +1,16 @@
 # Fused C2 A4 ladder study — closing report
 
-## Recommendation
+## Status (supersedes the recommendation below)
 
-**Keep C2 as the default. Do not flip to the existing four- or eight-candidate implementations.**
+**The prefill-timing section of this report is STALE: it was measured with `bench_qwen35_mq4`, q8 KV — not product.** `bench_qwen35_mq4` is not the product path and these timings used q8/q8 KV, not the product-default `kv_cache = auto` (fp8 on gfx1201). The old R9700 pp8192 C2 control (~3086 tok/s) is therefore confounded against the product rate (~5100 tok/s). Do not cite any tok/s, throughput-cost percentage, or the performance-based recommendation in this file as current. Product timing is being redone with `hipfire bench <canonical 27B> --backend noslots --workload stateless`, product-default KV; this file will be updated from that run.
 
-Fused8 improves R9700 WT2/code24 KLD by **−0.000999 / −0.002220**, recovering only **42.6%** of WMM4's WT2 standalone gain (115.7% on code24). It costs **15.02% / 12.52%** prefill throughput at pp512/pp8192 on R9700. Halo point estimates are **−4.31% / −2.71%**; the pp8192 effect is not resolved above the observed variability. This is not a negligible-cost, most-of-the-WT2-gain change. The existing four-candidate subset worsens both KLD means and is slower on R9700.
+**Unchanged:** the KLD results (canonical 27B MQ4-XTS, `eval_hipfire`, pinned fp8/q8) stand, the default stays `2`, and any default flip is non-exact and requires Main's word.
+
+## Original recommendation (stale; timing basis is not product)
+
+~~**Keep C2 as the default. Do not flip to the existing four- or eight-candidate implementations.**~~ Retained only as history: it rested on the stale `bench_qwen35_mq4`/q8 timings below and is not a current recommendation.
+
+Fused8 improves R9700 WT2/code24 KLD by **−0.000999 / −0.002220**, recovering only **42.6%** of WMM4's WT2 standalone gain (115.7% on code24). The existing four-candidate subset worsens both KLD means. (The previously reported 15.02% / 12.52% R9700 and 4.31% / 2.71% Halo prefill costs came from the stale timing and are not current.)
 
 The branch leaves all defaults unchanged. This is non-exact and nothing has been merged or re-pinned; any future default flip still requires Main's word. The conclusion is about the existing generic widened emitters, not an unmeasured redesigned multi-candidate one-pass emitter.
 
@@ -37,7 +43,9 @@ Model: `qwen3.8-27b.mq4-xts`, 14987185152 bytes, SHA256 `3e38ccbae3776470eb5a893
 - The standalone diagnostic reproduces WMM4's KLD means and sequence hashes. Its command disables producer fusion, SiLU fusion, FP8 stream, and CB verify IU4. Therefore the standalone-vs-fused contrast is **not only a candidate-ladder intervention**; the remaining WT2 gap is not assigned to a specific route difference here.
 - No Halo KLD claim is made; the quality study is the canonical R9700 pin comparison.
 
-## Prefill throughput — exclusive P1 ABBA
+## Prefill throughput — exclusive P1 ABBA (STALE: `bench_qwen35_mq4`, q8 KV: not product)
+
+> **STALE / not product.** Every number in this section and its table came from `bench_qwen35_mq4` with q8/q8 KV. Superseded by product `hipfire bench` timing (pending). Kept only as provenance of the old run.
 
 Every comparison is two ABBA blocks in one exclusive P1 fabric hold, four fresh processes per arm, three prefill passes per process. Discard pass 1 (JIT); retain two warm samples. Report the geometric mean of per-process medians. Prompt IDs are literally `0..pp-1`; generation and decode warmup are disabled. GPU DPM warmup is three seconds outside the timed forward call. The timed region is production `forward_prefill_batch` plus device synchronization.
 
@@ -86,4 +94,4 @@ KEEP directory on hiptrx: `/home/kaden/qcal/release-0.4.3/a4-ladder-runs/`.
 - `oracle-*.receipt.json`, `oracle-builds.json`, `build-tests.receipt.json`, admission receipts and exact `*.command.txt` launch commands.
 - Reusable commands and harness details: `experiments/a4-ladder/README.md`, `runner.py`, `producer_oracle.cpp`, `run_producer_oracle.sh` on the research branch.
 
-**Decision: retain default 2; research switch only.**
+**Decision: retain default 2; research switch only.** (Quality results stand; timing evidence above is stale/not product.)

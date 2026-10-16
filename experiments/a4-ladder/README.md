@@ -1,5 +1,7 @@
 # A4 fused-ladder study harness
 
+> **Timing subcommand is stale / not product:** it drives `bench_qwen35_mq4` with q8 KV. Its tok/s are not product numbers (see RESULTS.md status). The quality subcommand is unaffected.
+
 `runner.py` (Python 3, stdlib only) is the quality and timing harness for the widened fused C2 A4
 candidate ladder. It never opens a fabric hold itself: `quality` and `timing` refuse to run unless
 `FABRIC_JOB` is set, i.e. they were launched by `fabric-run.sh`. Default behaviour is unchanged; the
