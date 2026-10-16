@@ -117,6 +117,23 @@ pub fn moe_cpu_experts_enabled() -> bool {
     *ENABLED
 }
 
+/// The pinned physical-core pool the routed-expert splice runs on. Knobs (both
+/// developer vars, read once when the pool is first built):
+/// `HIPFIRE_CPU_EXPERT_THREADS` (worker count; `0`/unset = one per physical core
+/// in the process's allowed CPU set) and `HIPFIRE_CPU_EXPERT_PIN` (`0` = do not
+/// pin workers; default on).
+fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    use hipfire_cpu::splice_pool::SplicePoolConfig;
+    static CFG: LazyLock<SplicePoolConfig> = LazyLock::new(|| SplicePoolConfig {
+        threads: hipfire_config::developer_var("HIPFIRE_CPU_EXPERT_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0),
+        pin: hipfire_config::developer_bool("HIPFIRE_CPU_EXPERT_PIN", true),
+    });
+    hipfire_cpu::splice_pool::install(*CFG, f)
+}
+
 /// Whether the expanded MoE timing trace is armed: the existing
 /// `HIPFIRE_CPU_EXEC_TRACE` diagnostic. Resolved per call (not cached) so the
 /// debug script's trace-off control run in the same process snapshot shape
@@ -1029,20 +1046,25 @@ pub fn moe_cpu_experts<'a>(
                 timing.gu_mix[gi] = timing.gu_mix[gi].saturating_add(1);
                 timing.dn_mix[di] = timing.dn_mix[di].saturating_add(1);
             }
-            moe_cpu_experts_host(
-                dim,
-                mi,
-                rows,
-                top_k,
-                experts,
-                x,
-                ti,
-                tw,
-                acc,
-                &mut scratch,
-                &mut timing,
-                bf16_round_trip,
-            )?;
+            // The whole CPU side of the splice (gate_up, the SwiGLU/rotate
+            // middle, down, combine) runs on the pinned physical-core pool.
+            let scratch_ref: &mut MoeScratch = &mut scratch;
+            in_splice_pool(|| {
+                moe_cpu_experts_host(
+                    dim,
+                    mi,
+                    rows,
+                    top_k,
+                    experts,
+                    x,
+                    ti,
+                    tw,
+                    acc,
+                    scratch_ref,
+                    &mut timing,
+                    bf16_round_trip,
+                )
+            })?;
             let t_h2d = Instant::now();
             upload_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.h2d_ns = t_h2d.elapsed().as_nanos() as u64;

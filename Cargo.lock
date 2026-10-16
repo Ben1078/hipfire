@@ -1583,6 +1583,7 @@ name = "hipfire-cpu"
 version = "0.4.3"
 dependencies = [
  "half",
+ "libc",
  "proptest",
  "rayon",
 ]

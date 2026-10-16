@@ -770,6 +770,84 @@ mod test {
         }
     }
 
+    /// The splice runs on a pool whose worker count is a host/knob property, and
+    /// the same CPU row must produce identical bytes regardless of it: chunking
+    /// only partitions whole rows (`shared_rows_per_block`), and every output
+    /// element is one row dot accumulated in a fixed group order.
+    #[test]
+    fn gemv_shared_is_bitwise_identical_across_pool_sizes() {
+        struct Batch<'a> {
+            quants: &'a [CpuQuant],
+            packs: &'a [Vec<u8>],
+            xs: &'a [Vec<Vec<f32>>],
+        }
+        impl SharedJobSource for Batch<'_> {
+            fn jobs(&self) -> usize {
+                self.quants.len()
+            }
+            fn n(&self, j: usize) -> usize {
+                self.xs[j].len()
+            }
+            fn quant(&self, j: usize) -> CpuQuant {
+                self.quants[j]
+            }
+            fn packed(&self, j: usize) -> &[u8] {
+                &self.packs[j]
+            }
+            fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+                &self.xs[j][t]
+            }
+        }
+        let k = 512;
+        let tiers = [
+            CpuQuant::Mq6G256,
+            CpuQuant::Mq4G256,
+            CpuQuant::Mq4G128V2,
+            CpuQuant::Mq3G256Lloyd,
+        ];
+        for requested in [Some(false), None] {
+            for (m, jobs) in [(1usize, 1usize), (5, 10), (257, 10), (640, 3)] {
+                let quants: Vec<_> = (0..jobs).map(|j| tiers[j % tiers.len()]).collect();
+                let ns: Vec<usize> = (0..jobs).map(|j| [1usize, 3, 2][j % 3]).collect();
+                let packs: Vec<Vec<u8>> = quants.iter().map(|&q| weights(q, m, k)).collect();
+                let xs: Vec<Vec<Vec<f32>>> = ns
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &n)| {
+                        (0..n)
+                            .map(|t| x_of(k).iter().map(|v| v + (j * 7 + t) as f32).collect())
+                            .collect()
+                    })
+                    .collect();
+                let src = Batch {
+                    quants: &quants,
+                    packs: &packs,
+                    xs: &xs,
+                };
+                let total: usize = ns.iter().map(|n| n * m).sum();
+                let mut baseline: Option<Vec<u32>> = None;
+                for workers in [1usize, 3, 16] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap();
+                    let bits: Vec<u32> = pool.install(|| {
+                        let mut out = vec![0.0f32; total];
+                        gemv_shared_sourced(m, k, &mut out, &src, requested);
+                        out.iter().map(|v| v.to_bits()).collect()
+                    });
+                    match &baseline {
+                        None => baseline = Some(bits),
+                        Some(b) => assert_eq!(
+                            &bits, b,
+                            "m={m} jobs={jobs} requested={requested:?}: {workers} workers differ from 1"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn shared_row_grain_stays_within_worker_budget_without_overflow() {
         for m in [1, 7, 257, usize::MAX] {

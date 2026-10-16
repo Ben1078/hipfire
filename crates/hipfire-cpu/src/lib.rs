@@ -32,6 +32,7 @@ pub mod gemv;
 pub mod moe;
 pub mod quant;
 pub mod simd;
+pub mod splice_pool;
 
 #[cfg(test)]
 pub(crate) mod testfix;
