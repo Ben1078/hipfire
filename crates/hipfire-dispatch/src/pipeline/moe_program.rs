@@ -13,6 +13,7 @@
 use super::steps::Step;
 use crate::context::DispatchCtx;
 use crate::cpu_exec;
+use crate::cpu_split::CpuSplitExecutor;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
     MoeRecipe, MoeResolution, MoeRouteCapability, NARROW_VERIFY_MAX_ROWS,
@@ -65,6 +66,18 @@ pub enum MoeStage {
     Combine,
     HostExperts,
     CpuSplice,
+    /// Eager CPU-cold/GPU-hot split ([`MoeDecodeSelection::cpu_split`],
+    /// [`MoePrefillSelection::cpu_split`]): the one input-readiness wait.
+    /// Downloads the ORIGINAL route and rotated activation, validates every
+    /// cold span and uploads the executor's separate masked ids. Lowered only
+    /// after the router and the rotated input exist and strictly before the
+    /// routed GPU tail, which is the only reader of the masked ids.
+    PrepareSplit,
+    /// Runs the cold slots' unweighted CPU arithmetic while the masked GPU
+    /// tail executes, then queues their F32 slot rows behind the GPU down on
+    /// the same stream. Lowered only after the routed `Down` and before the
+    /// canonical `Combine`; it never completes or synchronizes the stream.
+    JoinSplit,
 }
 
 fn router_shared_fuse_allowed(
@@ -109,6 +122,12 @@ pub(super) struct MoeDecodeSelection {
     /// no routed GPU stage may be lowered (see
     /// [`MoeParams::cpu_deferred_experts`](crate::families::moe::MoeParams::cpu_deferred_experts)).
     pub(super) cpu_deferred_experts: bool,
+    /// Distinct eager CPU-cold/GPU-hot split mode (see
+    /// [`RoutedExpertWeights::cpu_split`](crate::families::moe::RoutedExpertWeights::cpu_split)).
+    /// Mutually exclusive with `cpu_deferred_experts`: the routed GPU tail is
+    /// lowered over the executor's masked ids and the canonical combine reads
+    /// the original route.
+    pub(super) cpu_split: bool,
 }
 
 /// Static grouped-prefill choices resolved while sealing. It deliberately
@@ -124,6 +143,10 @@ pub(super) struct MoePrefillSelection {
     /// no routed GPU stage may be lowered (see
     /// [`MoePrefillParams::cpu_deferred_experts`](crate::families::moe::MoePrefillParams::cpu_deferred_experts)).
     pub(super) cpu_deferred_experts: bool,
+    /// Distinct eager CPU-cold/GPU-hot split mode for a window of at most
+    /// [`NARROW_VERIFY_MAX_ROWS`] rows (see [`MoeDecodeSelection::cpu_split`]).
+    /// Mutually exclusive with `cpu_deferred_experts`.
+    pub(super) cpu_split: bool,
 }
 
 impl MoePrefillSelection {
@@ -179,6 +202,12 @@ pub(super) struct MoeStepState<'a> {
     /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the shared down ran the whole tail as the
     /// HC row fold, including the next HC read's norm.
     hc_row_folded: Cell<bool>,
+    /// Where this invocation is in the split transaction (never read when the
+    /// call is not in the split mode).
+    split_phase: Cell<SplitPhase>,
+    /// The post-combine parity reference re-runs the routed GPU tail over the
+    /// ORIGINAL ids; while set, the masked view is not applied.
+    split_reference: Cell<bool>,
 }
 
 impl<'a> MoeStepState<'a> {
@@ -235,6 +264,8 @@ impl<'a> MoeStepState<'a> {
             hc_write: RefCell::new(None),
             hc_folded: Cell::new(false),
             hc_row_folded: Cell::new(false),
+            split_phase: Cell::new(SplitPhase::Idle),
+            split_reference: Cell::new(false),
         }
     }
 
@@ -295,6 +326,7 @@ impl<'a> MoeStepState<'a> {
             // A CPU-deferred call omits the combine that would consume the
             // absorbed fill, so it must never absorb one.
             && !selection.cpu_deferred_experts
+            && !selection.cpu_split
             && matches!(params.prelude.normalization, MoeNormalization::Provided)
             && super::qt44_qt53_prefill::combine_initial_zero_applies(
                 gpu,
@@ -392,6 +424,49 @@ impl<'a> MoeStepState<'a> {
         }
         Ok(())
     }
+
+    fn require_split_phase(&self, want: SplitPhase, stage: &str) -> Result<(), DispatchError> {
+        let have = self.split_phase.get();
+        if have != want {
+            return Err(split_error(format!(
+                "{stage} ran out of order (phase {have:?}, expected {want:?})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The decode params the masked routed GPU tail reads: the original call
+    /// with only `topk_indices` replaced by the executor's masked ids. `None`
+    /// outside the split mode and during the post-combine reference rerun, so
+    /// the caller keeps the original route. Every other consumer (combine,
+    /// shared, router) never takes this view.
+    fn masked_decode<'p>(
+        &self,
+        params: &MoeParams<'p>,
+        selection: &MoeDecodeSelection,
+    ) -> Result<Option<MoeParams<'p>>, DispatchError> {
+        if !selection.cpu_split || self.split_reference.get() {
+            return Ok(None);
+        }
+        self.require_split_phase(SplitPhase::Prepared, "the routed GPU tail")?;
+        let executor = decode_split_executor(params)?;
+        Ok(Some(params.with_topk_indices(executor.masked_indices())))
+    }
+
+    /// Prefill counterpart of [`Self::masked_decode`] (the grouped scatter
+    /// reads it too).
+    fn masked_prefill<'p>(
+        &self,
+        params: &MoePrefillParams<'p>,
+        selection: &MoePrefillSelection,
+    ) -> Result<Option<MoePrefillParams<'p>>, DispatchError> {
+        if !selection.cpu_split || self.split_reference.get() {
+            return Ok(None);
+        }
+        self.require_split_phase(SplitPhase::Prepared, "the routed GPU tail")?;
+        let executor = prefill_split_executor(params)?;
+        Ok(Some(params.with_topk_indices(executor.masked_indices())))
+    }
 }
 
 /// Opaque operand for one granular sealed MoE operation. The private state
@@ -441,6 +516,8 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::Combine => self.combine(gpu),
             MoeStage::HostExperts => self.host_experts(gpu),
             MoeStage::CpuSplice => self.cpu_splice(gpu),
+            MoeStage::PrepareSplit => self.prepare_split(gpu),
+            MoeStage::JoinSplit => self.join_split(gpu),
         }
     }
 
@@ -496,10 +573,20 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection
-            .route
-            .is_some_and(MoeRouteCapability::is_sealed_grouped)
-        {
+        if selection.cpu_split {
+            // The CPU computes from the F32 rotated basis. The grouped stage may
+            // skip it when the GPU gate/up rotates to F16 itself, so the split
+            // always writes it (the same rotation the stage would have run).
+            return gpu
+                .rotate_x_mq_batched(
+                    params.x_norm_batch,
+                    params.x_rot_batch,
+                    params.gate_up_k,
+                    params.batch_size,
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string()));
+        }
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::input_basis(
                 gpu,
                 params,
@@ -897,6 +984,8 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn scatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
         self.state.require_route_ready()?;
+        let view = self.state.masked_prefill(params, selection)?;
+        let params = view.as_ref().unwrap_or(params);
         if !selection.uses_grouped_rows() {
             return Err(DispatchError::Hip(
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
@@ -914,6 +1003,8 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn gate_up(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         self.state.require_route_ready()?;
         if let Ok((params, selection)) = self.state.decode_parts() {
+            let view = self.state.masked_decode(params, selection)?;
+            let params = view.as_ref().unwrap_or(params);
             return super::decode_gate_up_stage(
                 gpu,
                 params,
@@ -928,10 +1019,9 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection
-            .route
-            .is_some_and(MoeRouteCapability::is_sealed_grouped)
-        {
+        let view = self.state.masked_prefill(params, selection)?;
+        let params = view.as_ref().unwrap_or(params);
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::gate_up(
                 gpu,
                 params,
@@ -951,6 +1041,8 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn unscatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let view = self.state.masked_prefill(params, selection)?;
+        let params = view.as_ref().unwrap_or(params);
         if !selection.uses_grouped_rows() {
             return Err(DispatchError::Hip(
                 "sealed moe: unscatter is only valid for grouped prefill path 2".into(),
@@ -967,6 +1059,8 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn activation(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
+            let view = self.state.masked_decode(params, selection)?;
+            let params = view.as_ref().unwrap_or(params);
             return super::decode_activation_stage(
                 gpu,
                 params,
@@ -976,10 +1070,9 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection
-            .route
-            .is_some_and(MoeRouteCapability::is_sealed_grouped)
-        {
+        let view = self.state.masked_prefill(params, selection)?;
+        let params = view.as_ref().unwrap_or(params);
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::activation(
                 gpu,
                 params,
@@ -995,6 +1088,8 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
+            let view = self.state.masked_decode(params, selection)?;
+            let params = view.as_ref().unwrap_or(params);
             let target = params.routed_out.unwrap_or(params.x_residual);
             // The down kernel itself folds into `target` (no expanded rows, no
             // later combine stage) on these routes; observe that boundary here.
@@ -1058,10 +1153,9 @@ impl<'a> SealedMoeOp<'a> {
             return Ok(());
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection
-            .route
-            .is_some_and(MoeRouteCapability::is_sealed_grouped)
-        {
+        let view = self.state.masked_prefill(params, selection)?;
+        let params = view.as_ref().unwrap_or(params);
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
@@ -1095,6 +1189,9 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn combine(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
+            if selection.cpu_split {
+                return self.split_combine_decode(gpu, params, selection);
+            }
             return super::decode_combine_stage(
                 gpu,
                 params,
@@ -1103,10 +1200,10 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection
-            .route
-            .is_some_and(MoeRouteCapability::is_sealed_grouped)
-        {
+        if selection.cpu_split {
+            return self.split_combine_prefill(gpu, params, selection);
+        }
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             // The row fold combines inside its own kernel; only the rank order
             // is owed here, and the absorbed target fill is not (the shared
             // down's rows overwrite the target).
@@ -1231,6 +1328,183 @@ impl<'a> SealedMoeOp<'a> {
                 )
             }
         }
+    }
+
+    /// `PrepareSplit`: the one input-readiness wait of the eager CPU split.
+    /// Every refusal (capture, retained/shadow bodies, PM4/AQL, route width,
+    /// non-expanded down, shape) is raised before the executor touches any
+    /// state; the executor then downloads the ORIGINAL ids/weights and the
+    /// rotated activation, completes them, validates every cold span and
+    /// uploads the separate masked ids. No routed GPU launch precedes it.
+    pub(super) fn prepare_split(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        self.state.require_route_ready()?;
+        self.state
+            .require_split_phase(SplitPhase::Idle, "PrepareSplit")?;
+        match self.state.call.protocol() {
+            MoeProtocol::IndexedDecode => {
+                let (params, selection) = self.state.decode_parts()?;
+                if !selection.cpu_split {
+                    return Err(split_error("PrepareSplit lowered without the split selection"));
+                }
+                validate_split_decode(gpu, params, selection)?;
+                let executor = decode_split_executor(params)?;
+                executor.prepare(
+                    &*gpu,
+                    params.batch_size,
+                    params.x_rot_local,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.routed_experts,
+                )?;
+            }
+            MoeProtocol::GroupedPrefill => {
+                let (params, selection) = self.state.prefill_parts()?;
+                if !selection.cpu_split {
+                    return Err(split_error("PrepareSplit lowered without the split selection"));
+                }
+                validate_split_prefill(gpu, params, selection)?;
+                let executor = prefill_split_executor(params)?;
+                executor.prepare(
+                    &*gpu,
+                    params.batch_size,
+                    params.x_rot_batch,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.routed_experts,
+                )?;
+            }
+        }
+        self.state.split_phase.set(SplitPhase::Prepared);
+        Ok(())
+    }
+
+    /// `JoinSplit`: the cold CPU arithmetic runs on the orchestration thread
+    /// while the already queued masked GPU tail executes; the cold F32 slot
+    /// rows are then queued on the same stream behind the GPU down (whose
+    /// masked slots store zero). Never completes or synchronizes the stream.
+    pub(super) fn join_split(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        self.state
+            .require_split_phase(SplitPhase::Prepared, "JoinSplit")?;
+        match self.state.call.protocol() {
+            MoeProtocol::IndexedDecode => {
+                let (params, selection) = self.state.decode_parts()?;
+                if !selection.cpu_split {
+                    return Err(split_error("JoinSplit lowered without the split selection"));
+                }
+                decode_split_executor(params)?.join(
+                    &*gpu,
+                    params.batch_size,
+                    params.down_expanded,
+                    params.routed_experts,
+                )?;
+            }
+            MoeProtocol::GroupedPrefill => {
+                let (params, selection) = self.state.prefill_parts()?;
+                if !selection.cpu_split {
+                    return Err(split_error("JoinSplit lowered without the split selection"));
+                }
+                prefill_split_executor(params)?.join(
+                    &*gpu,
+                    params.batch_size,
+                    params.down_expanded,
+                    params.routed_experts,
+                )?;
+            }
+        }
+        self.state.split_phase.set(SplitPhase::Joined);
+        Ok(())
+    }
+
+    /// The canonical combine of a split call: the unchanged BF16 combine over
+    /// the original ids/weights and the joined `down_expanded` slot rows, then
+    /// (only while the lab parity record asks for it) the unmasked GPU tail is
+    /// re-run into the now-dead `down_expanded`. The reference never re-combines.
+    fn split_combine_decode(
+        &self,
+        gpu: &mut Gpu,
+        params: &MoeParams<'_>,
+        selection: &MoeDecodeSelection,
+    ) -> Result<(), DispatchError> {
+        self.state
+            .require_split_phase(SplitPhase::Joined, "the canonical combine")?;
+        let executor = decode_split_executor(params)?;
+        let target = params.routed_out.unwrap_or(params.x_residual);
+        let rows = params.batch_size;
+        executor.parity_before_combine(&*gpu, rows, params.down_expanded, target)?;
+        super::decode_combine_stage(gpu, params, target, selection.route)?;
+        executor.parity_after_combine(&*gpu, rows, target)?;
+        if executor.wants_reference() {
+            self.split_reference_tail(gpu)?;
+            executor.parity_reference(&*gpu, rows, params.down_expanded)?;
+        }
+        Ok(())
+    }
+
+    /// Prefill counterpart of [`Self::split_combine_decode`].
+    fn split_combine_prefill(
+        &self,
+        gpu: &mut Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+    ) -> Result<(), DispatchError> {
+        self.state
+            .require_split_phase(SplitPhase::Joined, "the canonical combine")?;
+        // The absorbed zero fill belongs to the BF16-row grouped combine; the
+        // split folds F32 slot rows and always accumulates into a filled target.
+        if self.state.initial_zero.take() {
+            return Err(split_error(
+                "the canonical expanded combine cannot consume an absorbed target fill",
+            ));
+        }
+        let executor = prefill_split_executor(params)?;
+        let target = params.routed_out.unwrap_or(params.x_batch);
+        let rows = params.batch_size;
+        executor.parity_before_combine(&*gpu, rows, params.down_expanded, target)?;
+        super::qt44_qt53_prefill::combine(
+            gpu,
+            params,
+            selection.uses_grouped_rows(),
+            selection.path2_m_total,
+            false,
+        )?;
+        executor.parity_after_combine(&*gpu, rows, target)?;
+        if executor.wants_reference() {
+            self.split_reference_tail(gpu)?;
+            executor.parity_reference(&*gpu, rows, params.down_expanded)?;
+        }
+        Ok(())
+    }
+
+    /// Re-run the SAME routed gate/up, activation and down stages over the
+    /// ORIGINAL (unmasked) ids into `down_expanded`. Runs strictly after the
+    /// canonical combine consumed the D2 rows and strictly before the shared
+    /// down, so it writes only scratch that is dead at that point: routed
+    /// `gate_batch`/`up_batch`/`rot_batch`, the grouped scatter/`y_*_grouped`
+    /// scratch and `down_expanded`. The shared expert's hidden (`shared.rotated`
+    /// and the gate/up outputs) is read-only here, and the one routed stage
+    /// that also writes it (the fused unscatter activation) recomputes
+    /// identical bits from the unchanged shared gate/up outputs. No combine.
+    fn split_reference_tail(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        self.state.split_reference.set(true);
+        let result = self.split_reference_stages(gpu);
+        self.state.split_reference.set(false);
+        result
+    }
+
+    fn split_reference_stages(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let grouped = match self.state.call.protocol() {
+            MoeProtocol::IndexedDecode => false,
+            MoeProtocol::GroupedPrefill => self.state.prefill_parts()?.1.uses_grouped_rows(),
+        };
+        if grouped {
+            self.scatter(gpu)?;
+        }
+        self.gate_up(gpu)?;
+        if grouped {
+            self.unscatter(gpu)?;
+        }
+        self.activation(gpu)?;
+        self.down(gpu)
     }
 
     pub(super) fn mutation_fence(&self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -1407,6 +1681,18 @@ fn lower_decode<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
     let (params, selection) = state.decode_parts()?;
+    if selection.cpu_split {
+        if let Some(reason) = cpu_split_decode_conflict(
+            params,
+            selection.route,
+            selection.cpu_deferred_experts,
+            // The executor-dependent shape check ran at seal and runs again in
+            // `validate_split_decode`; lowering needs no device object.
+            None,
+        ) {
+            return Err(split_error(reason));
+        }
+    }
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
@@ -1469,6 +1755,12 @@ fn lower_decode<'a>(
         // expanded routed scratch is not refreshed here, so combining it would
         // fold stale rows. The mutation fence still marks the routed-stage
         // boundary the splice completes.
+        if selection.cpu_split {
+            // The sole input-readiness wait: after the router wrote the
+            // original route and the rotated input exists, strictly before the
+            // first routed GPU launch.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::PrepareSplit))?;
+        }
         if !selection.cpu_deferred_experts {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
@@ -1478,6 +1770,11 @@ fn lower_decode<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
+        if selection.cpu_split {
+            // The cold slot rows are queued behind the GPU down (same stream)
+            // and before the canonical combine of the original route.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
+        }
         let down_self_combines = selection.down_last_combine
             || !crate::families::moe::moe_down_writes_expanded(
                 params.dtypes.routed_down,
@@ -1491,6 +1788,11 @@ fn lower_decode<'a>(
                 .is_some_and(MoeRouteCapability::is_sealed_grouped)
                 || !down_self_combines)
             && !params.defer_routed_combine;
+        if selection.cpu_split && !combine_after_down {
+            return Err(split_error(
+                "requires the canonical combine over expanded slot rows (no fused, ninepath or self-combining down)",
+            ));
+        }
         if params.ep_row_gather.is_some() {
             // The gather fills exactly the ten expanded rows the grouped
             // indexed down wrote; every other decode lowering either folds
@@ -1547,6 +1849,20 @@ fn lower_prefill<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
     let (params, selection) = state.prefill_parts()?;
+    if selection.cpu_split {
+        // Checked before any other lowering decision: the mode must never
+        // fall into the generic or deferred arms by accident.
+        if let Some(reason) = cpu_split_prefill_conflict(
+            params,
+            selection.route,
+            selection.cpu_deferred_experts,
+            // The executor-dependent shape check ran at seal and runs again in
+            // `validate_split_prefill`; lowering needs no device object.
+            None,
+        ) {
+            return Err(split_error(reason));
+        }
+    }
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
@@ -1608,6 +1924,35 @@ fn lower_prefill<'a>(
             .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx))
         {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
+        }
+        if selection.cpu_split {
+            // Distinct eager CPU-cold/GPU-hot split. The original route feeds
+            // the unchanged canonical combine and the shared expert; only the
+            // routed GPU tail between `PrepareSplit` and `JoinSplit` reads the
+            // executor's masked ids. `PrepareSplit` is the sole input-readiness
+            // wait and precedes the first routed GPU launch; `JoinSplit` runs
+            // the cold CPU arithmetic while that tail executes and queues the
+            // cold F32 slot rows behind the GPU down, before the combine.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::PrepareSplit))?;
+            if selection.uses_grouped_rows() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
+            }
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+            if selection.uses_grouped_rows() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
+            }
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::MutationFence),
+            )?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+            if params.recipe.shared_after_combine() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
+            return Ok(steps);
         }
         if selection.cpu_deferred_experts {
             // The arch's CPU splice owns the routed FFN for this narrow window;
@@ -1772,6 +2117,57 @@ pub(super) fn lowered_stages(call: &SealedMoeCall<'_>) -> Result<Vec<MoeStage>, 
         .collect())
 }
 
+/// The split transaction's phase discipline for a call sealed in the split
+/// mode (test probe: nothing launches and no executor is needed). The routed
+/// GPU tail may not take the masked view before `PrepareSplit`, `PrepareSplit`
+/// and `JoinSplit` each run exactly once and in order, the combine needs the
+/// joined phase, and the post-combine reference keeps the original route.
+#[cfg(test)]
+pub(super) fn split_phase_probe(call: &SealedMoeCall<'_>) -> Result<(), String> {
+    let state = MoeStepState::new(call);
+    if let Ok((params, selection)) = state.decode_parts() {
+        if state.masked_decode(params, selection).is_ok() {
+            return Err("decode tail took the masked view before PrepareSplit".into());
+        }
+    }
+    if let Ok((params, selection)) = state.prefill_parts() {
+        if state.masked_prefill(params, selection).is_ok() {
+            return Err("prefill tail took the masked view before PrepareSplit".into());
+        }
+    }
+    for want in [SplitPhase::Prepared, SplitPhase::Joined] {
+        if state.require_split_phase(want, "probe").is_ok() {
+            return Err(format!("{want:?} accepted from Idle"));
+        }
+    }
+    state.require_split_phase(SplitPhase::Idle, "PrepareSplit").map_err(|e| format!("{e:?}"))?;
+    state.split_phase.set(SplitPhase::Prepared);
+    if state.require_split_phase(SplitPhase::Idle, "PrepareSplit").is_ok() {
+        return Err("PrepareSplit ran twice".into());
+    }
+    if state.require_split_phase(SplitPhase::Joined, "Combine").is_ok() {
+        return Err("the canonical combine ran before JoinSplit".into());
+    }
+    state.require_split_phase(SplitPhase::Prepared, "JoinSplit").map_err(|e| format!("{e:?}"))?;
+    state.split_phase.set(SplitPhase::Joined);
+    if state.require_split_phase(SplitPhase::Prepared, "JoinSplit").is_ok() {
+        return Err("JoinSplit ran twice".into());
+    }
+    state.require_split_phase(SplitPhase::Joined, "Combine").map_err(|e| format!("{e:?}"))?;
+    state.split_reference.set(true);
+    if let Ok((params, selection)) = state.decode_parts() {
+        if !matches!(state.masked_decode(params, selection), Ok(None)) {
+            return Err("decode reference rerun did not keep the original route".into());
+        }
+    }
+    if let Ok((params, selection)) = state.prefill_parts() {
+        if !matches!(state.masked_prefill(params, selection), Ok(None)) {
+            return Err("prefill reference rerun did not keep the original route".into());
+        }
+    }
+    Ok(())
+}
+
 /// [`execute`] for a call preceded by `Step::Clear(clear)` and, optionally,
 /// followed by the HC write `hc` whose gates are ready.
 ///
@@ -1812,9 +2208,8 @@ pub(super) fn execute_after_clear(
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
-                if selection
-                    .route
-                    .is_some_and(MoeRouteCapability::is_sealed_grouped)
+                if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
+                    && !selection.cpu_split
                     && super::qt44_qt53_prefill::row_fold_applies(
                         gpu,
                         params,
@@ -1987,6 +2382,27 @@ pub(super) fn select_decode(
             ));
         }
     }
+    // The distinct CPU-cold/GPU-hot split of the one-row decode. Every
+    // admission refusal is raised here, before the call is published.
+    let cpu_split = match crate::families::moe::cpu_split_executor(
+        params.routed_experts,
+        params.batch_size,
+    ) {
+        Some(executor) => {
+            if let Some(reason) =
+                cpu_split_decode_conflict(params, route, params.cpu_deferred_experts, Some(executor))
+            {
+                return Err(DispatchError::Hip(format!("sealed moe: CPU tier split: {reason}")));
+            }
+            if !resolution.use_gpu_topk || !resolution.needs_x_rot_local {
+                return Err(split_error(
+                    "requires the GPU top-K path with a rotated local activation",
+                ));
+            }
+            true
+        }
+        None => false,
+    };
     if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
         if !resolution.use_gpu_topk {
             return Err(DispatchError::Hip(
@@ -2129,18 +2545,378 @@ pub(super) fn select_decode(
     resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
-        router_shared_fuse,
+        router_shared_fuse: router_shared_fuse && !cpu_split,
         exact_wave64_router,
         wave64_router,
-        down_last_combine,
+        down_last_combine: down_last_combine && !cpu_split,
         route,
-        ninepath_d3: ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
-        ninepath_d4: ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3"),
-        ninepath_mq3l,
-        ninepath_mq4v2,
-        ninepath_mq6v2,
+        // The split's routed down always writes the expanded F32 slot rows the
+        // canonical combine folds: no fused or self-combining down arm exists.
+        ninepath_d3: !cpu_split && ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
+        ninepath_d4: !cpu_split
+            && ninepath_eligible
+            && !matches!(ninepath_mode, "0" | "off" | "d3"),
+        ninepath_mq3l: ninepath_mq3l && !cpu_split,
+        ninepath_mq4v2: ninepath_mq4v2 && !cpu_split,
+        ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
         cpu_deferred_experts: params.cpu_deferred_experts,
+        cpu_split,
     })
+}
+
+/// Snapshot of device states that make a host-synchronous CPU split unsound.
+/// Its host work cannot be captured, recorded, replayed or shadow-validated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CpuSplitRunGate {
+    pub(super) graph_capture: bool,
+    pub(super) verify_capture: bool,
+    pub(super) replay_capture: bool,
+    pub(super) stream_capture: bool,
+    pub(super) recording: bool,
+    pub(super) aql: bool,
+    pub(super) pm4: bool,
+    pub(super) shadow: bool,
+}
+
+impl CpuSplitRunGate {
+    pub(super) fn observe(gpu: &Gpu) -> Result<Self, DispatchError> {
+        let stream_capture = match gpu.active_stream.as_ref() {
+            Some(stream) => gpu
+                .hip
+                .stream_is_capturing(stream)
+                .map_err(|e| split_error(format!("stream capture query: {e}")))?,
+            None => false,
+        };
+        Ok(Self {
+            graph_capture: gpu.graphs.capture_mode,
+            verify_capture: gpu.graphs.verify.capturing.is_some(),
+            replay_capture: gpu.graphs.replay.capturing.is_some(),
+            stream_capture,
+            recording: gpu.replay.is_recording(),
+            aql: gpu.replay.should_route_aql(),
+            pm4: gpu.replay.should_route_pm4(),
+            shadow: gpu.replay.shadow_body_route().is_some()
+                || gpu.replay.state() == rdna_compute::replay::ReplayState::ShadowValidated,
+        })
+    }
+
+    /// The first refused state, named for the operator.
+    pub(super) fn refusal(self) -> Option<&'static str> {
+        if self.graph_capture || self.verify_capture || self.replay_capture || self.stream_capture {
+            Some("graph capture")
+        } else if self.recording {
+            Some("replay recording")
+        } else if self.pm4 {
+            Some("a retained PM4 body")
+        } else if self.aql {
+            Some("a retained AQL body")
+        } else if self.shadow {
+            Some("a shadow-validated retained body")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn require_eager(self) -> Result<(), DispatchError> {
+        match self.refusal() {
+            None => Ok(()),
+            Some(state) => Err(split_error(format!(
+                "is a host-synchronous step and is refused under {state}; run eager (replay.backend=hip, memory.offload_exec=pcie)"
+            ))),
+        }
+    }
+}
+
+/// Where one invocation is in the eager CPU split transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitPhase {
+    /// Nothing has run; the routed GPU tail must not.
+    Idle,
+    /// `PrepareSplit` completed: the masked ids are queued on the stream.
+    Prepared,
+    /// `JoinSplit` completed: the cold slot rows are queued behind the GPU
+    /// down, so the canonical combine may run.
+    Joined,
+}
+
+/// The executor constructor's fixed route width (it refuses any other).
+const SPLIT_TOP_K: usize = 10;
+const _: () = assert!(crate::cpu_split::CPU_SPLIT_MAX_ROWS == NARROW_VERIFY_MAX_ROWS);
+
+fn split_error(message: impl std::fmt::Display) -> DispatchError {
+    DispatchError::Hip(format!("sealed moe: CPU tier split: {message}"))
+}
+
+/// The executor sealed into a decode call (the same predicate that sealed it).
+fn decode_split_executor<'p>(
+    params: &MoeParams<'p>,
+) -> Result<&'p CpuSplitExecutor, DispatchError> {
+    let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+    crate::families::moe::cpu_split_executor(experts, params.batch_size)
+        .ok_or_else(|| split_error("the executor sealed into this call is no longer attached"))
+}
+
+/// The executor sealed into a prefill call (the same predicate that sealed it).
+fn prefill_split_executor<'p>(
+    params: &MoePrefillParams<'p>,
+) -> Result<&'p CpuSplitExecutor, DispatchError> {
+    let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+    crate::families::moe::cpu_split_executor(experts, params.batch_size)
+        .ok_or_else(|| split_error("the executor sealed into this call is no longer attached"))
+}
+
+fn split_shape_conflict(
+    executor: &CpuSplitExecutor,
+    n_exp: usize,
+    k_top: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    mi: usize,
+) -> Option<&'static str> {
+    if k_top != SPLIT_TOP_K
+        || n_exp != executor.placement().len()
+        || gate_up_k != down_m
+        || down_k != mi
+        || executor.dim() != down_m
+        || executor.mi() != mi
+    {
+        return Some(
+            "the executor plan does not match this layer's expert count, top-k or hidden/intermediate geometry",
+        );
+    }
+    None
+}
+
+/// Why a one-row decode call cannot run in the CPU split mode, or `None`.
+/// One predicate for sealing, lowering and execution.
+///
+/// The mode keeps the router, the shared expert and the canonical combine on
+/// the original grouped QT44/QT53 route unchanged: only the routed GPU tail
+/// reads the executor's masked ids, the cold slots' unweighted F32 rows are
+/// installed into `down_expanded`, and the unchanged BF16 combine folds the
+/// original route once. Anything that changes that bracket refuses.
+pub(super) fn cpu_split_decode_conflict(
+    params: &MoeParams<'_>,
+    route: Option<MoeRouteCapability>,
+    cpu_deferred_experts: bool,
+    executor: Option<&CpuSplitExecutor>,
+) -> Option<&'static str> {
+    if params.batch_size != 1 {
+        return Some("indexed decode is one row; windows of two to four rows are the grouped prefill program");
+    }
+    if cpu_deferred_experts || params.cpu_deferred_experts {
+        return Some("CPU tier split and CPU-deferred routed experts are mutually exclusive");
+    }
+    if !route.is_some_and(|route| route.is_qt44_qt53_grouped() && !route.is_slab()) {
+        return Some("requires the original grouped QT44/QT53 route");
+    }
+    if !matches!(
+        params.recipe,
+        MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        }
+    ) {
+        return Some("requires the bf16 shared_after_combine softmax recipe");
+    }
+    if params.ep_mode != crate::families::moe::MoeEpMode::None
+        || params.routed_out.is_some()
+        || params.defer_routed_combine
+        || params.ep_row_gather.is_some()
+    {
+        return Some("is a single-device call with the canonical routed combine (no EP, partial, deferred or gathered combine)");
+    }
+    if params.expert_down_awq_ptrs.is_some()
+        || params.routed_gate_up_paro.is_some()
+        || params.routed_down_paro.is_some()
+    {
+        return Some("does not admit AWQ or Paro sidecars");
+    }
+    if !crate::families::moe::moe_down_writes_expanded(
+        params.dtypes.routed_down,
+        params.expert_dtype_tags.is_some(),
+    ) {
+        return Some("requires an expanded-output (non self-combining) down projection");
+    }
+    executor.and_then(|executor| {
+        split_shape_conflict(
+            executor,
+            params.n_exp,
+            params.k,
+            params.routed_gate_up_k,
+            params.routed_down_m,
+            params.routed_down_k,
+            params.mi,
+        )
+    })
+}
+
+/// Prefill counterpart of [`cpu_split_decode_conflict`] for a window of one to
+/// [`NARROW_VERIFY_MAX_ROWS`] rows. Wider windows never reach it.
+pub(super) fn cpu_split_prefill_conflict(
+    params: &MoePrefillParams<'_>,
+    route: Option<MoeRouteCapability>,
+    cpu_deferred_experts: bool,
+    executor: Option<&CpuSplitExecutor>,
+) -> Option<&'static str> {
+    if params.batch_size == 0 || params.batch_size > crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+        return Some("the window exceeds the four-row cap (wider windows are ordinary wide prefill)");
+    }
+    if cpu_deferred_experts || params.cpu_deferred_experts {
+        return Some("CPU tier split and CPU-deferred routed experts are mutually exclusive");
+    }
+    if !route.is_some_and(|route| route.is_qt44_qt53_grouped() && !route.is_slab()) {
+        return Some("requires the original grouped QT44/QT53 route");
+    }
+    if !matches!(
+        params.recipe,
+        MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        }
+    ) {
+        return Some("requires the bf16 shared_after_combine softmax recipe");
+    }
+    if !matches!(params.prelude.normalization, MoeNormalization::Provided) {
+        return Some("requires a provided natural activation (no in-program norm)");
+    }
+    if params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+        || params.routed_out.is_some()
+        || !matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::Replicated
+        )
+    {
+        return Some("is a replicated single-device mode (no EP gather/exchange/partial/root route)");
+    }
+    if params.expert_stage_ptrs.is_some()
+        || params.expert_down_awq_ptrs.is_some()
+        || params.paro_gate_up.is_some()
+        || params.paro_down.is_some()
+    {
+        return Some("does not admit a staged expert table or AWQ/Paro sidecars");
+    }
+    if !crate::families::moe::moe_down_writes_expanded(
+        params.dtypes.routed_down,
+        params.expert_dtype_tags.is_some(),
+    ) {
+        return Some("requires an expanded-output (non self-combining) down projection");
+    }
+    executor.and_then(|executor| {
+        split_shape_conflict(
+            executor,
+            params.n_exp,
+            params.k_top,
+            params.gate_up_k,
+            params.down_m,
+            params.down_k,
+            params.mi,
+        )
+    })
+}
+
+/// Eager-only gate of the split: it blocks on the host between the router and
+/// the routed tail, so a graph capture (ordinary, specialized verify, replay
+/// or raw stream), a replay recording, a retained body, retained PM4/AQL
+/// transports and a shadow-validated body all refuse, before any state of this
+/// call is mutated.
+fn split_run_gate(gpu: &Gpu) -> Result<(), DispatchError> {
+    CpuSplitRunGate::observe(gpu)?.require_eager()?;
+    if gpu.replay.retained_body_active() {
+        return Err(split_error(
+            "is a host-synchronous step and is refused under a retained replay body; run eager (replay.backend=hip, memory.offload_exec=pcie)",
+        ));
+    }
+    Ok(())
+}
+
+/// The expanded slot scratch must hold `rows * k * dim` F32 values.
+fn split_expanded_extent(
+    expanded: &GpuTensor,
+    rows: usize,
+    k_top: usize,
+    dim: usize,
+) -> Result<(), DispatchError> {
+    let need = rows
+        .checked_mul(k_top)
+        .and_then(|slots| slots.checked_mul(dim))
+        .and_then(|values| values.checked_mul(4))
+        .ok_or_else(|| split_error("expanded slot extent overflows"))?;
+    if expanded.buf.size() < need {
+        return Err(split_error(format!(
+            "down_expanded holds {} bytes, the slot rows need {need}",
+            expanded.buf.size()
+        )));
+    }
+    Ok(())
+}
+
+/// Everything the split needs from the device, checked before the first
+/// launch (and again by `PrepareSplit`): eager state, the route width the
+/// router actually produces, and that the routed tail leaves F32 slot rows.
+pub(super) fn validate_split_decode(
+    gpu: &Gpu,
+    params: &MoeParams<'_>,
+    selection: &MoeDecodeSelection,
+) -> Result<(), DispatchError> {
+    split_run_gate(gpu)?;
+    let executor = decode_split_executor(params)?;
+    if let Some(reason) = cpu_split_decode_conflict(
+        params,
+        selection.route,
+        selection.cpu_deferred_experts,
+        Some(executor),
+    ) {
+        return Err(split_error(reason));
+    }
+    // The ordinary decode route produces exactly `rows` rows; a canonicalised
+    // (prefill-invariant) route width is a different route contract.
+    if gpu.route_rows(params.batch_size) != params.batch_size {
+        return Err(split_error(
+            "requires route rows equal to the window rows (prefill-invariant scope is refused)",
+        ));
+    }
+    split_expanded_extent(params.down_expanded, params.batch_size, params.k, params.routed_down_m)
+}
+
+/// Prefill counterpart of [`validate_split_decode`]. The routed down must be
+/// the decode-kernel F32 expanded rows in slot order `[row * 10 + rank, dim]`
+/// ([`super::qt44_qt53_prefill::writes_slot_ordered_rows`]), never grouped BF16
+/// rows or a row-fold target; this device/width cannot satisfy that on a
+/// symmetric-IU4 or WMMA grouped down, and then the call refuses rather than
+/// silently changing arithmetic.
+pub(super) fn validate_split_prefill(
+    gpu: &Gpu,
+    params: &MoePrefillParams<'_>,
+    selection: &MoePrefillSelection,
+) -> Result<(), DispatchError> {
+    split_run_gate(gpu)?;
+    let executor = prefill_split_executor(params)?;
+    if let Some(reason) = cpu_split_prefill_conflict(
+        params,
+        selection.route,
+        selection.cpu_deferred_experts,
+        Some(executor),
+    ) {
+        return Err(split_error(reason));
+    }
+    if gpu.route_rows(params.batch_size) != params.batch_size {
+        return Err(split_error(
+            "requires route rows equal to the window rows (prefill-invariant scope is refused)",
+        ));
+    }
+    if !super::qt44_qt53_prefill::writes_slot_ordered_rows(
+        gpu,
+        params,
+        selection.uses_grouped_rows(),
+    ) {
+        return Err(split_error(
+            "this device and width take a grouped BF16 down, not the F32 slot-ordered expanded rows the canonical combine and the cold-slot install require",
+        ));
+    }
+    split_expanded_extent(params.down_expanded, params.batch_size, params.k_top, params.down_m)
 }
 
 /// A grouped FP8 launcher reads one immutable contiguous block table, not the
@@ -2238,6 +3014,8 @@ pub(super) fn select_prefill(
                 shared_after_combine: true,
             })
             || params.cpu_deferred_experts
+            || crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
+                .is_some()
             || params.routed_out.is_some()
             || params.expert_stage_ptrs.is_some()
             || params.ep_row_gather.is_some()
@@ -2263,6 +3041,7 @@ pub(super) fn select_prefill(
             coalesced_verify: false,
             route: Some(route),
             cpu_deferred_experts: false,
+            cpu_split: false,
         });
     }
     let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
@@ -2349,6 +3128,23 @@ pub(super) fn select_prefill(
             });
         }
     }
+    // The distinct CPU-cold/GPU-hot split: a window of at most four rows over
+    // an attached executor. Wider windows are ordinary wide prefill. Every
+    // admission refusal is raised here, before the call is published.
+    let cpu_split = match crate::families::moe::cpu_split_executor(
+        params.routed_experts,
+        params.batch_size,
+    ) {
+        Some(executor) => {
+            if let Some(reason) =
+                cpu_split_prefill_conflict(params, route, params.cpu_deferred_experts, Some(executor))
+            {
+                return Err(DispatchError::Hip(format!("sealed moe: CPU tier split: {reason}")));
+            }
+            true
+        }
+        None => false,
+    };
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
@@ -2409,6 +3205,7 @@ pub(super) fn select_prefill(
         coalesced_verify,
         route,
         cpu_deferred_experts: params.cpu_deferred_experts,
+        cpu_split,
     })
 }
 

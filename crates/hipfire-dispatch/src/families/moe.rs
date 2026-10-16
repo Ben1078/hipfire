@@ -618,6 +618,7 @@ pub(crate) fn fp8_b128_generic_refusal() -> DispatchError {
 }
 
 /// Source of the activation consumed by a MoE recipe.
+#[derive(Clone, Copy)]
 pub enum MoeNormalization<'a> {
     Provided,
     RmsNorm {
@@ -646,6 +647,7 @@ pub struct MoeSharedWeights<'a> {
 }
 
 /// Decode scratch and weights for the optional replicated/shared expert.
+#[derive(Clone, Copy)]
 pub struct MoeSharedDecode<'a> {
     pub weights: MoeSharedWeights<'a>,
     pub intermediate: usize,
@@ -655,6 +657,7 @@ pub struct MoeSharedDecode<'a> {
 }
 
 /// Prefill scratch and weights for the optional replicated/shared expert.
+#[derive(Clone, Copy)]
 pub struct MoeSharedPrefill<'a> {
     pub weights: MoeSharedWeights<'a>,
     pub intermediate: usize,
@@ -665,6 +668,7 @@ pub struct MoeSharedPrefill<'a> {
 }
 
 /// Router projection policy for Q8 prefill inputs.
+#[derive(Clone, Copy)]
 pub enum MoeQ8RouterPolicy<'a> {
     DispatcherEntry,
     FreshFp16Wmma {
@@ -674,6 +678,7 @@ pub enum MoeQ8RouterPolicy<'a> {
 }
 
 /// Complete prefill prologue declaration.
+#[derive(Clone, Copy)]
 pub struct MoePrefillPrelude<'a> {
     pub normalization: MoeNormalization<'a>,
     pub router: WeightRef<'a>,
@@ -778,6 +783,7 @@ pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
 ///
 /// `experts_all_gate_up_mq4` mirrors the `ffn.experts.iter().all(..)` clause
 /// the original `gate_side_mq4` check used (qwen35.rs:4598-4605). The routed
+#[derive(Clone, Copy)]
 pub struct MoeDtypes<'a> {
     pub router: DType,
     /// Optional shared-expert projection dtypes. `None` is a first-class
@@ -1291,6 +1297,19 @@ pub trait RoutedExpertWeights {
     fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
         None
     }
+
+    /// Eager CPU-cold/GPU-hot split executor attached to this layer (the arch
+    /// owns attachment, the immutable expert placement and the format/layout
+    /// admission). `None` (the default) leaves every call in its ordinary
+    /// mode. When `Some`, a call of at most
+    /// [`crate::cpu_split::CPU_SPLIT_MAX_ROWS`] rows on the original grouped
+    /// QT44/QT53 route is sealed in the distinct split mode: the routed GPU
+    /// tail reads the executor's masked ids while the CPU computes the cold
+    /// slots' unweighted outputs, and the canonical combine still reads the
+    /// original route. Wider windows are ordinary wide prefill.
+    fn cpu_split(&self) -> Option<&crate::cpu_split::CpuSplitExecutor> {
+        None
+    }
 }
 
 /// Expert-parallel row exchange for the indexed decode MoE and the few-row
@@ -1402,6 +1421,7 @@ pub struct MoeTileExchangeParams<'a> {
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
+#[derive(Clone, Copy)]
 pub struct MoeParams<'a> {
     pub dtypes: MoeDtypes<'a>,
     pub recipe: MoeRecipe,
@@ -1761,6 +1781,7 @@ pub struct MoeStageTables<'a> {
 ///
 /// All tensor refs are `&'a GpuTensor` (shared, not `&mut` — GpuTensor is Copy).
 /// Scratch tensors are model-owned; the family holds only references.
+#[derive(Clone, Copy)]
 pub struct MoePrefillParams<'a> {
     // dtype snapshot
     pub dtypes: MoeDtypes<'a>,
@@ -2136,6 +2157,50 @@ pub fn gated_moe_prefill_admissible(
 /// load-bearing (a 1-row window is decode, not verify) and lives at each
 /// verify use site, not here.
 pub const NARROW_VERIFY_MAX_ROWS: usize = 4;
+
+/// The layer's CPU split executor when a `rows`-row call takes the split mode
+/// (`1..=CPU_SPLIT_MAX_ROWS` rows and the owner attached an executor). The one
+/// predicate both sealing and execution read; wider windows return `None` and
+/// stay ordinary wide prefill.
+pub fn cpu_split_executor(
+    experts: &dyn RoutedExpertWeights,
+    rows: usize,
+) -> Option<&crate::cpu_split::CpuSplitExecutor> {
+    if rows == 0 || rows > crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+        return None;
+    }
+    experts
+        .cpu_split()
+        .filter(|executor| rows <= executor.max_rows())
+}
+
+impl<'a> MoeParams<'a> {
+    /// A by-value view of this call whose routed ids are `ids`; every other
+    /// operand, including the weights the canonical combine reads, is shared.
+    /// Only the GPU routed gate/up, activation and down readers of the CPU
+    /// split take it; the original route is never rewritten.
+    pub fn with_topk_indices<'b>(&self, ids: &'b GpuTensor) -> MoeParams<'b>
+    where
+        'a: 'b,
+    {
+        let mut view: MoeParams<'b> = *self;
+        view.topk_indices = ids;
+        view
+    }
+}
+
+impl<'a> MoePrefillParams<'a> {
+    /// Prefill counterpart of [`MoeParams::with_topk_indices`] (also read by
+    /// the grouped scatter).
+    pub fn with_topk_indices<'b>(&self, ids: &'b GpuTensor) -> MoePrefillParams<'b>
+    where
+        'a: 'b,
+    {
+        let mut view: MoePrefillParams<'b> = *self;
+        view.topk_indices = ids;
+        view
+    }
+}
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
 ///

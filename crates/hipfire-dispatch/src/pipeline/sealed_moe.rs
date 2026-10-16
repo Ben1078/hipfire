@@ -2169,6 +2169,23 @@ impl<'a> SealedMoeCall<'a> {
                 gpu.arch
             )));
         }
+        // The eager CPU-cold/GPU-hot split blocks the host between the router
+        // and the routed tail, so capture, retained/shadow bodies, PM4/AQL, a
+        // canonicalised route width or a grouped (non-F32-slot) down refuse
+        // here, before any launch or state mutation of this call.
+        match (&self.params, &self.selection) {
+            (SealedParams::Decode(params), MoeKernelSelection::Decode(selection))
+                if selection.cpu_split =>
+            {
+                moe_program::validate_split_decode(gpu, params, selection)?;
+            }
+            (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection))
+                if selection.cpu_split =>
+            {
+                moe_program::validate_split_prefill(gpu, params, selection)?;
+            }
+            _ => {}
+        }
         if let MoeKernelSelection::Decode(selection) = &self.selection {
             if !selection.resolution.use_gpu_topk && gpu.graphs.replay.capturing.is_some() {
                 return Err(DispatchError::UnsupportedVariant {
@@ -7655,6 +7672,7 @@ mod tests {
             ninepath_mq4v2: false,
             ninepath_mq6v2: false,
             cpu_deferred_experts: false,
+            cpu_split: false,
         })
     }
 
@@ -7674,6 +7692,7 @@ mod tests {
             coalesced_verify: false,
             route,
             cpu_deferred_experts: false,
+            cpu_split: false,
         })
     }
 
@@ -7856,6 +7875,465 @@ mod tests {
         }
     }
 
+    // ---- eager CPU-cold/GPU-hot split lowering and admission (no GPU) ----
+
+    /// Stages a one-row decode call lowers to over the original grouped
+    /// QT44/QT53 route, in the split mode when `split` (nothing launches).
+    fn split_decode_stages(
+        route: Option<MoeRouteCapability>,
+        split: bool,
+        configure: impl FnOnce(&mut MoeParams<'_>),
+        select: impl FnOnce(&mut MoeDecodeSelection),
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF4_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = decode_scratch(0xF5_0000);
+        let mut params = MoeParams {
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ..ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                8,
+                4,
+                MoeEpMode::None,
+                None,
+                false,
+            )
+        };
+        configure(&mut params);
+        let MoeKernelSelection::Decode(mut selection) = decode_selection(&ctx, &params, route)
+        else {
+            unreachable!("decode_selection returns a decode selection");
+        };
+        selection.cpu_split = split;
+        select(&mut selection);
+        let call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Decode(selection),
+            SealedParams::Decode(params),
+        );
+        moe_program::lowered_stages(&call)
+    }
+
+    /// Same for a `rows`-row grouped prefill window.
+    fn split_prefill_stages(
+        rows: usize,
+        route: Option<MoeRouteCapability>,
+        split: bool,
+        configure: impl FnOnce(&mut MoePrefillParams<'_>),
+        select: impl FnOnce(&mut MoePrefillSelection),
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF6_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = prefill_scratch(0xF7_0000);
+        let mut params = MoePrefillParams {
+            batch_size: rows,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+            )
+        };
+        params.prelude.route = PrefillRouteMode::Replicated;
+        // The Qwen4 routed-only recipe: the natural activation is provided.
+        params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+        configure(&mut params);
+        let MoeKernelSelection::Prefill(mut selection) = prefill_selection(&ctx, &params, route)
+        else {
+            unreachable!("prefill_selection returns a prefill selection");
+        };
+        selection.cpu_split = split;
+        select(&mut selection);
+        let call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Prefill(selection),
+            SealedParams::Prefill(params),
+        );
+        moe_program::lowered_stages(&call)
+    }
+
+    fn split_refused(result: Result<Vec<MoeStage>, DispatchError>, label: &str, needle: &str) {
+        let error = result.expect_err(label);
+        let text = format!("{error:?}");
+        assert!(text.contains(needle), "{label}: {text}");
+    }
+
+    const SPLIT_ROUTES: [MoeRouteCapability; 2] = [
+        MoeRouteCapability::Qt44Qt53Grouped,
+        MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+    ];
+
+    #[test]
+    fn split_mode_brackets_the_routed_gpu_tail_in_both_protocols() {
+        for route in SPLIT_ROUTES {
+            let mut programs = vec![(
+                "decode".to_string(),
+                split_decode_stages(Some(route), true, |_| {}, |_| {}).unwrap(),
+            )];
+            for rows in 1..=crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                programs.push((
+                    format!("prefill rows={rows}"),
+                    split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap(),
+                ));
+            }
+            for (label, stages) in programs {
+                let label = format!("{route:?} {label}: {stages:?}");
+                let at = |stage: MoeStage| stages.iter().position(|s| *s == stage);
+                let count = |stage: MoeStage| stages.iter().filter(|s| **s == stage).count();
+                for once in [
+                    MoeStage::InputBasis,
+                    MoeStage::Route,
+                    MoeStage::PrepareSplit,
+                    MoeStage::GateUp,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::JoinSplit,
+                    MoeStage::Combine,
+                    MoeStage::SharedDown,
+                ] {
+                    assert_eq!(count(once), 1, "{once:?} in {label}");
+                }
+                let prepare = at(MoeStage::PrepareSplit).unwrap();
+                // Original route and the rotated input exist before the one
+                // input-readiness wait; nothing routed on the GPU precedes it.
+                assert!(at(MoeStage::InputBasis).unwrap() < prepare, "{label}");
+                assert!(at(MoeStage::Route).unwrap() < prepare, "{label}");
+                let first_tail = [MoeStage::Scatter, MoeStage::GateUp]
+                    .into_iter()
+                    .filter_map(at)
+                    .min()
+                    .unwrap();
+                assert!(prepare < first_tail, "{label}");
+                // The cold rows are queued after the GPU down and before the
+                // canonical combine; the shared down follows it exactly once.
+                let join = at(MoeStage::JoinSplit).unwrap();
+                assert!(at(MoeStage::Down).unwrap() < join, "{label}");
+                assert!(join < at(MoeStage::Combine).unwrap(), "{label}");
+                assert!(
+                    at(MoeStage::Combine).unwrap() < at(MoeStage::SharedDown).unwrap(),
+                    "{label}"
+                );
+                // Neither the D1 deferral nor the host arm is in the mode.
+                for absent in [
+                    MoeStage::CpuSplice,
+                    MoeStage::HostExperts,
+                    MoeStage::RowGather,
+                    MoeStage::TileMask,
+                    MoeStage::TileExchange,
+                ] {
+                    assert!(at(absent).is_none(), "{absent:?} in {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_mode_adds_only_the_two_split_stages_to_the_ordinary_program() {
+        let without_split = |stages: Vec<MoeStage>| -> Vec<MoeStage> {
+            stages
+                .into_iter()
+                .filter(|s| !matches!(s, MoeStage::PrepareSplit | MoeStage::JoinSplit))
+                .collect()
+        };
+        for route in SPLIT_ROUTES {
+            let ordinary = split_decode_stages(Some(route), false, |_| {}, |_| {}).unwrap();
+            assert!(!ordinary.contains(&MoeStage::PrepareSplit), "{ordinary:?}");
+            assert!(!ordinary.contains(&MoeStage::JoinSplit), "{ordinary:?}");
+            let split = split_decode_stages(Some(route), true, |_| {}, |_| {}).unwrap();
+            assert_eq!(without_split(split), ordinary, "decode {route:?}");
+            for rows in 1..=crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                let ordinary =
+                    split_prefill_stages(rows, Some(route), false, |_| {}, |_| {}).unwrap();
+                assert!(!ordinary.contains(&MoeStage::PrepareSplit), "{ordinary:?}");
+                assert!(!ordinary.contains(&MoeStage::JoinSplit), "{ordinary:?}");
+                let split = split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap();
+                assert_eq!(without_split(split), ordinary, "prefill rows={rows} {route:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn split_mode_is_distinct_from_cpu_deferred_experts() {
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let split = split_prefill_stages(4, route, true, |_| {}, |_| {}).unwrap();
+        let deferred = split_prefill_stages(
+            4,
+            route,
+            false,
+            |params| params.cpu_deferred_experts = true,
+            |selection| selection.cpu_deferred_experts = true,
+        )
+        .unwrap();
+        // The deferral drops the whole GPU tail; the split keeps it.
+        assert!(deferred.contains(&MoeStage::CpuSplice) && !deferred.contains(&MoeStage::GateUp));
+        assert!(!split.contains(&MoeStage::CpuSplice) && split.contains(&MoeStage::GateUp));
+        split_refused(
+            split_prefill_stages(
+                4,
+                route,
+                true,
+                |_| {},
+                |selection| selection.cpu_deferred_experts = true,
+            ),
+            "split + deferred selection",
+            "mutually exclusive",
+        );
+        split_refused(
+            split_prefill_stages(4, route, true, |params| params.cpu_deferred_experts = true, |_| {}),
+            "split + deferred params",
+            "mutually exclusive",
+        );
+        split_refused(
+            split_decode_stages(route, true, |params| params.cpu_deferred_experts = true, |_| {}),
+            "decode split + deferred params",
+            "mutually exclusive",
+        );
+        split_refused(
+            split_decode_stages(route, true, |_| {}, |selection| selection.cpu_deferred_experts = true),
+            "decode split + deferred selection",
+            "mutually exclusive",
+        );
+    }
+
+    #[test]
+    fn split_mode_refuses_every_lowering_it_does_not_bracket() {
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let grouped = "grouped QT44/QT53";
+        for (label, route) in [
+            ("no route", None),
+            ("slab", Some(MoeRouteCapability::SlabCodecGrouped)),
+            ("fp8", Some(MoeRouteCapability::Fp8B128Grouped)),
+        ] {
+            split_refused(
+                split_prefill_stages(2, route, true, |_| {}, |_| {}),
+                &format!("prefill {label}"),
+                grouped,
+            );
+            split_refused(
+                split_decode_stages(route, true, |_| {}, |_| {}),
+                &format!("decode {label}"),
+                grouped,
+            );
+        }
+        // The recipe must keep BF16 round trips and the shared expert after the combine.
+        for (bf16, after) in [(false, true), (true, false)] {
+            let recipe = MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: bf16,
+                shared_after_combine: after,
+            };
+            split_refused(
+                split_prefill_stages(2, route, true, |p| p.recipe = recipe, |_| {}),
+                "prefill recipe",
+                "shared_after_combine",
+            );
+            split_refused(
+                split_decode_stages(route, true, |p| p.recipe = recipe, |_| {}),
+                "decode recipe",
+                "shared_after_combine",
+            );
+        }
+        // Single-device canonical combine only: no partial, EP gather/exchange or deferred combine.
+        split_refused(
+            split_prefill_stages(2, route, true, |p| p.routed_out = Some(p.x_batch), |_| {}),
+            "prefill partial",
+            "single-device",
+        );
+        split_refused(
+            split_prefill_stages(2, route, true, |p| p.ep_row_gather = Some(&NoopGather), |_| {}),
+            "prefill gather",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.routed_out = Some(p.x_residual), |_| {}),
+            "decode partial",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.ep_row_gather = Some(&NoopGather), |_| {}),
+            "decode gather",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.defer_routed_combine = true, |_| {}),
+            "decode deferred combine",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.ep_mode = MoeEpMode::RootRoutedPartial, |_| {}),
+            "decode root partial",
+            "single-device",
+        );
+        // Row caps: decode is one row; the grouped window is one to four rows.
+        split_refused(
+            split_decode_stages(route, true, |p| p.batch_size = 2, |_| {}),
+            "decode two rows",
+            "one row",
+        );
+        for rows in [0, crate::cpu_split::CPU_SPLIT_MAX_ROWS + 1, 8] {
+            split_refused(
+                split_prefill_stages(rows, route, true, |_| {}, |_| {}),
+                &format!("prefill rows={rows}"),
+                "four-row cap",
+            );
+        }
+    }
+
+    #[test]
+    fn split_cap_matches_the_narrow_verify_window_and_wide_prefill_is_ordinary() {
+        assert_eq!(crate::cpu_split::CPU_SPLIT_MAX_ROWS, 4);
+        assert_eq!(
+            crate::cpu_split::CPU_SPLIT_MAX_ROWS,
+            crate::families::moe::NARROW_VERIFY_MAX_ROWS
+        );
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        // No attachment: no row count takes the mode (the default provider is `None`).
+        for rows in [0, 1, 2, 3, 4, 5, 8, 512] {
+            assert!(
+                crate::families::moe::cpu_split_executor(&fixture.routed, rows).is_none(),
+                "rows={rows}"
+            );
+        }
+        // Without a provider a window sealed with the flag off lowers the
+        // ordinary wide program at every width above the cap.
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        for rows in [5, 8] {
+            let stages = split_prefill_stages(rows, route, false, |_| {}, |_| {}).unwrap();
+            assert!(
+                !stages.contains(&MoeStage::PrepareSplit) && !stages.contains(&MoeStage::JoinSplit),
+                "rows={rows}: {stages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_transaction_phases_are_ordered_and_the_reference_keeps_the_original_route() {
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        {
+            let table = table(4, DType::MQ4G256);
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let fixture = live_fixture(&table, 0xF9_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let ctx = DispatchCtx::for_test("gfx1201");
+            let scratch = decode_scratch(0xFA_0000);
+            let params = MoeParams {
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_decode_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    0,
+                    8,
+                    4,
+                    MoeEpMode::None,
+                    None,
+                    false,
+                )
+            };
+            let MoeKernelSelection::Decode(mut selection) = decode_selection(&ctx, &params, route)
+            else {
+                unreachable!("decode_selection returns a decode selection");
+            };
+            selection.cpu_split = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Decode(selection),
+                SealedParams::Decode(params),
+            );
+            moe_program::split_phase_probe(&call).unwrap();
+        }
+        {
+            let table = table(4, DType::MQ4G256);
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let fixture = live_fixture(&table, 0xFB_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let ctx = DispatchCtx::for_test("gfx1201");
+            let scratch = prefill_scratch(0xFC_0000);
+            let mut params = MoePrefillParams {
+                batch_size: 3,
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_prefill_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            params.prelude.route = PrefillRouteMode::Replicated;
+            params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+            let MoeKernelSelection::Prefill(mut selection) =
+                prefill_selection(&ctx, &params, route)
+            else {
+                unreachable!("prefill_selection returns a prefill selection");
+            };
+            selection.cpu_split = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Prefill(selection),
+                SealedParams::Prefill(params),
+            );
+            moe_program::split_phase_probe(&call).unwrap();
+        }
+    }
+
+    #[test]
+    fn split_run_gate_refuses_capture_retained_shadow_and_pm4() {
+        use moe_program::CpuSplitRunGate;
+        assert_eq!(CpuSplitRunGate::default().refusal(), None);
+        CpuSplitRunGate::default().require_eager().unwrap();
+        let cases = [
+            (CpuSplitRunGate { graph_capture: true, ..Default::default() }, "graph capture"),
+            (CpuSplitRunGate { verify_capture: true, ..Default::default() }, "graph capture"),
+            (CpuSplitRunGate { replay_capture: true, ..Default::default() }, "graph capture"),
+            (CpuSplitRunGate { stream_capture: true, ..Default::default() }, "graph capture"),
+            (CpuSplitRunGate { recording: true, ..Default::default() }, "replay recording"),
+            (CpuSplitRunGate { pm4: true, ..Default::default() }, "PM4"),
+            (CpuSplitRunGate { aql: true, ..Default::default() }, "AQL"),
+            (CpuSplitRunGate { shadow: true, ..Default::default() }, "shadow"),
+        ];
+        for (gate, name) in cases {
+            let error = gate.require_eager().expect_err(name);
+            let text = format!("{error:?}");
+            assert!(text.contains(name) && text.contains("CPU tier split"), "{gate:?}: {text}");
+        }
+    }
+
     #[test]
     fn fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2() {
         for rows in [1, 2, 17, 128, 1536] {
@@ -7891,6 +8369,7 @@ mod tests {
                 coalesced_verify: false,
                 route: Some(MoeRouteCapability::Fp8B128Grouped),
                 cpu_deferred_experts: false,
+                cpu_split: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
             assert_eq!(
