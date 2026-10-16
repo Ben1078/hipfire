@@ -1917,6 +1917,7 @@ impl Gpu {
         topk_idx: &GpuTensor,
         topk_w: &GpuTensor,
         tokens: usize,
+        normalize_topk_prob: bool,
         keep: usize,
         round_logits: bool,
     ) -> HipResult<()> {
@@ -1928,20 +1929,29 @@ impl Gpu {
         let wp = topk_w.buf.as_ptr();
         let kp = keep as *mut c_void;
         let round = i32::from(round_logits);
+        let ne = 512i32;
+        let kt = 10i32;
+        let norm = i32::from(normalize_topk_prob);
         let mut params = [
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+            &kt as *const _ as *mut c_void,
+            &norm as *const _ as *mut c_void,
             &round as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(func, [tokens as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(lp);
             b.push_ptr(ip);
             b.push_ptr(wp);
-            b.push_ptr(kp);
+            b.push_i32(ne);
+            b.push_i32(kt);
+            b.push_i32(norm);
             b.push_i32(round);
+            b.push_ptr(kp);
             b
         })
     }

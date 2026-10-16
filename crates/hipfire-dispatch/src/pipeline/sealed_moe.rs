@@ -2383,7 +2383,7 @@ pub(super) fn produce_prefill_route<'a>(
             if keep_mask != 0 {
                 gpu.moe_router_softmax_top10_masked_f32(
                     scores, params.topk_indices, params.topk_weights, params.batch_size,
-                    keep_mask, params.recipe.bf16_round_trip(),
+                    normalize, keep_mask, params.recipe.bf16_round_trip(),
                 ).map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else if grouped {
                 gpu.moe_router_softmax_top10_f32(

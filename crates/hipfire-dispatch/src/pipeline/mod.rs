@@ -3640,7 +3640,7 @@ fn decode_route_gpu_stage(
         if keep_mask != 0 {
             hip!(gpu.moe_router_softmax_top10_masked_f32(
                 p.router_logits, p.topk_indices, p.topk_weights, 1,
-                keep_mask, p.recipe.bf16_round_trip(),
+                p.norm_topk_prob, keep_mask, p.recipe.bf16_round_trip(),
             ))?;
         } else if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             hip!(gpu.moe_router_softmax_top10_f32(
