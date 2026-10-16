@@ -46,6 +46,12 @@ required-features = ["lab"]
 name = "device_wait_deadline"
 required-features = ["lab"]
 
+# Two-device (XTX + Strix Halo iGPU) portable host-memory / handoff / bandwidth
+# probe; needs both GPUs visible in one process (offload-prefill iGPU engine).
+[[example]]
+name = "two_device_probe"
+required-features = ["lab"]
+
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #

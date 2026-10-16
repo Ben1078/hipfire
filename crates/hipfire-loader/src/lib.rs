@@ -8,6 +8,7 @@ pub mod admission;
 pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
+mod qwen4_igpu;
 mod qwen4_slab;
 pub mod decide;
 

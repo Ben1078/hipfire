@@ -641,7 +641,8 @@ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high"
 // same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
 // a value the schema accepts becomes unselectable (and an unselectable value
 // cycles from the wrong place).
-pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback"];
+// `igpu` is gfx1151-only (Flash-Next eager prefill); other hosts keep pcie/cpu.
+pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback", "igpu"];
 /// Values of `memory.ple_format`; exported so the TUI offers exactly this list.
 pub const PLE_FORMATS: &[&str] = &["auto", "q4", "q8"];
 /// Values of `speculation.mode`; exported so the TUI offers exactly this list.
@@ -819,7 +820,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_OFFLOAD_EXEC"),
-        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'; 'igpu' (opt-in, default off, gfx1151 only) runs the host-placed layers of an eager Flash-Next prefill wider than 4 rows as whole layers on the integrated GPU (developer variable HIPFIRE_IGPU_DEVICE selects the device index); decode and every verify path stay unchanged. The CPU engine (cpu/passback) measures about 740 tok/s pp512 on a 16-core Zen5 host: it is not a prefill accelerator. Hosts without gfx1151 keep pcie/cpu/passback. Never a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
     ),
     field!(
         "memory.offload_passback_share",
@@ -8476,6 +8477,13 @@ pub mod memory {
         /// byte-identical to [`OffloadExec::Cpu`], before diffing output against
         /// a reference.
         Passback,
+        /// The integrated GPU executes whole host-placed layers of an eager
+        /// Flash-Next prefill wider than four rows. gfx1151 only, default-off,
+        /// and not a CPU engine: the CPU-execution predicates (`Cpu | Passback`)
+        /// never match it. `HIPFIRE_IGPU_DEVICE` (developer variable, device
+        /// index) picks the iGPU. Only prefill wider than 4 rows is engined;
+        /// decode and every verify path (wide verify included) are unchanged.
+        Igpu,
     }
 
     impl std::fmt::Display for OffloadExec {
@@ -8484,6 +8492,7 @@ pub mod memory {
                 OffloadExec::Pcie => write!(f, "pcie"),
                 OffloadExec::Cpu => write!(f, "cpu"),
                 OffloadExec::Passback => write!(f, "passback"),
+                OffloadExec::Igpu => write!(f, "igpu"),
             }
         }
     }
@@ -8496,6 +8505,7 @@ pub mod memory {
         match raw.map(|v| v.trim().to_ascii_lowercase()) {
             Some(v) if v == "cpu" => OffloadExec::Cpu,
             Some(v) if v == "passback" => OffloadExec::Passback,
+            Some(v) if v == "igpu" => OffloadExec::Igpu,
             _ => OffloadExec::Pcie,
         }
     }
@@ -8589,10 +8599,27 @@ pub mod memory {
             );
             assert_eq!(parse_offload_exec(Some("PASSBACK")), OffloadExec::Passback);
             assert_eq!(parse_offload_exec(Some("passback0")), OffloadExec::Pcie);
+            // `igpu` is its own mode, trimmed and case-insensitive like the others,
+            // and no near-miss spelling selects it.
+            assert_eq!(parse_offload_exec(Some("igpu")), OffloadExec::Igpu);
+            assert_eq!(parse_offload_exec(Some(" iGPU ")), OffloadExec::Igpu);
+            assert_eq!(parse_offload_exec(Some("IGPU")), OffloadExec::Igpu);
+            assert_eq!(parse_offload_exec(Some("igpu0")), OffloadExec::Pcie);
+            assert_eq!(parse_offload_exec(Some("gpu")), OffloadExec::Pcie);
+            // Schema list and parser agree on every spelling, igpu included.
+            for name in crate::OFFLOAD_EXECS {
+                assert_eq!(
+                    parse_offload_exec(Some(name)).to_string(),
+                    *name,
+                    "{name} must round-trip through the parser"
+                );
+            }
+            assert!(crate::OFFLOAD_EXECS.contains(&"igpu"));
             // Display is the wire spelling the registry/TOML round-trips.
             assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
             assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
             assert_eq!(OffloadExec::Passback.to_string(), "passback");
+            assert_eq!(OffloadExec::Igpu.to_string(), "igpu");
         }
 
         #[test]

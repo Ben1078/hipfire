@@ -291,8 +291,20 @@ impl SessionState for Qwen4Bundle {
         } else {
             ""
         };
+        // `memory.offload_exec=igpu` is part of the numerical history of a prefix:
+        // the REQUEST always tags the scope (`/igpu-off` when it fell back, or the
+        // digest of the frozen manifest of the layers that actually bound), so an
+        // igpu-prefilled snapshot is never restored into a pcie/cpu bundle or one
+        // with another manifest, and vice versa. Unset keeps the scope unchanged.
+        let igpu = crate::gpu_forward::igpu_engine::scope_suffix(
+            crate::gpu_forward::igpu_engine::qwen4_igpu_enabled(),
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::igpu_manifest)
+                .as_deref(),
+        );
         Some(format!(
-            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}",
+            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}{igpu}",
             self.state_format
         ))
     }
@@ -821,6 +833,79 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .is_some_and(Qwen4GpuForward::has_cpu_deferred_experts)
+    }
+
+    /// Whether any host-placed trunk layer runs its prefill experts on the iGPU
+    /// engine (`memory.offload_exec=igpu`).
+    pub fn has_igpu_engine(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(Qwen4GpuForward::has_igpu_engine)
+    }
+
+    /// Trunk layers on the iGPU engine, in layer order; empty when not armed.
+    pub fn igpu_engined_layers(&self) -> Vec<usize> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::igpu_engined_layers)
+            .unwrap_or_default()
+    }
+
+    /// The frozen numerical-manifest digest of the engine (also in the snapshot
+    /// scope); `None` when not armed.
+    pub fn igpu_manifest(&self) -> Option<String> {
+        self.execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::igpu_manifest)
+    }
+
+    /// Lab diagnostic: switch the engine's parity capture on or off (`layers`
+    /// filters the captured layers). No effect on the forward when unused.
+    pub fn igpu_parity_set(
+        &mut self,
+        on: bool,
+        layers: Option<&[usize]>,
+    ) -> Result<(), BundleError> {
+        self.execution
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 forward resources are not attached".into()))?
+            .igpu_parity_set(on, layers)
+            .map_err(BundleError::Forward)
+    }
+
+    /// Lab diagnostic: drain the engine's captured parity records.
+    pub fn igpu_take_parity_records(
+        &mut self,
+    ) -> Vec<hipfire_dispatch::igpu_exec::IgpuParityRecord> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::igpu_take_parity_records)
+            .unwrap_or_default()
+    }
+
+    /// Lab diagnostic: the model-device expert pointer tables of one trunk layer.
+    pub fn igpu_xtx_expert_tables(
+        &self,
+        layer: usize,
+    ) -> Option<(&rdna_compute::GpuTensor, &rdna_compute::GpuTensor)> {
+        self.execution
+            .as_ref()?
+            .igpu_xtx_expert_tables(layer)
+    }
+
+    /// Lab diagnostic: run one parity case through `layer`'s engine (parity mode
+    /// must be on).
+    pub fn igpu_parity_execute(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        layer: usize,
+        case: &hipfire_dispatch::igpu_exec::IgpuParityCase,
+    ) -> Result<hipfire_dispatch::igpu_exec::IgpuParityOutcome, BundleError> {
+        self.execution
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 forward resources are not attached".into()))?
+            .igpu_parity_execute(gpu, layer, case)
+            .map_err(BundleError::Forward)
     }
 
     /// Attach reusable ordinary-HIP execution resources after the manifest
@@ -2555,6 +2640,11 @@ impl Qwen4Bundle {
             mtp.reset(gpu)
                 .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
+        // A full cold reset rebuilt every owner, so a failed engined prefill's
+        // partial state is gone.
+        if let Some(forward) = self.execution.as_mut() {
+            forward.clear_igpu_failure();
+        }
         Ok(())
     }
 
@@ -3546,6 +3636,23 @@ impl Qwen4Bundle {
     /// leases/page-cache resources, free mutable GPU state, free finalized
     /// resident weights, then drain the attached transaction/census.
     pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        // UPFRONT, before ANY model buffer is released: the iGPU engine's two
+        // devices must be provably drained. If not, the whole bundle is quarantined
+        // (leaked, never freed) and the Gpu refuses every later release, so model
+        // buffers, modules and runtime handles stay valid under in-flight work.
+        if let Some(why) = self
+            .execution
+            .as_ref()
+            .and_then(|forward| forward.igpu_quiesce_all(gpu).err())
+        {
+            let message = format!(
+                "qwen4 iGPU engine could not be drained ({why}); the bundle and the Gpu are \
+                 quarantined and every model allocation is retained"
+            );
+            gpu.quarantine(&message);
+            std::mem::forget(self);
+            return Err(BundleError::Forward(message));
+        }
         // Peers drain and free first: their gather events and P2P reads end
         // before rank 0's buffers go.
         let ep_result = self.ep_close(gpu);

@@ -943,6 +943,20 @@ impl HfqFile {
                 .is_some_and(|overlay| overlay.has_awq_sidecars())
     }
 
+    /// Whether this source carries an AWQ scale sidecar of a ROUTED EXPERT
+    /// weight ([`is_awq_expert_sidecar_name`]); attention/trunk/shared-expert
+    /// sidecars do not count. Unlike [`Self::has_awq_sidecars`] this is the
+    /// question a routed-expert consumer asks.
+    pub fn has_awq_expert_sidecars(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|tensor| is_awq_expert_sidecar_name(&tensor.name))
+            || self
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.has_awq_expert_sidecars())
+    }
+
     /// Open an HFQM container that lives inside a larger file, starting at
     /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
     /// MTP section embedded after the trunk's tensor data.
@@ -2438,6 +2452,41 @@ fn load_f16_tensor(
     };
 
     gpu.upload_f32(&f32_data, shape)
+}
+
+/// Whether `name` is the AWQ scale sidecar (`<weight>.awq_scale.weight`) of a
+/// routed-expert weight: the sidecar suffix on a tensor under an `.experts.`
+/// scope (aggregate `…mlp.experts.gate_up_proj` or a per-expert
+/// `…mlp.experts.N.…`). Attention, GDN, dense-FFN and `shared_expert`
+/// sidecars are not routed-expert sidecars.
+pub fn is_awq_expert_sidecar_name(name: &str) -> bool {
+    name.ends_with(".awq_scale.weight") && name.contains(".experts.")
+}
+
+#[cfg(test)]
+mod awq_expert_sidecar_name_tests {
+    use super::is_awq_expert_sidecar_name;
+
+    #[test]
+    fn only_routed_expert_sidecars_count() {
+        for expert in [
+            "model.language_model.layers.3.mlp.experts.gate_up_proj.awq_scale.weight",
+            "model.language_model.layers.3.mlp.experts.down_proj.awq_scale.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj.awq_scale.weight",
+            "model.layers.3.mlp.experts.12.gate_proj.weight.awq_scale.weight",
+        ] {
+            assert!(is_awq_expert_sidecar_name(expert), "{expert}");
+        }
+        for other in [
+            "model.language_model.layers.3.self_attn.q_proj.weight.awq_scale.weight",
+            "model.language_model.layers.3.linear_attn.in_proj_qkv.weight.awq_scale.weight",
+            "model.language_model.layers.3.mlp.shared_expert.down_proj.weight.awq_scale.weight",
+            "model.language_model.layers.3.mlp.experts.gate_up_proj",
+            "model.language_model.layers.3.mlp.experts.gate_up_proj.weight",
+        ] {
+            assert!(!is_awq_expert_sidecar_name(other), "{other}");
+        }
+    }
 }
 
 /// Resolve a validated AWQ scale sidecar payload as little-endian F32 bytes.

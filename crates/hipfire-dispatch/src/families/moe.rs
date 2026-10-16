@@ -1199,6 +1199,16 @@ pub trait RoutedExpertWeights {
     fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
         None
     }
+
+    /// Whole-layer iGPU prefill engine attached to this layer's routed
+    /// experts (the arch owns attachment and cache identity). `None` (the
+    /// default) keeps every call on the GPU grouped route. When `Some`, a
+    /// grouped prefill of at least [`IGPU_PREFILL_MIN_ROWS`] rows is sealed
+    /// in the distinct iGPU mode: the routed scatter/gate/up/down/combine
+    /// stages are replaced by one `MoeStage::IgpuExperts`.
+    fn igpu_engine(&self) -> Option<&crate::igpu_exec::IgpuLayerEngine> {
+        None
+    }
 }
 
 /// Expert-parallel row exchange for the indexed decode MoE and the few-row
@@ -2044,6 +2054,24 @@ pub fn gated_moe_prefill_admissible(
 /// load-bearing (a 1-row window is decode, not verify) and lives at each
 /// verify use site, not here.
 pub const NARROW_VERIFY_MAX_ROWS: usize = 4;
+
+/// First row count served by the whole-layer iGPU prefill engine: a window
+/// strictly wider than the narrow verify window. Windows of at most
+/// [`NARROW_VERIFY_MAX_ROWS`] rows never take the engine.
+pub const IGPU_PREFILL_MIN_ROWS: usize = NARROW_VERIFY_MAX_ROWS + 1;
+
+/// The layer's whole-layer iGPU engine when a `rows`-row grouped prefill takes
+/// it (`rows >= IGPU_PREFILL_MIN_ROWS` and the owner attached an engine).
+/// The one predicate both sealing and execution read.
+pub fn igpu_prefill_engine(
+    experts: &dyn RoutedExpertWeights,
+    rows: usize,
+) -> Option<&crate::igpu_exec::IgpuLayerEngine> {
+    if rows < IGPU_PREFILL_MIN_ROWS {
+        return None;
+    }
+    experts.igpu_engine()
+}
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
 ///

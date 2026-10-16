@@ -334,6 +334,9 @@ pub(crate) const FP8_WMMA_MIN_BATCH: usize = 1024;
 /// 1 MiB is generous relative to the observed overread (bytes to one group header)
 /// and now costs host RAM only, so there is no reason to shave it.
 const HOST_TAIL_PAD_BYTES: usize = 1024 * 1024;
+/// Alignment of every subview of a pooled host backing (a page; the engine
+/// requires 16 B).
+const HOST_POOL_ALIGN: usize = 4096;
 
 // AR-forward hipGraph policy (2026-05-15, after `<think>\n!!!!!` attractor
 // debug on Qwen3.5-27B mq4 gfx1100):
@@ -1317,6 +1320,28 @@ pub struct Gpu {
     /// reconstructed. Stored as `usize` (not a raw pointer) to leave `Gpu`'s
     /// auto-traits exactly as they were for the VMM arena map.
     host_mapped: HashMap<usize, usize>,
+    /// `memory.offload_exec=igpu` armed: new host-mapped allocations also set
+    /// `hipHostMallocPortable` so a second device can map them. Default off;
+    /// the default allocation flags are exactly `hipHostMallocMapped`.
+    host_mapped_portable: bool,
+    /// Device-visible bases of host-mapped owners allocated while
+    /// [`Self::arm_portable_host_mapped`] was on (the only ones a second device
+    /// may be leased).
+    host_portable: std::collections::HashSet<usize>,
+    /// Live keepalive leases per host-mapped owner (see `crate::host_lease`):
+    /// the allocation is not freed while a strong clone exists.
+    host_leases: HashMap<usize, std::sync::Weak<crate::host_lease::HostLeaseToken>>,
+    /// The single pooled portable backing (`reserve_portable_host_pool`); the
+    /// matching host-mapped uploads are aligned subviews of it.
+    host_pool: Option<crate::host_lease::HostPool>,
+    /// Pooled tensors: device-visible base -> (offset in pool, logical bytes).
+    host_pooled: HashMap<usize, (usize, usize)>,
+    /// Exact logical sizes the pool was reserved for, with the count still to be
+    /// carved; an upload of any other size takes a standalone allocation.
+    host_pool_sizes: HashMap<usize, usize>,
+    /// Set by [`Self::quarantine`]: a second device (or other in-flight reader)
+    /// could not be proven drained, so no model allocation may be released.
+    quarantine: Option<String>,
     /// Host-mapped error block of the bounded device spin waits
     /// (`crate::device_wait`). Allocated by the first launch of such a kernel
     /// and kept for the `Gpu`'s lifetime, because captured graphs bake in its
@@ -1936,6 +1961,12 @@ impl Gpu {
     /// `crate::graph::bind_thread`.
     #[inline]
     pub fn bind_thread(&self) -> HipResult<()> {
+        // A quarantined Gpu (a reader of its memory could not be proven drained)
+        // issues no further work: every allocation, launch, copy and load binds
+        // the device first, so this rejects them all.
+        if let Some(error) = self.quarantine_refusal("bind_thread") {
+            return Err(error);
+        }
         crate::graph::bind_thread(&self.hip, self.device_id)
     }
 
@@ -1990,6 +2021,22 @@ impl Gpu {
     }
 
     pub fn init_with_device(id: i32) -> HipResult<Self> {
+        // After an unprovable drain no new `Gpu` may be opened in this process:
+        // a fresh load could reuse the device and memory the leaked bundle's
+        // in-flight work still touches. Restart the process.
+        if let Some(reason) = PROCESS_QUARANTINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "Gpu::init refused: a Gpu in this process is quarantined after an \
+                     unprovable drain ({reason}); restart the process"
+                ),
+            ));
+        }
         // Honor HIPFIRE_DEVICES for every direct entry point before the HIP
         // runtime initializes; a no-op when unset or already applied (daemon).
         match hipfire_config::devices::apply_entry_point_device_visibility() {
@@ -2176,6 +2223,13 @@ impl Gpu {
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
             host_mapped: HashMap::new(),
+            host_mapped_portable: false,
+            host_portable: std::collections::HashSet::new(),
+            host_leases: HashMap::new(),
+            host_pool: None,
+            host_pooled: HashMap::new(),
+            host_pool_sizes: HashMap::new(),
+            quarantine: None,
             device_wait: None,
             router_fault: None,
             active_stream: None,
@@ -5505,10 +5559,13 @@ impl Gpu {
         dtype: DType,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
+        if let Some(tensor) = self.carve_host_pool(byte_size, shape, dtype) {
+            return Ok(tensor);
+        }
         let alloc_bytes = byte_size.saturating_add(HOST_TAIL_PAD_BYTES);
         let host_ptr = self
             .hip
-            .host_malloc(alloc_bytes, hip_bridge::HIP_HOST_MALLOC_MAPPED)
+            .host_malloc(alloc_bytes, self.host_mapped_flags())
             .map_err(|mut error| {
                 // hip-bridge backs host allocations with GTT unless the operator
                 // set HSA_USERPTR_FOR_PAGED_MEM; TTM caps GTT, not free RAM.
@@ -5551,11 +5608,284 @@ impl Gpu {
                 &format!("duplicate host-mapped tensor base address 0x{key:x}"),
             ));
         }
+        if self.host_mapped_portable {
+            self.host_portable.insert(key);
+        }
         Ok(GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(dev_ptr, byte_size) },
             shape: shape.to_vec(),
             dtype,
         })
+    }
+
+    /// `hipHostMalloc` flags of a new host-mapped tensor: exactly
+    /// `hipHostMallocMapped` unless [`Self::arm_portable_host_mapped`] ran.
+    fn host_mapped_flags(&self) -> u32 {
+        if self.host_mapped_portable {
+            hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_PORTABLE
+        } else {
+            hip_bridge::HIP_HOST_MALLOC_MAPPED
+        }
+    }
+
+    /// Make every host-mapped tensor allocated after this call
+    /// `hipHostMallocMapped | hipHostMallocPortable`, so a second device can map
+    /// the same pinned bytes (`memory.offload_exec=igpu`). Must run before the
+    /// weights allocate: tensors allocated earlier keep non-portable flags.
+    /// Never called on the default path, which keeps its exact flags.
+    pub fn arm_portable_host_mapped(&mut self) {
+        self.host_mapped_portable = true;
+    }
+
+    /// Whether new host-mapped tensors are allocated portable.
+    pub fn host_mapped_portable(&self) -> bool {
+        self.host_mapped_portable
+    }
+
+    /// Mark this `Gpu` unusable for any release: a reader of its memory (the
+    /// second device of `memory.offload_exec=igpu`) could not be proven drained,
+    /// so freeing, unloading or dropping model allocations, modules or runtime
+    /// handles is unsafe. After this, `free_tensor`, the registered
+    /// VMM/host-mapped releases and `Drop` retain everything (a leak, never a
+    /// free under an in-flight read). Irreversible; the first reason is kept.
+    pub fn quarantine(&mut self, reason: &str) {
+        if self.quarantine.is_none() {
+            self.quarantine = Some(reason.to_string());
+        }
+        *PROCESS_QUARANTINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
+        // The runtime handles whose `Drop` would release live state.
+        std::mem::forget(self.rocblas.take());
+        std::mem::forget(std::mem::replace(&mut self.pool, crate::pool::GpuPool::new()));
+    }
+
+    /// The quarantine reason, if [`Self::quarantine`] ran.
+    pub fn quarantined(&self) -> Option<&str> {
+        self.quarantine.as_deref()
+    }
+
+    fn quarantine_refusal(&self, what: &str) -> Option<HipError> {
+        self.quarantine.as_ref().map(|reason| {
+            HipError::new(
+                0,
+                &format!("{what} refused: the Gpu is quarantined ({reason}); allocations retained"),
+            )
+        })
+    }
+
+    /// The owner whose lease governs `key`: the pool base for a pooled tensor,
+    /// the tensor itself otherwise.
+    fn lease_owner_key(&self, key: usize) -> usize {
+        match (&self.host_pool, self.host_pooled.contains_key(&key)) {
+            (Some(pool), true) => pool.dev_key,
+            _ => key,
+        }
+    }
+
+    /// Whether a live [`crate::HostMappedLease`] exists on the owner of the
+    /// host-mapped tensor at device-visible base `key`.
+    pub fn host_mapped_leased(&self, key: usize) -> bool {
+        self.host_leases
+            .get(&self.lease_owner_key(key))
+            .is_some_and(|lease| lease.strong_count() > 0)
+    }
+
+    /// Bytes one tensor of logical size `byte_size` takes in a host pool: the
+    /// size plus the zeroed tail pad forward kernels overread, rounded up to a
+    /// page so every subview starts page-aligned.
+    pub fn host_pool_footprint(byte_size: usize) -> usize {
+        byte_size
+            .saturating_add(HOST_TAIL_PAD_BYTES)
+            .div_ceil(HOST_POOL_ALIGN)
+            .saturating_mul(HOST_POOL_ALIGN)
+    }
+
+    /// Reserve the ONE pinned backing of the host-mapped tensors whose logical
+    /// sizes are `sizes` (`memory.offload_exec=igpu`): a single
+    /// `hipHostMalloc(MAPPED | PORTABLE)` of the summed [`Self::host_pool_footprint`]s.
+    /// Subsequent host-mapped uploads whose exact size is still reserved become
+    /// aligned subviews of it; any other upload is an ordinary standalone
+    /// allocation. Fails closed: portable allocation must be armed, no pool may
+    /// exist, and the device alias must be non-null. Returns the pool capacity.
+    pub fn reserve_portable_host_pool(&mut self, sizes: &[usize]) -> HipResult<usize> {
+        self.bind_thread()?;
+        if !self.host_mapped_portable {
+            return Err(HipError::new(
+                0,
+                "reserve_portable_host_pool: portable host allocation is not armed",
+            ));
+        }
+        if self.host_pool.is_some() {
+            return Err(HipError::new(0, "reserve_portable_host_pool: a pool already exists"));
+        }
+        let mut capacity = 0usize;
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for &size in sizes {
+            capacity = capacity
+                .checked_add(Self::host_pool_footprint(size))
+                .ok_or_else(|| HipError::new(0, "reserve_portable_host_pool: size overflow"))?;
+            *counts.entry(size).or_insert(0) += 1;
+        }
+        if capacity == 0 {
+            return Err(HipError::new(0, "reserve_portable_host_pool: nothing to reserve"));
+        }
+        let host_ptr = self
+            .hip
+            .host_malloc(capacity, self.host_mapped_flags())
+            .map_err(|mut error| {
+                error.message.push_str(&format!(
+                    "; {capacity} pooled host-mapped bytes with HSA_USERPTR_FOR_PAGED_MEM={} \
+                     (0 = GTT, capped by /sys/module/ttm/parameters/pages_limit)",
+                    std::env::var("HSA_USERPTR_FOR_PAGED_MEM").unwrap_or_default()
+                ));
+                error
+            })?;
+        let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
+            Ok(ptr) if !ptr.is_null() => ptr,
+            other => {
+                let _ = self.hip.host_free(host_ptr);
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "reserve_portable_host_pool: hipHostGetDevicePointer failed ({other:?}); \
+                         no host-pointer fallback"
+                    ),
+                ));
+            }
+        };
+        self.host_pool = Some(crate::host_lease::HostPool {
+            host_ptr: host_ptr as usize,
+            dev_key: dev_ptr as usize,
+            capacity,
+            cursor: 0,
+            live: 0,
+        });
+        self.host_pool_sizes = counts;
+        Ok(capacity)
+    }
+
+    /// Carve one reserved-size tensor out of the host pool, `None` when there is
+    /// no pool, the size is not (or no longer) reserved, or it does not fit.
+    fn carve_host_pool(
+        &mut self,
+        byte_size: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Option<GpuTensor> {
+        let footprint = Self::host_pool_footprint(byte_size);
+        let pool = self.host_pool.as_mut()?;
+        let remaining = self.host_pool_sizes.get_mut(&byte_size).filter(|n| **n > 0)?;
+        let end = pool.cursor.checked_add(footprint)?;
+        if end > pool.capacity {
+            return None;
+        }
+        *remaining -= 1;
+        let offset = pool.cursor;
+        pool.cursor = end;
+        pool.live += 1;
+        let key = pool.dev_key + offset;
+        self.host_mapped.insert(key, pool.host_ptr + offset);
+        self.host_pooled.insert(key, (offset, byte_size));
+        Some(GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(key as *mut _, byte_size) },
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// The shared keepalive view of `tensor`'s extent in its host-mapped owner
+    /// (the pool for a pooled tensor, else the tensor's own allocation). The
+    /// lease on the owner is created on first call and cloned afterwards. Fails
+    /// closed: the tensor must be a host-mapped tensor of this `Gpu` that lives in
+    /// a MAPPED|PORTABLE owner. While any clone lives, freeing the owner
+    /// (`free_tensor`, unload) is refused.
+    pub fn host_mapped_view(&mut self, tensor: &GpuTensor) -> HipResult<crate::HostMappedView> {
+        let key = tensor.buf.as_ptr() as usize;
+        if !tensor.buf.is_host_mapped() {
+            return Err(HipError::new(0, "host_mapped_view: tensor is not host-mapped"));
+        }
+        let host_ptr = *self.host_mapped.get(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("host_mapped_view: 0x{key:x} is not a host-mapped tensor of this Gpu"),
+            )
+        })?;
+        let (owner_key, owner_host, owner_len, offset) = match (&self.host_pool, self.host_pooled.get(&key)) {
+            (Some(pool), Some(&(offset, _))) => {
+                (pool.dev_key, pool.host_ptr, pool.capacity, offset)
+            }
+            _ => {
+                if !self.host_portable.contains(&key) {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "host_mapped_view: 0x{key:x} was not allocated MAPPED|PORTABLE \
+                             (arm_portable_host_mapped must precede the allocation)"
+                        ),
+                    ));
+                }
+                (key, host_ptr, tensor.buf.size().saturating_add(HOST_TAIL_PAD_BYTES), 0)
+            }
+        };
+        let token = match self.host_leases.get(&owner_key).and_then(std::sync::Weak::upgrade) {
+            Some(existing) => existing,
+            None => {
+                let token = std::sync::Arc::new(crate::host_lease::HostLeaseToken {
+                    key: owner_key,
+                    host_ptr: owner_host,
+                    bytes: owner_len,
+                });
+                self.host_leases.insert(owner_key, std::sync::Arc::downgrade(&token));
+                token
+            }
+        };
+        Ok(crate::HostMappedView {
+            lease: crate::HostMappedLease(token),
+            offset,
+            len: tensor.buf.size(),
+        })
+    }
+
+    /// Stop allocating new host-mapped tensors portable (an armed `Gpu` reused
+    /// by a later load that fell back to the normal route). Tensors already
+    /// allocated keep their flags and leases; the pool, if any, is untouched.
+    pub fn disarm_portable_host_mapped(&mut self) {
+        self.host_mapped_portable = false;
+    }
+
+    /// Free a reserved pool that was never carved (`live == 0`) and is not
+    /// leased, clearing its size plan and lease entry, so a retry (or a refused
+    /// load) does not keep gigabytes of pinned RAM held. No-op without a pool.
+    /// `Err` if any tensor still lives in it, a lease exists, or the `Gpu` is
+    /// quarantined.
+    pub fn release_unused_host_pool(&mut self) -> HipResult<()> {
+        if let Some(error) = self.quarantine_refusal("host pool release") {
+            return Err(error);
+        }
+        let Some(pool) = self.host_pool.as_ref() else {
+            return Ok(());
+        };
+        let (pool_key, pool_host, live) = (pool.dev_key, pool.host_ptr, pool.live);
+        if live > 0 {
+            return Err(HipError::new(
+                0,
+                &format!("release_unused_host_pool: {live} tensors still live in the pool"),
+            ));
+        }
+        if self
+            .host_leases
+            .get(&pool_key)
+            .is_some_and(|lease| lease.strong_count() > 0)
+        {
+            return Err(HipError::new(0, "release_unused_host_pool: the pool is leased"));
+        }
+        self.bind_thread()?;
+        self.hip.host_free(pool_host as *mut std::ffi::c_void)?;
+        self.host_pool = None;
+        self.host_pool_sizes.clear();
+        self.host_leases.remove(&pool_key);
+        Ok(())
     }
 
     /// Live `hipHostMalloc` owners. Zero after a clean unload; nonzero means a leak.
@@ -5718,16 +6048,43 @@ impl Gpu {
     /// [`Self::release_registered_vmm`]. Returns the number still registered.
     fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
         let mut first_error = None;
+        if let Some(error) = self.quarantine_refusal("host-mapped release") {
+            return Err(error);
+        }
         // Remove only on success, mirroring `release_registered_vmm`: draining
         // unconditionally would drop the sole record of a pointer whose
         // `hipHostFree` failed, turning a retryable failure into an invisible
         // leak that `host_mapped_count()` could no longer report.
         let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
         for key in keys {
+            if self.host_mapped_leased(key) {
+                first_error.get_or_insert_with(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "host-mapped allocation 0x{key:x} is still leased by a second \
+                             device engine; retained instead of freed"
+                        ),
+                    )
+                });
+                continue;
+            }
+            if self.host_pooled.contains_key(&key) {
+                // A pooled tensor owns no allocation of its own; the pool is
+                // freed once below.
+                self.host_mapped.remove(&key);
+                self.host_pooled.remove(&key);
+                if let Some(pool) = self.host_pool.as_mut() {
+                    pool.live = pool.live.saturating_sub(1);
+                }
+                continue;
+            }
             let host_ptr = self.host_mapped[&key];
             match self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
                 Ok(()) => {
                     self.host_mapped.remove(&key);
+                    self.host_portable.remove(&key);
+                    self.host_leases.remove(&key);
                 }
                 Err(err) => {
                     if first_error.is_none() {
@@ -5735,6 +6092,37 @@ impl Gpu {
                     }
                 }
             }
+        }
+        if let Some(pool) = self.host_pool.as_ref() {
+            let (pool_key, pool_host, live) = (pool.dev_key, pool.host_ptr, pool.live);
+            let leased = self
+                .host_leases
+                .get(&pool_key)
+                .is_some_and(|lease| lease.strong_count() > 0);
+            if live == 0 && !leased {
+                match self.hip.host_free(pool_host as *mut std::ffi::c_void) {
+                    Ok(()) => {
+                        self.host_pool = None;
+                        self.host_pool_sizes.clear();
+                        self.host_leases.remove(&pool_key);
+                    }
+                    Err(err) => {
+                        first_error.get_or_insert(err);
+                    }
+                }
+            } else if leased {
+                first_error.get_or_insert_with(|| {
+                    HipError::new(
+                        0,
+                        "pooled host-mapped backing is still leased by a second device \
+                         engine; retained instead of freed",
+                    )
+                });
+            }
+        }
+        // No armed state survives a model unload.
+        if first_error.is_none() {
+            self.host_mapped_portable = false;
         }
         match first_error {
             Some(err) => Err(err),
@@ -6745,6 +7133,9 @@ impl Gpu {
     }
 
     fn release_registered_vmm(&mut self) -> HipResult<usize> {
+        if let Some(error) = self.quarantine_refusal("VMM release") {
+            return Err(error);
+        }
         let keys: Vec<usize> = self.vmm_arenas.keys().copied().collect();
         let mut first_error = None;
         for key in keys {
@@ -7063,11 +7454,45 @@ impl Gpu {
     /// and returns the error (never a false clean free).
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
+        if let Some(error) = self.quarantine_refusal("free_tensor") {
+            return Err(error);
+        }
         let key = tensor.buf.as_ptr() as usize;
         if tensor.buf.is_host_mapped() {
             // Host-mapped owners are never pooled: hipHostFree takes the host
             // pointer, and an offloaded weight is static (freed at unload), so
             // there is nothing to gain from reusing the mapping.
+            if self.host_mapped_leased(key) {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "host-mapped tensor at 0x{key:x} is still leased by a second device \
+                         engine; drain and drop the engine first (allocation retained)"
+                    ),
+                ));
+            }
+            if self.host_pooled.contains_key(&key) {
+                // A pooled tensor frees no allocation of its own: it leaves the
+                // registry, and the pool is released with its last subview.
+                self.host_mapped.remove(&key);
+                self.host_pooled.remove(&key);
+                let released = match self.host_pool.as_mut() {
+                    Some(pool) => {
+                        pool.live = pool.live.saturating_sub(1);
+                        (pool.live == 0).then_some((pool.dev_key, pool.host_ptr))
+                    }
+                    None => None,
+                };
+                if let Some((pool_key, pool_host)) = released {
+                    self.host_pool = None;
+                    self.host_pool_sizes.clear();
+                    self.host_leases.remove(&pool_key);
+                    return self.hip.host_free(pool_host as *mut std::ffi::c_void);
+                }
+                return Ok(());
+            }
+            self.host_portable.remove(&key);
+            self.host_leases.remove(&key);
             let host_ptr = self.host_mapped.remove(&key).ok_or_else(|| {
                 HipError::new(
                     0,
@@ -8365,11 +8790,22 @@ impl Gpu {
     }
 }
 
+/// Process-wide quarantine verdict ([`Gpu::quarantine`]); refuses any later
+/// `Gpu::init*` so a leaked bundle's in-flight work is never raced by a reload.
+static PROCESS_QUARANTINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 impl Drop for Gpu {
     /// Defensive: bind owning device before any future per-field `Drop`
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
+        if let Some(reason) = self.quarantine.as_ref() {
+            eprintln!(
+                "[rdna-compute] Gpu dropped while quarantined ({reason}); model allocations, \
+                 modules and runtime handles are retained"
+            );
+            return;
+        }
         // Before any bind/free: drop every registered module handle while the
         // runtime and `self.modules` are still alive (no-op unless flagged).
         crate::scratch::qsa_code_check_unregister_all(&self.modules);

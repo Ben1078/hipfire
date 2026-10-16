@@ -649,6 +649,8 @@ mod tests {
             OffloadBudget::Layers(4),
         ] {
             assert!(!cpu_offload_configured_from(OffloadExec::Pcie, budget, budget));
+            // `igpu` runs host-placed layers on the integrated GPU, not on the CPU.
+            assert!(!cpu_offload_configured_from(OffloadExec::Igpu, budget, budget));
         }
         // CPU with both tiers unset is not configured on any model.
         assert!(!cpu_offload_configured_from(

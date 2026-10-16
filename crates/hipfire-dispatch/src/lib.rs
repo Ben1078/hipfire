@@ -13,6 +13,7 @@ mod macros;
 pub mod context;
 pub mod cpu_exec;
 pub mod families;
+pub mod igpu_exec;
 pub mod offload_split;
 pub mod ops;
 pub mod pipeline;

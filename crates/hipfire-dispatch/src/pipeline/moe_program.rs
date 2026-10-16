@@ -65,6 +65,14 @@ pub enum MoeStage {
     Combine,
     HostExperts,
     CpuSplice,
+    /// Whole-layer iGPU prefill ([`MoePrefillSelection::igpu_experts`]): the
+    /// attached engine runs the routed experts for the layer from the natural
+    /// `x_norm` and the original route, and accumulates into the same target
+    /// the routed `Combine` would. Lowered only at the combine seam (after
+    /// `MutationFence`, before a `shared_after_combine` `SharedDown`) of the
+    /// distinct iGPU grouped-prefill mode; it replaces `Scatter`, `GateUp`,
+    /// `Unscatter`, `Activation`, `Down` and `Combine`.
+    IgpuExperts,
 }
 
 fn router_shared_fuse_allowed(
@@ -124,6 +132,13 @@ pub(super) struct MoePrefillSelection {
     /// no routed GPU stage may be lowered (see
     /// [`MoePrefillParams::cpu_deferred_experts`](crate::families::moe::MoePrefillParams::cpu_deferred_experts)).
     pub(super) cpu_deferred_experts: bool,
+    /// Distinct whole-layer iGPU mode: the layer's attached engine
+    /// ([`RoutedExpertWeights::igpu_engine`](crate::families::moe::RoutedExpertWeights::igpu_engine))
+    /// takes a window of at least
+    /// [`IGPU_PREFILL_MIN_ROWS`](crate::families::moe::IGPU_PREFILL_MIN_ROWS)
+    /// rows. No routed GPU stage is lowered; mutually exclusive with
+    /// `cpu_deferred_experts`.
+    pub(super) igpu_experts: bool,
 }
 
 impl MoePrefillSelection {
@@ -275,6 +290,22 @@ impl<'a> MoeStepState<'a> {
         Ok((params, selection))
     }
 
+    /// Whether this iGPU call's `clear` is the routed-only zero target the
+    /// engine starts from: the call is in the iGPU mode and the clear zeroes
+    /// exactly the `batch_size × down_m` elements of the routed target. The
+    /// clear still runs (the model's existing preclear is preserved); the
+    /// engine then writes the target from +0.0 and never reads or downloads
+    /// it. Pure over the call: no device state.
+    fn igpu_clears_target(&self, clear: &super::layer_ops::ClearOp<'_>) -> bool {
+        let Ok((params, selection)) = self.prefill_parts() else {
+            return false;
+        };
+        let target = params.routed_out.unwrap_or(params.x_batch);
+        selection.igpu_experts
+            && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
+            && Some(clear.elements) == params.batch_size.checked_mul(params.down_m)
+    }
+
     /// Whether the qt44 combine of this call can take over `clear`'s zero
     /// fill (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201):
     /// the combine writes every element `clear` zeroes, into that very
@@ -296,6 +327,10 @@ impl<'a> MoeStepState<'a> {
             // A CPU-deferred call omits the combine that would consume the
             // absorbed fill, so it must never absorb one.
             && !selection.cpu_deferred_experts
+            // The iGPU engine writes the target itself and never runs the
+            // qt44 combine that would consume an absorbed fill: the clear
+            // always runs, exactly as for the GPU route.
+            && !selection.igpu_experts
             && matches!(params.prelude.normalization, MoeNormalization::Provided)
             && super::qt44_qt53_prefill::combine_initial_zero_applies(
                 gpu,
@@ -442,6 +477,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::Combine => self.combine(gpu),
             MoeStage::HostExperts => self.host_experts(gpu),
             MoeStage::CpuSplice => self.cpu_splice(gpu),
+            MoeStage::IgpuExperts => self.igpu_experts(gpu),
         }
     }
 
@@ -859,6 +895,14 @@ impl<'a> SealedMoeOp<'a> {
             // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
             // shared down's GEMM epilogue when this call admits it.
             if let Some(hc) = self.state.hc_write.take() {
+                // The HC row fold consumes the grouped-down rows and the
+                // combine-order scratch an iGPU call never produces; its offer
+                // is withheld in `execute_after_clear`, and a stray one refuses.
+                if selection.igpu_experts && hc.row_fold.is_some() {
+                    return Err(DispatchError::Hip(
+                        "sealed moe: the HC row fold needs grouped-down rows an iGPU prefill never produces".into(),
+                    ));
+                }
                 let row_fold = hc.row_fold.is_some();
                 if super::qt44_qt53_prefill::shared_down_hc(
                     gpu,
@@ -1195,6 +1239,84 @@ impl<'a> SealedMoeOp<'a> {
         }
     }
 
+    /// The whole-layer iGPU routed experts, executed where the routed
+    /// `Combine` would be. The engine consumes the natural F32 `x_norm` the
+    /// router read and the original route's ids/weights, and writes the
+    /// canonical zero-initialised BF16 combine (`initial_zero = true`: it
+    /// neither reads nor downloads the target) into
+    /// `routed_out.unwrap_or(x_batch)`, the routed-only zero target this
+    /// call's own clear just zeroed (the preclear still runs).
+    /// Eager only: the engine is a host sync point with its own queues, so a
+    /// graph capture, retained body (AQL/PM4), recording or shadow run refuses
+    /// before the engine is touched.
+    pub(super) fn igpu_experts(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, selection) = self.state.prefill_parts()?;
+        if !selection.igpu_experts {
+            return Err(DispatchError::Hip(
+                "sealed moe: iGPU experts stage lowered without the iGPU selection".into(),
+            ));
+        }
+        if let Some(reason) =
+            igpu_prefill_conflict(params, selection.route, selection.cpu_deferred_experts)
+        {
+            return Err(DispatchError::Hip(format!("sealed moe: {reason}")));
+        }
+        // The engine consumes the route's ids/weights: they must exist.
+        self.state.require_route_ready()?;
+        IgpuRunGate::observe(gpu)?.require_eager()?;
+        // The engine consumes the route exactly as the router produced it for
+        // `rows` rows; a canonicalised (prefill-invariant) route width is a
+        // different route contract and stays on the GPU tail.
+        if gpu.route_rows(params.batch_size) != params.batch_size {
+            return Err(DispatchError::Hip(
+                "sealed moe: the iGPU prefill engine requires route rows equal to the window rows (prefill-invariant scope is refused)".into(),
+            ));
+        }
+        let engine = crate::families::moe::igpu_prefill_engine(
+            params.routed_experts,
+            params.batch_size,
+        )
+        .ok_or_else(|| {
+            DispatchError::Hip(
+                "sealed moe: the iGPU engine sealed into this call is no longer attached".into(),
+            )
+        })?;
+        let target = params.routed_out.unwrap_or(params.x_batch);
+        if let Some(reason) = igpu_extent_error(
+            params.batch_size,
+            params.gate_up_k,
+            params.down_m,
+            params.k_top,
+            params.x_norm_batch.dtype,
+            [
+                params.x_norm_batch.numel(),
+                params.topk_indices.numel(),
+                params.topk_weights.numel(),
+                target.numel(),
+            ],
+        ) {
+            return Err(DispatchError::Hip(format!("sealed moe: {reason}")));
+        }
+        // The engine starts the target from +0.0 (a routed-only zero target:
+        // the call's own clear, `execute_after_clear`) and never reads or
+        // downloads it. A call whose target was not cleared by this call's
+        // clear step would have its residual overwritten, so it refuses.
+        if !self.state.initial_zero.take() {
+            return Err(DispatchError::Hip(
+                "sealed moe: the iGPU prefill engine requires a routed-only zero target cleared by this call's clear step".into(),
+            ));
+        }
+        engine.execute(
+            gpu,
+            params.x_norm_batch,
+            params.topk_indices,
+            params.topk_weights,
+            target,
+            params.batch_size,
+            true,
+        )
+    }
+
     pub(super) fn mutation_fence(&self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => super::decode_mutation_fence_stage(),
@@ -1502,6 +1624,15 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+    if selection.igpu_experts {
+        // Checked before any other lowering decision: the mode must never
+        // fall into the generic or deferred arms by accident.
+        if let Some(reason) =
+            igpu_prefill_conflict(params, selection.route, selection.cpu_deferred_experts)
+        {
+            return Err(DispatchError::Hip(format!("sealed moe: {reason}")));
+        }
+    }
     if params.ep_row_gather.is_some()
         && (!selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
             || params.routed_out.is_some())
@@ -1553,6 +1684,21 @@ fn lower_prefill<'a>(
             .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx))
         {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
+        }
+        if selection.igpu_experts {
+            // Original route and the unchanged `shared_after_combine` shared
+            // expert (XTX) bracket the engine; it stands where the routed
+            // `Combine` would, after the fence that marks the routed-stage
+            // boundary. Scatter/GateUp/Unscatter/Activation/Down/Combine are
+            // never lowered: the engine reads the natural `x_norm` and the
+            // routed ids/weights, not the grouped scratch.
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::MutationFence),
+            )?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::IgpuExperts))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            return Ok(steps);
         }
         if selection.cpu_deferred_experts {
             // The arch's CPU splice owns the routed FFN for this narrow window;
@@ -1697,6 +1843,16 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
 }
 
+/// Whether `clear` is the routed-only zero target of this iGPU call (test
+/// probe: nothing launches).
+#[cfg(test)]
+pub(super) fn igpu_zero_target_for_test(
+    call: &SealedMoeCall<'_>,
+    clear: &super::layer_ops::ClearOp<'_>,
+) -> bool {
+    MoeStepState::new(call).igpu_clears_target(clear)
+}
+
 /// The MoE stages a call lowers to, in order (test probe: nothing launches).
 #[cfg(test)]
 pub(super) fn lowered_stages(call: &SealedMoeCall<'_>) -> Result<Vec<MoeStage>, DispatchError> {
@@ -1749,12 +1905,16 @@ pub(super) fn execute_after_clear(
     if !absorbed {
         super::layer_ops::execute_clear(gpu, clear)?;
     }
-    state.initial_zero.set(absorbed);
+    // `absorbed`: the clear was skipped and the combine writes from +0.0. An
+    // iGPU call runs its clear anyway (preclear preserved) and the engine
+    // starts from +0.0 into that cleared target; both are consumed once.
+    state.initial_zero.set(absorbed || state.igpu_clears_target(clear));
     if let Some(write) = hc {
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
                 if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
+                    && !selection.igpu_experts
                     && super::qt44_qt53_prefill::row_fold_applies(
                         gpu,
                         params,
@@ -2082,6 +2242,160 @@ pub(super) fn select_decode(
     })
 }
 
+/// Why a grouped prefill cannot run in the distinct whole-layer iGPU mode, or
+/// `None` when it can. One predicate for sealing (`select_prefill`), lowering
+/// and the stage itself.
+///
+/// The mode intercepts exactly the original grouped QT44/QT53 route: the
+/// router, the shared expert's gate/up and the route run unchanged on the model
+/// GPU, the engine replaces the routed tail, and the `shared_after_combine`
+/// shared down runs unchanged afterwards (so the routed contribution lands in
+/// the target first and the shared contribution second, like the GPU tail).
+/// Anything that changes that bracket refuses.
+pub(super) fn igpu_prefill_conflict(
+    params: &MoePrefillParams<'_>,
+    route: Option<MoeRouteCapability>,
+    cpu_deferred_experts: bool,
+) -> Option<&'static str> {
+    if params.batch_size < crate::families::moe::IGPU_PREFILL_MIN_ROWS {
+        return Some("iGPU prefill requires a window wider than the narrow verify window");
+    }
+    if cpu_deferred_experts || params.cpu_deferred_experts {
+        return Some("iGPU prefill and CPU-deferred routed experts are mutually exclusive");
+    }
+    if !route.is_some_and(|route| route.is_qt44_qt53_grouped() && !route.is_slab()) {
+        return Some("iGPU prefill requires the original grouped QT44/QT53 route");
+    }
+    // The routed-only zero-target recipe (the Qwen4 ffn_output contract): BF16
+    // round trips, the shared expert after the combine, and a provided natural
+    // activation. The engine's canonical zero-initialised BF16 combine is the
+    // only combine this call runs; no other recipe's rounding is admitted.
+    if !matches!(
+        params.recipe,
+        MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        }
+    ) {
+        return Some("iGPU prefill requires the bf16 shared_after_combine softmax recipe");
+    }
+    if !matches!(params.prelude.normalization, MoeNormalization::Provided) {
+        return Some("iGPU prefill requires a provided natural activation (no in-program norm)");
+    }
+    if params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+        || !matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::Replicated
+        )
+    {
+        return Some("iGPU prefill is a replicated single-device mode (no EP gather/exchange/root route)");
+    }
+    None
+}
+
+/// Extent/dtype contract of the engine's operands. Host-side counts only.
+pub(super) fn igpu_extent_error(
+    rows: usize,
+    hidden_in: usize,
+    hidden_out: usize,
+    k_top: usize,
+    x_norm_dtype: rdna_compute::DType,
+    // `[x_norm, topk_indices, topk_weights, target]` element counts.
+    numel: [usize; 4],
+) -> Option<String> {
+    if x_norm_dtype != rdna_compute::DType::F32 {
+        return Some(format!(
+            "iGPU prefill consumes the natural F32 x_norm, got {x_norm_dtype:?}"
+        ));
+    }
+    let need = |a: usize, b: usize| a.checked_mul(b);
+    let required = [
+        ("x_norm", need(rows, hidden_in), numel[0]),
+        ("topk_indices", need(rows, k_top), numel[1]),
+        ("topk_weights", need(rows, k_top), numel[2]),
+        ("target", need(rows, hidden_out), numel[3]),
+    ];
+    for (name, need, have) in required {
+        match need {
+            Some(need) if have >= need => {}
+            Some(need) => {
+                return Some(format!(
+                    "iGPU prefill {name} holds {have} elements, the call needs {need}"
+                ));
+            }
+            None => return Some(format!("iGPU prefill {name} extent overflows")),
+        }
+    }
+    None
+}
+
+/// Snapshot of every device state that makes a host-synchronous engine run
+/// unsound: the engine's work is invisible to a recorded/replayed tape, a
+/// captured graph, and a shadow comparison of the retained body. Mirrors the
+/// CPU splice's refusal (`cpu_exec::moe_cpu_experts`) and adds the retained
+/// AQL/PM4 transports and shadow routes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct IgpuRunGate {
+    pub(super) graph_capture: bool,
+    pub(super) verify_capture: bool,
+    pub(super) replay_capture: bool,
+    pub(super) stream_capture: bool,
+    pub(super) recording: bool,
+    pub(super) aql: bool,
+    pub(super) pm4: bool,
+    pub(super) shadow: bool,
+}
+
+impl IgpuRunGate {
+    pub(super) fn observe(gpu: &Gpu) -> Result<Self, DispatchError> {
+        let stream_capture = match gpu.active_stream.as_ref() {
+            Some(stream) => gpu
+                .hip
+                .stream_is_capturing(stream)
+                .map_err(|e| DispatchError::Hip(format!("sealed moe: iGPU stream capture query: {e}")))?,
+            None => false,
+        };
+        Ok(Self {
+            graph_capture: gpu.graphs.capture_mode,
+            verify_capture: gpu.graphs.verify.capturing.is_some(),
+            replay_capture: gpu.graphs.replay.capturing.is_some(),
+            stream_capture,
+            recording: gpu.replay.is_recording(),
+            aql: gpu.replay.should_route_aql(),
+            pm4: gpu.replay.should_route_pm4(),
+            shadow: gpu.replay.shadow_body_route().is_some()
+                || gpu.replay.state() == rdna_compute::replay::ReplayState::ShadowValidated,
+        })
+    }
+
+    /// The first refused state, named for the operator.
+    pub(super) fn refusal(self) -> Option<&'static str> {
+        if self.graph_capture || self.verify_capture || self.replay_capture || self.stream_capture {
+            Some("graph capture")
+        } else if self.recording {
+            Some("replay recording")
+        } else if self.pm4 {
+            Some("a retained PM4 body")
+        } else if self.aql {
+            Some("a retained AQL body")
+        } else if self.shadow {
+            Some("a shadow-validated retained body")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn require_eager(self) -> Result<(), DispatchError> {
+        match self.refusal() {
+            None => Ok(()),
+            Some(state) => Err(DispatchError::Hip(format!(
+                "sealed moe: the iGPU prefill engine is a host-synchronous step and is refused under {state}; run eager (replay.backend=hip, memory.offload_exec=pcie)"
+            ))),
+        }
+    }
+}
+
 /// A grouped FP8 launcher reads one immutable contiguous block table, not the
 /// legacy device pointer indirection. Prove that both tables name those same
 /// live blocks before constructing the launcher's borrowed base view.
@@ -2171,6 +2485,8 @@ pub(super) fn select_prefill(
             shared_after_combine: true,
         })
             || params.cpu_deferred_experts
+            || crate::families::moe::igpu_prefill_engine(params.routed_experts, params.batch_size)
+                .is_some()
             || params.routed_out.is_some()
             || params.expert_stage_ptrs.is_some()
             || params.ep_row_gather.is_some()
@@ -2193,6 +2509,7 @@ pub(super) fn select_prefill(
             coalesced_verify: false,
             route: Some(route),
             cpu_deferred_experts: false,
+            igpu_experts: false,
         });
     }
     let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
@@ -2261,6 +2578,14 @@ pub(super) fn select_prefill(
             });
         }
     }
+    let igpu_experts =
+        crate::families::moe::igpu_prefill_engine(params.routed_experts, params.batch_size)
+            .is_some();
+    if igpu_experts {
+        if let Some(reason) = igpu_prefill_conflict(params, route, params.cpu_deferred_experts) {
+            return Err(DispatchError::Hip(format!("sealed moe: {reason}")));
+        }
+    }
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
@@ -2321,6 +2646,7 @@ pub(super) fn select_prefill(
         coalesced_verify,
         route,
         cpu_deferred_experts: params.cpu_deferred_experts,
+        igpu_experts,
     })
 }
 

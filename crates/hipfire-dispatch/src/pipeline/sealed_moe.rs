@@ -2277,6 +2277,12 @@ impl<'a> SealedMoeCall<'a> {
         if let (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection)) =
             (&self.params, &self.selection)
         {
+            // The whole-layer iGPU mode is host-synchronous and eager-only:
+            // refuse a capture/retained/shadow/PM4 state before any launch of
+            // this call (the stage re-checks at its own launch).
+            if selection.igpu_experts {
+                moe_program::IgpuRunGate::observe(gpu)?.require_eager()?;
+            }
             if selection
                 .route
                 .is_some_and(MoeRouteCapability::is_fp8_grouped)
@@ -7609,6 +7615,7 @@ mod tests {
             coalesced_verify: false,
             route,
             cpu_deferred_experts: false,
+            igpu_experts: false,
         })
     }
 
@@ -7791,6 +7798,375 @@ mod tests {
         }
     }
 
+    /// Stages a whole-layer iGPU grouped call lowers to (nothing launches).
+    /// `configure` edits the otherwise valid iGPU parameters; `selection` edits
+    /// the sealed selection. The route is the original grouped QT44/QT53 one.
+    fn igpu_stages(
+        route: Option<MoeRouteCapability>,
+        configure: impl FnOnce(&mut MoePrefillParams<'_>),
+        select: impl FnOnce(&mut MoePrefillSelection),
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        igpu_stages_with_root(route, false, configure, select)
+    }
+
+    /// `keep_produce_root` leaves the fixture's own `ProduceRoot` route
+    /// authority (a compact EP root) instead of the replicated one.
+    fn igpu_stages_with_root(
+        route: Option<MoeRouteCapability>,
+        keep_produce_root: bool,
+        configure: impl FnOnce(&mut MoePrefillParams<'_>),
+        select: impl FnOnce(&mut MoePrefillSelection),
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xED_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let scratch = prefill_scratch(0xEE_0000);
+        let mut params = MoePrefillParams {
+            batch_size: crate::families::moe::IGPU_PREFILL_MIN_ROWS,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+            )
+        };
+        if !keep_produce_root {
+            params.prelude.route = PrefillRouteMode::Replicated;
+            // The Qwen4 routed-only recipe: the natural activation is provided.
+            params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+        }
+        configure(&mut params);
+        let MoeKernelSelection::Prefill(mut selection) = prefill_selection(&ctx, &params, route)
+        else {
+            unreachable!("prefill_selection returns a prefill selection");
+        };
+        selection.igpu_experts = true;
+        select(&mut selection);
+        let call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Prefill(selection),
+            SealedParams::Prefill(params),
+        );
+        moe_program::lowered_stages(&call)
+    }
+
+    #[test]
+    fn igpu_mode_replaces_the_routed_tail_with_one_stage_at_the_combine_seam() {
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            let stages = igpu_stages(Some(route), |_| {}, |_| {}).unwrap();
+            // Original route and the unchanged post-combine shared expert
+            // bracket the engine; no routed GPU stage and no combine exists.
+            assert_eq!(
+                stages,
+                [
+                    MoeStage::Normalize,
+                    MoeStage::InputBasis,
+                    MoeStage::RouterProjection,
+                    MoeStage::SharedGateUp,
+                    MoeStage::SharedActivation,
+                    MoeStage::Route,
+                    MoeStage::MutationFence,
+                    MoeStage::IgpuExperts,
+                    MoeStage::SharedDown,
+                ],
+                "{route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn igpu_mode_matches_the_gpu_route_up_to_the_combine_seam() {
+        let igpu = igpu_stages(
+            Some(MoeRouteCapability::Qt44Qt53Grouped),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let gpu = igpu_stages(
+            Some(MoeRouteCapability::Qt44Qt53Grouped),
+            |_| {},
+            |selection| selection.igpu_experts = false,
+        )
+        .unwrap();
+        let route = |stages: &[MoeStage]| {
+            stages
+                .iter()
+                .position(|stage| *stage == MoeStage::Route)
+                .unwrap()
+        };
+        // Identical through the route: the iGPU mode never changes what the
+        // router, the shared gate/up or the route see.
+        assert_eq!(igpu[..=route(&igpu)], gpu[..=route(&gpu)]);
+        // The GPU tail's routed stages are exactly what the engine replaces,
+        // and the shared down follows both unchanged.
+        let fence = gpu
+            .iter()
+            .position(|stage| *stage == MoeStage::MutationFence)
+            .unwrap();
+        assert_eq!(gpu[fence + 1], MoeStage::Combine);
+        assert_eq!(gpu.last(), igpu.last());
+        assert_eq!(igpu.last(), Some(&MoeStage::SharedDown));
+        // Whether the GPU tail scatters is the device's path-2 decision; the
+        // iGPU mode never lowers either way.
+        for replaced in [
+            MoeStage::GateUp,
+            MoeStage::Activation,
+            MoeStage::Down,
+            MoeStage::Combine,
+        ] {
+            assert!(gpu.contains(&replaced) && !igpu.contains(&replaced), "{replaced:?}");
+        }
+        for replaced in [MoeStage::Scatter, MoeStage::Unscatter] {
+            assert!(!igpu.contains(&replaced), "{replaced:?}");
+        }
+    }
+
+    #[test]
+    fn igpu_mode_refuses_every_lowering_it_does_not_bracket() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let refused = |result: Result<Vec<MoeStage>, DispatchError>, what: &str| {
+            let error = result.expect_err(what);
+            assert!(format!("{error:?}").contains("iGPU prefill"), "{what}: {error:?}");
+        };
+        refused(
+            igpu_stages(None, |_| {}, |_| {}),
+            "generic (non-specialized) route",
+        );
+        refused(
+            igpu_stages(Some(MoeRouteCapability::Fp8B128Grouped), |_| {}, |_| {}),
+            "fp8 route",
+        );
+        refused(
+            igpu_stages(Some(MoeRouteCapability::SlabCodecGrouped), |_| {}, |_| {}),
+            "slab route",
+        );
+        refused(
+            igpu_stages(
+                grouped,
+                |params| {
+                    params.recipe = MoeRecipe::SoftmaxGatedShared {
+                        bf16_round_trip: true,
+                        shared_after_combine: false,
+                    }
+                },
+                |_| {},
+            ),
+            "shared before combine",
+        );
+        refused(
+            igpu_stages(
+                grouped,
+                |params| {
+                    params.recipe = MoeRecipe::SoftmaxGatedShared {
+                        bf16_round_trip: false,
+                        shared_after_combine: true,
+                    }
+                },
+                |_| {},
+            ),
+            "no bf16 round trips (not the canonical BF16 combine)",
+        );
+        refused(
+            igpu_stages(
+                grouped,
+                |params| {
+                    let norm = params.x_norm_batch;
+                    params.prelude.normalization =
+                        crate::families::moe::MoeNormalization::RmsNorm {
+                            weight: norm,
+                            plain_out: norm,
+                            eps: 1e-5,
+                        };
+                },
+                |_| {},
+            ),
+            "in-program norm",
+        );
+        refused(
+            igpu_stages(
+                grouped,
+                |params| params.recipe = MoeRecipe::SigmoidRoutedNoShared,
+                |_| {},
+            ),
+            "no-shared recipe",
+        );
+        refused(
+            igpu_stages(grouped, |params| params.batch_size = 4, |_| {}),
+            "narrow verify window",
+        );
+        refused(
+            igpu_stages(
+                grouped,
+                |params| params.ep_row_gather = Some(&NoopGather),
+                |_| {},
+            ),
+            "ep row gather",
+        );
+        refused(
+            igpu_stages_with_root(grouped, true, |_| {}, |_| {}),
+            "root-routed EP",
+        );
+        refused(
+            igpu_stages(
+                grouped,
+                |_| {},
+                |selection| selection.cpu_deferred_experts = true,
+            ),
+            "selection cpu-deferred",
+        );
+        refused(
+            igpu_stages(grouped, |params| params.cpu_deferred_experts = true, |_| {}),
+            "params cpu-deferred",
+        );
+    }
+
+    #[test]
+    fn igpu_call_takes_only_its_own_routed_only_zero_target_clear() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF0_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let scratch = prefill_scratch(0xF1_0000);
+        let build = |igpu: bool, rows: usize| {
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let mut params = MoePrefillParams {
+                batch_size: rows,
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_prefill_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            params.prelude.route = PrefillRouteMode::Replicated;
+            params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+            let MoeKernelSelection::Prefill(mut selection) = prefill_selection(
+                &ctx,
+                &params,
+                Some(MoeRouteCapability::Qt44Qt53Grouped),
+            ) else {
+                unreachable!("prefill_selection returns a prefill selection");
+            };
+            selection.igpu_experts = igpu;
+            (experts, selection, params)
+        };
+        let rows = crate::families::moe::IGPU_PREFILL_MIN_ROWS;
+        let hidden = 4; // `ep_prefill_params` down_m
+        let (experts, selection, params) = build(true, rows);
+        let call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Prefill(selection),
+            SealedParams::Prefill(params),
+        );
+        let clear = |tensor, elements| crate::pipeline::layer_ops::ClearOp { tensor, elements };
+        // The call's own target (`x_batch`) cleared over exactly rows × hidden.
+        assert!(moe_program::igpu_zero_target_for_test(
+            &call,
+            &clear(&scratch.x_batch, rows * hidden)
+        ));
+        // Short, long, or another tensor's clear is not the engine's zero target:
+        // the stage would then refuse rather than overwrite a residual.
+        assert!(!moe_program::igpu_zero_target_for_test(
+            &call,
+            &clear(&scratch.x_batch, rows * hidden - 1)
+        ));
+        assert!(!moe_program::igpu_zero_target_for_test(
+            &call,
+            &clear(&scratch.x_batch, rows * hidden + 1)
+        ));
+        assert!(!moe_program::igpu_zero_target_for_test(
+            &call,
+            &clear(&scratch.x_norm_batch, rows * hidden)
+        ));
+        // The GPU route never takes this predicate.
+        let (experts, selection, params) = build(false, rows);
+        let gpu_call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Prefill(selection),
+            SealedParams::Prefill(params),
+        );
+        assert!(!moe_program::igpu_zero_target_for_test(
+            &gpu_call,
+            &clear(&scratch.x_batch, rows * hidden)
+        ));
+    }
+
+    #[test]
+    fn igpu_engine_is_absent_for_every_row_count_without_an_attachment() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xEF_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        for rows in [0, 1, 4, 5, 512] {
+            assert!(
+                crate::families::moe::igpu_prefill_engine(&fixture.routed, rows).is_none(),
+                "rows={rows}"
+            );
+        }
+        assert_eq!(
+            crate::families::moe::IGPU_PREFILL_MIN_ROWS,
+            crate::families::moe::NARROW_VERIFY_MAX_ROWS + 1
+        );
+    }
+
+    #[test]
+    fn igpu_run_gate_refuses_capture_retained_shadow_and_pm4() {
+        use moe_program::IgpuRunGate;
+        assert_eq!(IgpuRunGate::default().refusal(), None);
+        IgpuRunGate::default().require_eager().unwrap();
+        let cases = [
+            (IgpuRunGate { graph_capture: true, ..Default::default() }, "graph capture"),
+            (IgpuRunGate { verify_capture: true, ..Default::default() }, "graph capture"),
+            (IgpuRunGate { replay_capture: true, ..Default::default() }, "graph capture"),
+            (IgpuRunGate { stream_capture: true, ..Default::default() }, "graph capture"),
+            (IgpuRunGate { recording: true, ..Default::default() }, "replay recording"),
+            (IgpuRunGate { pm4: true, ..Default::default() }, "PM4"),
+            (IgpuRunGate { aql: true, ..Default::default() }, "AQL"),
+            (IgpuRunGate { shadow: true, ..Default::default() }, "shadow"),
+        ];
+        for (gate, name) in cases {
+            let error = gate.require_eager().expect_err(name);
+            let text = format!("{error:?}");
+            assert!(text.contains(name) && text.contains("iGPU prefill engine"), "{gate:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn igpu_operand_extents_are_checked_before_the_engine_runs() {
+        use moe_program::igpu_extent_error as check;
+        let f32 = DType::F32;
+        assert_eq!(check(8, 2560, 2560, 10, f32, [8 * 2560, 80, 80, 8 * 2560]), None);
+        // Spare capacity is fine; a short operand or non-natural dtype is not.
+        assert_eq!(check(8, 2560, 2560, 10, f32, [9 * 2560, 90, 90, 9 * 2560]), None);
+        for short in 0..4 {
+            let mut numel = [8 * 2560, 80, 80, 8 * 2560];
+            numel[short] -= 1;
+            assert!(check(8, 2560, 2560, 10, f32, numel).is_some(), "operand {short}");
+        }
+        assert!(check(8, 2560, 2560, 10, DType::BF16, [8 * 2560, 80, 80, 8 * 2560]).is_some());
+        assert!(check(usize::MAX, 2560, 2560, 10, f32, [usize::MAX; 4]).is_some());
+    }
+
     #[test]
     fn fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2() {
         for rows in [1, 2, 17, 128, 1536] {
@@ -7826,6 +8202,7 @@ mod tests {
                 coalesced_verify: false,
                 route: Some(MoeRouteCapability::Fp8B128Grouped),
                 cpu_deferred_experts: false,
+                igpu_experts: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
             assert_eq!(

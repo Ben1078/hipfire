@@ -82,6 +82,10 @@ required-features = ["lab"]
 name = "fn_sampled_plumbing_oracle"
 required-features = ["lab"]
 
+[[example]]
+name = "qwen4_igpu_engine_parity"
+required-features = ["lab"]
+
 [[test]]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]

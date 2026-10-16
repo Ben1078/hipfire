@@ -1099,6 +1099,15 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// Opt-in routed CPU splice, only for whole host-mapped trunk aggregates.
     pub(crate) cpu_deferred_experts: bool,
     cpu_expert_owners: Option<cpu_splice::CpuExpertOwners>,
+    /// `memory.offload_exec=igpu`: the OWNING host aggregates this layer's engine
+    /// borrows (whole host-placed single-device layers only; `None` otherwise).
+    igpu_host: Option<igpu_engine::IgpuHostOwners>,
+    /// The whole-layer iGPU prefill engine of this layer, attached once at load.
+    igpu: Option<Arc<hipfire_dispatch::igpu_exec::IgpuLayerEngine>>,
+    /// Set per forward: the engine is visible to sealing/execution only inside an
+    /// eager prefill wider than the narrow verify window (never decode, verify,
+    /// lanes or the MTP head).
+    igpu_gate: std::sync::atomic::AtomicBool,
     /// Keeps the frozen payload owners and borrowed pointer tables alive.
     tier: Option<crate::expert_tier_owners::ExpertTierLease>,
     tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
@@ -1137,6 +1146,7 @@ impl Qwen4SlabLayer {
 }
 
 mod cpu_splice;
+pub mod igpu_engine;
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn len(&self) -> usize {
@@ -1168,6 +1178,14 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
             expert.gate_up.dtype,
             expert.down.dtype,
         )
+    }
+
+    fn igpu_engine(&self) -> Option<&hipfire_dispatch::igpu_exec::IgpuLayerEngine> {
+        if self.igpu_gate.load(std::sync::atomic::Ordering::Acquire) {
+            self.igpu.as_deref()
+        } else {
+            None
+        }
     }
 
     fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
@@ -2724,6 +2742,25 @@ impl Qwen4MoeLayerRuntime {
             })
             .flatten();
         let cpu_deferred_experts = cpu_expert_owners.is_some();
+        let igpu_host = (hipfire_dispatch::cpu_exec::igpu_exec_enabled()
+            && allow_tiers
+            && layer_label < config.num_hidden_layers
+            && tier_layer.is_none()
+            && fp8_tables.is_none()
+            && weights.ep_placement().is_none()
+            && local_host_mapped
+            && down_source.buf.is_host_mapped())
+        .then(|| {
+            igpu_engine::IgpuHostOwners::new(
+                gpu,
+                gate_up_source,
+                down_source,
+                config.num_experts,
+                gate_up_expert_bytes,
+                down_expert_bytes,
+            )
+        })
+        .flatten();
         Ok(Self {
             table,
             cache,
@@ -2744,6 +2781,9 @@ impl Qwen4MoeLayerRuntime {
             host_mapped: local_host_mapped,
             cpu_deferred_experts,
             cpu_expert_owners,
+            igpu_host,
+            igpu: None,
+            igpu_gate: std::sync::atomic::AtomicBool::new(false),
             tier: tier_layer.as_ref().map(|view| view.lease()),
             tier_identity,
             slab: None,
@@ -3040,6 +3080,9 @@ impl Qwen4MoeLayerRuntime {
             host_mapped,
             cpu_deferred_experts: false,
             cpu_expert_owners: None,
+            igpu_host: None,
+            igpu: None,
+            igpu_gate: std::sync::atomic::AtomicBool::new(false),
             tier: None,
             tier_identity: None,
             label: layer_label,
@@ -3124,6 +3167,27 @@ impl Qwen4MoeLayerRuntime {
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        // iGPU engine: the second device reads this layer's pinned host experts
+        // directly, so both devices must be drained before the host backing can
+        // be released. The engine (and this runtime's `igpu_host`) hold the shared
+        // `HostMappedLease` on that backing, and the owning `Gpu` refuses to free a
+        // leased backing; an engine that could not drain keeps its lease forever,
+        // so the host bytes are retained rather than freed under an in-flight read.
+        let mut igpu_error = None;
+        if let Some(engine) = self.igpu.as_ref() {
+            let drained = engine.quiesce(gpu);
+            if drained.is_err() || engine.unsafe_to_release() {
+                igpu_error = Some(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "qwen4 iGPU engine layer {} could not be drained ({}); its host expert \
+                         backing stays leased and is retained, not freed",
+                        self.label,
+                        drained.err().unwrap_or_else(|| "engine poisoned".to_string()),
+                    ),
+                ));
+            }
+        }
         // Tier tables are frozen borrowed sub-views; only the lease frees them.
         if self.tier.is_some() {
             return None;
@@ -3140,7 +3204,7 @@ impl Qwen4MoeLayerRuntime {
                 }
             }
         }
-        first
+        igpu_error.or(first)
     }
 }
 
@@ -5169,6 +5233,13 @@ pub struct Qwen4GpuForward {
     token_readback_early: bool,
     pub(crate) moe: Vec<Qwen4MoeLayerRuntime>,
     cpu_deferred_experts: bool,
+    /// Trunk layers with an attached iGPU prefill engine (`memory.offload_exec=igpu`).
+    igpu_layers: usize,
+    /// Set when a forward that exposed the iGPU engine returned any error: the
+    /// request's KV/GDN/PLE state may already be mutated, so every later forward
+    /// is refused until a full reset (`Qwen4Bundle::reset`) — never a retry on
+    /// partial state.
+    igpu_failed: Option<String>,
     expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
     /// placement): the zero dummy expert, the full per-layer tables for chunk
@@ -5580,6 +5651,117 @@ impl Qwen4GpuForward {
     pub(crate) fn has_cpu_deferred_experts(&self) -> bool {
         self.cpu_deferred_experts
     }
+    pub(crate) fn has_igpu_engine(&self) -> bool {
+        self.igpu_layers > 0
+    }
+    /// Drain BOTH devices before anything is released (the second device reads
+    /// pinned host experts and writes the model's `ffn_output`). `Err` means the
+    /// drain could not be proven, so the caller must quarantine, not free.
+    pub(crate) fn igpu_quiesce_all(&self, gpu: &Gpu) -> Result<(), String> {
+        let Some(engine) = self.igpu_shared_engine() else {
+            return Ok(());
+        };
+        engine.quiesce(gpu)?;
+        if engine.unsafe_to_release() {
+            return Err("the iGPU engine reports a failed drain".to_string());
+        }
+        Ok(())
+    }
+    /// Why the engined prefill state is invalid, if a stage error occurred.
+    pub(crate) fn igpu_failure(&self) -> Option<&str> {
+        self.igpu_failed.as_deref()
+    }
+    /// A full cold reset rebuilt every owner: the failed-request mark is moot.
+    pub(crate) fn clear_igpu_failure(&mut self) {
+        self.igpu_failed = None;
+    }
+    /// The shared engine of this forward, `None` unless engined layers exist.
+    fn igpu_shared_engine(&self) -> Option<&Arc<hipfire_dispatch::igpu_exec::IgpuEngine>> {
+        self.moe
+            .iter()
+            .find_map(|layer| layer.igpu.as_ref())
+            .map(|layer| layer.engine())
+    }
+    /// Frozen numerical manifest digest of the engine (A4 kernel identity, rows
+    /// policy, admitted layers, chunk capacity); `None` unless armed. It is part of
+    /// the bundle's snapshot scope: a prefix prefilled with a different manifest
+    /// is a different numerical history.
+    pub(crate) fn igpu_manifest(&self) -> Option<String> {
+        (self.igpu_layers > 0).then(|| {
+            let canonical = self
+                .igpu_shared_engine()
+                .map(|engine| engine.manifest().canonical())
+                .unwrap_or_default();
+            igpu_engine::manifest_digest(&canonical, &self.igpu_engined_layers(), self.scratch.max_chunk)
+        })
+    }
+    /// Lab diagnostic: the engine's parity capture switch (shared engine).
+    pub(crate) fn igpu_parity_set(
+        &self,
+        on: bool,
+        layers: Option<&[usize]>,
+    ) -> Result<(), String> {
+        self.igpu_shared_engine()
+            .ok_or_else(|| "no iGPU engine is armed".to_string())?
+            .set_parity(on, layers)
+    }
+    pub(crate) fn igpu_take_parity_records(
+        &self,
+    ) -> Vec<hipfire_dispatch::igpu_exec::IgpuParityRecord> {
+        self.igpu_shared_engine()
+            .map(|engine| engine.take_parity_records())
+            .unwrap_or_default()
+    }
+    /// The model-device expert pointer tables of one trunk layer (lab parity gate).
+    pub(crate) fn igpu_xtx_expert_tables(&self, layer: usize) -> Option<(&GpuTensor, &GpuTensor)> {
+        self.moe
+            .iter()
+            .find(|runtime| runtime.label == layer)
+            .map(|runtime| (&runtime.expert_gate_up_ptrs, &runtime.expert_down_ptrs))
+    }
+    /// Lab diagnostic: one parity case through `layer`'s engine.
+    pub(crate) fn igpu_parity_execute(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        case: &hipfire_dispatch::igpu_exec::IgpuParityCase,
+    ) -> Result<hipfire_dispatch::igpu_exec::IgpuParityOutcome, String> {
+        self.moe
+            .iter()
+            .find(|runtime| runtime.label == layer)
+            .and_then(|runtime| runtime.igpu.as_ref())
+            .ok_or_else(|| format!("layer {layer} is not on the iGPU engine"))?
+            .parity_execute(gpu, case)
+    }
+    /// Trunk layers on the iGPU engine, in layer order.
+    pub(crate) fn igpu_engined_layers(&self) -> Vec<usize> {
+        self.moe
+            .iter()
+            .filter(|layer| layer.igpu.is_some())
+            .map(|layer| layer.label)
+            .collect()
+    }
+    /// Whether the current forward exposes the engine (eager prefill wider than 4 rows).
+    fn igpu_prefill_gated(&self) -> bool {
+        self.moe
+            .first()
+            .is_some_and(|layer| layer.igpu_gate.load(std::sync::atomic::Ordering::Acquire))
+    }
+    /// An engine forward is host-synchronised and cross-device: never inside a
+    /// graph capture or a retained recording.
+    fn ensure_igpu_eager(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        let stream_capture = match gpu.active_stream.as_ref() {
+            Some(stream) => gpu.hip.stream_is_capturing(stream)?,
+            None => false,
+        };
+        if gpu.graphs.capture_mode || gpu.replay.is_recording() || stream_capture {
+            return Err(invalid(
+                "qwen4 iGPU prefill experts require eager HIP; graph capture/recording cannot \
+                 retain the cross-device steps. Set replay.backend=hip or memory.offload_exec=pcie",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn ensure_cpu_splice_eager(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
         if !self.has_cpu_deferred_experts() {
             return Ok(());
@@ -5661,6 +5843,7 @@ impl Qwen4GpuForward {
         let mut ep: Option<Qwen4ForwardEp> = None;
         let mut trunk_zba = Vec::new();
         let mut trunk_a4 = Vec::new();
+        let mut igpu_layers = 0usize;
         #[cfg(target_os = "linux")]
         let mut npu_trunk = None;
         let result = (|| {
@@ -5822,6 +6005,16 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
+            if hipfire_dispatch::cpu_exec::igpu_exec_enabled() {
+                igpu_layers = igpu_engine::attach_igpu(
+                    gpu,
+                    bundle,
+                    &mut moe,
+                    ep.is_some(),
+                    stock_fp8,
+                    max_chunk,
+                )?;
+            }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
                 if ep.is_none()
@@ -5957,6 +6150,8 @@ impl Qwen4GpuForward {
                 true,
             ),
             cpu_deferred_experts: moe.iter().any(|layer| layer.cpu_deferred_experts),
+            igpu_layers,
+            igpu_failed: None,
             moe,
             decode_q8,
             route_trace,
@@ -6473,6 +6668,19 @@ impl Qwen4GpuForward {
     /// whose recovery also failed, two resident expert layers may still hold
     /// another layer's bytes, and nothing here restores them.
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
+        // UPFRONT, before ANY forward or bundle model buffer is released: both
+        // devices must be provably drained. If not, the whole forward is
+        // quarantined (leaked) and the Gpu refuses every later release, so model
+        // buffers, modules and runtime handles stay valid under the in-flight work.
+        if let Err(why) = self.igpu_quiesce_all(gpu) {
+            let message = format!(
+                "qwen4 iGPU engine could not be drained ({why}); the forward and the Gpu are \
+                 quarantined and every model allocation is retained"
+            );
+            gpu.quarantine(&message);
+            std::mem::forget(self);
+            return Err(hip_bridge::HipError::new(0, &message));
+        }
         let Qwen4GpuForward {
             scratch,
             host_ple,
@@ -7091,6 +7299,7 @@ impl Qwen4GpuForward {
         let config = &bundle.config;
         let retained_candidate = self.ep.is_none()
             && !self.has_cpu_deferred_experts()
+            && !self.has_igpu_engine()
             && config.profile.is_flash_next()
             && !self.lane_scope
             && self.qsa_tap.is_none()
@@ -7192,6 +7401,13 @@ impl Qwen4GpuForward {
         };
         let prior_wide_verify = gpu.set_wide_verify_rows(wide_verify);
         let prior_ragged = std::mem::replace(&mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope);
+        let igpu_prefill = igpu_engine::prefill_gate(
+            self.igpu_layers > 0,
+            self.prefill_scope,
+            self.lane_scope,
+            tokens.len(),
+        );
+        igpu_engine::set_gate(&self.moe, igpu_prefill);
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -7202,6 +7418,15 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_policy,
         );
+        igpu_engine::set_gate(&self.moe, false);
+        if igpu_prefill {
+            // ANY stage error of an engined forward (a pre-enqueue rejection
+            // included) may follow an already-mutated KV/GDN state: the request is
+            // invalid until a full reset, whatever `engine.poisoned()` says.
+            if let Err(error) = &result {
+                self.igpu_failed = Some(error.to_string());
+            }
+        }
         gpu.qwen4_scope = scope;
         gpu.prefill_invariant_scope = prior_invariant;
         gpu.qwen4_append_f16_moe_scope = prior_f16_moe;
@@ -7223,7 +7448,32 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.ensure_cpu_splice_eager(gpu)?;
+        if let Some(why) = self.igpu_failed.as_deref() {
+            return Err(invalid(format!(
+                "qwen4 iGPU prefill failed earlier ({why}): the request state is not \
+                 recoverable, reset the session (no retry on partial state)"
+            )));
+        }
+        // A poisoned engine invalidates the bundle for every later forward
+        // instead of retrying or falling back.
+        if self
+            .igpu_shared_engine()
+            .is_some_and(|engine| engine.poisoned() || engine.unsafe_to_release())
+        {
+            return Err(invalid(
+                "qwen4 iGPU engine is poisoned after a failed prefill call: the request state is \
+                 not recoverable, reload the model",
+            ));
+        }
+        if self.igpu_prefill_gated() {
+            self.ensure_igpu_eager(gpu)?;
+        }
         let cpu_deferred_experts = self.cpu_deferred_experts;
+        // Scalars read once, before any field of `self` is borrowed for the rest
+        // of the forward (the retained-body closure and the PLE staging borrow
+        // disjoint fields, so no later `self.method()` call may capture `self`).
+        let igpu_armed = self.igpu_layers > 0;
+        let igpu_gated = self.igpu_prefill_gated();
         let ple_lookahead = std::mem::take(&mut self.ple_lookahead);
         if argmax_of.is_some() && tokens.len() != 1 {
             return Err(invalid("an argmax-token Qwen4 forward carries one token"));
@@ -7552,7 +7802,10 @@ impl Qwen4GpuForward {
             Some(stage)
                 if n >= stage.min_rows
                     && (stage.capture || wide_hidden_capture.is_none())
-                    && self.qsa_tap.is_none() =>
+                    && self.qsa_tap.is_none()
+                    // Engined layers' experts run on the iGPU: G2 staging would
+                    // only overwrite donors for no reader.
+                    && !igpu_gated =>
             {
                 let capturing = match gpu.active_stream.as_ref() {
                     Some(stream) => gpu.hip.stream_is_capturing(stream)?,
@@ -8289,6 +8542,7 @@ impl Qwen4GpuForward {
             let eligible = n == 1
                 && self.ep.is_none()
                 && !cpu_deferred_experts
+                && !igpu_armed
                 && config.profile.is_flash_next()
                 && !self.lane_scope
                 && !gpu.prefill_invariant_scope

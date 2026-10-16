@@ -329,6 +329,13 @@ pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 /// enough for offloaded weights — the GEMV/GEMM kernels read them directly.
 pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
 
+/// `hipHostMalloc` flag (`hipHostMallocPortable`): the pinned allocation is
+/// registered with every HIP context/device, not just the calling one, so one
+/// block is usable from several devices. Combine with
+/// [`HIP_HOST_MALLOC_MAPPED`] and fetch a per-device pointer with
+/// `host_get_device_pointer` while that device is current.
+pub const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;
+
 /// `hipHostMalloc` flag: fine-grained, coherent host memory. Overrides
 /// `HIP_HOST_COHERENT` for this allocation, so device system-scope stores are
 /// visible to the host without waiting for a kernel-boundary release.

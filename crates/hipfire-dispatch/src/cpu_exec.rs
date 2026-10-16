@@ -66,13 +66,14 @@ use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 /// `memory.offload_exec` resolved once from the process snapshot, mirroring the
 /// `forward_lowered_enabled` precedent: read once, never per step.
 ///
-/// One cached snapshot backs both predicates below, so the mode is resolved
+/// One cached snapshot backs the predicates below, so the mode is resolved
 /// exactly once for the process rather than once per boolean derived from it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostExecMode {
     Pcie,
     Cpu,
     Passback,
+    Igpu,
 }
 
 fn host_exec_mode() -> HostExecMode {
@@ -80,6 +81,7 @@ fn host_exec_mode() -> HostExecMode {
         match hipfire_config::memory::offload_exec() {
             hipfire_config::memory::OffloadExec::Cpu => HostExecMode::Cpu,
             hipfire_config::memory::OffloadExec::Passback => HostExecMode::Passback,
+            hipfire_config::memory::OffloadExec::Igpu => HostExecMode::Igpu,
             hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
         }
     });
@@ -92,13 +94,19 @@ fn host_exec_mode() -> HostExecMode {
 /// mechanism in this module keys on this predicate, so both modes are covered
 /// without renaming a call site.
 pub fn cpu_exec_enabled() -> bool {
-    host_exec_mode() != HostExecMode::Pcie
+    matches!(host_exec_mode(), HostExecMode::Cpu | HostExecMode::Passback)
 }
 
 /// `memory.offload_exec == passback`: the CPU runs a spilled step and hands part
 /// of its output rows back to the GPU ([`crate::offload_split`]).
 pub fn passback_enabled() -> bool {
     host_exec_mode() == HostExecMode::Passback
+}
+
+/// Whole-layer, eager prefill execution on a separate gfx1151 device.
+/// This never enables the CPU step or deferred-expert splice.
+pub fn igpu_exec_enabled() -> bool {
+    host_exec_mode() == HostExecMode::Igpu
 }
 
 /// Whether the CPU expert splice is armed: `memory.offload_exec=cpu` (or

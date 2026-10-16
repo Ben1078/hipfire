@@ -743,6 +743,7 @@ impl Carrier for Qwen4Carrier {
             spec: ctx.spec,
             native_mtp,
             max_k,
+            pp: ctx.pp,
         };
         // Expert parallelism: devices and peer access are verified with real
         // devices before rank 0 allocates anything.
@@ -1004,6 +1005,9 @@ pub struct Qwen4RankShared {
     /// rank attaches its own head).
     pub native_mtp: bool,
     pub max_k: usize,
+    /// The admitted pipeline-parallel degree of the load (`LoadCtx::pp`; Qwen4
+    /// admits only 1). A fact of the `memory.offload_exec=igpu` admission.
+    pub pp: usize,
 }
 
 /// Rank 0's tokenizer and chat template, from which the session cache's cache
@@ -1513,6 +1517,23 @@ struct RankCtx<'a> {
 /// Safe to call from any thread: it touches only `gpu` (bound to the calling
 /// thread by its own methods), the source, and process-global read-only config.
 pub fn load_qwen4_rank(
+    gpu: &mut rdna_compute::Gpu,
+    ep: Option<hipfire_arch_qwen4::weights::Qwen4EpPlacement>,
+    shared: &Qwen4RankShared,
+    expert_vram_layers: Option<usize>,
+    session: Option<Qwen4SessionSeed<'_>>,
+    src: ModelSource,
+) -> Result<Qwen4RankLoad, String> {
+    let loaded = load_qwen4_rank_body(gpu, ep, shared, expert_vram_layers, session, src);
+    if loaded.is_err() {
+        // A failed load leaves no armed state or unused pinned pool on `gpu`
+        // (`memory.offload_exec=igpu` only; otherwise a no-op).
+        crate::qwen4_igpu::release_after_failed_load(gpu);
+    }
+    loaded
+}
+
+fn load_qwen4_rank_body(
     gpu: &mut rdna_compute::Gpu,
     ep: Option<hipfire_arch_qwen4::weights::Qwen4EpPlacement>,
     shared: &Qwen4RankShared,
@@ -2260,6 +2281,28 @@ pub fn load_qwen4_rank(
             )
         );
     }
+    // `memory.offload_exec=igpu`: admission over the parsed artifact and the
+    // placement resolved above, and arming of portable host-mapped allocation.
+    // This is the last point before the first expert byte is allocated (the
+    // hot-set tier materialisation and the manifest fulfillment below), and the
+    // only one: a refused request is one log line and this rank loads on the
+    // normal expert path with `ctx.gpu` untouched. Mode unset: nothing here
+    // runs, logs or changes an allocation flag.
+    let _igpu = crate::qwen4_igpu::arm_qwen4_igpu(
+        ctx.gpu,
+        &crate::qwen4_igpu::Qwen4IgpuFacts {
+            ep: ep.is_some(),
+            pp: shared.pp,
+            tiered: hotset_plan.is_some(),
+            awq: hfq.has_awq_expert_sidecars(),
+            flash_next: config.profile.is_flash_next(),
+            dense_ffn: !routed_experts,
+            trunk_layers: config.num_hidden_layers,
+            recipe: &recipe,
+            weights: &manifest.weights,
+        },
+        &bytes_of,
+    );
     // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
     // head's, which stays F32): what legacy storage allocates at assembly
     // (named in the refusal when it does not fit), and VMM storage only

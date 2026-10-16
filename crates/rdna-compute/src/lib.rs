@@ -99,6 +99,8 @@ pub use trunk_mask::{
     TRUNK_QSA_BITS,
 };
 
+mod host_lease;
+pub use host_lease::{HostMappedLease, HostMappedView};
 pub use compiler::KernelCompiler;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
