@@ -269,19 +269,25 @@ fn trunk_prefill_invariant_scope(prefill: bool, arch: &str, rdna_opt_in: bool) -
 /// to run in; dispatch refuses it before its first launch.
 pub const QWEN4_COMPACT_FALLBACK_ROWS: usize = 512;
 
-/// Storage-only opt-in for the compact scratch (`1` on, default off; `0`
-/// leaves the IU4 math enabled and only keeps the full allocation plan).
+/// Storage-only knob of the compact scratch, read once as a tri-state:
+/// unset leaves the route's default (on for W3/MQ4 expert-slab artifacts, off
+/// for symmetric-IU4 ones), `1` forces it on where the route is eligible, `0`
+/// keeps the full allocation plan (the IU4 math stays enabled either way).
 pub const QWEN4_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_QWEN4_COMPACT_SCRATCH";
 
 /// Pure predicate of [`qwen4_forward_scratch_mode`]: every term must hold
 /// for the compact plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CompactScratchTerms {
-    pub knob: bool,
+    /// `None` unset, `Some(true)` `1`, `Some(false)` `0`.
+    pub knob: Option<bool>,
     pub exact_gfx1201: bool,
     pub grouped_gemm: bool,
     pub sym_iu4_requested: bool,
     pub source_symmetric: bool,
+    /// Every routed trunk layer is a slab arena (manifest recipe
+    /// `FlashNextSlab`).
+    pub source_slab: bool,
     pub ple_key_value_bf16: bool,
     pub flash_next_profile: bool,
 }
@@ -292,12 +298,27 @@ impl CompactScratchTerms {
         arch == "gfx1201"
     }
 
+    /// The knob as a tri-state with `developer_bool`'s spellings: `1` is
+    /// `Some(true)`, `0` is `Some(false)`, anything else (including unset)
+    /// is `None`.
+    pub(crate) fn knob_from_env() -> Option<bool> {
+        if hipfire_config::developer_bool(QWEN4_COMPACT_SCRATCH_ENV, false) {
+            Some(true)
+        } else if !hipfire_config::developer_bool(QWEN4_COMPACT_SCRATCH_ENV, true) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn mode(self) -> Qwen4ForwardScratchMode {
-        if self.knob
+        // Expert-slab artifacts default on (`0` opts out); the symmetric IU4
+        // route stays opt-in (`1`) and needs the IU4 route requested.
+        let route = (self.source_slab && self.knob != Some(false))
+            || (self.source_symmetric && self.sym_iu4_requested && self.knob == Some(true));
+        if route
             && self.exact_gfx1201
             && self.grouped_gemm
-            && self.sym_iu4_requested
-            && self.source_symmetric
             && self.ple_key_value_bf16
             && self.flash_next_profile
         {
@@ -313,37 +334,42 @@ impl CompactScratchTerms {
 /// `Full` whatever the artifact holds, so a caller can skip its payload
 /// header scan.
 pub fn qwen4_compact_scratch_possible(gpu: &Gpu, config: &Qwen4Config) -> bool {
-    qwen4_forward_scratch_mode(gpu, config, true, true) == Qwen4ForwardScratchMode::FnSymGfx1201
+    qwen4_forward_scratch_mode(gpu, config, true, true, true)
+        == Qwen4ForwardScratchMode::FnSymGfx1201
 }
 
-/// The scratch plan a load takes: `FnSymGfx1201` only for the opted-in exact
-/// gfx1201 Flash-Next symmetric-IU4 route.  `source_symmetric` is the proof
-/// from the artifact's actual routed payload headers
-/// ([`crate::artifact::routed_headers_symmetric`]), not metadata;
+/// The scratch plan a load takes: `FnSymGfx1201` for an exact gfx1201
+/// Flash-Next artifact whose MoE layers all run a route the compact buffers
+/// were sized for.  `source_slab` is the manifest's `FlashNextSlab` recipe
+/// (every routed trunk layer is a slab arena; default on, `0` opts out);
+/// `source_symmetric` is the proof from the artifact's actual routed payload
+/// headers ([`crate::artifact::routed_headers_symmetric`]), not metadata, and
+/// still needs the knob at `1` plus the IU4 route requested;
 /// `ple_key_value_bf16` states that the PLE key/value projections are BF16.
 /// Cheap arch/flag checks come first so a caller may skip its header scan
 /// when this would be `Full` regardless.  [`Qwen4GpuForward::new`] still
-/// confirms the symmetric proof on the loaded payloads and refuses a
-/// `FnSymGfx1201` forward the GPU check does not fully confirm.
+/// confirms the route on the loaded layers and refuses a `FnSymGfx1201`
+/// forward the GPU check does not fully confirm.
 pub fn qwen4_forward_scratch_mode(
     gpu: &Gpu,
     config: &Qwen4Config,
     source_symmetric: bool,
+    source_slab: bool,
     ple_key_value_bf16: bool,
 ) -> Qwen4ForwardScratchMode {
     // Freeze the gfx942 storage rung independently of row count or IU4 knobs.
     if gpu.arch == "gfx942" {
         return Qwen4ForwardScratchMode::Full;
     }
-    static KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool(QWEN4_COMPACT_SCRATCH_ENV, false)
-    });
+    static KNOB: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(CompactScratchTerms::knob_from_env);
     CompactScratchTerms {
         knob: *KNOB,
         exact_gfx1201: CompactScratchTerms::is_exact_gfx1201(&gpu.arch),
         grouped_gemm: gpu.flags.moe_grouped_gemm,
         sym_iu4_requested: gpu.qwen4_moe_sym_iu4_requested(),
         source_symmetric,
+        source_slab,
         ple_key_value_bf16,
         flash_next_profile: matches!(config.profile, crate::config::Qwen4Profile::FlashNext),
     }
@@ -5931,18 +5957,27 @@ impl Qwen4GpuForward {
                 ));
             }
             let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
-            if compact && moe.iter().flatten().any(|layer| layer.slab.is_some()) {
+            // Every MoE layer must run one route the compact buffers were
+            // sized for: all expert-slab layers (K1 lane-union GEMVs inside
+            // the 512-row F32 fallback, K2 grouped GEMMs writing the BF16
+            // grouped rows) or all symmetric-IU4 layers.
+            let slab_layers = moe.iter().flatten().filter(|layer| layer.slab.is_some()).count();
+            let all_slab = moe_count != 0 && slab_layers == moe_count;
+            if compact && slab_layers != 0 && !all_slab {
                 return Err(invalid(
-                    "the compact scratch plan has no expert-slab route (K1 decode needs the F32 MoE buffers)",
+                    "compact scratch needs every MoE layer on one route (expert-slab arenas or \
+                     symmetric IU4 headers), but only some layers are expert-slab arenas",
                 ));
             }
             if compact {
                 // The compact plan was admitted before any weight was
                 // loaded; it is valid only for the exact route it sized.
-                if gpu.arch != "gfx1201"
-                    || !gpu.flags.moe_grouped_gemm
-                    || !gpu.qwen4_moe_sym_iu4_requested()
-                {
+                if gpu.arch != "gfx1201" || !gpu.flags.moe_grouped_gemm {
+                    return Err(invalid(
+                        "compact scratch requires gfx1201 with the grouped MoE GEMM",
+                    ));
+                }
+                if !all_slab && !gpu.qwen4_moe_sym_iu4_requested() {
                     return Err(invalid(
                         "compact scratch requires gfx1201 with the grouped MoE GEMM and the \
                          symmetric IU4 route requested",
@@ -6007,8 +6042,11 @@ impl Qwen4GpuForward {
                     moe_count
                 );
                 // The compact scratch has no buffer for the F32 route of a
-                // layer that is not symmetric: never run it silently.
-                if compact && verified != moe_count {
+                // layer that is not symmetric: never run it silently.  An
+                // all-slab load is not on the symmetric route (its K2 GEMMs
+                // write the same grouped-row buffers, K1 stays inside the
+                // 512-row F32 fallback), so it has no symmetric count to meet.
+                if compact && !all_slab && verified != moe_count {
                     return Err(invalid(format!(
                         "compact scratch was selected from the artifact's source headers, but \
                          the GPU check verified only {verified}/{} layers symmetric",
@@ -10541,45 +10579,69 @@ mod tests {
 
     #[test]
     fn compact_mode_needs_every_term() {
-        let all = CompactScratchTerms {
-            knob: true,
+        // The expert-slab route: default on (unset), `1` on, `0` off; it
+        // needs no symmetric proof and no IU4 request.
+        let slab = CompactScratchTerms {
+            knob: None,
+            exact_gfx1201: true,
+            grouped_gemm: true,
+            sym_iu4_requested: false,
+            source_symmetric: false,
+            source_slab: true,
+            ple_key_value_bf16: true,
+            flash_next_profile: true,
+        };
+        assert_eq!(slab.mode(), Mode::FnSymGfx1201);
+        assert_eq!(
+            CompactScratchTerms { knob: Some(true), ..slab }.mode(),
+            Mode::FnSymGfx1201
+        );
+        assert_eq!(
+            CompactScratchTerms { sym_iu4_requested: true, ..slab }.mode(),
+            Mode::FnSymGfx1201
+        );
+        assert_eq!(
+            CompactScratchTerms { knob: Some(false), ..slab }.mode(),
+            Mode::Full
+        );
+        // The symmetric IU4 route stays opt-in: it needs `1` plus the IU4
+        // request plus the proven headers.
+        let sym = CompactScratchTerms {
+            knob: Some(true),
             exact_gfx1201: true,
             grouped_gemm: true,
             sym_iu4_requested: true,
             source_symmetric: true,
+            source_slab: false,
             ple_key_value_bf16: true,
             flash_next_profile: true,
         };
-        assert_eq!(all.mode(), Mode::FnSymGfx1201);
-        let off = [
-            CompactScratchTerms { knob: false, ..all },
-            CompactScratchTerms {
-                exact_gfx1201: false,
-                ..all
-            },
-            CompactScratchTerms {
-                grouped_gemm: false,
-                ..all
-            },
-            CompactScratchTerms {
-                sym_iu4_requested: false,
-                ..all
-            },
-            CompactScratchTerms {
-                source_symmetric: false,
-                ..all
-            },
-            CompactScratchTerms {
-                ple_key_value_bf16: false,
-                ..all
-            },
-            CompactScratchTerms {
-                flash_next_profile: false,
-                ..all
-            },
+        assert_eq!(sym.mode(), Mode::FnSymGfx1201);
+        let sym_off = [
+            CompactScratchTerms { knob: None, ..sym },
+            CompactScratchTerms { knob: Some(false), ..sym },
+            CompactScratchTerms { sym_iu4_requested: false, ..sym },
+            CompactScratchTerms { source_symmetric: false, ..sym },
         ];
-        for terms in off {
+        for terms in sym_off {
             assert_eq!(terms.mode(), Mode::Full, "{terms:?}");
+        }
+        // Neither route: a packed (non-slab, non-symmetric) artifact.
+        assert_eq!(
+            CompactScratchTerms { source_symmetric: false, ..sym }.mode(),
+            Mode::Full
+        );
+        // Device, PLE and profile terms gate both routes whatever the knob.
+        for base in [slab, CompactScratchTerms { knob: Some(true), ..slab }, sym] {
+            let off = [
+                CompactScratchTerms { exact_gfx1201: false, ..base },
+                CompactScratchTerms { grouped_gemm: false, ..base },
+                CompactScratchTerms { ple_key_value_bf16: false, ..base },
+                CompactScratchTerms { flash_next_profile: false, ..base },
+            ];
+            for terms in off {
+                assert_eq!(terms.mode(), Mode::Full, "{terms:?}");
+            }
         }
     }
 

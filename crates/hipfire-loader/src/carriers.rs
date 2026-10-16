@@ -1506,11 +1506,10 @@ pub fn qwen4_ep_vram_layers(
         gpu,
         &config,
     )?;
-    // The plan every rank's `load_qwen4_rank` derives from its own source and
-    // attaches; the reserve charges that plan, not a hardcoded `Full`.
-    let scratch_mode =
-        hipfire_arch_qwen4::artifact::source_forward_scratch_mode(gpu, hfq, &config, &manifest)
-            .map_err(|error| error.to_string())?;
+    // The plan every rank's `load_qwen4_rank` takes: an expert-parallel load
+    // never takes the compact plan (the owner-routed EP prefill refuses it),
+    // so the reserve charges the `Full` plan.
+    let scratch_mode = hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full;
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
             hfq.tensor_data(&entry.name)
@@ -1886,15 +1885,27 @@ fn load_qwen4_rank_scoped(
     // payload while the mapping is still readable and before any
     // placement input: `auto` charges exactly the plan `attach_forward`
     // allocates below.
+    // An expert-parallel load never takes the compact plan: the owner-routed
+    // EP prefill refuses it, so the rank keeps `Full` and the split helper
+    // charges the same.
     let scratch_mode = match full_scratch_mode {
         Some(mode) => mode,
+        None if ep.is_some() => hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full,
         None => hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
             ctx.gpu, &hfq, &config, &manifest,
         )
         .map_err(|error| error.to_string())?,
     };
     if scratch_mode != hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full {
-        eprintln!("  qwen4 forward scratch: {scratch_mode:?} plan (symmetric routed experts proven from the payload)");
+        let reason = if matches!(
+            manifest.identity.recipe,
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+        ) {
+            "every routed trunk layer is an expert-slab arena; HIPFIRE_QWEN4_COMPACT_SCRATCH=0 keeps the full plan"
+        } else {
+            "symmetric routed experts proven from the payload headers"
+        };
+        eprintln!("  qwen4 forward scratch: {scratch_mode:?} plan ({reason})");
     }
     let use_ranges = ctx.gpu.is_uma();
     if use_ranges {

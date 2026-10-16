@@ -1966,20 +1966,29 @@ pub fn ple_key_value_bf16(manifest: &Qwen4Manifest) -> bool {
 /// The forward scratch plan one artifact is admitted to, decided from the
 /// actual source payload before any placement or allocation: the selector's
 /// cheap arch/flag checks run first, and the routed-header scan only when
-/// they could select the compact plan.  Every real-model caller (the loader
-/// and the oracle examples) charges and attaches exactly this mode.
+/// they could select the compact plan on the symmetric route.  A manifest
+/// whose recipe is `FlashNextSlab` is an expert-slab artifact with no scan:
+/// [`crate::weights`] replaces every trunk routed aggregate by its layer's
+/// arena or refuses the manifest, so every routed trunk layer is a slab arena
+/// (the MTP head's experts live in the separate MTP forward).  Every
+/// real-model caller (the loader and the oracle examples) charges and attaches
+/// exactly this mode.
 pub fn source_forward_scratch_mode(
     gpu: &Gpu,
     hfq: &HfqFile,
     config: &Qwen4Config,
     manifest: &Qwen4Manifest,
 ) -> Result<Qwen4ForwardScratchMode, Qwen4ArtifactError> {
-    if qwen4_forward_scratch_mode(gpu, config, true, true) == Qwen4ForwardScratchMode::Full {
+    if qwen4_forward_scratch_mode(gpu, config, true, true, true) == Qwen4ForwardScratchMode::Full {
         return Ok(Qwen4ForwardScratchMode::Full);
     }
     let ple_bf16 = ple_key_value_bf16(manifest);
-    let symmetric = ple_bf16 && routed_headers_symmetric(hfq, manifest)?;
-    Ok(qwen4_forward_scratch_mode(gpu, config, symmetric, ple_bf16))
+    let slab = matches!(
+        manifest.identity.recipe,
+        crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+    );
+    let symmetric = ple_bf16 && !slab && routed_headers_symmetric(hfq, manifest)?;
+    Ok(qwen4_forward_scratch_mode(gpu, config, symmetric, slab, ple_bf16))
 }
 
 /// The geometry facts of a PLE table header that admission checks against the
