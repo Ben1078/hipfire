@@ -12,7 +12,7 @@
 
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
-use crate::expert_slab_table::{build_expert_slab_table, ExpertSlabTableError};
+use crate::expert_slab_table::{build_expert_slab_table_with_keep, ExpertSlabTableError};
 use crate::expert_hotset::HOTSET_ENV;
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::ple::PleHashMetadata;
@@ -241,7 +241,10 @@ fn refuse_expert_slabs(
         Err(error) => return Err(Qwen4ArtifactError::ExpertSlabsMetadata(error)),
     };
     if let Some(metadata) = metadata {
-        let table = build_expert_slab_table(&metadata, tensors)
+        let value: serde_json::Value = serde_json::from_str(metadata_json)
+            .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: metadata: {error}")))?;
+        let keep = crate::ExpertKeep::from_metadata(&value).map_err(Qwen4ArtifactError::new)?;
+        let table = build_expert_slab_table_with_keep(&metadata, tensors, keep.as_ref())
             .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
         let counts = table.counts();
         return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
@@ -318,7 +321,7 @@ fn expert_slab_plan(
     let value: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: metadata: {error}")))?;
     let keep = crate::ExpertKeep::from_metadata(&value).map_err(Qwen4ArtifactError::new)?;
-    let table = crate::expert_slab_table::build_expert_slab_table_with_keep(&metadata, tensors, keep.as_ref())
+    let table = build_expert_slab_table_with_keep(&metadata, tensors, keep.as_ref())
         .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
     let counts = table.counts();
     if counts.w2 != 0 {
@@ -2363,6 +2366,47 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("not available on any GPU"));
+    }
+
+    #[test]
+    fn slab_pruned_inventory_preserves_cpu_refusal_and_gpu_route() {
+        use expert_slabs::ExpertFormat;
+        let keep = crate::ExpertKeep::new(512, vec![(16..32).collect(); 48], None, 10).unwrap();
+        let mut headers = crate::expert_slab_table::full_fn_headers(|_, _| ExpertFormat::Mq3I4);
+        headers.retain(|info| parse_expert_entry_name(&info.name)
+            .map_or(true, |(layer, expert, _)| keep.is_kept(layer, expert)));
+        let mut cursor = 4096;
+        for info in &mut headers {
+            info.data_offset = cursor;
+            cursor += info.data_size;
+        }
+        let mut metadata: serde_json::Value = serde_json::from_str(&slab_metadata()).unwrap();
+        metadata["qwen4.expert_keep"] = keep.to_metadata_value();
+        let metadata = metadata.to_string();
+        let expected = Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+            w3: keep.total_kept(), w2: 0, mq4: 0,
+        };
+        assert_eq!(refuse_expert_slabs(&metadata, &headers).unwrap_err(), expected);
+        for device in [None, Some("gfx1100")] {
+            assert_eq!(expert_slab_plan(&metadata, &headers, device).unwrap_err(), expected);
+        }
+        let table = build_expert_slab_table_with_keep(
+            &expert_slabs::ExpertSlabsV1::fn_v1(), &headers, Some(&keep),
+        ).unwrap();
+        for expert in [0, 15, 32, 511] {
+            let slab = table.slab(0, expert).unwrap();
+            assert_eq!(slab.gate_up.len, 0);
+            assert_eq!(slab.down.len, 0);
+        }
+        assert_ne!(table.slab(0, 16).unwrap().gate_up.len, 0);
+        assert_ne!(table.slab(0, 31).unwrap().down.len, 0);
+        for arch in ["gfx1201", "gfx1151"] {
+            let plan = expert_slab_plan(&metadata, &headers, Some(arch)).unwrap().unwrap();
+            assert_eq!(
+                plan.physical_bytes(),
+                (keep.total_kept() * ExpertFormat::Mq3I4.slab_bytes()) as u64,
+            );
+        }
     }
 
     #[test]
