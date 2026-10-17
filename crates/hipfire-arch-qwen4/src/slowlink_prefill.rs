@@ -1446,36 +1446,39 @@ fn select(
     tokens: &[u32],
     output: &PromptOutput<'_>,
     mode: SlowlinkMode,
-) -> Result<Selection, String> {
+) -> Result<Selection, std::borrow::Cow<'static, str>> {
     if mode == SlowlinkMode::Off {
-        return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=0".to_string());
+        return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=0".into());
     }
     let Some(profile) = forward.slowlink_profile().copied() else {
-        return Err("no admitted slow-link profile".to_string());
+        return Err("no admitted slow-link profile".into());
     };
     if let Some(reason) = forward.slowlink.unavailable.clone() {
-        return Err(reason);
+        return Err(reason.into());
     }
-    bundle.slowlink_prompt_eligible().map_err(str::to_string)?;
+    bundle
+        .slowlink_prompt_eligible()
+        .map_err(std::borrow::Cow::Borrowed)?;
     if let Some(why) = forward.slowlink_forward_blocker(&bundle.config) {
-        return Err(why.to_string());
+        return Err(std::borrow::Cow::Borrowed(why));
     }
     let rows = tokens.len();
     let entry = bundle.state.position;
     let end = entry
         .checked_add(rows)
-        .ok_or_else(|| "request position overflows".to_string())?;
+        .ok_or("request position overflows")?;
     if end > bundle.state.max_seq_len {
         return Err(format!(
             "request end {end} exceeds the context capacity {}",
             bundle.state.max_seq_len
-        ));
+        )
+        .into());
     }
     if tokens
         .iter()
         .any(|&token| token as usize >= bundle.config.vocab_size)
     {
-        return Err("a token id is outside the embedding vocabulary".to_string());
+        return Err("a token id is outside the embedding vocabulary".into());
     }
     // The forward's scratch must be EXACTLY the admitted tile: a larger one
     // (an incumbent 4096/8192-row chunk the caller asked for) would be retained
@@ -1484,7 +1487,8 @@ fn select(
         return Err(format!(
             "forward scratch holds {} rows, the admitted S1 tile is {}",
             forward.scratch.max_chunk, profile.tile_rows
-        ));
+        )
+        .into());
     }
     qualify_request(
         mode,
@@ -1527,7 +1531,8 @@ fn select(
             return Err(format!(
                 "window {} cuts differ from the transaction's pending boundaries",
                 window.index
-            ));
+            )
+            .into());
         }
     }
     let num_experts = profile.geometry.num_experts;
@@ -2520,7 +2525,7 @@ pub(crate) fn try_run_prompt(
     let selection = match select(forward, bundle, gpu, tokens, &output, mode) {
         Ok(selection) => selection,
         Err(reason) => {
-            bundle.slowlink_note_bypass(&reason);
+            bundle.slowlink_note_bypass(reason);
             return Ok(false);
         }
     };
