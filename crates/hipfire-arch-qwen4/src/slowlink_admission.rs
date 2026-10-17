@@ -59,9 +59,10 @@ pub const S1_TILE_ROWS: usize = 1536;
 /// sweep per prompt.
 pub const S1_WINDOW_ROWS: usize = 16384;
 
-/// Fewest request rows S1 runs when forced: at least two tiles, so the
-/// request is genuinely multi-chunk.
-pub const S1_MIN_FORCED_REQUEST_ROWS: usize = 2 * S1_TILE_ROWS;
+/// Fewest request rows S1 runs when forced: one row past a tile, the first
+/// genuinely multi-chunk request (a request of at most one tile is a named
+/// bypass). The automatic selector starts at [`S1_MIN_AUTO_REQUEST_ROWS`].
+pub const S1_MIN_FORCED_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
 
 /// Fewest request rows the automatic selector sends to S1: where the
 /// performance qualification starts. The 1,400 tok/s target is not
@@ -1657,22 +1658,19 @@ mod tests {
             ),
             Err(SlowlinkDecline::UnifiedMemory)
         );
-        for max_seq in [0, 1536, 3071] {
+        for max_seq in [0, 1, 1536] {
             assert_eq!(
                 preflight(SlowlinkMode::Force, &LoadShape { max_seq, ..shape() }),
                 Err(SlowlinkDecline::ShortContext { max_seq })
             );
         }
-        assert_eq!(
-            preflight(
-                SlowlinkMode::Force,
-                &LoadShape {
-                    max_seq: 3072,
-                    ..shape()
-                }
-            ),
-            Ok(())
-        );
+        for max_seq in [1537, 3072] {
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &LoadShape { max_seq, ..shape() }),
+                Ok(()),
+                "{max_seq}"
+            );
+        }
     }
 
     #[test]
@@ -2175,12 +2173,20 @@ mod tests {
             session_cuts: 0,
             capture: CaptureKind::None,
         };
-        // Forced: from two tiles up.
+        // Forced: from one row past a tile up (the first genuinely multi-chunk
+        // request); a request of at most one tile is a named bypass.
         assert_eq!(
-            qualify_request(SlowlinkMode::Force, &profile, &req(3071)),
+            qualify_request(SlowlinkMode::Force, &profile, &req(1536)),
             Err(RequestBypass::TooShort {
-                rows: 3071,
-                minimum: 3072
+                rows: 1536,
+                minimum: 1537
+            })
+        );
+        assert_eq!(
+            qualify_request(SlowlinkMode::Force, &profile, &req(1537)),
+            Ok(RequestVerdict {
+                rows: 1537,
+                windows: 1
             })
         );
         assert_eq!(
