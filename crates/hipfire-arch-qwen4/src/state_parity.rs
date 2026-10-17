@@ -2664,10 +2664,25 @@ pub fn slowlink_state_digest(
     let mut qsa = Vec::with_capacity(state.qsa.len());
     for (layer, owner) in state.qsa.iter().enumerate() {
         let active = [
-            ("full_keys", &owner.full_keys, owner.full_len, owner.full_row_units),
-            ("full_values", &owner.full_values, owner.full_len, owner.full_row_units),
+            (
+                "full_keys",
+                &owner.full_keys,
+                owner.full_len,
+                owner.full_row_units,
+            ),
+            (
+                "full_values",
+                &owner.full_values,
+                owner.full_len,
+                owner.full_row_units,
+            ),
             ("raw_keys", &owner.raw_index_keys, owner.raw_len, raw_width),
-            ("pooled_keys", &owner.pooled_keys, owner.pooled_len, raw_width),
+            (
+                "pooled_keys",
+                &owner.pooled_keys,
+                owner.pooled_len,
+                raw_width,
+            ),
         ];
         let mut digests = Map::new();
         for (name, tensor, rows, width) in active {

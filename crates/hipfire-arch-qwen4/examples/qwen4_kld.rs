@@ -1725,11 +1725,17 @@ fn read_kl_npy(path: &Path) -> Result<Vec<f64>, String> {
         .and_then(|h| std::str::from_utf8(h).ok())
         .ok_or_else(|| format!("{}: truncated .npy header", path.display()))?;
     if !header.contains("'<f8'") || !header.contains("'fortran_order': False") {
-        return Err(format!("{}: not a C-order little-endian f8 array", path.display()));
+        return Err(format!(
+            "{}: not a C-order little-endian f8 array",
+            path.display()
+        ));
     }
     let data = &bytes[10 + header_len..];
     if data.len() % 8 != 0 {
-        return Err(format!("{}: payload is not a whole number of f64 rows", path.display()));
+        return Err(format!(
+            "{}: payload is not a whole number of f64 rows",
+            path.display()
+        ));
     }
     Ok(data
         .chunks_exact(8)
@@ -1760,7 +1766,9 @@ fn pair(base: &Path, cand: &Path, corpus_path: &Path, output: &Path) -> Result<(
             problems.push(format!("{arm}: {p}"));
         }
         if receipt["corpus_sha256"].as_str() != Some(corpus_sha.as_str()) {
-            problems.push(format!("{arm}: receipt corpus_sha256 differs from the supplied corpus"));
+            problems.push(format!(
+                "{arm}: receipt corpus_sha256 differs from the supplied corpus"
+            ));
         }
     }
     problems.extend(slowlink_receipt::kld_receipts_comparable(&rb, &rc));
@@ -1782,7 +1790,11 @@ fn pair(base: &Path, cand: &Path, corpus_path: &Path, output: &Path) -> Result<(
         return fail(problems);
     }
     let corpus: S11Corpus = serde_json::from_slice(&corpus_bytes).map_err(|e| e.to_string())?;
-    let counts: Vec<usize> = corpus.sequences.iter().map(|s| s.score_positions.len()).collect();
+    let counts: Vec<usize> = corpus
+        .sequences
+        .iter()
+        .map(|s| s.score_positions.len())
+        .collect();
     let (base_rows, cand_rows) = (read_kl_npy(base)?, read_kl_npy(cand)?);
     let reduce = |rows: &[f64]| slowlink_receipt::sequence_means(rows, &counts);
     let (bm, cm) = match (reduce(&base_rows), reduce(&cand_rows)) {
@@ -1842,7 +1854,9 @@ fn pair(base: &Path, cand: &Path, corpus_path: &Path, output: &Path) -> Result<(
     } else {
         Err(format!(
             "paired KLD verdict failed: lo {:+.6} > 0 and hi {:+.6} > {}",
-            ci.lo, ci.hi, slowlink_receipt::KLD_HI_LIMIT
+            ci.lo,
+            ci.hi,
+            slowlink_receipt::KLD_HI_LIMIT
         ))
     }
 }
@@ -2507,21 +2521,36 @@ mod slowlink_pair_tests {
     fn slowlink_pair_verdict_uses_per_sequence_means_over_the_full_corpus() {
         let dir = temp_dir("full");
         let (corpus_path, sha) = corpus(&dir, 24, 255);
-        let base: Vec<f64> = (0..6120).map(|i| 0.05 + 0.0001 * ((i / 255) % 5) as f64).collect();
-        let cand: Vec<f64> = base.iter().enumerate().map(|(i, v)| v + 0.0001 * ((i / 255) % 3) as f64).collect();
-        let (b, c) = (arm(&dir, "base", &sha, &base, 24), arm(&dir, "cand", &sha, &cand, 24));
+        let base: Vec<f64> = (0..6120)
+            .map(|i| 0.05 + 0.0001 * ((i / 255) % 5) as f64)
+            .collect();
+        let cand: Vec<f64> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.0001 * ((i / 255) % 3) as f64)
+            .collect();
+        let (b, c) = (
+            arm(&dir, "base", &sha, &base, 24),
+            arm(&dir, "cand", &sha, &cand, 24),
+        );
         let out = dir.join("pair.json");
         pair(&b, &c, &corpus_path, &out).unwrap();
-        let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(report["schema"], "hipfire.qwen4.slowlink_kld_pair.v1");
         assert_eq!(report["pass"], true);
         assert_eq!(report["sequences"], 24);
         assert_eq!(report["rows"], 6120);
         // A clearly worse candidate fails the verdict and the command.
-        let worse: Vec<f64> = base.iter().enumerate().map(|(i, v)| v + 0.05 + 0.0001 * ((i / 255) % 3) as f64).collect();
+        let worse: Vec<f64> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.05 + 0.0001 * ((i / 255) % 3) as f64)
+            .collect();
         let w = arm(&dir, "worse", &sha, &worse, 24);
         assert!(pair(&b, &w, &corpus_path, &out).is_err());
-        let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(report["pass"], false);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2531,17 +2560,28 @@ mod slowlink_pair_tests {
         let dir = temp_dir("partial");
         let (corpus_path, sha) = corpus(&dir, 10, 255);
         let rows: Vec<f64> = vec![0.05; 2550];
-        let (b, c) = (arm(&dir, "base", &sha, &rows, 10), arm(&dir, "cand", &sha, &rows, 10));
+        let (b, c) = (
+            arm(&dir, "base", &sha, &rows, 10),
+            arm(&dir, "cand", &sha, &rows, 10),
+        );
         let out = dir.join("pair.json");
         let error = pair(&b, &c, &corpus_path, &out).unwrap_err();
         assert!(error.contains("partial corpus"), "{error}");
-        assert!(!std::fs::read_to_string(&out).unwrap().contains("\"pass\": true"));
+        assert!(!std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("\"pass\": true"));
         // Full row count but another corpus SHA than the receipts name.
         let (full_corpus, full_sha) = corpus(&dir, 24, 255);
         let rows: Vec<f64> = vec![0.05; 6120];
-        let (b, c) = (arm(&dir, "b2", "9".repeat(64).as_str(), &rows, 24), arm(&dir, "c2", &full_sha, &rows, 24));
+        let (b, c) = (
+            arm(&dir, "b2", "9".repeat(64).as_str(), &rows, 24),
+            arm(&dir, "c2", &full_sha, &rows, 24),
+        );
         let error = pair(&b, &c, &full_corpus, &out).unwrap_err();
-        assert!(error.contains("corpus_sha256") || error.contains("not the same"), "{error}");
+        assert!(
+            error.contains("corpus_sha256") || error.contains("not the same"),
+            "{error}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

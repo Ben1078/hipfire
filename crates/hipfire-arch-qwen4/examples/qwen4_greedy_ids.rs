@@ -200,7 +200,9 @@ fn parse_record(line: &str, line_no: usize, normalize: Normalizer) -> Result<Rec
     let Value::Object(mut object) = value else {
         return Err(at("not a JSON object".into()));
     };
-    let id = object.remove("id").ok_or_else(|| at("missing \"id\"".into()))?;
+    let id = object
+        .remove("id")
+        .ok_or_else(|| at("missing \"id\"".into()))?;
     let messages = object.remove("messages");
     let prompt_ids = object.remove("prompt_ids");
     let tools = object.remove("tools");
@@ -242,8 +244,8 @@ fn parse_record(line: &str, line_no: usize, normalize: Normalizer) -> Result<Rec
             if tools.is_some() {
                 return Err(at("\"tools\" needs \"messages\"".into()));
             }
-            let ids: Vec<u32> = serde_json::from_value(ids)
-                .map_err(|e| at(format!("invalid prompt_ids: {e}")))?;
+            let ids: Vec<u32> =
+                serde_json::from_value(ids).map_err(|e| at(format!("invalid prompt_ids: {e}")))?;
             if ids.is_empty() {
                 return Err(at("\"prompt_ids\" is empty".into()));
             }
@@ -459,7 +461,9 @@ impl Model {
                     );
                 }
                 Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
-                    return Err("qwen4_greedy_ids takes a fixed expert layer count, not auto".into());
+                    return Err(
+                        "qwen4_greedy_ids takes a fixed expert layer count, not auto".into(),
+                    );
                 }
             }
             weights
@@ -480,7 +484,8 @@ impl Model {
                 }
                 // The store rejects a host-mapped entry as a range: borrow it
                 // from the resident source bytes, as the product loader does.
-                if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped
+                {
                     let (info, bytes) = source
                         .tensor_data(&entry.name)
                         .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
@@ -527,12 +532,8 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, max_seq, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
-        let prompt_logits = gpu
-            .zeros(&[vocab], DType::F32)
-            .map_err(|e| e.to_string())?;
-        let decode_logits = gpu
-            .zeros(&[vocab], DType::F32)
-            .map_err(|e| e.to_string())?;
+        let prompt_logits = gpu.zeros(&[vocab], DType::F32).map_err(|e| e.to_string())?;
+        let decode_logits = gpu.zeros(&[vocab], DType::F32).map_err(|e| e.to_string())?;
         eprintln!(
             "qwen4_greedy_ids: loaded {} on {} (vocab {vocab}, max_seq {max_seq})",
             path.display(),
@@ -556,7 +557,10 @@ impl Model {
         match prompt {
             Prompt::Ids(ids) => {
                 if let Some(bad) = ids.iter().find(|&&id| id as usize >= self.vocab) {
-                    return Err(format!("prompt id {bad} is outside the vocabulary ({})", self.vocab));
+                    return Err(format!(
+                        "prompt id {bad} is outside the vocabulary ({})",
+                        self.vocab
+                    ));
                 }
                 Ok(ids.clone())
             }
@@ -685,15 +689,13 @@ fn run() -> Result<(), String> {
     let mut out: Box<dyn Write> = match &args.output {
         Stream::Std => Box::new(std::io::stdout().lock()),
         Stream::File(path) => Box::new(std::io::BufWriter::new(
-            std::fs::File::create(path)
-                .map_err(|e| format!("create {}: {e}", path.display()))?,
+            std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?,
         )),
     };
     let mut model = Model::load(&args.model, args.max_seq)?;
     let mut receipts: Option<Box<dyn Write>> = match &args.receipt {
         Some(path) => Some(Box::new(std::io::BufWriter::new(
-            std::fs::File::create(path)
-                .map_err(|e| format!("create {}: {e}", path.display()))?,
+            std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?,
         ))),
         None => None,
     };
@@ -707,9 +709,13 @@ fn run() -> Result<(), String> {
         let (ids, finish, prefill_s, route) = model
             .generate(&prompt, record.resume_at, args.max_new_tokens)
             .map_err(|e| format!("record {label}: {e}"))?;
-        writeln!(out, "{}", output_line(&record.id, &ids, finish, prompt.len()))
-            .and_then(|()| out.flush())
-            .map_err(|e| format!("write output: {e}"))?;
+        writeln!(
+            out,
+            "{}",
+            output_line(&record.id, &ids, finish, prompt.len())
+        )
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("write output: {e}"))?;
         if let Some(sink) = receipts.as_mut() {
             // A requested receipt that is missing is a failed run: the arms
             // are compared by their ids, and the route each took is proof.
@@ -746,7 +752,9 @@ mod tests {
 
     #[test]
     fn date_reading_templates_are_detected() {
-        assert!(template_reads_date("{% if system_message.current_date %}x{% endif %}"));
+        assert!(template_reads_date(
+            "{% if system_message.current_date %}x{% endif %}"
+        ));
         assert!(template_reads_date("{{ strftime_now('%Y') }}"));
         assert!(!template_reads_date("<|im_start|>{{ message.role }}\n"));
     }
@@ -796,7 +804,12 @@ mod tests {
     fn record_resume_at_splits_an_id_prompt_at_an_interior_row() {
         let r = record(r#"{"id": "r", "prompt_ids": [1, 2, 3, 4, 5], "resume_at": 3}"#).unwrap();
         assert_eq!(r.resume_at, Some(3));
-        assert_eq!(record(r#"{"id": "r", "prompt_ids": [1, 2]}"#).unwrap().resume_at, None);
+        assert_eq!(
+            record(r#"{"id": "r", "prompt_ids": [1, 2]}"#)
+                .unwrap()
+                .resume_at,
+            None
+        );
         for bad in [
             r#"{"id": 1, "prompt_ids": [1, 2, 3], "resume_at": 0}"#,
             r#"{"id": 1, "prompt_ids": [1, 2, 3], "resume_at": 3}"#,
@@ -815,7 +828,9 @@ mod tests {
         let line: Value =
             serde_json::from_str(&receipt_line(&id, &[Some(receipt.clone())]).unwrap()).unwrap();
         assert_eq!(line, serde_json::json!({"id": "a", "slowlink": [receipt]}));
-        assert!(receipt_line(&id, &[None]).unwrap_err().contains("no slowlink receipt"));
+        assert!(receipt_line(&id, &[None])
+            .unwrap_err()
+            .contains("no slowlink receipt"));
         assert!(receipt_line(&id, &[]).is_err());
     }
 
@@ -939,9 +954,14 @@ mod tests {
                 "invalid messages",
             ),
             (r#"{"id": 1, "prompt": "hi"}"#, "unknown key"),
-            (r#"{"id": 1, "prompt_ids": [1], "tools": []}"#, "needs \"messages\""),
+            (
+                r#"{"id": 1, "prompt_ids": [1], "tools": []}"#,
+                "needs \"messages\"",
+            ),
         ] {
-            let error = record(bad).err().unwrap_or_else(|| panic!("accepted {bad}"));
+            let error = record(bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {bad}"));
             assert!(error.contains(needle), "{bad}: {error}");
         }
     }

@@ -92,7 +92,10 @@ fn load() -> Hw {
     require_hold();
     // Before the first config read of this process.
     match std::env::var(ROUTE_ENV) {
-        Ok(v) => assert_eq!(v, "1", "{ROUTE_ENV}={v} conflicts with the forced layer-major tests"),
+        Ok(v) => assert_eq!(
+            v, "1",
+            "{ROUTE_ENV}={v} conflicts with the forced layer-major tests"
+        ),
         Err(_) => std::env::set_var(ROUTE_ENV, "1"),
     }
     let model = std::env::var_os(MODEL_ENV)
@@ -101,7 +104,10 @@ fn load() -> Hw {
     let rows = std::env::var(ROWS_ENV)
         .ok()
         .map_or(3400, |v| v.parse::<usize>().expect("rows"));
-    assert!(rows > MAX_TILE_ROWS as usize, "the prompt must exceed one tile");
+    assert!(
+        rows > MAX_TILE_ROWS as usize,
+        "the prompt must exceed one tile"
+    );
     let mut gpu = Gpu::init().expect("GPU");
     let SlowlinkLoaded {
         bundle,
@@ -117,7 +123,14 @@ fn load() -> Hw {
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
     );
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
-    Hw { gpu, bundle, logits, vocab, eos: eos_token, rows }
+    Hw {
+        gpu,
+        bundle,
+        logits,
+        vocab,
+        eos: eos_token,
+        rows,
+    }
 }
 
 impl Hw {
@@ -151,7 +164,12 @@ impl Hw {
     }
 
     fn finish(self) {
-        let Hw { mut gpu, bundle, logits, .. } = self;
+        let Hw {
+            mut gpu,
+            bundle,
+            logits,
+            ..
+        } = self;
         gpu.free_tensor(logits).expect("free logits");
         bundle.free_gpu(&mut gpu).expect("free bundle");
     }
@@ -163,7 +181,10 @@ fn assert_valid(receipt: &Option<Value>, rows: usize) {
         ..Limits::default()
     };
     let bad = validate(receipt.as_ref(), Expect::LayerMajor, &limits);
-    assert!(bad.is_empty(), "receipt problems: {bad:?}\nreceipt: {receipt:?}");
+    assert!(
+        bad.is_empty(),
+        "receipt problems: {bad:?}\nreceipt: {receipt:?}"
+    );
 }
 
 /// The production panel transport, dispatch and ordered combine, on the
@@ -202,8 +223,14 @@ fn slowlink_repeated_epochs_are_deterministic_with_one_sweep_each() {
     for epoch in 1..4 {
         let again = hw.prefill(&ids);
         assert_valid(&again.2, hw.rows);
-        assert_eq!(again.0["combined"], first.0["combined"], "epoch {epoch}: state digest");
-        assert_eq!(again.1["combined"], first.1["combined"], "epoch {epoch}: final logits");
+        assert_eq!(
+            again.0["combined"], first.0["combined"],
+            "epoch {epoch}: state digest"
+        );
+        assert_eq!(
+            again.1["combined"], first.1["combined"],
+            "epoch {epoch}: final logits"
+        );
         assert_eq!(
             u64_at(again.2.as_ref().unwrap(), "submitted_bytes"),
             submitted,
@@ -227,7 +254,10 @@ fn slowlink_injected_failures_abort_cleanly_and_rerun_matches() {
         hw.bundle.reset(&mut hw.gpu).expect("reset");
         hw.bundle.slowlink_inject_failure(Some(point)).expect("arm");
         let failed = hw.bundle.prefill_final(&mut hw.gpu, &ids, 0, &hw.logits);
-        assert!(failed.is_err(), "{point}: the injected failure did not fail the request");
+        assert!(
+            failed.is_err(),
+            "{point}: the injected failure did not fail the request"
+        );
         let consumed = hw
             .bundle
             .slowlink_receipt()
@@ -236,8 +266,14 @@ fn slowlink_injected_failures_abort_cleanly_and_rerun_matches() {
         hw.bundle.slowlink_inject_failure(None).expect("clear");
         let again = hw.prefill(&ids);
         assert_valid(&again.2, hw.rows);
-        assert_eq!(again.0["combined"], clean.0["combined"], "{point}: state after abort + rerun");
-        assert_eq!(again.1["combined"], clean.1["combined"], "{point}: logits after abort + rerun");
+        assert_eq!(
+            again.0["combined"], clean.0["combined"],
+            "{point}: state after abort + rerun"
+        );
+        assert_eq!(
+            again.1["combined"], clean.1["combined"],
+            "{point}: logits after abort + rerun"
+        );
     }
     hw.finish();
 }
@@ -264,7 +300,11 @@ fn slowlink_decode_after_prefill_replays_the_eager_ids() {
         );
         warm += 1;
     }
-    assert_eq!(hw.gpu.replay.state(), rdna_compute::replay::ReplayState::Ready, "retained body never became Ready");
+    assert_eq!(
+        hw.gpu.replay.state(),
+        rdna_compute::replay::ReplayState::Ready,
+        "retained body never became Ready"
+    );
     hw.gpu.replay.begin_replay_observation_window();
     for _ in 0..DECODE {
         replay_ids.push(
@@ -274,12 +314,18 @@ fn slowlink_decode_after_prefill_replays_the_eager_ids() {
         );
     }
     let observed = hw.gpu.replay.replay_observation();
-    assert_eq!(observed.count, DECODE as u64, "not every measured token replayed");
+    assert_eq!(
+        observed.count, DECODE as u64,
+        "not every measured token replayed"
+    );
     assert!(!observed.failed);
     hw.gpu.replay.configure_model_default(false);
     hw.prefill(&ids);
     let eager = hw.decode(replay_ids.len());
-    assert_eq!(eager, replay_ids, "retained replay differs from eager decode after S1 prefill");
+    assert_eq!(
+        eager, replay_ids,
+        "retained replay differs from eager decode after S1 prefill"
+    );
     hw.finish();
 }
 
