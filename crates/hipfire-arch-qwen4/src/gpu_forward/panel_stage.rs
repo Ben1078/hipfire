@@ -1,0 +1,2805 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! S1 slow-link layer-major prefill: expert panel transport.
+//!
+//! One prompt window sweeps every host layer's expert payload over the link
+//! exactly once. This module owns the sweep's VRAM side: a bounded pool of
+//! equally sized pages (two active 32-expert slots plus one next-layer
+//! lookahead store cut into 32-expert pages), the copy stream that fills them,
+//! and the ready/free events that order the copies against the compute
+//! stream's readers. Nothing here replays the incumbent stage: no donor layer
+//! is borrowed, no weight is transformed, and no hot resident weight is ever a
+//! copy destination.
+//!
+//! A page's life is `Free -> Copying -> Ready -> InUse -> Retiring -> Free`.
+//!
+//! * [`ExpertPanelRing::enqueue`] picks a free page, makes the copy stream wait
+//!   on the page's free event (recorded after its previous last reader), copies
+//!   the group's expert extents (runs of adjacent host bytes coalesced), zeroes
+//!   the tail pad the kernels' over-read can reach, uploads the two rebased
+//!   per-expert pointer tables and records `ready`. `ready` therefore covers
+//!   payload, tables and pad.
+//! * [`ExpertPanelRing::acquire`] makes the compute stream wait on `ready` and
+//!   lends D's dispatch the page as [`PanelBindingParts`].
+//! * [`ExpertPanelRing::retire`] records the free event on the compute stream
+//!   after the group's last reader was enqueued. Only then may the page be
+//!   refilled; the CPU may enqueue the refill long before the free event
+//!   completes because the copy stream waits on it.
+//!
+//! A ticket `(slot, epoch, layer, group, codec)` is checked on every acquire
+//! and retire, so a stale ticket, a forged layer/codec or a double retire can
+//! never touch a page that now holds other bytes at the same address.
+//! Pinned host sources and the pinned table staging stay owned until the page's
+//! previous copy is known complete (the next enqueue of that page waits for it
+//! on the host) or until [`ExpertPanelRing::drain`]. A failed operation
+//! quarantines the ring: every call but `drain` is refused and no owner is
+//! released until the streams are drained.
+//!
+//! All state transitions live in [`RingCore`], generic over a [`PanelBackend`],
+//! so the lifecycle is unit tested without HIP; [`HipPanelBackend`] is the real
+//! one.
+
+use super::*;
+use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
+use std::any::Any;
+
+type R<T> = Result<T, Qwen4GpuForwardError>;
+
+/// Alignment the page payload offsets preserve of every source address.
+const EXTENT_ALIGN: usize = 256;
+/// Largest group a page holds (D's `PanelLimits::experts_per_slot`).
+pub(crate) const MAX_GROUP_EXPERTS: usize = 32;
+/// Largest per-layer expert table.
+pub(crate) const MAX_TABLE_EXPERTS: usize = 1024;
+
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    value
+        .checked_add(align - 1)
+        .map(|v| v & !(align - 1))
+}
+
+// ── sources ──────────────────────────────────────────────────────────
+
+/// Codec identity of a group's experts; one group never mixes codecs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PanelCodec(pub(crate) u32);
+
+/// One projection's bytes in pinned host memory (CPU-readable address).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertExtent {
+    pub(crate) addr: usize,
+    pub(crate) len: usize,
+}
+
+/// One expert's host bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertSource {
+    pub(crate) codec: PanelCodec,
+    pub(crate) gate_up: ExpertExtent,
+    pub(crate) down: ExpertExtent,
+}
+
+/// One expert as the placement gives it: device-visible alias addresses of the
+/// host-mapped arena (the values of the layer's pointer entries).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AliasExpert {
+    pub(crate) codec: PanelCodec,
+    pub(crate) gate_up_addr: usize,
+    pub(crate) gate_up_len: usize,
+    pub(crate) down_addr: usize,
+    pub(crate) down_len: usize,
+}
+
+/// A host layer's immutable expert sources. Indexed by the layer's local
+/// expert id; `None` is an expert the layer does not hold (pruned).
+pub(crate) struct LayerExpertSources {
+    layer: usize,
+    host_base: usize,
+    host_bytes: usize,
+    experts: Vec<Option<ExpertSource>>,
+    owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl LayerExpertSources {
+    /// # Safety
+    /// `[host_base, host_base + host_bytes)` must be readable pinned host
+    /// memory that stays valid and unmodified for as long as `owner` (or a
+    /// clone of it) lives. Every extent is checked to lie inside that range.
+    pub(crate) unsafe fn new(
+        layer: usize,
+        host_base: usize,
+        host_bytes: usize,
+        experts: Vec<Option<ExpertSource>>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
+        if experts.is_empty() || experts.len() > MAX_TABLE_EXPERTS {
+            return Err(invalid(format!(
+                "panel sources layer {layer}: {} experts is outside 1..={MAX_TABLE_EXPERTS}",
+                experts.len()
+            )));
+        }
+        let host_end = host_base
+            .checked_add(host_bytes)
+            .ok_or_else(|| invalid(format!("panel sources layer {layer}: host range overflows")))?;
+        for (id, expert) in experts.iter().enumerate() {
+            let Some(expert) = expert else { continue };
+            for (name, extent) in [("gate_up", expert.gate_up), ("down", expert.down)] {
+                let end = extent.addr.checked_add(extent.len).ok_or_else(|| {
+                    invalid(format!(
+                        "panel sources layer {layer} expert {id} {name} extent overflows"
+                    ))
+                })?;
+                if extent.len == 0 || extent.addr < host_base || end > host_end {
+                    return Err(invalid(format!(
+                        "panel sources layer {layer} expert {id} {name} extent [{:#x}, +{}) is outside the host owner [{host_base:#x}, +{host_bytes})",
+                        extent.addr, extent.len
+                    )));
+                }
+            }
+        }
+        Ok(Self {
+            layer,
+            host_base,
+            host_bytes,
+            experts,
+            owner,
+        })
+    }
+
+    /// Sources from the placement's device-visible alias addresses: each alias
+    /// address must lie in `[alias_base, alias_base + host_bytes)` and maps to
+    /// `cpu_base + (alias - alias_base)`.
+    ///
+    /// # Safety
+    /// As [`Self::new`], for the CPU range `[cpu_base, cpu_base + host_bytes)`.
+    pub(crate) unsafe fn from_alias(
+        layer: usize,
+        cpu_base: usize,
+        alias_base: usize,
+        host_bytes: usize,
+        experts: &[Option<AliasExpert>],
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
+        let translate = |id: usize, addr: usize| -> R<usize> {
+            addr.checked_sub(alias_base)
+                .filter(|offset| *offset < host_bytes)
+                .and_then(|offset| cpu_base.checked_add(offset))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "panel sources layer {layer} expert {id}: alias {addr:#x} is outside the host owner [{alias_base:#x}, +{host_bytes})"
+                    ))
+                })
+        };
+        let mut out = Vec::with_capacity(experts.len());
+        for (id, expert) in experts.iter().enumerate() {
+            out.push(match expert {
+                None => None,
+                Some(e) => Some(ExpertSource {
+                    codec: e.codec,
+                    gate_up: ExpertExtent {
+                        addr: translate(id, e.gate_up_addr)?,
+                        len: e.gate_up_len,
+                    },
+                    down: ExpertExtent {
+                        addr: translate(id, e.down_addr)?,
+                        len: e.down_len,
+                    },
+                }),
+            });
+        }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { Self::new(layer, cpu_base, host_bytes, out, owner) }
+    }
+
+    pub(crate) fn layer(&self) -> usize {
+        self.layer
+    }
+
+    pub(crate) fn num_experts(&self) -> usize {
+        self.experts.len()
+    }
+
+    pub(crate) fn expert(&self, id: usize) -> Option<&ExpertSource> {
+        self.experts.get(id).and_then(Option::as_ref)
+    }
+
+    pub(crate) fn host_range(&self) -> (usize, usize) {
+        (self.host_base, self.host_bytes)
+    }
+
+    fn owner(&self) -> &Arc<dyn Any + Send + Sync> {
+        &self.owner
+    }
+}
+
+// ── groups and layout ────────────────────────────────────────────────
+
+/// One transfer unit: up to `experts_per_slot` ascending experts of one codec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertGroupPlan {
+    pub(crate) layer: usize,
+    pub(crate) group: u32,
+    pub(crate) codec: PanelCodec,
+    pub(crate) experts: SmallVec<[usize; MAX_GROUP_EXPERTS]>,
+}
+
+impl ExpertGroupPlan {
+    /// The immutable full-layer schedule: every present expert in ascending
+    /// order, a new group at each codec change or every `experts_per_slot`.
+    pub(crate) fn partition(
+        sources: &LayerExpertSources,
+        experts_per_slot: usize,
+    ) -> R<Vec<Self>> {
+        if experts_per_slot == 0 || experts_per_slot > MAX_GROUP_EXPERTS {
+            return Err(invalid(format!(
+                "panel group size {experts_per_slot} is outside 1..={MAX_GROUP_EXPERTS}"
+            )));
+        }
+        let mut out: Vec<Self> = Vec::new();
+        for id in 0..sources.num_experts() {
+            let Some(expert) = sources.expert(id) else {
+                continue;
+            };
+            match out.last_mut() {
+                Some(last) if last.codec == expert.codec && last.experts.len() < experts_per_slot => {
+                    last.experts.push(id)
+                }
+                _ => {
+                    let group = u32::try_from(out.len())
+                        .map_err(|_| invalid("panel group index overflows u32"))?;
+                    let mut experts = SmallVec::new();
+                    experts.push(id);
+                    out.push(Self {
+                        layer: sources.layer(),
+                        group,
+                        codec: expert.codec,
+                        experts,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyRun {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+/// Where a group's bytes sit in a page.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupLayout {
+    runs: SmallVec<[CopyRun; 8]>,
+    /// Page offset of each group expert's gate/up and down (parallel to the
+    /// group's `experts`).
+    gate_up: SmallVec<[usize; MAX_GROUP_EXPERTS]>,
+    down: SmallVec<[usize; MAX_GROUP_EXPERTS]>,
+    /// End of the payload; the zeroed tail pad starts here.
+    used: usize,
+    /// Sum of the experts' extent lengths.
+    extent_bytes: usize,
+}
+
+impl GroupLayout {
+    fn submitted_bytes(&self) -> usize {
+        self.runs.iter().map(|run| run.len).sum()
+    }
+}
+
+/// Lay out `experts` (ascending ids of `sources`). Extents are sorted by host
+/// address and merged where they touch or overlap; runs are packed back to back
+/// so that each run's page offset is congruent to its source address modulo
+/// [`EXTENT_ALIGN`], which preserves whatever alignment the source extents had.
+fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<GroupLayout> {
+    // (addr, len, index in `experts`, is_down)
+    let mut items: SmallVec<[(usize, usize, usize, bool); 2 * MAX_GROUP_EXPERTS]> = SmallVec::new();
+    for (index, &id) in experts.iter().enumerate() {
+        let expert = sources.expert(id).ok_or_else(|| {
+            invalid(format!(
+                "panel layout layer {}: expert {id} is not held",
+                sources.layer()
+            ))
+        })?;
+        items.push((expert.gate_up.addr, expert.gate_up.len, index, false));
+        items.push((expert.down.addr, expert.down.len, index, true));
+    }
+    items.sort_unstable();
+    let overflow = || invalid("panel layout overflows");
+    // (source start, source end, page offset)
+    let mut runs: SmallVec<[(usize, usize, usize); 8]> = SmallVec::new();
+    let mut item_run: SmallVec<[usize; 2 * MAX_GROUP_EXPERTS]> = SmallVec::new();
+    let mut cursor = 0usize;
+    let mut extent_bytes = 0usize;
+    for &(addr, len, _, _) in &items {
+        let end = addr.checked_add(len).ok_or_else(overflow)?;
+        extent_bytes = extent_bytes.checked_add(len).ok_or_else(overflow)?;
+        match runs.last_mut() {
+            Some(run) if addr <= run.1 => run.1 = run.1.max(end),
+            _ => {
+                let dst = align_up(cursor, EXTENT_ALIGN)
+                    .and_then(|aligned| aligned.checked_add(addr % EXTENT_ALIGN))
+                    .ok_or_else(overflow)?;
+                runs.push((addr, end, dst));
+            }
+        }
+        item_run.push(runs.len() - 1);
+        let run = runs.last().expect("run exists");
+        cursor = run.2.checked_add(run.1 - run.0).ok_or_else(overflow)?;
+    }
+    let mut layout = GroupLayout {
+        runs: runs
+            .iter()
+            .map(|&(start, end, dst)| CopyRun {
+                src: start,
+                dst,
+                len: end - start,
+            })
+            .collect(),
+        gate_up: SmallVec::from_elem(0, experts.len()),
+        down: SmallVec::from_elem(0, experts.len()),
+        used: cursor,
+        extent_bytes,
+    };
+    for (&(addr, _, index, down), &run) in items.iter().zip(&item_run) {
+        let (start, _, dst) = runs[run];
+        let offset = dst + (addr - start);
+        if down {
+            layout.down[index] = offset;
+        } else {
+            layout.gate_up[index] = offset;
+        }
+    }
+    Ok(layout)
+}
+
+/// The two little-endian per-expert pointer tables of a page: every group
+/// expert rebased to `page_base + offset`, every other entry zero (the panel
+/// never reads it).
+fn fill_tables(
+    layout: &GroupLayout,
+    experts: &[usize],
+    page_base: usize,
+    gate_up: &mut [u64],
+    down: &mut [u64],
+) -> R<()> {
+    gate_up.fill(0);
+    down.fill(0);
+    for (index, &id) in experts.iter().enumerate() {
+        if id >= gate_up.len() || id >= down.len() {
+            return Err(invalid(format!(
+                "panel table: expert {id} is outside the {}-entry table",
+                gate_up.len()
+            )));
+        }
+        for (table, offset) in [
+            (&mut *gate_up, layout.gate_up[index]),
+            (&mut *down, layout.down[index]),
+        ] {
+            let address = page_base.checked_add(offset).ok_or_else(|| {
+                invalid(format!("panel table: expert {id} rebased entry overflows"))
+            })?;
+            table[id] = u64::try_from(address)
+                .map_err(|_| invalid(format!("panel table: expert {id} address exceeds u64")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Largest page payload any group of `layers` needs (the pool's
+/// `payload_bytes`).
+pub(crate) fn required_payload_bytes(
+    layers: &[&LayerExpertSources],
+    experts_per_slot: usize,
+) -> R<usize> {
+    let mut largest = 0usize;
+    for sources in layers {
+        for group in ExpertGroupPlan::partition(sources, experts_per_slot)? {
+            largest = largest.max(plan_group_layout(&group.experts, sources)?.used);
+        }
+    }
+    if largest == 0 {
+        return Err(invalid("panel pool: no host experts to size a page"));
+    }
+    Ok(largest)
+}
+
+// ── pool geometry ────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PanelPoolSpec {
+    /// Pages reserved for current-layer groups (two in S1).
+    pub(crate) active_slots: usize,
+    /// Additional pages of the one-layer lookahead store (at most 16 for MQ4).
+    pub(crate) lookahead_pages: usize,
+    pub(crate) experts_per_slot: usize,
+    /// Entries of each per-layer pointer table.
+    pub(crate) num_experts: usize,
+    /// Largest group payload ([`required_payload_bytes`]); the tail pad is
+    /// added by the page.
+    pub(crate) payload_bytes: usize,
+    /// Copy/compute interval records the receipt timeline keeps (0 = off).
+    pub(crate) timeline_records: usize,
+    /// Whole-layer compute marks the receipt timeline keeps.
+    pub(crate) timeline_layers: usize,
+}
+
+/// Charged bytes of a pool (VRAM `payload` + `tables`, pinned host `staging`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PanelPoolReserve {
+    pub(crate) pages: usize,
+    pub(crate) page_bytes: usize,
+    pub(crate) payload: usize,
+    pub(crate) tables: usize,
+    pub(crate) staging: usize,
+    /// `payload + tables` (device).
+    pub(crate) device_total: usize,
+}
+
+impl PanelPoolSpec {
+    pub(crate) fn pages(&self) -> usize {
+        self.active_slots + self.lookahead_pages
+    }
+
+    /// One page: payload, then the zeroed tail pad, rounded to 256.
+    pub(crate) fn page_bytes(&self) -> Option<usize> {
+        self.payload_bytes
+            .checked_add(ARENA_TAIL_PAD_BYTES)
+            .and_then(|bytes| align_up(bytes, EXTENT_ALIGN))
+    }
+
+    pub(crate) fn validate(&self) -> R<()> {
+        if self.active_slots == 0 {
+            return Err(invalid("panel pool needs at least one active slot"));
+        }
+        if self.experts_per_slot == 0 || self.experts_per_slot > MAX_GROUP_EXPERTS {
+            return Err(invalid(format!(
+                "panel pool group size {} is outside 1..={MAX_GROUP_EXPERTS}",
+                self.experts_per_slot
+            )));
+        }
+        if self.num_experts == 0 || self.num_experts > MAX_TABLE_EXPERTS {
+            return Err(invalid(format!(
+                "panel pool table of {} entries is outside 1..={MAX_TABLE_EXPERTS}",
+                self.num_experts
+            )));
+        }
+        if self.payload_bytes == 0 {
+            return Err(invalid("panel pool payload is empty"));
+        }
+        self.reserve().map(|_| ()).ok_or_else(|| invalid("panel pool byte size overflows"))
+    }
+
+    /// The bytes this pool charges, `None` on overflow.
+    pub(crate) fn reserve(&self) -> Option<PanelPoolReserve> {
+        let pages = self.pages();
+        let page_bytes = self.page_bytes()?;
+        let payload = page_bytes.checked_mul(pages)?;
+        let table = self.num_experts.checked_mul(std::mem::size_of::<u64>())?;
+        let tables = table.checked_mul(2)?.checked_mul(pages)?;
+        Some(PanelPoolReserve {
+            pages,
+            page_bytes,
+            payload,
+            tables,
+            staging: tables,
+            device_total: payload.checked_add(tables)?,
+        })
+    }
+}
+
+// ── tickets, statistics, timeline ────────────────────────────────────
+
+/// Names one filled page content: `(slot, epoch, layer, group, codec)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PanelTicket {
+    pub(crate) slot: usize,
+    /// Ring-unique and never reused: a page refilled at the same address has a
+    /// new epoch.
+    pub(crate) epoch: u64,
+    pub(crate) layer: usize,
+    pub(crate) group: u32,
+    pub(crate) codec: PanelCodec,
+}
+
+/// Cumulative since the last [`RingCore::begin_window`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PanelStats {
+    pub(crate) enqueued: u64,
+    pub(crate) acquired: u64,
+    pub(crate) retired: u64,
+    /// Retired without ever being acquired (prefetched, then unused).
+    pub(crate) discarded: u64,
+    /// Bytes H2D-copied as payload (submitted).
+    pub(crate) submitted_payload_bytes: u64,
+    /// Sum of the experts' own extent lengths of those groups.
+    pub(crate) extent_bytes: u64,
+    pub(crate) table_bytes: u64,
+    /// Payload bytes of groups the compute stream acquired.
+    pub(crate) acquired_payload_bytes: u64,
+    /// Payload bytes of groups retired unread.
+    pub(crate) discarded_payload_bytes: u64,
+    /// Enqueues refused for lack of a free page of the needed class.
+    pub(crate) page_full_stalls: u64,
+    /// Acquires whose copy had not completed when the compute stream got there.
+    pub(crate) copy_starved_stalls: u64,
+    pub(crate) timeline_overflow: u64,
+    pub(crate) layer_mark_overflow: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TimelineEvent {
+    Base,
+    CopyStart(usize),
+    CopyEnd(usize),
+    ComputeBegin(usize),
+    ComputeEnd(usize),
+    LayerBegin(usize),
+    LayerEnd(usize),
+}
+
+/// One group's intervals in ms since the window base event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PanelSpanMs {
+    pub(crate) layer: usize,
+    pub(crate) group: u32,
+    pub(crate) bytes: usize,
+    pub(crate) copy_start: f64,
+    pub(crate) copy_end: f64,
+    /// Acquire..retire on the compute stream; `None` if never acquired.
+    pub(crate) compute: Option<(f64, f64)>,
+}
+
+/// A whole layer's compute interval (`mark_layer_begin`..`mark_layer_end`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LayerSpanMs {
+    pub(crate) layer: usize,
+    pub(crate) begin: f64,
+    pub(crate) end: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct OverlapSummary {
+    /// Count of (layer L compute, next layer's H2D) interval pairs that intersect.
+    pub(crate) cross_layer_intersections: u64,
+    pub(crate) cross_layer_overlap_ms: f64,
+    /// Gaps between consecutive copies (waiting on a free event or on work).
+    pub(crate) copy_idle_ms: f64,
+    pub(crate) copy_busy_ms: f64,
+    pub(crate) compute_busy_ms: f64,
+    pub(crate) page_full_stalls: u64,
+    pub(crate) copy_starved_stalls: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PanelTimeline {
+    pub(crate) spans: Vec<PanelSpanMs>,
+    pub(crate) layers: Vec<LayerSpanMs>,
+    pub(crate) overlap: OverlapSummary,
+    pub(crate) stats: PanelStats,
+}
+
+fn union_ms(mut intervals: Vec<(f64, f64)>) -> f64 {
+    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut total = 0.0;
+    let mut open: Option<(f64, f64)> = None;
+    for (start, end) in intervals {
+        match open.as_mut() {
+            Some(cur) if start <= cur.1 => cur.1 = cur.1.max(end),
+            _ => {
+                if let Some(cur) = open.take() {
+                    total += cur.1 - cur.0;
+                }
+                open = Some((start, end));
+            }
+        }
+    }
+    if let Some(cur) = open {
+        total += cur.1 - cur.0;
+    }
+    total
+}
+
+/// Receipt numbers from measured intervals only. Layer compute intervals come
+/// from the whole-layer marks when the layer has one, else from that layer's
+/// per-group acquire..retire spans; "next layer" is the next distinct layer in
+/// ascending order that has copies.
+pub(crate) fn summarize_overlap(
+    spans: &[PanelSpanMs],
+    layers: &[LayerSpanMs],
+    stats: &PanelStats,
+) -> OverlapSummary {
+    let mut summary = OverlapSummary {
+        page_full_stalls: stats.page_full_stalls,
+        copy_starved_stalls: stats.copy_starved_stalls,
+        ..OverlapSummary::default()
+    };
+    let mut by_copy: Vec<&PanelSpanMs> = spans.iter().collect();
+    by_copy.sort_by(|a, b| {
+        a.copy_start
+            .partial_cmp(&b.copy_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for pair in by_copy.windows(2) {
+        summary.copy_idle_ms += (pair[1].copy_start - pair[0].copy_end).max(0.0);
+    }
+    summary.copy_busy_ms = union_ms(spans.iter().map(|s| (s.copy_start, s.copy_end)).collect());
+    summary.compute_busy_ms = union_ms(spans.iter().filter_map(|s| s.compute).collect());
+    let mut order: Vec<usize> = spans
+        .iter()
+        .map(|s| s.layer)
+        .chain(layers.iter().map(|l| l.layer))
+        .collect();
+    order.sort_unstable();
+    order.dedup();
+    for window in order.windows(2) {
+        let (current, next) = (window[0], window[1]);
+        let copies: Vec<(f64, f64)> = spans
+            .iter()
+            .filter(|s| s.layer == next)
+            .map(|s| (s.copy_start, s.copy_end))
+            .collect();
+        if copies.is_empty() {
+            continue;
+        }
+        let mut compute: Vec<(f64, f64)> = layers
+            .iter()
+            .filter(|l| l.layer == current)
+            .map(|l| (l.begin, l.end))
+            .collect();
+        if compute.is_empty() {
+            compute = spans
+                .iter()
+                .filter(|s| s.layer == current)
+                .filter_map(|s| s.compute)
+                .collect();
+        }
+        for &(c0, c1) in &compute {
+            for &(h0, h1) in &copies {
+                let overlap = c1.min(h1) - c0.max(h0);
+                if overlap > 0.0 {
+                    summary.cross_layer_intersections += 1;
+                    summary.cross_layer_overlap_ms += overlap;
+                }
+            }
+        }
+    }
+    summary
+}
+
+// ── backend ──────────────────────────────────────────────────────────
+
+/// Device operations of the ring. `Ctx` is `Gpu` for HIP and `()` for the CPU
+/// model.
+pub(crate) trait PanelBackend {
+    type Ctx: ?Sized;
+
+    /// Device address of the page payload (what the rebased tables point into).
+    fn page_base(&self, slot: usize) -> usize;
+    /// Host staging of the page's two pointer tables, `num_experts` entries each.
+    /// Only written after [`Self::await_copy_done`] of the slot's previous fill.
+    fn tables_mut(&mut self, slot: usize) -> (&mut [u64], &mut [u64]);
+    /// Host-wait until the slot's last recorded `ready` completed: its payload
+    /// and table copies no longer read host memory.
+    fn await_copy_done(&mut self, ctx: &Self::Ctx, slot: usize) -> R<()>;
+    /// Copy stream: wait the slot's free event (if one was ever recorded).
+    fn copy_begin(&mut self, ctx: &Self::Ctx, slot: usize, wait_free: bool, rec: Option<usize>)
+        -> R<()>;
+    fn copy_payload(
+        &mut self,
+        ctx: &Self::Ctx,
+        slot: usize,
+        src: usize,
+        dst: usize,
+        len: usize,
+    ) -> R<()>;
+    fn copy_zero(&mut self, ctx: &Self::Ctx, slot: usize, dst: usize, len: usize) -> R<()>;
+    fn copy_tables(&mut self, ctx: &Self::Ctx, slot: usize) -> R<()>;
+    /// Copy stream: record `ready` after payload, pad and tables.
+    fn copy_end(&mut self, ctx: &Self::Ctx, slot: usize, rec: Option<usize>) -> R<()>;
+    /// Compute stream waits `ready`; returns whether the copy was still running.
+    fn compute_acquire(&mut self, ctx: &Self::Ctx, slot: usize, rec: Option<usize>) -> R<bool>;
+    /// Compute stream records the slot's free event (after the last reader).
+    fn compute_release(&mut self, ctx: &Self::Ctx, slot: usize, rec: Option<usize>) -> R<()>;
+    fn mark_base(&mut self, ctx: &Self::Ctx) -> R<()>;
+    fn mark_layer(&mut self, ctx: &Self::Ctx, mark: usize, end: bool) -> R<()>;
+    /// Synchronize the copy and compute streams.
+    fn drain(&mut self, ctx: &Self::Ctx) -> R<()>;
+    fn elapsed_ms(&self, ctx: &Self::Ctx, from: TimelineEvent, to: TimelineEvent) -> R<f64>;
+}
+
+// ── core state machine ───────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageState {
+    Free,
+    Copying,
+    Ready,
+    InUse,
+    Retiring,
+}
+
+struct Page {
+    state: PageState,
+    epoch: u64,
+    layer: usize,
+    group: u32,
+    codec: PanelCodec,
+    experts: SmallVec<[usize; MAX_GROUP_EXPERTS]>,
+    host_base: usize,
+    payload_bytes: usize,
+    used: usize,
+    acquired: bool,
+    /// A fill was ever issued since the last drain: its `ready` exists.
+    filled: bool,
+    /// A free event was recorded since the last drain.
+    free_recorded: bool,
+    rec: Option<usize>,
+    /// Pinned host source owner of the current/last fill.
+    retained: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            state: PageState::Free,
+            epoch: 0,
+            layer: 0,
+            group: 0,
+            codec: PanelCodec(0),
+            experts: SmallVec::new(),
+            host_base: 0,
+            payload_bytes: 0,
+            used: 0,
+            acquired: false,
+            filled: false,
+            free_recorded: false,
+            rec: None,
+            retained: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Current,
+    Lookahead,
+}
+
+struct SpanRec {
+    layer: usize,
+    group: u32,
+    bytes: usize,
+    acquired: bool,
+    released: bool,
+}
+
+struct LayerMark {
+    layer: usize,
+    ended: bool,
+}
+
+pub(crate) struct RingCore<B: PanelBackend> {
+    spec: PanelPoolSpec,
+    pages: Vec<Page>,
+    /// Free pages in the order they were freed (FIFO): the page free the
+    /// longest is refilled first, so its free event is the likeliest complete.
+    free: Vec<usize>,
+    next_epoch: u64,
+    current: Option<usize>,
+    next: Option<usize>,
+    /// Last group enqueued per window layer.
+    cursors: SmallVec<[(usize, u32); 2]>,
+    poisoned: bool,
+    stats: PanelStats,
+    records: Vec<SpanRec>,
+    marks: Vec<LayerMark>,
+    backend: B,
+}
+
+impl<B: PanelBackend> RingCore<B> {
+    pub(crate) fn new(spec: PanelPoolSpec, backend: B) -> R<Self> {
+        spec.validate()?;
+        let pages = spec.pages();
+        Ok(Self {
+            spec,
+            pages: (0..pages).map(|_| Page::new()).collect(),
+            free: (0..pages).collect(),
+            next_epoch: 1,
+            current: None,
+            next: None,
+            cursors: SmallVec::new(),
+            poisoned: false,
+            stats: PanelStats::default(),
+            records: Vec::with_capacity(spec.timeline_records),
+            marks: Vec::with_capacity(spec.timeline_layers),
+            backend,
+        })
+    }
+
+    pub(crate) fn stats(&self) -> PanelStats {
+        self.stats
+    }
+
+    pub(crate) fn is_quarantined(&self) -> bool {
+        self.poisoned
+    }
+
+    fn check_live(&self) -> R<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "panel ring is quarantined by an earlier failure; drain it first",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Start of an admitted prompt window: every page must be free. Resets the
+    /// statistics, the timeline and the layer window, and stamps the base event.
+    pub(crate) fn begin_window(&mut self, ctx: &B::Ctx) -> R<()> {
+        self.check_live()?;
+        if let Some(busy) = self.pages.iter().position(|p| p.state != PageState::Free) {
+            return Err(invalid(format!(
+                "panel window starts with page {busy} still {:?}",
+                self.pages[busy].state
+            )));
+        }
+        self.current = None;
+        self.next = None;
+        self.cursors.clear();
+        self.stats = PanelStats::default();
+        self.records.clear();
+        self.marks.clear();
+        self.run(|core| core.backend.mark_base(ctx))
+    }
+
+    /// Declare the layers whose groups may be enqueued: `current` (compute
+    /// consumers) and `next` (the one lookahead layer). `current` is `None`
+    /// before the first host layer so its payload can already prefetch.
+    pub(crate) fn set_layers(&mut self, current: Option<usize>, next: Option<usize>) -> R<()> {
+        self.check_live()?;
+        if let (Some(c), Some(n)) = (current, next) {
+            if n <= c {
+                return Err(invalid(format!(
+                    "panel window next layer {n} is not after current {c}"
+                )));
+            }
+        }
+        match (self.current, current) {
+            (Some(_), None) => return Err(invalid("panel window cannot return to no current layer")),
+            (Some(old), Some(new)) if new < old => {
+                return Err(invalid(format!("panel window moves back from layer {old} to {new}")))
+            }
+            _ => {}
+        }
+        if let (Some(old), Some(new)) = (self.next, next) {
+            if new < old {
+                return Err(invalid(format!(
+                    "panel lookahead moves back from layer {old} to {new}"
+                )));
+            }
+        }
+        if let Some(page) = self.pages.iter().position(|p| {
+            p.state != PageState::Free && Some(p.layer) != current && Some(p.layer) != next
+        }) {
+            return Err(invalid(format!(
+                "panel page {page} of layer {} is still live outside the new window",
+                self.pages[page].layer
+            )));
+        }
+        self.current = current;
+        self.next = next;
+        self.cursors
+            .retain(|(layer, _)| Some(*layer) == current || Some(*layer) == next);
+        Ok(())
+    }
+
+    fn classify(&self, layer: usize) -> R<Class> {
+        if Some(layer) == self.current {
+            Ok(Class::Current)
+        } else if Some(layer) == self.next {
+            if self.spec.lookahead_pages == 0 {
+                return Err(invalid("panel pool has no lookahead pages"));
+            }
+            Ok(Class::Lookahead)
+        } else {
+            Err(invalid(format!(
+                "panel layer {layer} is outside the window (current {:?}, next {:?})",
+                self.current, self.next
+            )))
+        }
+    }
+
+    /// Run a mutating device sequence; a failure quarantines the ring.
+    fn run<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        let result = f(self);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// Enqueue `group`, or `Ok(None)` (counted) when no free page of its class
+    /// exists yet. Every validation failure happens before any mutation.
+    pub(crate) fn try_enqueue(
+        &mut self,
+        ctx: &B::Ctx,
+        group: &ExpertGroupPlan,
+        sources: &LayerExpertSources,
+    ) -> R<Option<PanelTicket>> {
+        self.check_live()?;
+        let class = self.classify(group.layer)?;
+        if sources.layer() != group.layer {
+            return Err(invalid(format!(
+                "panel group layer {} enqueued with sources of layer {}",
+                group.layer,
+                sources.layer()
+            )));
+        }
+        if sources.num_experts() != self.spec.num_experts {
+            return Err(invalid(format!(
+                "panel sources hold a {}-entry table, the pool {}",
+                sources.num_experts(),
+                self.spec.num_experts
+            )));
+        }
+        if group.experts.is_empty() || group.experts.len() > self.spec.experts_per_slot {
+            return Err(invalid(format!(
+                "panel group of {} experts is outside 1..={}",
+                group.experts.len(),
+                self.spec.experts_per_slot
+            )));
+        }
+        if group.experts.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(invalid("panel group experts are not strictly ascending"));
+        }
+        for &id in &group.experts {
+            match sources.expert(id) {
+                Some(expert) if expert.codec == group.codec => {}
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "panel group codec {:?} does not match expert {id}",
+                        group.codec
+                    )))
+                }
+                None => return Err(invalid(format!("panel group expert {id} is not held"))),
+            }
+        }
+        let cursor = self.cursors.iter().find(|(layer, _)| *layer == group.layer);
+        if let Some(&(_, last)) = cursor {
+            if group.group <= last {
+                return Err(invalid(format!(
+                    "panel layer {} group {} enqueued again or out of order (last {last}); one transfer per group per window",
+                    group.layer, group.group
+                )));
+            }
+        }
+        let layout = plan_group_layout(&group.experts, sources)?;
+        let page_bytes = self
+            .spec
+            .page_bytes()
+            .ok_or_else(|| invalid("panel page size overflows"))?;
+        if layout
+            .used
+            .checked_add(ARENA_TAIL_PAD_BYTES)
+            .map_or(true, |need| need > page_bytes)
+        {
+            return Err(invalid(format!(
+                "panel layer {} group {} needs {} payload bytes plus pad, a page holds {page_bytes}",
+                group.layer, group.group, layout.used
+            )));
+        }
+        let position = match class {
+            Class::Current => (!self.free.is_empty()).then_some(0),
+            Class::Lookahead => self
+                .free
+                .iter()
+                .position(|&slot| slot >= self.spec.active_slots),
+        };
+        let Some(position) = position else {
+            self.stats.page_full_stalls += 1;
+            return Ok(None);
+        };
+        let slot = self.free.remove(position);
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        let rec = if self.spec.timeline_records == 0 {
+            None
+        } else if self.records.len() < self.spec.timeline_records {
+            self.records.push(SpanRec {
+                layer: group.layer,
+                group: group.group,
+                bytes: layout.submitted_bytes(),
+                acquired: false,
+                released: false,
+            });
+            Some(self.records.len() - 1)
+        } else {
+            self.stats.timeline_overflow += 1;
+            None
+        };
+        self.run(|core| core.fill(ctx, slot, epoch, group, sources, &layout, rec))?;
+        match self.cursors.iter_mut().find(|(layer, _)| *layer == group.layer) {
+            Some(entry) => entry.1 = group.group,
+            None => self.cursors.push((group.layer, group.group)),
+        }
+        Ok(Some(PanelTicket {
+            slot,
+            epoch,
+            layer: group.layer,
+            group: group.group,
+            codec: group.codec,
+        }))
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        ctx: &B::Ctx,
+        group: &ExpertGroupPlan,
+        sources: &LayerExpertSources,
+    ) -> R<PanelTicket> {
+        self.try_enqueue(ctx, group, sources)?.ok_or_else(|| {
+            invalid(format!(
+                "panel ring is full: no free page for layer {} group {}",
+                group.layer, group.group
+            ))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        ctx: &B::Ctx,
+        slot: usize,
+        epoch: u64,
+        group: &ExpertGroupPlan,
+        sources: &LayerExpertSources,
+        layout: &GroupLayout,
+        rec: Option<usize>,
+    ) -> R<()> {
+        let (filled, wait_free) = {
+            let page = &self.pages[slot];
+            (page.filled, page.free_recorded)
+        };
+        // The previous fill's copies must be done before its pinned table
+        // staging is overwritten and its source owner released.
+        if filled {
+            self.backend.await_copy_done(ctx, slot)?;
+        }
+        let base = self.backend.page_base(slot);
+        {
+            let page = &mut self.pages[slot];
+            page.retained = Some(Arc::clone(sources.owner()));
+            page.state = PageState::Copying;
+            page.epoch = epoch;
+            page.layer = group.layer;
+            page.group = group.group;
+            page.codec = group.codec;
+            page.experts = group.experts.clone();
+            page.host_base = sources.host_range().0;
+            page.payload_bytes = layout.submitted_bytes();
+            page.used = layout.used;
+            page.acquired = false;
+            page.filled = true;
+            page.rec = rec;
+        }
+        let (gate_up, down) = self.backend.tables_mut(slot);
+        fill_tables(layout, &group.experts, base, gate_up, down)?;
+        self.backend.copy_begin(ctx, slot, wait_free, rec)?;
+        for run in &layout.runs {
+            self.backend.copy_payload(ctx, slot, run.src, run.dst, run.len)?;
+        }
+        self.backend
+            .copy_zero(ctx, slot, layout.used, ARENA_TAIL_PAD_BYTES)?;
+        self.backend.copy_tables(ctx, slot)?;
+        self.backend.copy_end(ctx, slot, rec)?;
+        self.pages[slot].state = PageState::Ready;
+        self.stats.enqueued += 1;
+        self.stats.submitted_payload_bytes += layout.submitted_bytes() as u64;
+        self.stats.extent_bytes += layout.extent_bytes as u64;
+        self.stats.table_bytes +=
+            (2 * self.spec.num_experts * std::mem::size_of::<u64>()) as u64;
+        Ok(())
+    }
+
+    /// Resolve a ticket to its page, refusing stale or forged ones.
+    fn checked_slot(&self, ticket: PanelTicket, allowed: &[PageState]) -> R<usize> {
+        let page = self
+            .pages
+            .get(ticket.slot)
+            .ok_or_else(|| invalid(format!("panel ticket slot {} is out of range", ticket.slot)))?;
+        if page.epoch != ticket.epoch {
+            return Err(invalid(format!(
+                "stale panel ticket: slot {} epoch {} was refilled (now epoch {})",
+                ticket.slot, ticket.epoch, page.epoch
+            )));
+        }
+        if page.layer != ticket.layer {
+            return Err(invalid(format!(
+                "stale panel ticket: layer {} does not match the page's layer {}",
+                ticket.layer, page.layer
+            )));
+        }
+        if page.group != ticket.group {
+            return Err(invalid(format!(
+                "stale panel ticket: group {} does not match the page's group {}",
+                ticket.group, page.group
+            )));
+        }
+        if page.codec != ticket.codec {
+            return Err(invalid(format!(
+                "stale panel ticket: codec {:?} does not match the page's codec {:?}",
+                ticket.codec, page.codec
+            )));
+        }
+        if !allowed.contains(&page.state) {
+            return Err(invalid(format!(
+                "panel ticket slot {} epoch {} is {:?}, expected one of {allowed:?}",
+                ticket.slot, ticket.epoch, page.state
+            )));
+        }
+        Ok(ticket.slot)
+    }
+
+    /// `Ready -> InUse`: the compute stream waits for the copy.
+    pub(crate) fn acquire(&mut self, ctx: &B::Ctx, ticket: PanelTicket) -> R<()> {
+        self.check_live()?;
+        let slot = self.checked_slot(ticket, &[PageState::Ready])?;
+        let rec = self.pages[slot].rec;
+        let starved = self.run(|core| core.backend.compute_acquire(ctx, slot, rec))?;
+        if starved {
+            self.stats.copy_starved_stalls += 1;
+        }
+        let page = &mut self.pages[slot];
+        page.state = PageState::InUse;
+        page.acquired = true;
+        self.stats.acquired += 1;
+        self.stats.acquired_payload_bytes += page.payload_bytes as u64;
+        if let Some(record) = rec.and_then(|r| self.records.get_mut(r)) {
+            record.acquired = true;
+        }
+        Ok(())
+    }
+
+    /// The page is leased: it must be `InUse` under exactly this ticket.
+    fn leased(&self, ticket: PanelTicket) -> R<&Page> {
+        let slot = self.checked_slot(ticket, &[PageState::InUse])?;
+        Ok(&self.pages[slot])
+    }
+
+    /// `InUse|Ready -> Retiring -> Free`: call after the group's last reader
+    /// was enqueued on the compute stream. A `Ready` page was prefetched and
+    /// never read; it is released without a read and counted as discarded.
+    pub(crate) fn retire(&mut self, ctx: &B::Ctx, ticket: PanelTicket) -> R<()> {
+        self.check_live()?;
+        let slot = self.checked_slot(ticket, &[PageState::InUse, PageState::Ready])?;
+        let (acquired, rec, bytes) = {
+            let page = &mut self.pages[slot];
+            page.state = PageState::Retiring;
+            (page.acquired, page.rec, page.payload_bytes)
+        };
+        let compute_rec = if acquired { rec } else { None };
+        self.run(|core| core.backend.compute_release(ctx, slot, compute_rec))?;
+        let page = &mut self.pages[slot];
+        page.state = PageState::Free;
+        page.free_recorded = true;
+        self.free.push(slot);
+        self.stats.retired += 1;
+        if !acquired {
+            self.stats.discarded += 1;
+            self.stats.discarded_payload_bytes += bytes as u64;
+        }
+        if let Some(record) = rec.and_then(|r| self.records.get_mut(r)) {
+            record.released = acquired;
+        }
+        Ok(())
+    }
+
+    /// Drain both streams, then force every page free, release every retained
+    /// source, end the window and clear the quarantine. Outstanding tickets go
+    /// stale. A failed drain keeps the quarantine and every owner alive.
+    pub(crate) fn drain(&mut self, ctx: &B::Ctx) -> R<()> {
+        if let Err(error) = self.backend.drain(ctx) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        for page in &mut self.pages {
+            page.state = PageState::Free;
+            page.retained = None;
+            page.filled = false;
+            page.free_recorded = false;
+            page.rec = None;
+            page.acquired = false;
+        }
+        self.free.clear();
+        self.free.extend(0..self.pages.len());
+        self.current = None;
+        self.next = None;
+        self.cursors.clear();
+        self.poisoned = false;
+        Ok(())
+    }
+
+    pub(crate) fn mark_layer_begin(&mut self, ctx: &B::Ctx, layer: usize) -> R<()> {
+        self.check_live()?;
+        if self.spec.timeline_layers == 0 {
+            return Ok(());
+        }
+        if self.marks.len() >= self.spec.timeline_layers {
+            self.stats.layer_mark_overflow += 1;
+            return Ok(());
+        }
+        let mark = self.marks.len();
+        self.marks.push(LayerMark {
+            layer,
+            ended: false,
+        });
+        self.run(|core| core.backend.mark_layer(ctx, mark, false))
+    }
+
+    pub(crate) fn mark_layer_end(&mut self, ctx: &B::Ctx, layer: usize) -> R<()> {
+        self.check_live()?;
+        if self.spec.timeline_layers == 0 {
+            return Ok(());
+        }
+        let Some(mark) = self
+            .marks
+            .iter()
+            .rposition(|m| m.layer == layer && !m.ended)
+        else {
+            if self.stats.layer_mark_overflow > 0 {
+                return Ok(());
+            }
+            return Err(invalid(format!("layer {layer} has no open compute mark")));
+        };
+        self.marks[mark].ended = true;
+        self.run(|core| core.backend.mark_layer(ctx, mark, true))
+    }
+
+    /// Intervals and receipt numbers of this window. Call after [`Self::drain`]
+    /// (or once the window's work completed): every event must have completed.
+    pub(crate) fn timeline(&self, ctx: &B::Ctx) -> R<PanelTimeline> {
+        let ms = |from, to| self.backend.elapsed_ms(ctx, from, to);
+        let mut spans = Vec::with_capacity(self.records.len());
+        for (index, record) in self.records.iter().enumerate() {
+            let compute = if record.acquired && record.released {
+                Some((
+                    ms(TimelineEvent::Base, TimelineEvent::ComputeBegin(index))?,
+                    ms(TimelineEvent::Base, TimelineEvent::ComputeEnd(index))?,
+                ))
+            } else {
+                None
+            };
+            spans.push(PanelSpanMs {
+                layer: record.layer,
+                group: record.group,
+                bytes: record.bytes,
+                copy_start: ms(TimelineEvent::Base, TimelineEvent::CopyStart(index))?,
+                copy_end: ms(TimelineEvent::Base, TimelineEvent::CopyEnd(index))?,
+                compute,
+            });
+        }
+        let mut layers = Vec::with_capacity(self.marks.len());
+        for (index, mark) in self.marks.iter().enumerate() {
+            if !mark.ended {
+                continue;
+            }
+            layers.push(LayerSpanMs {
+                layer: mark.layer,
+                begin: ms(TimelineEvent::Base, TimelineEvent::LayerBegin(index))?,
+                end: ms(TimelineEvent::Base, TimelineEvent::LayerEnd(index))?,
+            });
+        }
+        let overlap = summarize_overlap(&spans, &layers, &self.stats);
+        Ok(PanelTimeline {
+            spans,
+            layers,
+            overlap,
+            stats: self.stats,
+        })
+    }
+}
+
+// ── layer-ahead schedule ─────────────────────────────────────────────
+
+struct ScheduledLayer {
+    sources: LayerExpertSources,
+    groups: Vec<ExpertGroupPlan>,
+    /// Next group index to enqueue.
+    next_group: usize,
+    tickets: Vec<Option<PanelTicket>>,
+}
+
+/// The frozen weight schedule of one window: every host layer's groups in
+/// ascending layer/expert order, at most one layer ahead of compute, one
+/// transfer per group. [`Self::pump`] enqueues missing current-layer groups
+/// first, then the next layer's, until the pool is full.
+pub(crate) struct PanelSchedule {
+    layers: Vec<ScheduledLayer>,
+    /// Index of the layer compute is on; `None` before the first host layer.
+    current: Option<usize>,
+    sweep_bytes: u64,
+    extent_bytes: u64,
+}
+
+impl PanelSchedule {
+    /// `layers` must be ascending by layer index. Plans every group's layout
+    /// now so a malformed source fails before any transfer.
+    pub(crate) fn new(layers: Vec<LayerExpertSources>, experts_per_slot: usize) -> R<Self> {
+        let mut scheduled = Vec::with_capacity(layers.len());
+        let (mut sweep_bytes, mut extent_bytes) = (0u64, 0u64);
+        let mut previous: Option<usize> = None;
+        for sources in layers {
+            if previous.is_some_and(|p| sources.layer() <= p) {
+                return Err(invalid("panel schedule layers are not strictly ascending"));
+            }
+            previous = Some(sources.layer());
+            let groups = ExpertGroupPlan::partition(&sources, experts_per_slot)?;
+            for group in &groups {
+                let layout = plan_group_layout(&group.experts, &sources)?;
+                sweep_bytes += layout.submitted_bytes() as u64;
+                extent_bytes += layout.extent_bytes as u64;
+            }
+            scheduled.push(ScheduledLayer {
+                tickets: vec![None; groups.len()],
+                next_group: 0,
+                groups,
+                sources,
+            });
+        }
+        Ok(Self {
+            layers: scheduled,
+            current: None,
+            sweep_bytes,
+            extent_bytes,
+        })
+    }
+
+    /// Payload bytes one full sweep submits (all groups' coalesced runs).
+    pub(crate) fn sweep_bytes(&self) -> u64 {
+        self.sweep_bytes
+    }
+
+    /// Sum of the experts' own extents over the sweep.
+    pub(crate) fn extent_bytes(&self) -> u64 {
+        self.extent_bytes
+    }
+
+    pub(crate) fn layer_groups(&self, layer: usize) -> Option<&[ExpertGroupPlan]> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .map(|l| l.groups.as_slice())
+    }
+
+    fn next_index(&self) -> Option<usize> {
+        let next = self.current.map_or(0, |c| c + 1);
+        (next < self.layers.len()).then_some(next)
+    }
+
+    fn apply_window<B: PanelBackend>(&self, core: &mut RingCore<B>) -> R<()> {
+        core.set_layers(
+            self.current.map(|c| self.layers[c].sources.layer()),
+            self.next_index().map(|n| self.layers[n].sources.layer()),
+        )
+    }
+
+    /// Start of the window: lookahead covers the first host layer while
+    /// resident layers compute. Pumps immediately.
+    pub(crate) fn prime<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+    ) -> R<usize> {
+        self.current = None;
+        for layer in &mut self.layers {
+            layer.next_group = 0;
+            layer.tickets.iter_mut().for_each(|t| *t = None);
+        }
+        core.begin_window(ctx)?;
+        self.apply_window(core)?;
+        self.pump(core, ctx)
+    }
+
+    /// Compute reaches host layer `layer` (the next in the schedule).
+    pub(crate) fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize> {
+        let expected = self.next_index().ok_or_else(|| {
+            invalid(format!("panel schedule has no layer after {:?}", self.current))
+        })?;
+        if self.layers[expected].sources.layer() != layer {
+            return Err(invalid(format!(
+                "panel schedule expects layer {} next, compute entered {layer}",
+                self.layers[expected].sources.layer()
+            )));
+        }
+        self.current = Some(expected);
+        self.apply_window(core)?;
+        self.pump(core, ctx)
+    }
+
+    /// Enqueue as many groups as free pages allow: the current layer's
+    /// missing groups first, then the next layer's.
+    pub(crate) fn pump<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+    ) -> R<usize> {
+        let mut issued = 0;
+        for index in [self.current, self.next_index()].into_iter().flatten() {
+            let layer = &mut self.layers[index];
+            while layer.next_group < layer.groups.len() {
+                let group = layer.next_group;
+                match core.try_enqueue(ctx, &layer.groups[group], &layer.sources)? {
+                    Some(ticket) => {
+                        layer.tickets[group] = Some(ticket);
+                        layer.next_group += 1;
+                        issued += 1;
+                    }
+                    None => return Ok(issued),
+                }
+            }
+        }
+        Ok(issued)
+    }
+
+    /// The ticket of `(layer, group)` once enqueued.
+    pub(crate) fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .and_then(|l| l.tickets.get(group as usize).copied().flatten())
+    }
+
+    /// The ticket of a current-layer group compute needs now, enqueueing the
+    /// groups before it if the pool allowed none yet. Errors (no state
+    /// change) when the pool is full: retire earlier tickets first.
+    pub(crate) fn require<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket> {
+        if let Some(ticket) = self.ticket(layer, group) {
+            return Ok(ticket);
+        }
+        self.pump(core, ctx)?;
+        self.ticket(layer, group).ok_or_else(|| {
+            invalid(format!(
+                "panel layer {layer} group {group} cannot be enqueued: the pool is full or the layer is not current"
+            ))
+        })
+    }
+}
+
+// ── HIP backend and public ring ──────────────────────────────────────
+
+/// Real device resources of the pool.
+pub(crate) struct HipPanelBackend {
+    copy: hip_bridge::Stream,
+    payloads: Vec<GpuTensor>,
+    gate_ups: Vec<GpuTensor>,
+    downs: Vec<GpuTensor>,
+    ready: Vec<hip_bridge::Event>,
+    free: Vec<hip_bridge::Event>,
+    /// Pinned host staging of every page's two pointer tables.
+    staging: hip_bridge::PinnedHostBuffer,
+    table_len: usize,
+    base: Option<hip_bridge::Event>,
+    /// Four per record: copy start/end, compute begin/end.
+    timing: Vec<hip_bridge::Event>,
+    /// Two per layer mark: begin/end.
+    layer_timing: Vec<hip_bridge::Event>,
+}
+
+fn compute_stream(gpu: &Gpu) -> R<&hip_bridge::Stream> {
+    gpu.active_stream
+        .as_ref()
+        .ok_or_else(|| invalid("panel ring: compute stream missing"))
+}
+
+impl HipPanelBackend {
+    fn new(gpu: &mut Gpu, spec: &PanelPoolSpec) -> R<Self> {
+        let reserve = spec
+            .reserve()
+            .ok_or_else(|| invalid("panel pool byte size overflows"))?;
+        let staging = gpu.hip.host_buffer(reserve.staging)?;
+        gpu.ensure_capture_stream()?;
+        let copy = gpu.hip.stream_create_non_blocking()?;
+        let mut backend = Self {
+            copy,
+            payloads: Vec::with_capacity(reserve.pages),
+            gate_ups: Vec::with_capacity(reserve.pages),
+            downs: Vec::with_capacity(reserve.pages),
+            ready: Vec::with_capacity(reserve.pages),
+            free: Vec::with_capacity(reserve.pages),
+            staging,
+            table_len: spec.num_experts,
+            base: None,
+            timing: Vec::new(),
+            layer_timing: Vec::new(),
+        };
+        if let Err(error) = backend.populate(gpu, spec, &reserve) {
+            let _ = backend.release(gpu);
+            return Err(error);
+        }
+        Ok(backend)
+    }
+
+    fn populate(
+        &mut self,
+        gpu: &mut Gpu,
+        spec: &PanelPoolSpec,
+        reserve: &PanelPoolReserve,
+    ) -> R<()> {
+        let table_bytes = spec.num_experts * std::mem::size_of::<u64>();
+        for _ in 0..reserve.pages {
+            self.payloads
+                .push(gpu.alloc_tensor(&[reserve.page_bytes], DType::Raw)?);
+            for tables in [&mut self.gate_ups, &mut self.downs] {
+                let tensor = gpu.alloc_tensor(&[2 * spec.num_experts], DType::F32)?;
+                gpu.hip.memset(&tensor.buf, 0, table_bytes)?;
+                tables.push(tensor);
+            }
+            self.ready
+                .push(gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?);
+            self.free
+                .push(gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?);
+        }
+        if spec.timeline_records > 0 || spec.timeline_layers > 0 {
+            self.base = Some(gpu.hip.event_create()?);
+        }
+        for _ in 0..4 * spec.timeline_records {
+            self.timing.push(gpu.hip.event_create()?);
+        }
+        for _ in 0..2 * spec.timeline_layers {
+            self.layer_timing.push(gpu.hip.event_create()?);
+        }
+        Ok(())
+    }
+
+    /// Free every device resource. Streams must be drained.
+    fn release(mut self, gpu: &mut Gpu) -> R<()> {
+        let mut first: Option<Qwen4GpuForwardError> = None;
+        let mut note = |result: Result<(), hip_bridge::HipError>| {
+            if let Err(error) = result {
+                first.get_or_insert(error.into());
+            }
+        };
+        for tensor in self
+            .payloads
+            .drain(..)
+            .chain(self.gate_ups.drain(..))
+            .chain(self.downs.drain(..))
+        {
+            note(gpu.free_tensor(tensor));
+        }
+        for event in self
+            .ready
+            .drain(..)
+            .chain(self.free.drain(..))
+            .chain(self.base.take())
+            .chain(self.timing.drain(..))
+            .chain(self.layer_timing.drain(..))
+        {
+            note(gpu.hip.event_destroy(event));
+        }
+        note(gpu.hip.stream_destroy(self.copy));
+        match first {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn timeline_event(&self, event: TimelineEvent) -> R<&hip_bridge::Event> {
+        let missing = || invalid(format!("panel timeline event {event:?} was not allocated"));
+        match event {
+            TimelineEvent::Base => self.base.as_ref().ok_or_else(missing),
+            TimelineEvent::CopyStart(r) => self.timing.get(4 * r).ok_or_else(missing),
+            TimelineEvent::CopyEnd(r) => self.timing.get(4 * r + 1).ok_or_else(missing),
+            TimelineEvent::ComputeBegin(r) => self.timing.get(4 * r + 2).ok_or_else(missing),
+            TimelineEvent::ComputeEnd(r) => self.timing.get(4 * r + 3).ok_or_else(missing),
+            TimelineEvent::LayerBegin(m) => self.layer_timing.get(2 * m).ok_or_else(missing),
+            TimelineEvent::LayerEnd(m) => self.layer_timing.get(2 * m + 1).ok_or_else(missing),
+        }
+    }
+}
+
+impl PanelBackend for HipPanelBackend {
+    type Ctx = Gpu;
+
+    fn page_base(&self, slot: usize) -> usize {
+        self.payloads[slot].buf.as_ptr() as usize
+    }
+
+    fn tables_mut(&mut self, slot: usize) -> (&mut [u64], &mut [u64]) {
+        let n = self.table_len;
+        let stride = 2 * n * std::mem::size_of::<u64>();
+        let region = &mut self.staging.as_bytes_mut()[slot * stride..(slot + 1) * stride];
+        // SAFETY: hipHostMalloc storage is page aligned and the region starts
+        // at a multiple of 8 bytes, so the u64 view has no unaligned head/tail
+        // and covers exactly 2 * n entries.
+        let (head, entries, tail) = unsafe { region.align_to_mut::<u64>() };
+        assert!(head.is_empty() && tail.is_empty() && entries.len() == 2 * n);
+        entries.split_at_mut(n)
+    }
+
+    fn await_copy_done(&mut self, gpu: &Gpu, slot: usize) -> R<()> {
+        gpu.hip.event_synchronize(&self.ready[slot])?;
+        Ok(())
+    }
+
+    fn copy_begin(&mut self, gpu: &Gpu, slot: usize, wait_free: bool, rec: Option<usize>) -> R<()> {
+        if wait_free {
+            gpu.hip.stream_wait_event(&self.copy, &self.free[slot])?;
+        }
+        if let Some(rec) = rec {
+            gpu.hip
+                .event_record(self.timeline_event(TimelineEvent::CopyStart(rec))?, Some(&self.copy))?;
+        }
+        Ok(())
+    }
+
+    fn copy_payload(&mut self, gpu: &Gpu, slot: usize, src: usize, dst: usize, len: usize) -> R<()> {
+        // SAFETY: `src..src+len` was checked against the layer's pinned host
+        // range in `LayerExpertSources::new`; the ring retains the owner until
+        // this copy is known complete.
+        let source = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+        gpu.hip.memcpy_htod_async(
+            &self.payloads[slot].buf.byte_view(dst, len),
+            source,
+            &self.copy,
+        )?;
+        Ok(())
+    }
+
+    fn copy_zero(&mut self, gpu: &Gpu, slot: usize, dst: usize, len: usize) -> R<()> {
+        gpu.hip.memset_async(
+            &self.payloads[slot].buf.byte_view(dst, len),
+            0,
+            len,
+            &self.copy,
+        )?;
+        Ok(())
+    }
+
+    fn copy_tables(&mut self, gpu: &Gpu, slot: usize) -> R<()> {
+        let n = self.table_len;
+        let table_bytes = n * std::mem::size_of::<u64>();
+        let stride = 2 * table_bytes;
+        let region = &self.staging.as_bytes_mut()[slot * stride..(slot + 1) * stride];
+        let (gate_up, down) = region.split_at(table_bytes);
+        gpu.hip
+            .memcpy_htod_async(&self.gate_ups[slot].buf, gate_up, &self.copy)?;
+        gpu.hip
+            .memcpy_htod_async(&self.downs[slot].buf, down, &self.copy)?;
+        Ok(())
+    }
+
+    fn copy_end(&mut self, gpu: &Gpu, slot: usize, rec: Option<usize>) -> R<()> {
+        if let Some(rec) = rec {
+            gpu.hip
+                .event_record(self.timeline_event(TimelineEvent::CopyEnd(rec))?, Some(&self.copy))?;
+        }
+        gpu.hip.event_record(&self.ready[slot], Some(&self.copy))?;
+        Ok(())
+    }
+
+    fn compute_acquire(&mut self, gpu: &Gpu, slot: usize, rec: Option<usize>) -> R<bool> {
+        let compute = compute_stream(gpu)?;
+        let starved = !gpu.hip.event_query(&self.ready[slot])?;
+        gpu.hip.stream_wait_event(compute, &self.ready[slot])?;
+        if let Some(rec) = rec {
+            gpu.hip
+                .event_record(self.timeline_event(TimelineEvent::ComputeBegin(rec))?, Some(compute))?;
+        }
+        Ok(starved)
+    }
+
+    fn compute_release(&mut self, gpu: &Gpu, slot: usize, rec: Option<usize>) -> R<()> {
+        let compute = compute_stream(gpu)?;
+        if let Some(rec) = rec {
+            gpu.hip
+                .event_record(self.timeline_event(TimelineEvent::ComputeEnd(rec))?, Some(compute))?;
+        }
+        gpu.hip.event_record(&self.free[slot], Some(compute))?;
+        Ok(())
+    }
+
+    fn mark_base(&mut self, gpu: &Gpu) -> R<()> {
+        if let Some(base) = self.base.as_ref() {
+            gpu.hip.event_record(base, Some(&self.copy))?;
+        }
+        Ok(())
+    }
+
+    fn mark_layer(&mut self, gpu: &Gpu, mark: usize, end: bool) -> R<()> {
+        let event = self.timeline_event(if end {
+            TimelineEvent::LayerEnd(mark)
+        } else {
+            TimelineEvent::LayerBegin(mark)
+        })?;
+        gpu.hip.event_record(event, Some(compute_stream(gpu)?))?;
+        Ok(())
+    }
+
+    fn drain(&mut self, gpu: &Gpu) -> R<()> {
+        gpu.hip.stream_synchronize(&self.copy)?;
+        gpu.hip.stream_synchronize(compute_stream(gpu)?)?;
+        Ok(())
+    }
+
+    fn elapsed_ms(&self, gpu: &Gpu, from: TimelineEvent, to: TimelineEvent) -> R<f64> {
+        Ok(f64::from(gpu.hip.event_elapsed_ms(
+            self.timeline_event(from)?,
+            self.timeline_event(to)?,
+        )?))
+    }
+}
+
+/// D's dispatch input for one leased page. Everything borrows the ring, so it
+/// cannot outlive the lease; the page is never freed through it.
+pub(crate) struct PanelBindingParts<'a> {
+    pub(crate) ticket: PanelTicket,
+    /// Ascending global expert ids the page holds.
+    pub(crate) experts: &'a [usize],
+    /// Generation epoch: differs whenever the page is refilled at this address.
+    pub(crate) epoch: u64,
+    pub(crate) layer: usize,
+    pub(crate) group: u32,
+    pub(crate) codec: PanelCodec,
+    /// The page payload allocation (tables point into it).
+    pub(crate) payload: &'a GpuTensor,
+    /// Bytes of `payload` holding expert data (the tail pad follows).
+    pub(crate) payload_used: usize,
+    /// 512-entry (pool `num_experts`) device pointer tables, global expert id
+    /// indexed, rebased onto `payload`; entries outside `experts` are zero.
+    pub(crate) gate_up_table: &'a GpuTensor,
+    pub(crate) down_table: &'a GpuTensor,
+    /// Source provenance: the layer's pinned host owner base address.
+    pub(crate) source_host_base: usize,
+}
+
+/// A page checked out for compute; borrows the ring exclusively until dropped.
+/// Drop it, then [`ExpertPanelRing::retire`] the ticket.
+pub(crate) struct ExpertPanelLease<'a> {
+    ring: &'a ExpertPanelRing,
+    ticket: PanelTicket,
+}
+
+impl<'a> ExpertPanelLease<'a> {
+    pub(crate) fn ticket(&self) -> PanelTicket {
+        self.ticket
+    }
+
+    pub(crate) fn parts(&self) -> PanelBindingParts<'_> {
+        let core = &self.ring.core;
+        let page = &core.pages[self.ticket.slot];
+        let slot = self.ticket.slot;
+        PanelBindingParts {
+            ticket: self.ticket,
+            experts: &page.experts,
+            epoch: page.epoch,
+            layer: page.layer,
+            group: page.group,
+            codec: page.codec,
+            payload: &core.backend.payloads[slot],
+            payload_used: page.used,
+            gate_up_table: &core.backend.gate_ups[slot],
+            down_table: &core.backend.downs[slot],
+            source_host_base: page.host_base,
+        }
+    }
+}
+
+/// The expert panel ring: `enqueue / acquire / retire / drain` over the page
+/// pool, plus the window/layer/timeline controls of S1's schedule.
+pub(crate) struct ExpertPanelRing {
+    core: RingCore<HipPanelBackend>,
+}
+
+impl ExpertPanelRing {
+    /// Allocate the pool (charged by [`PanelPoolSpec::reserve`]).
+    pub(crate) fn new(gpu: &mut Gpu, spec: PanelPoolSpec) -> R<Self> {
+        spec.validate()?;
+        let backend = HipPanelBackend::new(gpu, &spec)?;
+        Ok(Self {
+            core: RingCore::new(spec, backend)?,
+        })
+    }
+
+    pub(crate) fn spec(&self) -> &PanelPoolSpec {
+        &self.core.spec
+    }
+
+    /// Start a window and prefetch the first host layer's groups (no compute
+    /// layer yet). Returns the number of groups enqueued.
+    pub(crate) fn prime(&mut self, gpu: &Gpu, schedule: &mut PanelSchedule) -> R<usize> {
+        schedule.prime(&mut self.core, gpu)
+    }
+
+    /// Compute reached host layer `layer`.
+    pub(crate) fn enter_layer(
+        &mut self,
+        gpu: &Gpu,
+        schedule: &mut PanelSchedule,
+        layer: usize,
+    ) -> R<usize> {
+        schedule.enter_layer(&mut self.core, gpu, layer)
+    }
+
+    /// Enqueue whatever free pages allow (call after each retire).
+    pub(crate) fn pump(&mut self, gpu: &Gpu, schedule: &mut PanelSchedule) -> R<usize> {
+        schedule.pump(&mut self.core, gpu)
+    }
+
+    /// Ticket of current-layer `group`, enqueueing it if still missing.
+    pub(crate) fn require(
+        &mut self,
+        gpu: &Gpu,
+        schedule: &mut PanelSchedule,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket> {
+        schedule.require(&mut self.core, gpu, layer, group)
+    }
+
+    pub(crate) fn begin_window(&mut self, gpu: &Gpu) -> R<()> {
+        self.core.begin_window(gpu)
+    }
+
+    pub(crate) fn set_layers(&mut self, current: Option<usize>, next: Option<usize>) -> R<()> {
+        self.core.set_layers(current, next)
+    }
+
+    pub(crate) fn try_enqueue(
+        &mut self,
+        gpu: &Gpu,
+        group: &ExpertGroupPlan,
+        source: &LayerExpertSources,
+    ) -> R<Option<PanelTicket>> {
+        self.core.try_enqueue(gpu, group, source)
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        gpu: &Gpu,
+        group: &ExpertGroupPlan,
+        source: &LayerExpertSources,
+    ) -> R<PanelTicket> {
+        self.core.enqueue(gpu, group, source)
+    }
+
+    pub(crate) fn acquire<'a>(
+        &'a mut self,
+        gpu: &Gpu,
+        ticket: PanelTicket,
+    ) -> R<ExpertPanelLease<'a>> {
+        self.core.acquire(gpu, ticket)?;
+        self.core.leased(ticket)?;
+        Ok(ExpertPanelLease { ring: self, ticket })
+    }
+
+    pub(crate) fn retire(&mut self, gpu: &Gpu, ticket: PanelTicket) -> R<()> {
+        self.core.retire(gpu, ticket)
+    }
+
+    pub(crate) fn drain(&mut self, gpu: &Gpu) -> R<()> {
+        self.core.drain(gpu)
+    }
+
+    pub(crate) fn mark_layer_begin(&mut self, gpu: &Gpu, layer: usize) -> R<()> {
+        self.core.mark_layer_begin(gpu, layer)
+    }
+
+    pub(crate) fn mark_layer_end(&mut self, gpu: &Gpu, layer: usize) -> R<()> {
+        self.core.mark_layer_end(gpu, layer)
+    }
+
+    pub(crate) fn stats(&self) -> PanelStats {
+        self.core.stats()
+    }
+
+    pub(crate) fn timeline(&self, gpu: &Gpu) -> R<PanelTimeline> {
+        self.core.timeline(gpu)
+    }
+
+    /// Drain, then free the pool. A failed drain leaks the device and pinned
+    /// memory rather than freeing what the device may still use.
+    pub(crate) fn free_gpu(mut self, gpu: &mut Gpu) -> R<()> {
+        if let Err(error) = self.core.drain(&*gpu) {
+            std::mem::forget(self);
+            return Err(error);
+        }
+        self.core.backend.release(gpu)
+    }
+}
+
+#[cfg(test)]
+mod slowlink_ring {
+    use super::*;
+    use std::collections::HashMap;
+
+    const GU: usize = 4096;
+    const DN: usize = 2048;
+    const HOST: usize = 0x7000_0000;
+    const EXPERTS: usize = 64;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Op {
+        AwaitCopyDone(usize),
+        Begin(usize, bool),
+        Payload(usize, usize, usize, usize),
+        Zero(usize, usize, usize),
+        Tables(usize),
+        End(usize),
+        Acquire(usize),
+        Release(usize),
+        Drain,
+        Base,
+        Layer(usize, bool),
+    }
+
+    struct Mock {
+        ops: Vec<Op>,
+        tables: Vec<(Vec<u64>, Vec<u64>)>,
+        clock: f64,
+        times: HashMap<TimelineEvent, f64>,
+        starved: bool,
+        /// Fail the nth (0-based) op.
+        fail_at: Option<usize>,
+        fail_drain: bool,
+    }
+
+    impl Mock {
+        fn new(pages: usize) -> Self {
+            Self {
+                ops: Vec::new(),
+                tables: (0..pages)
+                    .map(|_| (vec![0; EXPERTS], vec![0; EXPERTS]))
+                    .collect(),
+                clock: 0.0,
+                times: HashMap::new(),
+                starved: false,
+                fail_at: None,
+                fail_drain: false,
+            }
+        }
+
+        fn op(&mut self, op: Op) -> R<()> {
+            if self.fail_at == Some(self.ops.len()) {
+                self.fail_at = None;
+                return Err(invalid("injected device failure"));
+            }
+            self.ops.push(op);
+            self.clock += 1.0;
+            Ok(())
+        }
+
+        fn stamp(&mut self, event: TimelineEvent) {
+            self.times.insert(event, self.clock);
+        }
+    }
+
+    impl PanelBackend for Mock {
+        type Ctx = ();
+
+        fn page_base(&self, slot: usize) -> usize {
+            0x2_0000_0000 + slot * 0x1000_0000
+        }
+        fn tables_mut(&mut self, slot: usize) -> (&mut [u64], &mut [u64]) {
+            let (g, d) = &mut self.tables[slot];
+            (g.as_mut_slice(), d.as_mut_slice())
+        }
+        fn await_copy_done(&mut self, _: &(), slot: usize) -> R<()> {
+            self.op(Op::AwaitCopyDone(slot))
+        }
+        fn copy_begin(&mut self, _: &(), slot: usize, wait_free: bool, rec: Option<usize>) -> R<()> {
+            self.op(Op::Begin(slot, wait_free))?;
+            if let Some(r) = rec {
+                self.stamp(TimelineEvent::CopyStart(r));
+            }
+            Ok(())
+        }
+        fn copy_payload(&mut self, _: &(), slot: usize, src: usize, dst: usize, len: usize) -> R<()> {
+            self.op(Op::Payload(slot, src, dst, len))
+        }
+        fn copy_zero(&mut self, _: &(), slot: usize, dst: usize, len: usize) -> R<()> {
+            self.op(Op::Zero(slot, dst, len))
+        }
+        fn copy_tables(&mut self, _: &(), slot: usize) -> R<()> {
+            self.op(Op::Tables(slot))
+        }
+        fn copy_end(&mut self, _: &(), slot: usize, rec: Option<usize>) -> R<()> {
+            self.op(Op::End(slot))?;
+            if let Some(r) = rec {
+                self.stamp(TimelineEvent::CopyEnd(r));
+            }
+            Ok(())
+        }
+        fn compute_acquire(&mut self, _: &(), slot: usize, rec: Option<usize>) -> R<bool> {
+            self.op(Op::Acquire(slot))?;
+            if let Some(r) = rec {
+                self.stamp(TimelineEvent::ComputeBegin(r));
+            }
+            Ok(self.starved)
+        }
+        fn compute_release(&mut self, _: &(), slot: usize, rec: Option<usize>) -> R<()> {
+            self.op(Op::Release(slot))?;
+            if let Some(r) = rec {
+                self.stamp(TimelineEvent::ComputeEnd(r));
+            }
+            Ok(())
+        }
+        fn mark_base(&mut self, _: &()) -> R<()> {
+            self.op(Op::Base)?;
+            self.stamp(TimelineEvent::Base);
+            Ok(())
+        }
+        fn mark_layer(&mut self, _: &(), mark: usize, end: bool) -> R<()> {
+            self.op(Op::Layer(mark, end))?;
+            self.stamp(if end {
+                TimelineEvent::LayerEnd(mark)
+            } else {
+                TimelineEvent::LayerBegin(mark)
+            });
+            Ok(())
+        }
+        fn drain(&mut self, _: &()) -> R<()> {
+            if self.fail_drain {
+                return Err(invalid("injected drain failure"));
+            }
+            self.op(Op::Drain)
+        }
+        fn elapsed_ms(&self, _: &(), from: TimelineEvent, to: TimelineEvent) -> R<f64> {
+            let at = |e: &TimelineEvent| {
+                self.times
+                    .get(e)
+                    .copied()
+                    .ok_or_else(|| invalid(format!("no event {e:?}")))
+            };
+            Ok(at(&to)? - at(&from)?)
+        }
+    }
+
+    fn spec(active: usize, lookahead: usize) -> PanelPoolSpec {
+        PanelPoolSpec {
+            active_slots: active,
+            lookahead_pages: lookahead,
+            experts_per_slot: 4,
+            num_experts: EXPERTS,
+            payload_bytes: 4 * (GU + DN),
+            timeline_records: 64,
+            timeline_layers: 8,
+        }
+    }
+
+    fn core(active: usize, lookahead: usize) -> RingCore<Mock> {
+        RingCore::new(spec(active, lookahead), Mock::new(active + lookahead)).unwrap()
+    }
+
+    /// Experts `0..EXPERTS` back to back (gate/up then down), codec per id.
+    fn sources_with(
+        layer: usize,
+        owner: Arc<dyn Any + Send + Sync>,
+        codec: impl Fn(usize) -> u32,
+    ) -> LayerExpertSources {
+        let experts = (0..EXPERTS)
+            .map(|id| {
+                let base = HOST + id * (GU + DN);
+                Some(ExpertSource {
+                    codec: PanelCodec(codec(id)),
+                    gate_up: ExpertExtent { addr: base, len: GU },
+                    down: ExpertExtent {
+                        addr: base + GU,
+                        len: DN,
+                    },
+                })
+            })
+            .collect();
+        // SAFETY: the mock backend never dereferences a source address.
+        unsafe { LayerExpertSources::new(layer, HOST, EXPERTS * (GU + DN), experts, owner) }.unwrap()
+    }
+
+    fn sources(layer: usize) -> LayerExpertSources {
+        sources_with(layer, Arc::new(0u8), |_| 1)
+    }
+
+    fn group(sources: &LayerExpertSources, index: usize) -> ExpertGroupPlan {
+        ExpertGroupPlan::partition(sources, 4).unwrap()[index].clone()
+    }
+
+    fn err_text(error: Qwen4GpuForwardError) -> String {
+        error.to_string()
+    }
+
+    #[test]
+    fn slowlink_ring_stale_epoch_layer_group_and_codec_are_rejected() {
+        let mut ring = core(1, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(3), None).unwrap();
+        let s = sources(3);
+        let first = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        ring.acquire(&(), first).unwrap();
+        ring.retire(&(), first).unwrap();
+        // Same slot (one-page pool), new epoch: the old ticket is stale.
+        let second = ring.enqueue(&(), &group(&s, 1), &s).unwrap();
+        assert_eq!(first.slot, second.slot);
+        assert!(second.epoch > first.epoch);
+        let text = err_text(ring.acquire(&(), first).unwrap_err());
+        assert!(text.contains("stale panel ticket") && text.contains("epoch"), "{text}");
+        assert!(ring.retire(&(), first).is_err());
+        // Forged fields with the right epoch are each refused, state untouched.
+        for (forged, needle) in [
+            (PanelTicket { layer: 4, ..second }, "layer"),
+            (PanelTicket { group: 9, ..second }, "group"),
+            (PanelTicket { codec: PanelCodec(7), ..second }, "codec"),
+        ] {
+            let text = err_text(ring.acquire(&(), forged).unwrap_err());
+            assert!(text.contains("stale panel ticket") && text.contains(needle), "{text}");
+        }
+        ring.acquire(&(), second).unwrap();
+        // Double retire / acquire of a retired ticket.
+        ring.retire(&(), second).unwrap();
+        assert!(ring.retire(&(), second).is_err());
+        assert!(ring.acquire(&(), second).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_delayed_free_is_never_reused_and_orders_reuse_after_release() {
+        let mut ring = core(2, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let s = sources(0);
+        let a = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        let b = ring.enqueue(&(), &group(&s, 1), &s).unwrap();
+        ring.acquire(&(), a).unwrap();
+        ring.acquire(&(), b).unwrap();
+        // Both pages are in use: nothing may be refilled, however long it takes.
+        assert_eq!(ring.try_enqueue(&(), &group(&s, 2), &s).unwrap(), None);
+        assert_eq!(ring.stats().page_full_stalls, 1);
+        let text = err_text(ring.enqueue(&(), &group(&s, 2), &s).unwrap_err());
+        assert!(text.contains("full"), "{text}");
+        // Only the retired page comes back, after its free event was recorded.
+        ring.retire(&(), b).unwrap();
+        let c = ring.enqueue(&(), &group(&s, 2), &s).unwrap();
+        assert_eq!(c.slot, b.slot);
+        let ops = &ring.backend.ops;
+        let release = ops.iter().position(|o| *o == Op::Release(b.slot)).unwrap();
+        let begin = ops
+            .iter()
+            .rposition(|o| matches!(o, Op::Begin(s, _) if *s == b.slot))
+            .unwrap();
+        assert!(release < begin);
+        assert_eq!(ops[begin], Op::Begin(b.slot, true), "reuse waits the free event");
+        // The first fill of a page never waits a free event nobody recorded.
+        assert!(ops.contains(&Op::Begin(a.slot, false)));
+    }
+
+    #[test]
+    fn slowlink_ring_free_pages_are_reused_in_freed_order() {
+        let mut ring = core(3, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let s = sources(0);
+        let t: Vec<_> = (0..3)
+            .map(|g| ring.enqueue(&(), &group(&s, g), &s).unwrap())
+            .collect();
+        for ticket in [t[2], t[0], t[1]] {
+            ring.acquire(&(), ticket).unwrap();
+            ring.retire(&(), ticket).unwrap();
+        }
+        let next: Vec<_> = (3..6)
+            .map(|g| ring.enqueue(&(), &group(&s, g), &s).unwrap().slot)
+            .collect();
+        assert_eq!(next, vec![t[2].slot, t[0].slot, t[1].slot]);
+    }
+
+    #[test]
+    fn slowlink_ring_layout_rebases_pointers_and_zeroes_absent_entries() {
+        let s = sources(0);
+        let g = group(&s, 2); // experts 8..12
+        assert_eq!(g.experts.as_slice(), &[8, 9, 10, 11]);
+        let layout = plan_group_layout(&g.experts, &s).unwrap();
+        // Contiguous experts coalesce into one run copied once.
+        assert_eq!(layout.runs.len(), 1);
+        assert_eq!(layout.runs[0].src, HOST + 8 * (GU + DN));
+        assert_eq!(layout.runs[0].len, 4 * (GU + DN));
+        assert_eq!(layout.submitted_bytes(), layout.extent_bytes);
+        assert_eq!(layout.used, layout.runs[0].dst + 4 * (GU + DN));
+        assert_eq!(layout.runs[0].dst % EXTENT_ALIGN, layout.runs[0].src % EXTENT_ALIGN);
+        let mut gu = vec![u64::MAX; EXPERTS];
+        let mut dn = vec![u64::MAX; EXPERTS];
+        let base = 0x2_0000_0000usize;
+        fill_tables(&layout, &g.experts, base, &mut gu, &mut dn).unwrap();
+        for (i, &id) in g.experts.iter().enumerate() {
+            let dst = layout.runs[0].dst + i * (GU + DN);
+            assert_eq!(gu[id], (base + dst) as u64);
+            assert_eq!(dn[id], (base + dst + GU) as u64);
+        }
+        assert_eq!(gu.iter().filter(|&&v| v != 0).count(), 4);
+        assert_eq!(dn.iter().filter(|&&v| v != 0).count(), 4);
+        // Rebasing refuses to wrap the address space.
+        assert!(fill_tables(&layout, &g.experts, usize::MAX - 8, &mut gu, &mut dn).is_err());
+        // An expert id outside the table is refused.
+        assert!(fill_tables(&layout, &[EXPERTS], base, &mut gu, &mut dn).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_layout_packs_separate_runs_and_preserves_source_alignment() {
+        // Experts 2 and 0 in descending host order with a hole between them.
+        let experts = vec![
+            Some(ExpertSource {
+                codec: PanelCodec(1),
+                gate_up: ExpertExtent { addr: HOST + 10_000, len: 1000 },
+                down: ExpertExtent { addr: HOST + 11_000, len: 500 },
+            }),
+            None,
+            Some(ExpertSource {
+                codec: PanelCodec(1),
+                gate_up: ExpertExtent { addr: HOST + 100_000, len: 777 },
+                down: ExpertExtent { addr: HOST + 200_001, len: 33 },
+            }),
+        ];
+        // SAFETY: never dereferenced.
+        let s = unsafe {
+            LayerExpertSources::new(0, HOST, 1 << 20, experts, Arc::new(0u8))
+        }
+        .unwrap();
+        let layout = plan_group_layout(&[0, 2], &s).unwrap();
+        assert_eq!(layout.runs.len(), 3);
+        for run in &layout.runs {
+            assert_eq!(run.dst % EXTENT_ALIGN, run.src % EXTENT_ALIGN);
+        }
+        // Runs never overlap in the page and every extent lands inside a run.
+        let mut sorted: Vec<_> = layout.runs.iter().copied().collect();
+        sorted.sort_by_key(|r| r.dst);
+        for pair in sorted.windows(2) {
+            assert!(pair[0].dst + pair[0].len <= pair[1].dst);
+        }
+        assert_eq!(layout.used, sorted[2].dst + sorted[2].len);
+        assert_eq!(layout.extent_bytes, 1000 + 500 + 777 + 33);
+        assert_eq!(layout.submitted_bytes(), layout.extent_bytes);
+    }
+
+    #[test]
+    fn slowlink_ring_layout_overlap_is_copied_once_and_overflow_is_refused() {
+        let experts = vec![Some(ExpertSource {
+            codec: PanelCodec(1),
+            gate_up: ExpertExtent { addr: HOST, len: 1000 },
+            down: ExpertExtent { addr: HOST + 600, len: 1000 },
+        })];
+        // SAFETY: never dereferenced.
+        let s = unsafe { LayerExpertSources::new(0, HOST, 4096, experts, Arc::new(0u8)) }.unwrap();
+        let layout = plan_group_layout(&[0], &s).unwrap();
+        assert_eq!(layout.runs.len(), 1);
+        assert_eq!(layout.submitted_bytes(), 1600);
+        assert_eq!(layout.extent_bytes, 2000);
+        assert_eq!(layout.down[0] - layout.gate_up[0], 600);
+        // Extent length overflowing the address space.
+        let bad = vec![Some(ExpertSource {
+            codec: PanelCodec(1),
+            gate_up: ExpertExtent { addr: usize::MAX - 4, len: 100 },
+            down: ExpertExtent { addr: HOST, len: 8 },
+        })];
+        // SAFETY: construction must fail before anything is read.
+        assert!(unsafe { LayerExpertSources::new(0, HOST, 4096, bad, Arc::new(0u8)) }.is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_sources_refuse_ranges_outside_the_host_owner() {
+        let mk = |gate_up: ExpertExtent, down: ExpertExtent| {
+            // SAFETY: construction is expected to fail before anything is read.
+            unsafe {
+                LayerExpertSources::new(
+                    0,
+                    HOST,
+                    1 << 20,
+                    vec![Some(ExpertSource { codec: PanelCodec(1), gate_up, down })],
+                    Arc::new(0u8),
+                )
+            }
+        };
+        let ok = ExpertExtent { addr: HOST, len: 256 };
+        assert!(mk(ok, ExpertExtent { addr: HOST + 256, len: 256 }).is_ok());
+        assert!(mk(ok, ExpertExtent { addr: HOST - 256, len: 256 }).is_err());
+        assert!(mk(ok, ExpertExtent { addr: HOST + (1 << 20) - 255, len: 256 }).is_err());
+        assert!(mk(ok, ExpertExtent { addr: HOST, len: 0 }).is_err());
+        // SAFETY: as above.
+        assert!(unsafe { LayerExpertSources::new(0, HOST, 1, Vec::new(), Arc::new(0u8)) }.is_err());
+        // Host range overflow.
+        assert!(unsafe {
+            LayerExpertSources::new(0, usize::MAX - 8, 64, vec![None], Arc::new(0u8))
+        }
+        .is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_alias_translation_rebases_to_cpu_addresses() {
+        let alias_base = 0x5000_0000usize;
+        let e = |off: usize| AliasExpert {
+            codec: PanelCodec(1),
+            gate_up_addr: alias_base + off,
+            gate_up_len: GU,
+            down_addr: alias_base + off + GU,
+            down_len: DN,
+        };
+        // SAFETY: never dereferenced.
+        let s = unsafe {
+            LayerExpertSources::from_alias(
+                2,
+                HOST,
+                alias_base,
+                1 << 20,
+                &[Some(e(0)), None, Some(e(GU + DN))],
+                Arc::new(0u8),
+            )
+        }
+        .unwrap();
+        assert_eq!(s.expert(0).unwrap().gate_up.addr, HOST);
+        assert_eq!(s.expert(2).unwrap().down.addr, HOST + GU + DN + GU);
+        assert!(s.expert(1).is_none());
+        for bad in [alias_base - 1, alias_base + (1 << 20)] {
+            let mut x = e(0);
+            x.gate_up_addr = bad;
+            // SAFETY: construction must fail.
+            assert!(unsafe {
+                LayerExpertSources::from_alias(0, HOST, alias_base, 1 << 20, &[Some(x)], Arc::new(0u8))
+            }
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn slowlink_ring_partition_splits_on_codec_and_group_size() {
+        let s = sources_with(5, Arc::new(0u8), |id| u32::from(id >= 6));
+        let groups = ExpertGroupPlan::partition(&s, 4).unwrap();
+        // 0..4, 4..6 (codec change), 6..10, ... 60..64.
+        assert_eq!(groups[0].experts.as_slice(), &[0, 1, 2, 3]);
+        assert_eq!(groups[1].experts.as_slice(), &[4, 5]);
+        assert_eq!(groups[2].experts.as_slice(), &[6, 7, 8, 9]);
+        assert!(groups.iter().enumerate().all(|(i, g)| g.group as usize == i && g.layer == 5));
+        let all: Vec<usize> = groups.iter().flat_map(|g| g.experts.iter().copied()).collect();
+        assert_eq!(all, (0..EXPERTS).collect::<Vec<_>>());
+        assert!(ExpertGroupPlan::partition(&s, 0).is_err());
+        assert!(ExpertGroupPlan::partition(&s, 33).is_err());
+        // A mixed-codec group is refused at enqueue.
+        let mut ring = core(1, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(5), None).unwrap();
+        let mut mixed = groups[1].clone();
+        mixed.experts.push(6);
+        assert!(ring.enqueue(&(), &mixed, &s).is_err());
+        assert!(!ring.is_quarantined(), "a validation failure mutates nothing");
+        assert!(ring.backend.ops.len() == 1, "only the window base op ran");
+    }
+
+    #[test]
+    fn slowlink_ring_retained_sources_live_until_copy_done_or_drain() {
+        let owner = Arc::new(0u8);
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let s = sources_with(0, any, |_| 1);
+        assert_eq!(Arc::strong_count(&owner), 2);
+        let mut ring = core(1, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let t = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        assert_eq!(Arc::strong_count(&owner), 3, "the page retains the source owner");
+        ring.acquire(&(), t).unwrap();
+        ring.retire(&(), t).unwrap();
+        // Retired but not yet known complete on the host: still retained.
+        assert_eq!(Arc::strong_count(&owner), 3);
+        let s2_owner = Arc::new(1u8);
+        let s2 = sources_with(0, s2_owner.clone(), |_| 1);
+        let t2 = ring.enqueue(&(), &group(&s2, 1), &s2).unwrap();
+        // The refill waited for the previous copy on the host before dropping it.
+        assert_eq!(Arc::strong_count(&owner), 2);
+        let wait = ring
+            .backend
+            .ops
+            .iter()
+            .rposition(|o| *o == Op::AwaitCopyDone(t.slot))
+            .unwrap();
+        let tables = ring
+            .backend
+            .ops
+            .iter()
+            .rposition(|o| *o == Op::Tables(t.slot))
+            .unwrap();
+        assert!(wait < tables, "staging is rewritten only after the old copy completed");
+        assert_eq!(Arc::strong_count(&s2_owner), 3);
+        ring.acquire(&(), t2).unwrap();
+        ring.retire(&(), t2).unwrap();
+        ring.drain(&()).unwrap();
+        assert_eq!(Arc::strong_count(&s2_owner), 2, "drain releases the retained owner");
+    }
+
+    #[test]
+    fn slowlink_ring_failure_quarantines_and_drain_recovers() {
+        let owner = Arc::new(0u8);
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let s = sources_with(0, any, |_| 1);
+        let mut ring = core(2, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let ok = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        // Fail in the middle of the second group's copy (after Begin, at the payload).
+        let at = ring.backend.ops.len() + 2;
+        ring.backend.fail_at = Some(at);
+        assert!(ring.enqueue(&(), &group(&s, 1), &s).is_err());
+        assert!(ring.is_quarantined());
+        assert_eq!(Arc::strong_count(&owner), 4, "owners stay held while quarantined");
+        for result in [
+            ring.try_enqueue(&(), &group(&s, 2), &s).map(|_| ()),
+            ring.acquire(&(), ok),
+            ring.retire(&(), ok),
+            ring.begin_window(&()),
+            ring.set_layers(Some(0), None),
+        ] {
+            assert!(err_text(result.unwrap_err()).contains("quarantined"));
+        }
+        // A drain that fails keeps the quarantine and every owner.
+        ring.backend.fail_drain = true;
+        assert!(ring.drain(&()).is_err());
+        assert!(ring.is_quarantined());
+        assert_eq!(Arc::strong_count(&owner), 4);
+        ring.backend.fail_drain = false;
+        ring.drain(&()).unwrap();
+        assert!(!ring.is_quarantined());
+        assert_eq!(Arc::strong_count(&owner), 2, "drain released every retained owner");
+        // Outstanding tickets are stale; the ring works again.
+        assert!(ring.acquire(&(), ok).is_err());
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let again = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        assert!(again.epoch > ok.epoch);
+        // After the drain no page waits a free event nobody recorded.
+        assert!(matches!(ring.backend.ops.last(), Some(Op::End(_))));
+        assert!(ring
+            .backend
+            .ops
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Op::Begin(_, wait) => Some(!wait),
+                _ => None,
+            })
+            .unwrap());
+    }
+
+    #[test]
+    fn slowlink_ring_failure_during_acquire_or_retire_quarantines() {
+        let s = sources(0);
+        for stage in 0..2 {
+            let mut ring = core(1, 0);
+            ring.begin_window(&()).unwrap();
+            ring.set_layers(Some(0), None).unwrap();
+            let t = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+            if stage == 0 {
+                ring.backend.fail_at = Some(ring.backend.ops.len());
+                assert!(ring.acquire(&(), t).is_err());
+            } else {
+                ring.acquire(&(), t).unwrap();
+                ring.backend.fail_at = Some(ring.backend.ops.len());
+                assert!(ring.retire(&(), t).is_err());
+            }
+            assert!(ring.is_quarantined());
+            ring.drain(&()).unwrap();
+            assert!(!ring.is_quarantined());
+        }
+    }
+
+    #[test]
+    fn slowlink_ring_lookahead_prefetches_before_counts_and_never_takes_active_slots() {
+        let mut ring = core(2, 3);
+        ring.begin_window(&()).unwrap();
+        let l1 = sources(1);
+        // Before the first host layer computes: no current layer, layer 1 next.
+        ring.set_layers(None, Some(1)).unwrap();
+        let mut tickets = Vec::new();
+        for g in 0..3 {
+            let t = ring.enqueue(&(), &group(&l1, g), &l1).unwrap();
+            assert!(t.slot >= 2, "lookahead pages only");
+            tickets.push(t);
+        }
+        // The lookahead store is full though both active slots are free.
+        assert_eq!(ring.try_enqueue(&(), &group(&l1, 3), &l1).unwrap(), None);
+        // Compute reaches layer 1: its remaining groups use the active slots and
+        // already-ready pages are consumed in place, with no refetch.
+        ring.set_layers(Some(1), Some(2)).unwrap();
+        let t3 = ring.enqueue(&(), &group(&l1, 3), &l1).unwrap();
+        assert!(t3.slot < 2);
+        let ops_before = ring.backend.ops.len();
+        ring.acquire(&(), tickets[0]).unwrap();
+        assert_eq!(&ring.backend.ops[ops_before..], &[Op::Acquire(tickets[0].slot)]);
+        // A group that was already transferred cannot be transferred again.
+        let text = err_text(ring.enqueue(&(), &group(&l1, 1), &l1).unwrap_err());
+        assert!(text.contains("again") || text.contains("out of order"), "{text}");
+        // Current layer enqueue without a current layer is refused up front.
+        let mut early = core(2, 2);
+        early.begin_window(&()).unwrap();
+        early.set_layers(None, Some(1)).unwrap();
+        let l2 = sources(2);
+        assert!(early.enqueue(&(), &group(&l2, 0), &l2).is_err());
+        // At most current plus one layer ahead.
+        let l3 = sources(3);
+        assert!(early.enqueue(&(), &group(&l3, 0), &l3).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_window_moves_forward_only_and_refuses_stranded_pages() {
+        let mut ring = core(2, 2);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(None, Some(4)).unwrap();
+        let l4 = sources(4);
+        let t = ring.enqueue(&(), &group(&l4, 0), &l4).unwrap();
+        // Skipping past layer 4 with its page still ready is refused.
+        assert!(ring.set_layers(Some(6), Some(7)).is_err());
+        ring.set_layers(Some(4), Some(6)).unwrap();
+        assert!(ring.set_layers(Some(3), Some(6)).is_err());
+        assert!(ring.set_layers(Some(5), Some(5)).is_err());
+        assert!(ring.set_layers(None, Some(6)).is_err());
+        // A prefetched page whose experts routing never used is released
+        // unread and counted, not refetched or leaked.
+        ring.retire(&(), t).unwrap();
+        let stats = ring.stats();
+        assert_eq!((stats.discarded, stats.acquired), (1, 0));
+        assert_eq!(stats.discarded_payload_bytes, stats.submitted_payload_bytes);
+        ring.set_layers(Some(6), Some(7)).unwrap();
+        // A new window needs every page free.
+        let l6 = sources(6);
+        let live = ring.enqueue(&(), &group(&l6, 0), &l6).unwrap();
+        assert!(ring.begin_window(&()).is_err());
+        ring.retire(&(), live).unwrap();
+        ring.begin_window(&()).unwrap();
+        assert_eq!(ring.stats(), PanelStats::default());
+    }
+
+    #[test]
+    fn slowlink_ring_page_reused_across_layer_epochs_gets_fresh_tables() {
+        let mut ring = core(1, 0);
+        ring.begin_window(&()).unwrap();
+        let (a, b) = (sources(1), sources_with(2, Arc::new(9u8), |_| 2));
+        let mut seen = Vec::new();
+        for (current, s, g) in [(1, &a, 0), (2, &b, 7)] {
+            ring.set_layers(Some(current), None).unwrap();
+            let t = ring.enqueue(&(), &group(s, g), s).unwrap();
+            seen.push((t, ring.backend.tables[t.slot].0.clone(), ring.backend.page_base(t.slot)));
+            ring.acquire(&(), t).unwrap();
+            ring.retire(&(), t).unwrap();
+        }
+        // Same slot, same device address, different epoch/layer/codec identity.
+        assert_eq!(seen[0].0.slot, seen[1].0.slot);
+        assert_eq!(seen[0].2, seen[1].2);
+        assert_ne!(seen[0].0.epoch, seen[1].0.epoch);
+        assert_ne!(seen[0].0.codec, seen[1].0.codec);
+        assert_ne!(seen[0].1, seen[1].1, "the new group's tables name its own bytes");
+        // The old layer's ticket cannot be acquired at the same address.
+        assert!(ring.acquire(&(), seen[0].0).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_oversized_group_for_the_page_is_refused_before_mutation() {
+        let mut small = spec(1, 0);
+        small.payload_bytes = 2 * (GU + DN);
+        let mut ring = RingCore::new(small, Mock::new(1)).unwrap();
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let s = sources(0);
+        let ops = ring.backend.ops.len();
+        let text = err_text(ring.enqueue(&(), &group(&s, 0), &s).unwrap_err());
+        assert!(text.contains("page holds"), "{text}");
+        assert_eq!(ring.backend.ops.len(), ops);
+        assert!(!ring.is_quarantined());
+        assert_eq!(ring.free.len(), 1, "the page stayed free");
+    }
+
+    #[test]
+    fn slowlink_ring_pool_reserve_is_the_charged_mq4_working_set() {
+        // MQ4: 1,740,800 + 870,400 bytes per expert, 32-expert pages, two active
+        // slots plus a 512-expert lookahead store of 16 pages.
+        let group_bytes = 32 * (1_740_800 + 870_400);
+        let spec = PanelPoolSpec {
+            active_slots: 2,
+            lookahead_pages: 16,
+            experts_per_slot: 32,
+            num_experts: 512,
+            payload_bytes: group_bytes,
+            timeline_records: 0,
+            timeline_layers: 0,
+        };
+        spec.validate().unwrap();
+        let reserve = spec.reserve().unwrap();
+        assert_eq!(reserve.pages, 18);
+        assert!(reserve.page_bytes >= group_bytes + ARENA_TAIL_PAD_BYTES);
+        assert_eq!(reserve.page_bytes % EXTENT_ALIGN, 0);
+        assert_eq!(reserve.payload, 18 * reserve.page_bytes);
+        assert_eq!(reserve.tables, 18 * 2 * 512 * 8);
+        assert_eq!(reserve.staging, reserve.tables);
+        assert_eq!(reserve.device_total, reserve.payload + reserve.tables);
+        let gib = reserve.payload as f64 / (1u64 << 30) as f64;
+        assert!((1.40..1.50).contains(&gib), "payload {gib} GiB");
+        // Invalid or overflowing geometry never reaches an allocation.
+        for bad in [
+            PanelPoolSpec { active_slots: 0, ..spec },
+            PanelPoolSpec { experts_per_slot: 33, ..spec },
+            PanelPoolSpec { num_experts: 0, ..spec },
+            PanelPoolSpec { payload_bytes: 0, ..spec },
+            PanelPoolSpec { payload_bytes: usize::MAX, ..spec },
+            PanelPoolSpec { lookahead_pages: usize::MAX / 2, ..spec },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn slowlink_ring_schedule_sweeps_each_group_once_layer_ahead_in_order() {
+        let layers = vec![sources(2), sources(5), sources(6)];
+        let experts_per_slot = 4;
+        let mut schedule = PanelSchedule::new(layers, experts_per_slot).unwrap();
+        let per_layer = EXPERTS / experts_per_slot; // 16 groups
+        assert_eq!(schedule.sweep_bytes(), (3 * EXPERTS * (GU + DN)) as u64);
+        // Two active + four lookahead pages.
+        let mut ring = core(2, 4);
+        let issued = schedule.prime(&mut ring, &()).unwrap();
+        assert_eq!(issued, 4, "only the lookahead pages fill before layer 2 computes");
+        assert!(ring.backend.ops.iter().all(|o| !matches!(o, Op::Acquire(_))));
+        let mut order = Vec::new();
+        let mut prefetched_before_last = false;
+        for layer in [2usize, 5, 6] {
+            schedule.enter_layer(&mut ring, &(), layer).unwrap();
+            for g in 0..per_layer as u32 {
+                let t = schedule.require(&mut ring, &(), layer, g).unwrap();
+                assert_eq!((t.layer, t.group), (layer, g));
+                if layer == 2 && g as usize == per_layer - 1 {
+                    prefetched_before_last = schedule.ticket(5, 0).is_some();
+                }
+                ring.acquire(&(), t).unwrap();
+                order.push((layer, g));
+                ring.retire(&(), t).unwrap();
+                schedule.pump(&mut ring, &()).unwrap();
+            }
+        }
+        assert_eq!(order.len(), 3 * per_layer);
+        let stats = ring.stats();
+        // Exactly one transfer per group, and every byte submitted once.
+        assert_eq!(stats.enqueued, 3 * per_layer as u64);
+        assert_eq!(stats.submitted_payload_bytes, schedule.sweep_bytes());
+        assert_eq!(stats.discarded, 0);
+        // The cross-layer prefetch happened: layer 5's first group was already
+        // transferred while layer 2's last group was still to be consumed.
+        assert!(prefetched_before_last, "layer L+1 copies start before layer L finishes");
+        assert!(schedule.enter_layer(&mut ring, &(), 6).is_err(), "no layer after the last");
+        assert!(schedule.ticket(5, 3).is_some());
+        // Mismatched layer is refused.
+        let mut again = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut ring2 = core(2, 2);
+        again.prime(&mut ring2, &()).unwrap();
+        assert!(again.enter_layer(&mut ring2, &(), 5).is_err());
+        assert!(PanelSchedule::new(vec![sources(5), sources(2)], 4).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_schedule_pumps_current_layer_before_lookahead() {
+        let mut schedule = PanelSchedule::new(vec![sources(1), sources(2)], 4).unwrap();
+        let mut ring = core(2, 2);
+        schedule.prime(&mut ring, &()).unwrap();
+        // Layer 1 groups 0,1 sit in the two lookahead pages.
+        schedule.enter_layer(&mut ring, &(), 1).unwrap();
+        // Current layer groups took the active slots first; lookahead (layer 2)
+        // only got pages that were left.
+        assert!(schedule.ticket(1, 2).is_some() && schedule.ticket(1, 3).is_some());
+        assert!(schedule.ticket(2, 0).is_none());
+        let t = schedule.ticket(1, 0).unwrap();
+        ring.acquire(&(), t).unwrap();
+        ring.retire(&(), t).unwrap();
+        schedule.pump(&mut ring, &()).unwrap();
+        // The freed page goes to the current layer's next missing group.
+        assert!(schedule.ticket(1, 4).is_some());
+        assert!(schedule.ticket(2, 0).is_none());
+        assert!(ring.stats().page_full_stalls > 0);
+    }
+
+    #[test]
+    fn slowlink_ring_copy_starvation_is_counted_from_the_acquire_probe() {
+        let mut ring = core(2, 0);
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let s = sources(0);
+        let a = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        let b = ring.enqueue(&(), &group(&s, 1), &s).unwrap();
+        ring.acquire(&(), a).unwrap();
+        ring.backend.starved = true;
+        ring.acquire(&(), b).unwrap();
+        assert_eq!(ring.stats().copy_starved_stalls, 1);
+        assert_eq!(ring.stats().acquired, 2);
+        assert_eq!(ring.stats().acquired_payload_bytes, ring.stats().submitted_payload_bytes);
+    }
+
+    #[test]
+    fn slowlink_ring_overlap_summary_counts_cross_layer_intersections() {
+        let span = |layer, c0, c1, k: Option<(f64, f64)>| PanelSpanMs {
+            layer,
+            group: 0,
+            bytes: 1,
+            copy_start: c0,
+            copy_end: c1,
+            compute: k,
+        };
+        let stats = PanelStats {
+            page_full_stalls: 2,
+            copy_starved_stalls: 3,
+            ..PanelStats::default()
+        };
+        // Layer 1 computes over [10, 30); layer 2's copies run [5, 15) and
+        // [20, 40); layer 3's run after everything.
+        let spans = vec![
+            span(1, 0.0, 5.0, Some((10.0, 20.0))),
+            span(2, 5.0, 15.0, Some((40.0, 50.0))),
+            span(2, 20.0, 40.0, None),
+            span(3, 45.0, 60.0, None),
+        ];
+        let layers = [LayerSpanMs { layer: 1, begin: 10.0, end: 30.0 }];
+        let o = summarize_overlap(&spans, &layers, &stats);
+        // (L1 compute, L2 copy 5..15): 5 ms; (L1, 20..40): 10 ms.
+        assert_eq!(o.cross_layer_intersections, 3);
+        assert_eq!(o.cross_layer_overlap_ms, 20.0);
+        // Copies sorted by start: 0-5, 5-15, 20-40, 45-60 -> idle 0 + 5 + 5.
+        assert_eq!(o.copy_idle_ms, 10.0);
+        assert_eq!(o.copy_busy_ms, 5.0 + 10.0 + 20.0 + 15.0);
+        assert_eq!(o.compute_busy_ms, 20.0);
+        assert_eq!((o.page_full_stalls, o.copy_starved_stalls), (2, 3));
+        // Without whole-layer marks the per-group compute spans stand in:
+        // layer 1's group computes [10, 20) -> overlaps only copy 5..15.
+        let o = summarize_overlap(&spans, &[], &stats);
+        assert_eq!(o.cross_layer_intersections, 2);
+        assert_eq!(o.cross_layer_overlap_ms, 10.0);
+        // No overlap and no data stay zero rather than invented.
+        let none = summarize_overlap(&[], &[], &PanelStats::default());
+        assert_eq!(none, OverlapSummary::default());
+    }
+
+    #[test]
+    fn slowlink_ring_timeline_reads_recorded_events_and_reports_overflow() {
+        let mut small = spec(1, 1);
+        small.timeline_records = 2;
+        let mut ring = RingCore::new(small, Mock::new(2)).unwrap();
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(1), Some(2)).unwrap();
+        let (l1, l2) = (sources(1), sources(2));
+        ring.mark_layer_begin(&(), 1).unwrap();
+        let a = ring.enqueue(&(), &group(&l1, 0), &l1).unwrap();
+        let b = ring.enqueue(&(), &group(&l2, 0), &l2).unwrap();
+        ring.acquire(&(), a).unwrap();
+        ring.retire(&(), a).unwrap();
+        ring.mark_layer_end(&(), 1).unwrap();
+        ring.set_layers(Some(2), None).unwrap();
+        // A third record exceeds the two kept: counted, not silently dropped.
+        let c = ring.enqueue(&(), &group(&l2, 1), &l2).unwrap();
+        assert_eq!(ring.stats().timeline_overflow, 1);
+        ring.acquire(&(), b).unwrap();
+        ring.retire(&(), b).unwrap();
+        ring.acquire(&(), c).unwrap();
+        ring.retire(&(), c).unwrap();
+        ring.drain(&()).unwrap();
+        let timeline = ring.timeline(&()).unwrap();
+        assert_eq!(timeline.spans.len(), 2);
+        assert_eq!(timeline.layers.len(), 1);
+        assert!(timeline.spans[0].copy_end > timeline.spans[0].copy_start);
+        assert!(timeline.spans[0].compute.is_some());
+        // Layer 2's copy was enqueued inside layer 1's marked compute interval.
+        assert!(timeline.overlap.cross_layer_intersections >= 1);
+        assert_eq!(timeline.stats.timeline_overflow, 1);
+        // Closing a layer that was never marked is an error (no invented data).
+        assert!(ring.mark_layer_end(&(), 9).is_err());
+    }
+}
