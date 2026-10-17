@@ -276,40 +276,44 @@ impl Model {
         pin: &HotsetPin,
     ) -> Result<Self, String> {
         // S1 selector (`HIPFIRE_QWEN4_SLOWLINK_PREFILL` unset or `1`): the
-        // shared admission-first loader, so the profile and its joint
-        // placement are the product's and the same selector decides (a later
-        // automatic enablement needs no change here). Pinned hot sets and the
-        // PLE hot store are other routes: forced `1` refuses them, an unset
-        // selector keeps the loader below. `=0` keeps it unchanged too.
+        // shared admission-first loader runs ONLY when the same selector the
+        // product uses chooses S1 for this load; otherwise (selector `0`,
+        // unset and declined, fast/unified/unmeasured link, a pinned
+        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) it returns before any
+        // allocation and the loader below runs, placement and all, exactly as
+        // before. Pinned hot sets and the PLE hot store are other routes: a
+        // forced `1` refuses them, and with them the loader below is kept.
         let s1_mode = hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env();
         let hot_flags = ple_hot.is_some() || pin.budget_mib.is_some() || pin.sidecar.is_some();
-        if s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
-            || (s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Auto && !hot_flags)
-        {
-            if ple_hot.is_some() || pin.budget_mib.is_some() || pin.sidecar.is_some() {
-                return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 excludes --ple-hot, --hotset and --hot-budget-mib".into());
-            }
-            let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
-            let loaded = hipfire_arch_qwen4::slowlink_load::slowlink_load_bundle(
+        if hot_flags && s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force {
+            return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 excludes --ple-hot, --hotset and --hot-budget-mib".into());
+        }
+        // The GPU arch drives `memory.ple_format = auto` and the S1 selector;
+        // initialising it allocates no model memory, so admission still
+        // precedes every upload.
+        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        if s1_mode != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off && !hot_flags {
+            if let Some(loaded) = hipfire_arch_qwen4::slowlink_load::slowlink_load_if_selected(
                 &mut gpu, path, n_ctx, None,
-            )?;
-            let logits = gpu
-                .zeros(&[logit_rows * loaded.vocab], DType::F32)
-                .map_err(|e| e.to_string())?;
-            eprintln!(
-                "qwen4_kld: loaded {} on {} via the slowlink loader (vocab {})",
-                path.display(),
-                gpu.arch,
-                loaded.vocab
-            );
-            return Ok(Self {
-                gpu,
-                bundle: loaded.bundle,
-                logits,
-                vocab: loaded.vocab,
-                arch_id: loaded.arch_id,
-                tokenizer: loaded.tokenizer,
-            });
+            )? {
+                let logits = gpu
+                    .zeros(&[logit_rows * loaded.vocab], DType::F32)
+                    .map_err(|e| e.to_string())?;
+                eprintln!(
+                    "qwen4_kld: loaded {} on {} via the slowlink loader (vocab {})",
+                    path.display(),
+                    gpu.arch,
+                    loaded.vocab
+                );
+                return Ok(Self {
+                    gpu,
+                    bundle: loaded.bundle,
+                    logits,
+                    vocab: loaded.vocab,
+                    arch_id: loaded.arch_id,
+                    tokenizer: loaded.tokenizer,
+                });
+            }
         }
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
@@ -318,7 +322,6 @@ impl Model {
         let arch_id = hfq.arch_id;
         // The GPU arch drives `memory.ple_format = auto`; initialising it
         // allocates no model memory, so admission still precedes every upload.
-        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         // The evaluator never derives a missing q4: derive it with
         // `hipfire ple derive` (or a serve load) first.
         let choice = resolve_and_attach_ple_rows(

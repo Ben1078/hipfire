@@ -86,13 +86,43 @@ fn payload<'a>(
 /// the borrowed host-mapped payload fallback, no PLE hot store.
 /// `session_cache_budget = Some(bytes)` attaches a session cache of that
 /// budget. An explicit `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` pins the placement
-/// and declines S1, exactly as in the product.
+/// and declines S1, exactly as in the product. For the S1 gate and the
+/// hardware tests, whose incumbent arm intentionally names the product's
+/// automatic placement; examples that must keep their own baseline placement
+/// use [`slowlink_load_if_selected`].
 pub fn slowlink_load_bundle(
     gpu: &mut Gpu,
     path: &Path,
     max_seq: usize,
     session_cache_budget: Option<u64>,
 ) -> Result<SlowlinkLoaded, String> {
+    load_inner(gpu, path, max_seq, session_cache_budget, true)?
+        .ok_or_else(|| "slowlink load produced no bundle".to_string())
+}
+
+/// The S1 load only when the selector and admission choose S1 for this load
+/// (forced `1` or an eligible automatic selection); `Ok(None)` BEFORE any GPU
+/// allocation otherwise (selector off or unset-and-declined, fast/unified/
+/// unmeasured link, an explicit expert layer count, any other decline), so the
+/// caller's own loader and placement run byte for byte as before. A forced
+/// selector that is eligible but over capacity is an `Err` with its exact
+/// deficit, as in the product.
+pub fn slowlink_load_if_selected(
+    gpu: &mut Gpu,
+    path: &Path,
+    max_seq: usize,
+    session_cache_budget: Option<u64>,
+) -> Result<Option<SlowlinkLoaded>, String> {
+    load_inner(gpu, path, max_seq, session_cache_budget, false)
+}
+
+fn load_inner(
+    gpu: &mut Gpu,
+    path: &Path,
+    max_seq: usize,
+    session_cache_budget: Option<u64>,
+    product_fallback: bool,
+) -> Result<Option<SlowlinkLoaded>, String> {
     use crate::expert_residency as residency;
     use crate::slowlink_admission as s1;
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(path)
@@ -172,7 +202,13 @@ pub fn slowlink_load_bundle(
     let routed_experts = !receipt.config.ffn.is_dense();
     let mut weights = receipt.manifest.weights.clone();
     let explicit = residency::expert_vram_layers_from_env()?;
-    let (resident_layers, placement, profile) = if unified {
+    let (resident_layers, placement, profile) = if !product_fallback
+        && (unified || matches!(explicit, Some(residency::ExpertVramLayers::Layers(_))))
+    {
+        // A unified-memory or explicitly pinned load never selects S1: the
+        // caller's own loader decides its placement.
+        return Ok(None);
+    } else if unified {
         (receipt.config.num_hidden_layers, "unified-memory", None)
     } else if let Some(residency::ExpertVramLayers::Layers(layers)) = explicit {
         residency::place_routed_experts(&mut weights, layers);
@@ -219,6 +255,11 @@ pub fn slowlink_load_bundle(
             || crate::host_link::host_link(load.gpu),
             || s1::single_device_facts(&load),
         )?;
+        if profile.is_none() && !product_fallback {
+            // Not selected: the caller keeps its own (baseline) loader and
+            // placement exactly; nothing was allocated.
+            return Ok(None);
+        }
         let layers = match &profile {
             Some(p) => p.resident_layers,
             None => {
@@ -323,7 +364,7 @@ pub fn slowlink_load_bundle(
         "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
          host-mapped tensors={host_mapped_tensors} slowlink profile={slowlink_profile}"
     );
-    Ok(SlowlinkLoaded {
+    Ok(Some(SlowlinkLoaded {
         bundle,
         vocab,
         eos_token,
@@ -336,5 +377,5 @@ pub fn slowlink_load_bundle(
         ple_format: choice.format.name().to_string(),
         tokenizer,
         chat_template,
-    })
+    }))
 }

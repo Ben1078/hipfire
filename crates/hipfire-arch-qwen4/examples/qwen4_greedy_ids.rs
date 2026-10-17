@@ -353,50 +353,50 @@ impl Model {
     /// changes the numerics of a cold AR request.
     fn load(path: &Path, max_seq: usize) -> Result<Self, String> {
         // S1 selector (`HIPFIRE_QWEN4_SLOWLINK_PREFILL` unset or `1`): the
-        // shared admission-first loader (the product's selection and joint
-        // placement); the same selector the product uses decides, so a later
-        // automatic enablement needs no change here. A pinned
-        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` or an unset selector that
-        // declines S1 gives the incumbent placement and the receipt says so.
-        // `=0` (the kill switch) keeps the loader below unchanged.
+        // shared admission-first loader runs ONLY when the same selector the
+        // product uses chooses S1 for this load (forced `1`, or a later
+        // eligible automatic selection); otherwise (selector `0`, unset and
+        // declined, fast/unified/unmeasured link, a pinned
+        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) it returns before any allocation
+        // and the loader below runs, placement and all, exactly as before.
+        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         if hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env()
             != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off
         {
-            let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
-            let loaded = hipfire_arch_qwen4::slowlink_load::slowlink_load_bundle(
+            if let Some(loaded) = hipfire_arch_qwen4::slowlink_load::slowlink_load_if_selected(
                 &mut gpu, path, max_seq, None,
-            )?;
-            let prompt_logits = gpu
-                .zeros(&[loaded.vocab], DType::F32)
-                .map_err(|e| e.to_string())?;
-            let decode_logits = gpu
-                .zeros(&[loaded.vocab], DType::F32)
-                .map_err(|e| e.to_string())?;
-            eprintln!(
-                "qwen4_greedy_ids: loaded {} on {} via the slowlink loader (vocab {}, max_seq {max_seq}, ple rows {})",
-                path.display(),
-                gpu.arch,
-                loaded.vocab,
-                loaded.ple_format
-            );
-            return Ok(Self {
-                gpu,
-                bundle: loaded.bundle,
-                prompt_logits,
-                decode_logits,
-                vocab: loaded.vocab,
-                eos_token: loaded.eos_token,
-                max_seq,
-                tokenizer: loaded.tokenizer,
-                template: loaded.chat_template,
-            });
+            )? {
+                let prompt_logits = gpu
+                    .zeros(&[loaded.vocab], DType::F32)
+                    .map_err(|e| e.to_string())?;
+                let decode_logits = gpu
+                    .zeros(&[loaded.vocab], DType::F32)
+                    .map_err(|e| e.to_string())?;
+                eprintln!(
+                    "qwen4_greedy_ids: loaded {} on {} via the slowlink loader (vocab {}, max_seq {max_seq}, ple rows {})",
+                    path.display(),
+                    gpu.arch,
+                    loaded.vocab,
+                    loaded.ple_format
+                );
+                return Ok(Self {
+                    gpu,
+                    bundle: loaded.bundle,
+                    prompt_logits,
+                    decode_logits,
+                    vocab: loaded.vocab,
+                    eos_token: loaded.eos_token,
+                    max_seq,
+                    tokenizer: loaded.tokenizer,
+                    template: loaded.chat_template,
+                });
+            }
         }
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
             .map_err(|e| format!("tokenizer: {e}"))?;
         let template = hfq.chat_template();
-        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         // Never derives a missing q4 PLE table: derive it with
         // `hipfire ple derive` (or a serve load) first.
         let choice = resolve_and_attach_ple_rows(
