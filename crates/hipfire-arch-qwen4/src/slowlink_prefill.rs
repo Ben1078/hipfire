@@ -3373,7 +3373,7 @@ mod slowlink_prompt {
         );
         // A one-row head tile leaves one entry token in its successor's history:
         // that is where the entry must (and does) show, by the private cursor.
-        let short = plan(0, 16384, &[1]);
+        let short = self::plan(0, 16384, &[1]);
         assert_eq!(short.tiles[0].rows, 1);
         let short_tokens: Vec<u32> = (0..short.rows as u32).map(|t| t * 7 + 2).collect();
         let from_entry = PleCursor::histories_for(entry, &short.tiles, &short_tokens);
