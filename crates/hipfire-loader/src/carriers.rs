@@ -1324,6 +1324,52 @@ pub fn attach_qwen4_ep_peers(
         .map_err(|error| format!("qwen4: expert parallelism mesh setup failed: {error}"))
 }
 
+/// Select the S1 slow-link prefill profile for a load, or `Ok(None)` for the
+/// incumbent. Probe-free checks run first; `link` (the host-link probe) runs
+/// only for a load that passed them, and `inputs` (the memory query, manifest
+/// scan and census inputs) only for a link that is narrow, so every other load
+/// does no S1 work and keeps its placement byte for byte. A forced selector
+/// fails the load only on a capacity refusal of an otherwise eligible load
+/// (exact byte deficit); every other decline is the incumbent.
+fn qwen4_slowlink_select(
+    mode: hipfire_arch_qwen4::slowlink_admission::SlowlinkMode,
+    shape: &hipfire_arch_qwen4::slowlink_admission::LoadShape<'_>,
+    link: impl FnOnce() -> hipfire_arch_qwen4::host_link::HostLink,
+    inputs: impl FnOnce(
+        f64,
+    ) -> Result<
+        hipfire_arch_qwen4::slowlink_admission::AdmissionInputs,
+        hipfire_arch_qwen4::slowlink_admission::SlowlinkDecline,
+    >,
+) -> Result<Option<hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile>, String> {
+    use hipfire_arch_qwen4::slowlink_admission as s1;
+    let decline = match s1::preflight(mode, shape) {
+        Err(decline) => decline,
+        Ok(()) => match s1::link_verdict(link())
+            .and_then(inputs)
+            .and_then(|inputs| s1::admit(&inputs))
+        {
+            Ok(profile) => {
+                eprintln!("  qwen4 {}", profile.describe());
+                return Ok(Some(profile));
+            }
+            Err(decline) => decline,
+        },
+    };
+    if mode == s1::SlowlinkMode::Force && decline.is_capacity() {
+        return Err(format!(
+            "qwen4: {}=1 cannot be admitted: {decline}",
+            s1::SLOWLINK_PREFILL_ENV
+        ));
+    }
+    if decline != s1::SlowlinkDecline::AutoNotQualified {
+        eprintln!(
+            "  qwen4 slow-link prefill (S1): not selected ({decline}); incumbent placement unchanged"
+        );
+    }
+    Ok(None)
+}
+
 /// What the expert placement is sized from, for one rank of a `ranks`-way
 /// load: the replicated non-expert bytes, one MoE layer's routed-expert bytes
 /// on this rank, the `auto` reserve ([`residency::AutoReserve`]: the larger
@@ -2104,7 +2150,7 @@ fn load_qwen4_rank_scoped(
     // `max_seq`), never their virtual extent; a discrete card charges legacy
     // storage of `max_seq` whatever the backend, so VMM growth stays inside
     // the reserve and placement matches legacy.
-    let auto_inputs = || -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
+    let auto_inputs_at = |chunk_rows: usize| -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
         let (free, _) = ctx
             .gpu
             .device_mem_info()
@@ -2125,7 +2171,7 @@ fn load_qwen4_rank_scoped(
             state_format,
             scratch_mode,
             ep_ranks,
-            placement_chunk,
+            chunk_rows,
         )?;
         Ok((
             free as u64,
@@ -2136,6 +2182,7 @@ fn load_qwen4_rank_scoped(
             gather_bytes,
         ))
     };
+    // (`auto_inputs` is defined after the S1 selection below.)
     // What a whole-layer placement keeps free beyond the reserve: the safety
     // margin and, on a slab load that allocates them (`staged`), the two
     // dedicated long-prefill stage buffers sized from the largest layer.
@@ -2153,10 +2200,7 @@ fn load_qwen4_rank_scoped(
         ),
         ep.is_some(),
     );
-    let placement_charges = |layer_experts: u64, staged: bool| {
-        residency::PlacementCharges::new(layer_experts, staged && slab_stage)
-            .map_err(|error| format!("qwen4: {error}"))
-    };
+    // (`placement_charges` is defined after the S1 selection below.)
     let explicit =
         residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
     use hipfire_arch_qwen4::expert_hotset as hotsets;
@@ -2214,6 +2258,121 @@ fn load_qwen4_rank_scoped(
                 None
             }
         }
+    };
+    // S1 slow-link layer-major prefill (`HIPFIRE_QWEN4_SLOWLINK_PREFILL`, default
+    // off until promoted). Selected here, before any placement is sized and
+    // before any allocation: the probe-free checks first, the host link only
+    // for a load that passes them, then the joint placement (1536-row tile,
+    // prompt arena, expert page store, panel scratch, boundary state) which must
+    // still keep ten layers resident. Every other load keeps today's placement,
+    // reserve and log byte for byte (zero S1 charge).
+    let slowlink_mode = hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env();
+    let slowlink_profile = {
+        use hipfire_arch_qwen4::slowlink_admission as s1;
+        let chunk_rows_env = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS").ok();
+        let stage_env =
+            hipfire_config::developer_var(hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
+                .ok();
+        let shape = s1::LoadShape {
+            arch: &ctx.gpu.arch,
+            unified_memory: use_ranges,
+            expert_parallel: ep.is_some() || expert_vram_layers.is_some(),
+            pipeline_band: band.is_some(),
+            packed_mq4: matches!(
+                manifest.identity.recipe,
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
+            ),
+            routed_experts,
+            expert_keep: config.expert_keep.is_some(),
+            explicit_vram_layers: explicit.is_some(),
+            hotset_sidecar: hotset_path.is_some(),
+            whole_first: whole_first == hotsets::WholeFirstDecision::Active,
+            stage_opt_out: stage_env.as_deref() == Some("0"),
+            cpu_offload: hipfire_config::memory::offload_exec()
+                != hipfire_config::memory::OffloadExec::Pcie,
+            chunk_rows_env: chunk_rows_env.as_deref(),
+            max_seq: ctx.max_seq,
+        };
+        qwen4_slowlink_select(
+            slowlink_mode,
+            &shape,
+            || hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu),
+            |link_gbps| {
+                let geometry =
+                    s1::ModelGeometry::from_config(&config).map_err(s1::SlowlinkDecline::Geometry)?;
+                let (free, non_expert, layer_experts, base, ..) =
+                    auto_inputs_at(s1::S1_TILE_ROWS).map_err(s1::SlowlinkDecline::Geometry)?;
+                let incumbent = auto_inputs_at(placement_chunk)
+                    .map_err(s1::SlowlinkDecline::Geometry)?
+                    .3;
+                let baseline_layers = residency::PlacementCharges::new(layer_experts, false)
+                    .and_then(|charges| {
+                        residency::auto_placement_layers(
+                            free,
+                            non_expert,
+                            layer_experts,
+                            config.num_hidden_layers,
+                            incumbent.bytes(),
+                            &charges,
+                        )
+                    })
+                    .unwrap_or(0);
+                let (gate_up_layer_bytes, down_layer_bytes) =
+                    residency::routed_layer_payload_split(&manifest.weights, &bytes_of)
+                        .map_err(s1::SlowlinkDecline::Geometry)?;
+                let census_context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+                    backend,
+                    ctx.max_seq,
+                    ctx.max_seq,
+                    vmm_granularity,
+                );
+                let fixed_state_bytes = residency::state_census(
+                    &config,
+                    state_format,
+                    &census_context,
+                    s1::S1_TILE_ROWS,
+                    scratch_mode,
+                )
+                .map_err(s1::SlowlinkDecline::Geometry)?
+                .state;
+                Ok(s1::AdmissionInputs {
+                    geometry,
+                    free,
+                    non_expert,
+                    layer_expert_bytes: layer_experts,
+                    gate_up_layer_bytes,
+                    down_layer_bytes,
+                    trunk_layers: config.num_hidden_layers,
+                    base_reserve: base.bytes(),
+                    baseline_layers,
+                    fixed_state_bytes,
+                    window_rows: s1::S1_WINDOW_ROWS.min(ctx.max_seq),
+                    link_gbps,
+                })
+            },
+        )?
+    };
+    // The S1 profile sizes its placement from its own 1536-row tile, never the
+    // incumbent chunk; every other load keeps the incumbent placement chunk.
+    let placement_chunk = slowlink_profile
+        .as_ref()
+        .map_or(placement_chunk, |profile| profile.tile_rows);
+    let slowlink_reserve = match &slowlink_profile {
+        Some(profile) => profile
+            .reserve_bytes()
+            .map_err(|error| format!("qwen4: {error}"))?,
+        None => 0,
+    };
+    let auto_inputs = || auto_inputs_at(placement_chunk);
+    // What a whole-layer placement keeps free beyond the reserve: the safety
+    // margin, on a slab load that allocates them (`staged`) the two dedicated
+    // long-prefill stage buffers sized from the largest layer, and (S1 only)
+    // the slow-link prefill profile's census. The hot set path charges its own
+    // margin and tier-plan stage.
+    let placement_charges = |layer_experts: u64, staged: bool| {
+        residency::PlacementCharges::new(layer_experts, staged && slab_stage)
+            .map(|charges| charges.with_slowlink(slowlink_reserve))
+            .map_err(|error| format!("qwen4: {error}"))
     };
     // All optional-sidecar decisions finish against the original manifest:
     // binding, source/manifest eligibility, host limits, plan and a fresh
@@ -2531,6 +2690,7 @@ fn load_qwen4_rank_scoped(
             hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
         )
         && ep.is_none();
+
     let mut applied_layers = moe_layers;
     if let Some(policy) = placement {
         if use_ranges {
@@ -2600,6 +2760,19 @@ fn load_qwen4_rank_scoped(
                 }
             }
         };
+        if let Some(profile) = &slowlink_profile {
+            // The admitted joint plan kept at least ten layers; the placement
+            // just resolved from the same inputs must agree, or the load stops
+            // before anything is placed.
+            let kept = vram_layers.min(config.num_hidden_layers);
+            if kept < hipfire_arch_qwen4::slowlink_admission::S1_MIN_RESIDENT_LAYERS {
+                return Err(format!(
+                    "qwen4: slow-link prefill (S1) was admitted at {} resident layers but the placement kept {kept}; free GPU memory or set {}=0",
+                    profile.resident_layers,
+                    hipfire_arch_qwen4::slowlink_admission::SLOWLINK_PREFILL_ENV
+                ));
+            }
+        }
         let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
         applied_layers = vram_layers.min(config.num_hidden_layers);
         // This rank's pinned bytes; the host check covers every rank that
@@ -2925,6 +3098,11 @@ fn load_qwen4_rank_scoped(
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: trunk overlay setup failed: {detail}"));
         }
+    }
+    // The immutable S1 profile the placement above was charged for: the forward
+    // allocates its prompt arena and expert page store from it.
+    if let Some(profile) = slowlink_profile {
+        bundle.attach_slowlink_profile(profile);
     }
     if let Err(error) = bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode) {
         let detail = error.to_string();
@@ -7503,5 +7681,197 @@ mod dir_template_provenance_tests {
         assert!(described.starts_with(crate::SRC_DIR_TOKENIZER_CONFIG));
         assert!(described.ends_with(dir.join("tokenizer_config.json").to_str().unwrap()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod qwen4_slowlink_tests {
+    use super::qwen4_slowlink_select;
+    use hipfire_arch_qwen4::host_link::HostLink;
+    use hipfire_arch_qwen4::slowlink_admission as s1;
+    use std::cell::Cell;
+
+    const MIB: u64 = 1 << 20;
+    const LAYER: u64 = 512 * (1_740_800 + 870_400);
+    const NON_EXPERT: u64 = 5_364_000_000;
+    const BASE_RESERVE: u64 = 5261 * MIB;
+    const FIXED_STATE: u64 = 64 * MIB;
+    const MARGIN: u64 = 512 * MIB;
+
+    fn shape(arch: &str) -> s1::LoadShape<'_> {
+        s1::LoadShape {
+            arch,
+            unified_memory: false,
+            expert_parallel: false,
+            pipeline_band: false,
+            packed_mq4: true,
+            routed_experts: true,
+            expert_keep: false,
+            explicit_vram_layers: false,
+            hotset_sidecar: false,
+            whole_first: false,
+            stage_opt_out: false,
+            cpu_offload: false,
+            chunk_rows_env: None,
+            max_seq: 16640,
+        }
+    }
+
+    fn geometry() -> s1::ModelGeometry {
+        s1::ModelGeometry {
+            hidden: 2048,
+            hc_count: 4,
+            num_experts: 512,
+            experts_per_token: 10,
+            moe_intermediate: 640,
+        }
+    }
+
+    fn census_total() -> u64 {
+        let geometry = geometry();
+        let pages = s1::PanelPageLayout::new(512, 512 * 1_740_800, 512 * 870_400).unwrap();
+        let arena =
+            s1::PromptArenaLayout::new(&geometry, s1::S1_WINDOW_ROWS, s1::S1_TILE_ROWS).unwrap();
+        pages.total_bytes().unwrap()
+            + s1::panel_scratch_bytes(&geometry).unwrap()
+            + arena.total_bytes
+            + (1 + s1::S1_MAX_BOUNDARY_SNAPSHOTS as u64) * FIXED_STATE
+    }
+
+    /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.
+    fn free_for(layers: u64) -> u64 {
+        NON_EXPERT + BASE_RESERVE + MARGIN + census_total() + layers * LAYER + 1
+    }
+
+    fn inputs(free: u64, link_gbps: f64) -> s1::AdmissionInputs {
+        s1::AdmissionInputs {
+            geometry: geometry(),
+            free,
+            non_expert: NON_EXPERT,
+            layer_expert_bytes: LAYER,
+            gate_up_layer_bytes: 512 * 1_740_800,
+            down_layer_bytes: 512 * 870_400,
+            trunk_layers: 48,
+            base_reserve: BASE_RESERVE,
+            baseline_layers: 10,
+            fixed_state_bytes: FIXED_STATE,
+            window_rows: s1::S1_WINDOW_ROWS,
+            link_gbps,
+        }
+    }
+
+    /// `(probes, input builds, outcome)` of one selection.
+    fn select(
+        mode: s1::SlowlinkMode,
+        arch: &str,
+        link: HostLink,
+        free: u64,
+    ) -> (u32, u32, Result<Option<s1::SlowlinkProfile>, String>) {
+        let (probes, builds) = (Cell::new(0), Cell::new(0));
+        let outcome = qwen4_slowlink_select(
+            mode,
+            &shape(arch),
+            || {
+                probes.set(probes.get() + 1);
+                link
+            },
+            |gbps| {
+                builds.set(builds.get() + 1);
+                Ok(inputs(free, gbps))
+            },
+        );
+        (probes.get(), builds.get(), outcome)
+    }
+
+    #[test]
+    fn slowlink_unset_and_killed_selectors_never_probe_or_build_inputs() {
+        for mode in [s1::SlowlinkMode::Auto, s1::SlowlinkMode::Off] {
+            let (probes, builds, outcome) = select(
+                mode,
+                "gfx1100",
+                HostLink::Discrete { gbps: 7.09 },
+                free_for(10),
+            );
+            assert_eq!((probes, builds), (0, 0), "{mode:?}");
+            assert_eq!(outcome, Ok(None), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn slowlink_other_arches_never_probe_or_build_inputs() {
+        for arch in [
+            "gfx906", "gfx942", "gfx1010", "gfx1030", "gfx1101", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let (probes, builds, outcome) = select(
+                s1::SlowlinkMode::Force,
+                arch,
+                HostLink::Discrete { gbps: 7.09 },
+                free_for(10),
+            );
+            assert_eq!((probes, builds, outcome), (0, 0, Ok(None)), "{arch}");
+        }
+    }
+
+    #[test]
+    fn slowlink_link_truth_table_selects_only_a_measured_narrow_discrete_link() {
+        for (link, selected) in [
+            (HostLink::Discrete { gbps: 7.09 }, true),
+            (HostLink::Discrete { gbps: 15.99 }, true),
+            (HostLink::Discrete { gbps: 16.0 }, false),
+            (HostLink::Discrete { gbps: 26.0 }, false),
+            (HostLink::Discrete { gbps: 50.0 }, false),
+            (HostLink::Unified, false),
+            (HostLink::Unmeasured, false),
+        ] {
+            let (probes, builds, outcome) =
+                select(s1::SlowlinkMode::Force, "gfx1100", link, free_for(10));
+            // The link is measured once, and no S1 input is built (no memory
+            // query, manifest scan or allocation) for a link that cannot select.
+            assert_eq!(probes, 1, "{link:?}");
+            assert_eq!(builds, u32::from(selected), "{link:?}");
+            let profile = outcome.unwrap();
+            assert_eq!(profile.is_some(), selected, "{link:?}");
+            if let Some(profile) = profile {
+                assert_eq!(profile.resident_layers, 10);
+                assert_eq!(profile.tile_rows, 1536);
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_forced_deficit_fails_the_load_with_the_exact_bytes() {
+        let nine = free_for(9);
+        let (_, builds, outcome) = select(
+            s1::SlowlinkMode::Force,
+            "gfx1100",
+            HostLink::Discrete { gbps: 7.09 },
+            nine,
+        );
+        assert_eq!(builds, 1);
+        let error = outcome.unwrap_err();
+        assert!(error.contains("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1"), "{error}");
+        assert!(error.contains("keeps 9 of the required 10"), "{error}");
+        assert!(error.contains(&(LAYER - 1).to_string()), "{error}");
+    }
+
+    #[test]
+    fn slowlink_ineligible_forced_loads_are_the_incumbent_not_an_error() {
+        let mut load = shape("gfx1100");
+        load.explicit_vram_layers = true;
+        let outcome = qwen4_slowlink_select(
+            s1::SlowlinkMode::Force,
+            &load,
+            || unreachable!("probed"),
+            |_| unreachable!("inputs built"),
+        );
+        assert_eq!(outcome, Ok(None));
+        // A fully resident fit has nothing to stream: incumbent, not an error.
+        let (_, builds, outcome) = select(
+            s1::SlowlinkMode::Force,
+            "gfx1100",
+            HostLink::Discrete { gbps: 7.09 },
+            1 << 40,
+        );
+        assert_eq!((builds, outcome), (1, Ok(None)));
     }
 }
