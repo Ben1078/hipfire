@@ -797,6 +797,18 @@ pub fn execute_steps<'a>(
     execute_validated_steps(gpu, ctx, steps)
 }
 
+/// Whether `step` is the `Step::Clear` directly followed (inside the window)
+/// by a sealed MoE call sealed in the iGPU mode. Such a pair always runs
+/// through `execute_sealed_after_clear`, independent of the ZINIT / HC-fuse
+/// flags (off by default on gfx1100): that path is the only one that ties the
+/// engine's routed-only zero target to the clear step that zeroed it.
+pub(super) fn clear_precedes_igpu_moe(step: &Step<'_>, next: Option<&Step<'_>>) -> bool {
+    matches!(
+        (step, next),
+        (Step::Clear(_), Some(Step::Moe(call))) if call.is_igpu_prefill()
+    )
+}
+
 /// Host work a caller interleaves around every `Step::Moe` of a program run
 /// by [`execute_validated_steps_with_moe_hooks`] (Qwen4's G2 expert staging:
 /// wait for a staged layer's experts, then free / refill its stage).
@@ -987,8 +999,14 @@ fn execute_window<'a>(
         // over the fill when it can start from +0.0, else the fill runs first
         // inside the call.  H4 level 3 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): when the
         // hyper write that closes the block already has its gates, the shared
-        // down may carry it; a write so carried is skipped.
-        if moe_zinit || hc_level >= 3 {
+        // down may carry it; a write so carried is skipped.  An iGPU call
+        // (`memory.offload_exec=igpu`) ALWAYS takes this path, whatever the
+        // flags: only here is its routed-only zero target tied to the clear
+        // step that zeroed it, and a separately executed call refuses.
+        if moe_zinit
+            || hc_level >= 3
+            || clear_precedes_igpu_moe(&steps[i], steps[..end].get(i + 1))
+        {
             if let (Step::Clear(clear), Some(Step::Moe(call))) =
                 (&steps[i], steps[..end].get(i + 1))
             {

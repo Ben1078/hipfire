@@ -55,6 +55,12 @@
 //! and `<model>.plehotrows` pack), verified and with BYTES of the pack
 //! prewarmed, before scoring, so the identity gate covers rows read from the
 //! pack.
+//! `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` host-maps the routed experts of trunk
+//! layers N.. (discrete GPU). With `HIPFIRE_OFFLOAD_EXEC=igpu` the load arms
+//! portable host-mapped experts and the one pinned pool through
+//! `hipfire_arch_qwen4::igpu_load::arm_qwen4_igpu`, the same call the daemon's
+//! rank loader makes, so prefill runs on the iGPU engine; a refusal is one
+//! `[igpu-exec]` line and the normal route.
 //! Reduce with `saddle-quant reduce DIR`.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
@@ -149,13 +155,44 @@ fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTenso
     backing.sub_offset(0, tokens * vocab)
 }
 
+/// The bundle, released through [`Qwen4Bundle::free_gpu`] by [`Model`]'s `Drop`
+/// BEFORE `gpu`: with `HIPFIRE_OFFLOAD_EXEC=igpu` the iGPU engine and each
+/// layer's host-owner view hold leases on the pooled pinned backing, and the
+/// model `Gpu` refuses to `hipHostFree` a leased backing (dropping `gpu` first
+/// logs "failed to release host-mapped tensor during Gpu drop ... still leased
+/// by a second device engine" on every exit).
+struct OwnedBundle(Option<Qwen4Bundle>);
+
+impl std::ops::Deref for OwnedBundle {
+    type Target = Qwen4Bundle;
+    fn deref(&self) -> &Qwen4Bundle {
+        self.0.as_ref().expect("bundle is present until Model drops")
+    }
+}
+
+impl std::ops::DerefMut for OwnedBundle {
+    fn deref_mut(&mut self) -> &mut Qwen4Bundle {
+        self.0.as_mut().expect("bundle is present until Model drops")
+    }
+}
+
 struct Model {
     gpu: Gpu,
-    bundle: Qwen4Bundle,
+    bundle: OwnedBundle,
     logits: GpuTensor,
     vocab: usize,
     arch_id: u32,
     tokenizer: Tokenizer,
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        if let Some(bundle) = self.bundle.0.take() {
+            if let Err(error) = bundle.free_gpu(&mut self.gpu) {
+                eprintln!("qwen4_kld: bundle teardown failed: {error}");
+            }
+        }
+    }
 }
 
 impl Model {
@@ -163,14 +200,42 @@ impl Model {
     /// `ple_hot`: bytes of the PLE hot-row pack to prewarm; the store is
     /// attached verified before the first forward.
     fn load(path: &Path, n_ctx: usize, logit_rows: usize, ple_hot: Option<u64>) -> Result<Self, String> {
+        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        match Self::load_on(&mut gpu, path, n_ctx, logit_rows, ple_hot) {
+            Ok((bundle, logits, vocab, arch_id, tokenizer)) => Ok(Self {
+                gpu,
+                bundle: OwnedBundle(Some(bundle)),
+                logits,
+                vocab,
+                arch_id,
+                tokenizer,
+            }),
+            Err(error) => {
+                // As the daemon's `load_qwen4_rank`: a failed load leaves no armed
+                // state or unused pinned pool on the `Gpu`
+                // (`HIPFIRE_OFFLOAD_EXEC=igpu` only; otherwise a no-op).
+                hipfire_arch_qwen4::igpu_load::release_after_failed_load(&mut gpu);
+                Err(error)
+            }
+        }
+    }
+
+    /// The load proper, on a `Gpu` the caller owns so a failure can release what
+    /// the iGPU arming reserved on it.
+    fn load_on(
+        gpu: &mut Gpu,
+        path: &Path,
+        n_ctx: usize,
+        logit_rows: usize,
+        ple_hot: Option<u64>,
+    ) -> Result<(Qwen4Bundle, GpuTensor, usize, u32, Tokenizer), String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
             .map_err(|e| format!("tokenizer: {e}"))?;
         let arch_id = hfq.arch_id;
-        // The GPU arch drives `memory.ple_format = auto`; initialising it
-        // allocates no model memory, so admission still precedes every upload.
-        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        // The GPU arch drives `memory.ple_format = auto`; `Gpu::init` (the
+        // caller) allocates no model memory, so admission still precedes every upload.
         // The evaluator never derives a missing q4: derive it with
         // `hipfire ple derive` (or a serve load) first.
         let choice = resolve_and_attach_ple_rows(
@@ -236,7 +301,7 @@ impl Model {
         // The loader's forward scratch plan, decided from the actual payload
         // while the mapping is readable.
         let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-            &gpu,
+            &*gpu,
             &hfq,
             &receipt.config,
             &receipt.manifest,
@@ -246,7 +311,7 @@ impl Model {
             hfq.drop_mmap();
         }
         let mesh = DeviceMesh::single().map_err(|e| format!("qwen4 mesh: {e}"))?;
-        let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let expected = WeightOrigin::for_single(&mesh, &*gpu);
         let hot_plan =
             match (ple_hot, ple_descriptors.as_deref()) {
                 (Some(_), Some(descriptors)) => Some(
@@ -267,6 +332,9 @@ impl Model {
                 (None, _) => None,
             };
         let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
+        // Read from the artifact before the source takes it (routed-expert AWQ
+        // sidecars only; attention/trunk sidecars do not count).
+        let awq_experts = hfq.has_awq_expert_sidecars();
         let source = HfqModelSource::from_hfq(hfq);
         // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
         // and host-maps the rest (a slab artifact larger than one card).
@@ -292,11 +360,45 @@ impl Model {
             }
             weights
         };
+        // `memory.offload_exec=igpu`: the loader's admission and arming
+        // (`hipfire_loader` `load_qwen4_rank`), over this load's own placement,
+        // after the experts are placed and before the first expert byte is
+        // allocated. Mode unset: a silent no-op. A refusal is one log line and
+        // the load continues on the normal route with the `Gpu` unarmed.
+        let _igpu = hipfire_arch_qwen4::igpu_load::arm_qwen4_igpu(
+            &mut *gpu,
+            &hipfire_arch_qwen4::igpu_load::Qwen4IgpuFacts {
+                ep: false,
+                pp: 1,
+                tiered: false,
+                awq: awq_experts,
+                flash_next: receipt.config.profile.is_flash_next(),
+                dense_ffn: receipt.config.ffn.is_dense(),
+                trunk_layers: receipt.config.num_hidden_layers,
+                recipe: receipt.recipe(),
+                weights: &weights,
+            },
+            &|entry| {
+                source
+                    .tensor_data(&entry.name)
+                    .map(|(_, bytes)| bytes.len() as u64)
+            },
+        );
+        // Resolved BEFORE the fulfillment: a failure here must not strand the
+        // fulfilled weight transaction (nothing owns it until bundle assembly).
+        let state_format = hipfire_arch_qwen4::resolve_state_format(
+            &hipfire_runtime::config::get().kv_mode,
+            // Qwen3.5's DeltaNet `state_quant` knob: auto (q8) or fp32.
+            &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+            &*gpu,
+            &receipt.config,
+        )?;
+        let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&*gpu);
         let transaction = fulfill_manifest_from_payloads(
             &weights,
             &mesh,
             receipt.config.num_hidden_layers,
-            &mut gpu,
+            &mut *gpu,
             expected,
             |entry| {
                 if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
@@ -323,20 +425,12 @@ impl Model {
         )
         .map_err(|e| format!("qwen4 manifest fulfillment: {e}"))?;
         let vocab = receipt.config.vocab_size;
-        let state_format = hipfire_arch_qwen4::resolve_state_format(
-            &hipfire_runtime::config::get().kv_mode,
-            // Qwen3.5's DeltaNet `state_quant` knob: auto (q8) or fp32.
-            &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
-            &gpu,
-            &receipt.config,
-        )?;
-        let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
         let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
             receipt.config,
             &receipt.manifest.identity.recipe,
             transaction,
             &receipt.placements,
-            &mut gpu,
+            &mut *gpu,
             n_ctx,
             receipt.ple,
             receipt.ple_rows,
@@ -345,36 +439,40 @@ impl Model {
             None,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
-        bundle.attach_npu_trunk_identity(npu_identity);
-        if let Some(overlay) = trunk_overlay {
+        // Everything after assembly may fail with the iGPU engine's leases held
+        // on the pooled backing: free the bundle (as the daemon's rank loader
+        // does) before the caller releases the arming and drops the `Gpu`.
+        let finished = (|| -> Result<GpuTensor, String> {
+            bundle.attach_npu_trunk_identity(npu_identity);
+            if let Some(overlay) = trunk_overlay {
+                bundle
+                    .attach_trunk_overlay(overlay)
+                    .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+            }
             bundle
-                .attach_trunk_overlay(overlay)
-                .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
-        }
-        bundle
-            .attach_forward(&mut gpu, n_ctx, scratch_mode)
-            .map_err(|e| format!("qwen4 forward setup: {e}"))?;
-        if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
-            bundle
-                .attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?)
-                .map_err(|e| format!("qwen4 PLE hot store: {e}"))?;
-        }
-        let logits = gpu
-            .zeros(&[logit_rows * vocab], DType::F32)
-            .map_err(|e| e.to_string())?;
+                .attach_forward(&mut *gpu, n_ctx, scratch_mode)
+                .map_err(|e| format!("qwen4 forward setup: {e}"))?;
+            if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
+                bundle
+                    .attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?)
+                    .map_err(|e| format!("qwen4 PLE hot store: {e}"))?;
+            }
+            gpu.zeros(&[logit_rows * vocab], DType::F32)
+                .map_err(|e| e.to_string())
+        })();
+        let logits = match finished {
+            Ok(logits) => logits,
+            Err(error) => {
+                let _ = bundle.free_gpu(gpu);
+                return Err(error);
+            }
+        };
         eprintln!(
             "qwen4_kld: loaded {} on {} (vocab {vocab})",
             path.display(),
             gpu.arch
         );
-        Ok(Self {
-            gpu,
-            bundle,
-            logits,
-            vocab,
-            arch_id,
-            tokenizer,
-        })
+        Ok((bundle, logits, vocab, arch_id, tokenizer))
     }
 
     /// All-row logits for one chunk from a fresh state: one forward, with

@@ -1852,6 +1852,13 @@ impl SealedMoeCall<'_> {
         &self.selection
     }
 
+    /// Whether this call was sealed in the iGPU whole-layer mode. Such a call
+    /// must run through [`execute_sealed_after_clear`] when a `Step::Clear`
+    /// precedes it (the engine's routed-only zero-target contract).
+    pub(super) fn is_igpu_prefill(&self) -> bool {
+        matches!(&self.selection, MoeKernelSelection::Prefill(s) if s.igpu_experts)
+    }
+
     pub fn protocol(&self) -> MoeProtocol {
         self.protocol
     }
@@ -8128,6 +8135,24 @@ mod tests {
             &gpu_call,
             &clear(&scratch.x_batch, rows * hidden)
         ));
+        // G1-igpu hardware regression: with the ZINIT / HC-fuse flags off
+        // (the gfx1100 default) the step interpreter ran `Clear` and the iGPU
+        // `Moe` as separate steps and the stage refused ("requires a
+        // routed-only zero target cleared by this call's clear step"). The
+        // pair must always be taken by the after-clear path for an iGPU call
+        // and never for a GPU call.
+        use crate::pipeline::steps::{clear_precedes_igpu_moe, Step};
+        assert!(!gpu_call.is_igpu_prefill());
+        let gpu_moe = Step::Moe(gpu_call);
+        let pair_clear = Step::Clear(clear(&scratch.x_batch, rows * hidden));
+        assert!(!clear_precedes_igpu_moe(&pair_clear, Some(&gpu_moe)));
+        assert!(call.is_igpu_prefill());
+        let igpu_moe = Step::Moe(call);
+        assert!(clear_precedes_igpu_moe(&pair_clear, Some(&igpu_moe)));
+        // Only a Clear immediately before the call, inside the window.
+        assert!(!clear_precedes_igpu_moe(&pair_clear, None));
+        assert!(!clear_precedes_igpu_moe(&igpu_moe, Some(&pair_clear)));
+        assert!(!clear_precedes_igpu_moe(&igpu_moe, Some(&igpu_moe)));
     }
 
     #[test]

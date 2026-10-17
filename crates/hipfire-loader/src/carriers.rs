@@ -1528,7 +1528,7 @@ pub fn load_qwen4_rank(
     if loaded.is_err() {
         // A failed load leaves no armed state or unused pinned pool on `gpu`
         // (`memory.offload_exec=igpu` only; otherwise a no-op).
-        crate::qwen4_igpu::release_after_failed_load(gpu);
+        hipfire_arch_qwen4::igpu_load::release_after_failed_load(gpu);
     }
     loaded
 }
@@ -2312,9 +2312,9 @@ fn load_qwen4_rank_body(
     // only one: a refused request is one log line and this rank loads on the
     // normal expert path with `ctx.gpu` untouched. Mode unset: nothing here
     // runs, logs or changes an allocation flag.
-    let _igpu = crate::qwen4_igpu::arm_qwen4_igpu(
+    let _igpu = hipfire_arch_qwen4::igpu_load::arm_qwen4_igpu(
         ctx.gpu,
-        &crate::qwen4_igpu::Qwen4IgpuFacts {
+        &hipfire_arch_qwen4::igpu_load::Qwen4IgpuFacts {
             ep: ep.is_some(),
             pp: shared.pp,
             tiered: hotset_plan.is_some(),

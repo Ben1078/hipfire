@@ -2,13 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! `memory.offload_exec=igpu` load admission for the Qwen4 rank loader.
+//! `memory.offload_exec=igpu` load admission for Qwen4 loads (the product rank
+//! loader and the lab evaluators share this one implementation).
 //!
 //! The mode needs the host-mapped expert aggregates allocated
 //! `hipHostMallocPortable`, so the second device can map them. That is decided
-//! by [`hipfire_arch_qwen4::gpu_forward::igpu_engine::arm_igpu_for_load`], which
+//! by [`crate::gpu_forward::igpu_engine::arm_igpu_for_load`], which
 //! must run on the model `Gpu` **before the first expert byte is allocated**
-//! (the hot-set tier materialisation and the manifest fulfillment). The loader
+//! (the hot-set tier materialisation and the manifest fulfillment). The caller
 //! owns every fact that call needs: all of them are read from the parsed
 //! artifact (its recipe and manifest) and the resolved placement, never from an
 //! environment guess.
@@ -17,18 +18,19 @@
 //! line and the load continues on the normal expert path with the `Gpu` left
 //! unarmed (so host-mapped allocations keep their default flags and the arch's
 //! attach step has nothing to attach).
+//!
+//! `hipfire-loader` (`load_qwen4_rank`) and the `qwen4_kld` evaluator both call
+//! [`arm_qwen4_igpu`], so a lab load arms exactly as the daemon does.
 
-use hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX;
-use hipfire_arch_qwen4::gpu_forward::igpu_engine::{self, Qwen4IgpuArm, Qwen4IgpuLoadInputs};
-use hipfire_arch_qwen4::weights::{
-    Qwen4TierRecipe, ROUTED_DOWN_DTYPE, ROUTED_GATE_UP_DTYPE,
-};
+use crate::expert_arena::ARENA_SUFFIX;
+use crate::gpu_forward::igpu_engine::{self, Qwen4IgpuArm, Qwen4IgpuLoadInputs};
+use crate::weights::{Qwen4TierRecipe, ROUTED_DOWN_DTYPE, ROUTED_GATE_UP_DTYPE};
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use std::collections::BTreeMap;
 
 /// Every fact of one rank load the iGPU admission reads. Borrowed from the
-/// loader's own locals at the point where placement is resolved.
-pub(crate) struct Qwen4IgpuFacts<'a> {
+/// caller's own locals at the point where placement is resolved.
+pub struct Qwen4IgpuFacts<'a> {
     /// This load is a rank of an expert-parallel mesh.
     pub ep: bool,
     /// The admitted pipeline-parallel degree of the load (`ctx.pp`).
@@ -132,7 +134,7 @@ fn host_experts(facts: &Qwen4IgpuFacts<'_>) -> HostExperts {
 /// inputs cannot express). A load whose inputs carry an exclusion (`ep`, `pp`,
 /// `slab`, `tier`, `awq`, non-uniform or partial host layers) is still returned
 /// as inputs: the arch owns those refusals and their wording.
-pub(crate) fn qwen4_igpu_inputs(facts: &Qwen4IgpuFacts<'_>) -> Result<Qwen4IgpuLoadInputs, String> {
+pub fn qwen4_igpu_inputs(facts: &Qwen4IgpuFacts<'_>) -> Result<Qwen4IgpuLoadInputs, String> {
     if !facts.flash_next {
         return Err(
             "the profile is not Flash-Next (the engine serves the Flash-Next MoE prefill only)"
@@ -231,7 +233,7 @@ fn host_pool_sizes(
 ///   `None` with `gpu` not armed (an armed `Gpu` left by an earlier load is
 ///   disarmed): the load continues on the normal path and the arch attach step
 ///   stays silent.
-pub(crate) fn arm_qwen4_igpu(
+pub fn arm_qwen4_igpu(
     gpu: &mut rdna_compute::Gpu,
     facts: &Qwen4IgpuFacts<'_>,
     bytes_of: &dyn Fn(&WeightEntry) -> Option<u64>,
@@ -277,7 +279,7 @@ pub(crate) fn arm_qwen4_igpu(
 /// freed is released by their last free) and drop the armed state, so a retry on
 /// the same `Gpu` starts from the default flags and can reserve a fresh pool.
 /// A no-op unless `memory.offload_exec=igpu`.
-pub(crate) fn release_after_failed_load(gpu: &mut rdna_compute::Gpu) {
+pub fn release_after_failed_load(gpu: &mut rdna_compute::Gpu) {
     if !igpu_engine::qwen4_igpu_enabled() {
         return;
     }
@@ -605,5 +607,30 @@ mod tests {
         weights = mtp.into_iter().chain(trunk).collect();
         let error = host_pool_sizes(&facts(&recipe, &weights), &|_| Some(1)).unwrap_err();
         assert!(error.contains("MTP"), "{error}");
+    }
+
+    /// The `qwen4_kld` lab load: every expert starts resident, then
+    /// `place_routed_experts` (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`) host-maps
+    /// layers `N..` and the MTP head, and the load arms through this module like
+    /// the daemon. No ep/pp/tier/awq: plain inputs and the host trunk pool.
+    #[test]
+    fn lab_load_with_env_placed_experts_arms_plain_with_the_host_trunk_pool() {
+        let recipe = packed();
+        let mut weights = manifest(TRUNK + 1);
+        assert_eq!(
+            qwen4_igpu_inputs(&facts(&recipe, &weights)).unwrap_err(),
+            "no trunk layer's routed experts are host-placed, so nothing would run on the iGPU \
+             (place experts in host memory, e.g. HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS)"
+        );
+        let moved = crate::expert_residency::place_routed_experts(&mut weights, 2);
+        // Trunk layers 2 and 3 plus the MTP head, two aggregates each.
+        assert_eq!(moved, 6);
+        let load = facts(&recipe, &weights);
+        assert_eq!(qwen4_igpu_inputs(&load), Ok(Qwen4IgpuLoadInputs::PLAIN));
+        let sizes = host_pool_sizes(&load, &|entry| {
+            Some(if entry.name.ends_with("gate_up_proj") { 300 } else { 100 })
+        })
+        .unwrap();
+        assert_eq!(sizes, [300, 100].repeat(2));
     }
 }

@@ -189,21 +189,70 @@ struct Dims {
     k_top: usize,
 }
 
+/// The bundle, released through [`Qwen4Bundle::free_gpu`] by [`Model`]'s `Drop`
+/// BEFORE `gpu`: the iGPU engine and each layer's host-owner view hold leases on
+/// the pooled pinned backing, and the model `Gpu` refuses to `hipHostFree` a
+/// leased backing (G1-igpu: dropping `gpu` first logged "failed to release
+/// host-mapped tensor during Gpu drop ... still leased by a second device
+/// engine" on every exit, error paths included). `load` builds the `Model` as
+/// soon as the bundle is assembled, so its own later failures are covered too.
+struct OwnedBundle(Option<Qwen4Bundle>);
+
+impl std::ops::Deref for OwnedBundle {
+    type Target = Qwen4Bundle;
+    fn deref(&self) -> &Qwen4Bundle {
+        self.0.as_ref().expect("bundle is present until Model drops")
+    }
+}
+
+impl std::ops::DerefMut for OwnedBundle {
+    fn deref_mut(&mut self) -> &mut Qwen4Bundle {
+        self.0.as_mut().expect("bundle is present until Model drops")
+    }
+}
+
 struct Model {
     gpu: Gpu,
-    bundle: Qwen4Bundle,
+    bundle: OwnedBundle,
     tokenizer: Tokenizer,
     dims: Dims,
     vocab: usize,
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        if let Some(bundle) = self.bundle.0.take() {
+            if let Err(error) = bundle.free_gpu(&mut self.gpu) {
+                eprintln!("qwen4_igpu_engine_parity: bundle teardown failed: {error}");
+            }
+        }
+    }
 }
 
 /// The `qwen4_kld` load (the serve loader's range-loaded path) with the routed
 /// experts of layers `vram_layers..` host-mapped; `HIPFIRE_OFFLOAD_EXEC=igpu` arms the
 /// engine inside `attach_forward`. `rows` is both the context and the tile bound.
 fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
+    let mut gpu = Gpu::init().map_err(e)?;
+    match load_on(&mut gpu, path, rows, vram_layers) {
+        Ok((bundle, tokenizer, dims, vocab)) => {
+            Ok(Model { gpu, bundle: OwnedBundle(Some(bundle)), tokenizer, dims, vocab })
+        }
+        Err(error) => {
+            // As the daemon's `load_qwen4_rank`: a failed load leaves no armed
+            // state or unused pinned pool on the `Gpu` (a failure after bundle
+            // assembly has already freed the bundle inside `load_on`).
+            hipfire_arch_qwen4::igpu_load::release_after_failed_load(&mut gpu);
+            Err(error)
+        }
+    }
+}
+
+/// The load proper, on a `Gpu` the caller owns so every failure can release what
+/// the iGPU arming reserved on it before the `Gpu` drops.
+fn load_on(gpu: &mut Gpu, path: &Path, rows: usize, vram_layers: usize) -> R<(Qwen4Bundle, Tokenizer, Dims, usize)> {
     let mut hfq = HfqFile::open(path).map_err(|x| format!("open HFQM {}: {x}", path.display()))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|x| format!("tokenizer: {x}"))?;
-    let mut gpu = Gpu::init().map_err(e)?;
     if gpu.is_uma() {
         return Err(format!(
             "model device {} is an integrated GPU: the parity needs a discrete model device (the XTX) plus a distinct gfx1151",
@@ -216,7 +265,7 @@ fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
     // Portable host flags must precede every expert allocation: arm the iGPU engine's
     // load (a no-op unless HIPFIRE_OFFLOAD_EXEC=igpu); `attach_forward` opens the engine.
     if hipfire_arch_qwen4::gpu_forward::igpu_engine::arm_igpu_for_load(
-        &mut gpu,
+        &mut *gpu,
         &hipfire_arch_qwen4::gpu_forward::igpu_engine::Qwen4IgpuLoadInputs::PLAIN,
     )
     .is_none()
@@ -237,7 +286,7 @@ fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
     let trunk_overlay = hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
         .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-        &gpu,
+        &*gpu,
         &hfq,
         &receipt.config,
         &receipt.manifest,
@@ -245,7 +294,7 @@ fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
     .map_err(e)?;
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
     let mesh = DeviceMesh::single().map_err(|x| format!("qwen4 mesh: {x}"))?;
-    let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let expected = WeightOrigin::for_single(&mesh, &*gpu);
     let source = HfqModelSource::from_hfq(hfq);
     let mut weights = receipt.manifest.weights.clone();
     let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut weights, vram_layers);
@@ -277,11 +326,20 @@ fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
         pool_sizes.len(),
         capacity >> 20
     );
+    // Resolved BEFORE the fulfillment: a failure here must not strand the
+    // fulfilled weight transaction (nothing owns it until bundle assembly).
+    let state_format = hipfire_arch_qwen4::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        &*gpu,
+        &receipt.config,
+    )?;
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&*gpu);
     let transaction = fulfill_manifest_from_payloads(
         &weights,
         &mesh,
         receipt.config.num_hidden_layers,
-        &mut gpu,
+        &mut *gpu,
         expected,
         |entry| {
             if let Some(payload) =
@@ -312,19 +370,12 @@ fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
         k_top: receipt.config.num_experts_per_tok,
     };
     let vocab = receipt.config.vocab_size;
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
-        &hipfire_runtime::config::get().kv_mode,
-        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
-        &gpu,
-        &receipt.config,
-    )?;
-    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
-        &mut gpu,
+        &mut *gpu,
         rows,
         receipt.ple,
         receipt.ple_rows,
@@ -333,15 +384,24 @@ fn load(path: &Path, rows: usize, vram_layers: usize) -> R<Model> {
         None,
     )
     .map_err(|x| format!("qwen4 bundle assembly: {x}"))?;
-    bundle.attach_npu_trunk_identity(npu_identity);
-    if let Some(overlay) = trunk_overlay {
-        bundle.attach_trunk_overlay(overlay).map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+    // Everything after assembly may fail with the iGPU engine's leases held on the
+    // pooled backing: free the bundle (as the daemon does) before the caller
+    // releases the arming and drops the `Gpu`.
+    let finished = (|| -> R<()> {
+        bundle.attach_npu_trunk_identity(npu_identity);
+        if let Some(overlay) = trunk_overlay {
+            bundle.attach_trunk_overlay(overlay).map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+        }
+        bundle
+            .attach_forward(&mut *gpu, rows, scratch_mode)
+            .map_err(|x| format!("qwen4 forward setup: {x}"))
+    })();
+    if let Err(error) = finished {
+        let _ = bundle.free_gpu(gpu);
+        return Err(error);
     }
-    bundle
-        .attach_forward(&mut gpu, rows, scratch_mode)
-        .map_err(|x| format!("qwen4 forward setup: {x}"))?;
     eprintln!("qwen4_igpu_engine_parity: loaded {} on {} (vocab {vocab})", path.display(), gpu.arch);
-    Ok(Model { gpu, bundle, tokenizer, dims, vocab })
+    Ok((bundle, tokenizer, dims, vocab))
 }
 
 // ── XTX F16 WMMA reference ───────────────────────────────────────────

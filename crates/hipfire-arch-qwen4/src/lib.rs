@@ -39,6 +39,7 @@ pub mod expert_tier_plan;
 pub mod expert_tier_owners;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
+pub mod igpu_load;
 pub mod kv_backend;
 pub mod lane;
 pub mod lane_exec;
