@@ -62,10 +62,17 @@
 //! and `<model>.plehotrows` pack), verified and with BYTES of the pack
 //! prewarmed, before scoring, so the identity gate covers rows read from the
 //! pack.
+//! Model-running commands also accept `--hot-budget-mib N [--hotset SIDECAR]`
+//! to freeze the same bound expert partition as `qwen4_wide_verify`. CPU mode
+//! requires an armed D2 split; PCIe mode requires it unarmed. Passback, UMA,
+//! disabled CPU experts and conflicting expert VRAM-layer pins fail closed.
+//! Without these flags the existing loader is unchanged. `--decode` keeps the
+//! production AR n=1 route, including D2 host slots, for every scored row.
 //! Reduce with `saddle-quant reduce DIR`.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
 use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotPlan, PleHotWorker, Qwen4Bundle};
+use hipfire_config::memory::OffloadExec;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
@@ -80,6 +87,8 @@ use saddle_quant::format::kldref::{KldRef, RefHeader, RefWriter};
 use saddle_quant::format::kldseq::{self, ChunkScore};
 use saddle_quant::{ArtifactId, Estimator, OracleStats, TeacherVerdict, WindowSpec};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -138,7 +147,7 @@ fn verified_hot_store(
     Ok(hot)
 }
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...] | --tail-split K] [--score-tail K] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES] [--sequence-range START:END]\n  qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2] [--max-prompt N]";
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...] | --tail-split K] [--score-tail K] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES] [--sequence-range START:END]\n  qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2] [--max-prompt N]\n  ref/eval/s11ref/speed: [--hot-budget-mib N] [--hotset SIDECAR] (hotset requires a nonzero budget; fixed CPU/PCIe partition)";
 
 /// How a chunk is prefilled from a fresh state.
 #[derive(Clone, Copy)]
@@ -154,6 +163,80 @@ enum Prefill {
 /// Reuse the backing allocation, but expose exactly this cold window's rows.
 fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTensor {
     backing.sub_offset(0, tokens * vocab)
+}
+
+#[derive(Default)]
+struct HotsetPin {
+    budget_mib: Option<u64>,
+    sidecar: Option<PathBuf>,
+}
+
+impl HotsetPin {
+    fn parse_budget(text: &str) -> Result<u64, String> {
+        let mib: u64 = text
+            .parse()
+            .map_err(|_| format!("bad --hot-budget-mib '{text}'"))?;
+        if mib == 0 || mib.checked_mul(1 << 20).is_none() {
+            return Err("--hot-budget-mib must be nonzero and fit in bytes".into());
+        }
+        Ok(mib)
+    }
+
+    fn validate(&self, mode: &str) -> Result<(), String> {
+        if self.sidecar.is_some() && self.budget_mib.is_none() {
+            return Err("--hotset requires a nonzero --hot-budget-mib".into());
+        }
+        if self.budget_mib.is_some() && !matches!(mode, "ref" | "eval" | "s11ref" | "speed") {
+            return Err("--hot-budget-mib and --hotset require ref, eval, s11ref or speed".into());
+        }
+        Ok(())
+    }
+}
+
+// Keep the pinned controls identical to wide_verify, independently testable
+// without initializing HIP or touching the model.
+fn admit_pinned_control(
+    exec: OffloadExec,
+    uma: bool,
+    cpu_experts_enabled: bool,
+    explicit_vram_layers: bool,
+) -> Result<(), String> {
+    if uma {
+        return Err("fixed hotset requires a discrete GPU".into());
+    }
+    if explicit_vram_layers {
+        return Err("fixed hotset conflicts with HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS".into());
+    }
+    match exec {
+        OffloadExec::Pcie => Ok(()),
+        OffloadExec::Cpu if cpu_experts_enabled => Ok(()),
+        OffloadExec::Cpu => Err("fixed CPU hotset requires CPU experts enabled".into()),
+        OffloadExec::Passback => {
+            Err("fixed hotset requires HIPFIRE_OFFLOAD_EXEC=cpu or pcie (not passback)".into())
+        }
+    }
+}
+
+fn admit_pinned_split(
+    exec: OffloadExec,
+    has_split_layers: bool,
+    has_split_digest: bool,
+) -> Result<(), String> {
+    match exec {
+        OffloadExec::Cpu if has_split_layers && has_split_digest => Ok(()),
+        OffloadExec::Cpu => Err("requested D2 hotset split did not arm".into()),
+        OffloadExec::Pcie if !has_split_layers && !has_split_digest => Ok(()),
+        OffloadExec::Pcie => Err("pinned PCIe control unexpectedly armed a D2 split".into()),
+        OffloadExec::Passback => Err("passback is not a pinned control".into()),
+    }
+}
+
+fn partition_digest_hex(digest: [u8; 32]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("write digest to String");
+    }
+    hex
 }
 
 struct Model {
@@ -174,6 +257,7 @@ impl Model {
         n_ctx: usize,
         logit_rows: usize,
         ple_hot: Option<u64>,
+        pin: &HotsetPin,
     ) -> Result<Self, String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
@@ -196,7 +280,7 @@ impl Model {
             },
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
-        let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        let mut receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
             .map_err(|e| format!("qwen4 admission: {e}"))?;
         // `<model>.trunk-overlay` (QT44 trunk tensors + the A4 default), bound
         // to this base while it is open and applied by `attach_forward`.
@@ -254,6 +338,114 @@ impl Model {
             &receipt.manifest,
         )
         .map_err(|e| e.to_string())?;
+        // Materialize the frozen hot/cold partition before the ordinary
+        // manifest is fulfilled: cold experts must never get a pooled upload.
+        let tier_lease = if let Some(mib) = pin.budget_mib {
+            use hipfire_arch_qwen4::expert_hotset as hotsets;
+            admit_pinned_control(
+                hipfire_config::memory::offload_exec(),
+                gpu.is_uma(),
+                hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled(),
+                hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()?.is_some(),
+            )?;
+            let policy = match pin.sidecar.as_deref() {
+                Some(path) => hotsets::HotsetPolicy::Explicit(path.to_path_buf()),
+                None => hotsets::HotsetPolicy::from_env()?,
+            };
+            let env = hotsets::HotsetEnv {
+                gpu_arch: &gpu.arch,
+                unified_memory: false,
+                expert_parallel: false,
+                explicit_vram_layers: false,
+                source: match &receipt.manifest.identity.recipe {
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
+                        hotsets::HotsetSource::Aggregate
+                    }
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => {
+                        hotsets::HotsetSource::SlabArena
+                    }
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => {
+                        hotsets::HotsetSource::StockFp8
+                    }
+                    _ => {
+                        hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into())
+                    }
+                },
+            };
+            let sidecar_path = hotsets::preflight(&policy, path, &env).map_err(|skip| {
+                skip.log_line(&policy.sidecar_path(path))
+                    .unwrap_or_else(|| skip.to_string())
+            })?;
+            let base = hotsets::HotsetBase::from_hfq(&hfq)?;
+            let sidecar = hotsets::HotsetSidecar::load_bound(
+                &sidecar_path,
+                receipt.config.num_hidden_layers,
+                receipt.config.num_experts,
+                receipt.config.num_experts_per_tok,
+                &base,
+            )
+            .map_err(|skip| skip.to_string())?;
+            receipt
+                .manifest
+                .check_expert_tiers()
+                .map_err(|e| e.to_string())?;
+            let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
+                &hfq,
+                &receipt.config,
+                &receipt.manifest,
+            )?;
+            let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
+                &slabs,
+                sidecar.rank(),
+                mib * (1 << 20),
+            )
+            .map_err(|e| e.to_string())?;
+            hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
+            plan.check_executable(&gpu.arch)
+                .map_err(|e| e.to_string())?;
+            hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                &mut receipt.manifest.weights,
+                receipt.config.num_hidden_layers,
+            );
+            receipt.manifest = receipt
+                .manifest
+                .with_expert_tiers()
+                .map_err(|e| e.to_string())?;
+            {
+                let keep: BTreeSet<_> = receipt.manifest.resident_keys().collect();
+                receipt
+                    .placements
+                    .retain(|p| keep.contains(&(p.name.as_str(), p.layer)));
+            }
+            let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
+                &mut gpu,
+                std::sync::Arc::new(plan),
+                &|offset, len| {
+                    let offset = usize::try_from(offset)
+                        .map_err(|_| "hotset source offset overflow".to_string())?;
+                    let len = usize::try_from(len)
+                        .map_err(|_| "hotset source length overflow".to_string())?;
+                    hfq.data_range(offset, len).ok_or_else(|| {
+                        format!("source span {offset}+{len} is outside the artifact mapping")
+                    })
+                },
+            )
+            .map_err(|e| format!("expert tier materialize: {e}"))?;
+            lease.bind_hotset_sidecar_sha256(sidecar.sha256())?;
+            eprintln!(
+                "qwen4_kld: hotset {} sha256 {} fixed budget {mib} MiB",
+                sidecar_path.display(),
+                sidecar.sha256()
+            );
+            Some(lease)
+        } else {
+            None
+        };
+        // This is the real logical plan in BOTH controls, not the D2-only
+        // split identity (which correctly remains absent in PCIe mode).
+        let partition_digest = tier_lease
+            .as_ref()
+            .map(|lease| partition_digest_hex(lease.logical_digest()));
         if gpu.is_uma() {
             hfq.drop_mmap();
         }
@@ -355,7 +547,7 @@ impl Model {
             receipt.ple_rows,
             state_format,
             backend,
-            None,
+            tier_lease,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle.attach_npu_trunk_identity(npu_identity);
@@ -367,6 +559,17 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, n_ctx, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
+        if let Some(digest) = partition_digest {
+            let offload_exec = hipfire_config::memory::offload_exec();
+            let has_split_layers = !bundle.split_layers().is_empty();
+            let has_split_digest = bundle.split_digest().is_some();
+            admit_pinned_split(offload_exec, has_split_layers, has_split_digest)?;
+            eprintln!(
+                "qwen4_kld: offload_exec={offload_exec} split_armed={} partition_digest={digest}",
+                has_split_layers && has_split_digest
+            );
+            eprintln!("qwen4_kld: split_digest {:?}", bundle.split_digest());
+        }
         if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
             bundle
                 .attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?)
@@ -578,8 +781,9 @@ fn build_ref(
     n_ctx: usize,
     top_k: usize,
     max_chunks: Option<usize>,
+    pin: &HotsetPin,
 ) -> Result<(), String> {
-    let mut m = Model::load(model, n_ctx, n_ctx, None)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, None, pin)?;
     let text =
         std::fs::read_to_string(slice).map_err(|e| format!("read {}: {e}", slice.display()))?;
     // Qwen tokenizers add no BOS: chunks are plain n_ctx windows of the stream.
@@ -710,6 +914,7 @@ fn score(
     tail_split: Option<usize>,
     score_tail: Option<usize>,
     ple_hot: Option<u64>,
+    pin: &HotsetPin,
 ) -> Result<(), String> {
     let reference = KldRef::open(ref_path).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
@@ -724,7 +929,7 @@ fn score(
             "--tail-split must be below the window length {n_ctx}"
         ));
     }
-    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot, pin)?;
     if m.vocab != h.n_vocab {
         return Err(format!(
             "candidate vocab {} != reference vocab {}",
@@ -1131,6 +1336,7 @@ fn score_s11ref(
     ple_hot: Option<u64>,
     smoke_seqs: Option<usize>,
     sequence_range: Option<std::ops::Range<usize>>,
+    pin: &HotsetPin,
 ) -> Result<(), String> {
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
     // SAFETY: a read-only map of the immutable reference; parsing uses LE bytes.
@@ -1150,7 +1356,7 @@ fn score_s11ref(
         (None, Some(n)) => (0..n.min(total_sequences), 0..reference.header.n_rows),
         (None, None) => (0..total_sequences, 0..reference.header.n_rows),
     };
-    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot, pin)?;
     if m.vocab != reference.header.n_vocab {
         return Err(format!(
             "candidate vocab {} != S11REF vocab {}",
@@ -1307,6 +1513,7 @@ fn speed(
     reps: usize,
     max_prompt: Option<usize>,
     product_prompt: bool,
+    pin: &HotsetPin,
 ) -> Result<(), String> {
     let text =
         std::fs::read_to_string(prompt).map_err(|e| format!("read {}: {e}", prompt.display()))?;
@@ -1364,7 +1571,7 @@ fn speed(
         return Err("empty prompt".into());
     }
     let n_ctx = tokens.len() + warmup + decode_tokens + 8;
-    let mut m = Model::load(model, n_ctx, 1, None)?;
+    let mut m = Model::load(model, n_ctx, 1, None, pin)?;
     terminator_ids.push(m.bundle.config.eos_token_id);
     terminator_ids.sort_unstable();
     terminator_ids.dedup();
@@ -1441,6 +1648,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut logits, mut teacher, mut corpus) = (None, None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
     let (mut ple_hot, mut append_rows) = (None, Vec::new());
+    let mut pin = HotsetPin::default();
     let mut smoke_seqs: Option<usize> = None;
     let mut sequence_range: Option<std::ops::Range<usize>> = None;
     let mut prompt_file: Option<PathBuf> = None;
@@ -1464,6 +1672,8 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--max-chunks" => max_chunks = Some(number(value()?)?),
             "--decode" => decode = true,
             "--ple-hot" => ple_hot = Some(number(value()?)? as u64),
+            "--hotset" => pin.sidecar = Some(PathBuf::from(value()?)),
+            "--hot-budget-mib" => pin.budget_mib = Some(HotsetPin::parse_budget(&value()?)?),
             "--append-rows" => {
                 for rows in value()?.split(',') {
                     match number(rows.to_string())? {
@@ -1491,6 +1701,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
+    pin.validate(&mode)?;
     if sequence_range.is_some() {
         if mode != "s11ref" {
             return Err("--sequence-range is only for s11ref".into());
@@ -1516,7 +1727,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let score_tail = score_tail.or(tail_split);
     match (mode.as_str(), model, slice, ref_path, output) {
         ("ref", Some(model), Some(slice), None, Some(output)) => {
-            build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks)
+            build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks, &pin)
         }
         ("eval", Some(model), None, Some(ref_path), Some(output)) => score(
             &model,
@@ -1528,6 +1739,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             tail_split,
             score_tail,
             ple_hot,
+            &pin,
         ),
         ("s11ref", Some(model), None, Some(ref_path), Some(output)) => {
             let corpus = corpus.ok_or(
@@ -1542,6 +1754,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 ple_hot,
                 smoke_seqs,
                 sequence_range,
+                &pin,
             )
         }
         ("speed", Some(model), None, None, Some(output)) => {
@@ -1555,6 +1768,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 reps,
                 max_prompt,
                 product_prompt,
+                &pin,
             )
         }
         ("ple-derive", Some(model), None, None, None) => {
@@ -1589,6 +1803,154 @@ fn main() {
     if let Err(error) = run_args(std::env::args().skip(1)) {
         eprintln!("qwen4_kld: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod pinned_control_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_cli_budget_is_checked_without_loading_a_model() {
+        assert!(HotsetPin::default().validate("import").is_ok());
+        for bad in [
+            "",
+            "0",
+            "-1",
+            "bad",
+            "17592186044416",
+            "18446744073709551616",
+        ] {
+            assert!(HotsetPin::parse_budget(bad).is_err(), "{bad}");
+            assert!(run_args(
+                ["eval", "--hot-budget-mib", bad]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err());
+        }
+        let pin = HotsetPin {
+            budget_mib: Some(HotsetPin::parse_budget("6000").unwrap()),
+            sidecar: Some(PathBuf::from("bound.expert-hotset")),
+        };
+        assert_eq!(pin.budget_mib, Some(6000));
+        for mode in ["ref", "eval", "s11ref", "speed"] {
+            assert!(pin.validate(mode).is_ok(), "{mode}");
+        }
+        for mode in ["import", "ple-derive", "unknown"] {
+            assert!(pin.validate(mode).is_err(), "{mode}");
+        }
+        for flag in ["--hotset", "--hot-budget-mib"] {
+            assert!(run_args(["s11ref", flag].into_iter().map(str::to_owned))
+                .unwrap_err()
+                .contains("needs a value"));
+        }
+        assert!(run_args(
+            ["s11ref", "--decode", "--hotset", "bound.expert-hotset"]
+                .into_iter()
+                .map(str::to_owned)
+        )
+        .unwrap_err()
+        .contains("requires a nonzero"));
+        // Accepted pin args reach existing mode validation, not the GPU.
+        assert!(run_args(
+            [
+                "s11ref",
+                "--model",
+                "missing.hfq",
+                "--ref",
+                "ref.s11ref",
+                "--output",
+                "out.npy",
+                "--decode",
+                "--hot-budget-mib",
+                "6000",
+                "--hotset",
+                "bound.expert-hotset"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+        )
+        .unwrap_err()
+        .contains("--corpus"));
+        assert!(run_args(
+            [
+                "eval",
+                "--decode",
+                "--append-rows",
+                "1",
+                "--hot-budget-mib",
+                "6000"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+        )
+        .unwrap_err()
+        .contains("excludes --decode"));
+    }
+
+    #[test]
+    fn pinned_policy_requires_the_requested_execution_and_split() {
+        use hipfire_config::memory::parse_offload_exec;
+        let cpu = parse_offload_exec(Some(" CPU "));
+        let pcie = parse_offload_exec(Some(" PCIE "));
+        assert_eq!(cpu, OffloadExec::Cpu);
+        assert_eq!(pcie, OffloadExec::Pcie);
+        assert!(admit_pinned_control(cpu, false, true, false).is_ok());
+        assert!(admit_pinned_control(cpu, false, false, false).is_err());
+        assert!(admit_pinned_control(pcie, false, false, false).is_ok());
+        for exec in [cpu, pcie, OffloadExec::Passback] {
+            assert!(admit_pinned_control(exec, true, true, false).is_err());
+            assert!(admit_pinned_control(exec, false, true, true).is_err());
+            for layers in [false, true] {
+                for digest in [false, true] {
+                    let expected = match exec {
+                        OffloadExec::Cpu => layers && digest,
+                        OffloadExec::Pcie => !layers && !digest,
+                        OffloadExec::Passback => false,
+                    };
+                    assert_eq!(admit_pinned_split(exec, layers, digest).is_ok(), expected);
+                }
+            }
+        }
+        assert!(admit_pinned_control(OffloadExec::Passback, false, true, false).is_err());
+    }
+
+    #[test]
+    fn pinned_hotset_preflight_fails_closed_without_gpu() {
+        use hipfire_arch_qwen4::expert_hotset as hotsets;
+        let env = hotsets::HotsetEnv {
+            gpu_arch: "gfx1201",
+            unified_memory: false,
+            expert_parallel: false,
+            explicit_vram_layers: false,
+            source: hotsets::HotsetSource::Aggregate,
+        };
+        let missing = std::env::temp_dir()
+            .join(format!("qwen4-kld-{}", std::process::id()))
+            .join("missing.expert-hotset");
+        for policy in [
+            hotsets::HotsetPolicy::Off,
+            hotsets::HotsetPolicy::Explicit(PathBuf::new()),
+            hotsets::HotsetPolicy::Explicit(missing),
+        ] {
+            assert!(hotsets::preflight(&policy, Path::new("model.hfq"), &env).is_err());
+        }
+        assert!(hotsets::require_experts(0).is_err());
+    }
+
+    #[test]
+    fn partition_digest_preserves_every_byte_as_lowercase_hex() {
+        let bytes = std::array::from_fn(|i| i as u8);
+        let expected = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert_eq!(partition_digest_hex(bytes), expected);
+        let hex = partition_digest_hex([0xab; 32]);
+        assert_eq!(hex, "ab".repeat(32));
+        assert_eq!(hex.len(), 64);
+        assert!(hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(partition_digest_hex([0; 32]), "0".repeat(64));
     }
 }
 
