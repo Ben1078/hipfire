@@ -2185,6 +2185,51 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
 }
 
+/// The stages of the S1 layer-major PREPARE half of a sealed grouped prefill, in
+/// lowering order: everything [`lower_prefill`] runs before its routed tail
+/// (`Scatter` .. `Combine`) for a `shared_after_combine` recipe.  The routed tail
+/// runs later, window-wide, from `slowlink_prefill`; the shared down runs after
+/// it from `slowlink_prefill::finish_shared`.
+pub(super) const PREPARE_STAGES: [MoeStage; 6] = [
+    MoeStage::Normalize,
+    MoeStage::InputBasis,
+    MoeStage::RouterProjection,
+    MoeStage::SharedGateUp,
+    MoeStage::SharedActivation,
+    MoeStage::Route,
+];
+
+/// Run [`PREPARE_STAGES`] of a sealed grouped prefill call (one tile of the S1
+/// window) through the shared Step interpreter.  Refuses, before any launch,
+/// every call whose lowering is not exactly the plain grouped tail followed by a
+/// shared down after the combine.
+pub(super) fn execute_prepare(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), DispatchError> {
+    let state = MoeStepState::new(call);
+    let (params, selection) = state.prefill_parts()?;
+    if !selection
+        .route
+        .is_some_and(MoeRouteCapability::is_sealed_grouped)
+        || selection.cpu_split
+        || selection.cpu_deferred_experts
+        || !params.recipe.shared_after_combine()
+        || params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+        || params.routed_out.is_some()
+    {
+        return Err(DispatchError::Hip(
+            "slowlink prepare: the call is not a plain sealed grouped prefill with the shared down after the combine".into(),
+        ));
+    }
+    let mut steps: SmallVec<[Step<'_>; INLINE_STEP_CAPACITY]> = SmallVec::new();
+    for stage in PREPARE_STAGES {
+        append_step(
+            &mut steps,
+            Step::MoeStage(SealedMoeOp::new(&state), stage),
+        )?;
+    }
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+}
+
 /// The MoE stages a call lowers to, in order (test probe: nothing launches).
 #[cfg(test)]
 pub(super) fn lowered_stages(call: &SealedMoeCall<'_>) -> Result<Vec<MoeStage>, DispatchError> {

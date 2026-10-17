@@ -2917,6 +2917,82 @@ fn fp8_combine(
     Ok(())
 }
 
+// ───────────── S1 slow-link layer-major prefill hooks (`slowlink_prefill`) ─────────────
+
+/// Pre-mutation admission of one tile call into the S1 layer-major window: the sealed
+/// expert-slab K2 route over a uniform MQ4 layer, the plain grouped tail (no EP, CPU
+/// split/splice, stage tables, routed-out partial or FP8), BF16-row combine arithmetic
+/// and a shared down after the combine.  `Err` means the caller must stay on the
+/// incumbent route; nothing has been launched or written.
+pub(super) fn slowlink_admission(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    use rdna_compute::slab_moe::SlabBuckets;
+    let refuse = |why: &str| {
+        Err(DispatchError::Hip(format!(
+            "slowlink layer-major prefill: {why}; staying on the incumbent route"
+        )))
+    };
+    if is_fp8(p) || !is_slab(p) {
+        return refuse("not the sealed expert-slab route");
+    }
+    if !super::slab_route::arch_supported(&gpu.arch) {
+        return refuse("the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only");
+    }
+    if !grouped_geometry(p) {
+        return refuse("the declared grouped geometry is not admitted");
+    }
+    if !slab_k2(gpu, p) {
+        return refuse("the tile is not a K2 grouped call at its route rows");
+    }
+    if p.batch_size == 0
+        || p.k_top != 10
+        || p.cpu_deferred_experts
+        || p.expert_stage_ptrs.is_some()
+        || p.routed_out.is_some()
+        || p.ep_row_gather.is_some()
+        || p.ep_tile_exchange.is_some()
+    {
+        return refuse("the call is not a plain single-device grouped tail");
+    }
+    if !p.recipe.bf16_round_trip() || !p.recipe.shared_after_combine() {
+        return refuse("the recipe is not the BF16-row combine with the shared down after it");
+    }
+    if p.down_m % 64 != 0
+        || p.down_m % 8 != 0
+        || p.gate_up_k % 256 != 0
+        || p.down_k % 128 != 0
+        || (gpu.arch == "gfx1100" && p.down_k != 640)
+    {
+        return refuse("the projection geometry is not the K2 sealed geometry");
+    }
+    let layer = super::slab_route::layer(
+        &gpu.arch,
+        p.route_policy.as_ref(),
+        &p.dtypes,
+        p.expert_dtype_tags,
+    )?;
+    match layer.buckets {
+        SlabBuckets::Uniform(bucket) if bucket != 0 => Ok(()),
+        _ => refuse("the layer is not uniform MQ4"),
+    }
+}
+
+/// The shared down of one tile, accumulating into `target` (the tile's rows of the
+/// window combine accumulator) instead of the call's own target.  The selector and
+/// activation tensors are the call's, restored by the caller.
+pub(super) fn slowlink_shared_down(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    target: &GpuTensor,
+) -> Result<(), DispatchError> {
+    let mut view: MoePrefillParams<'_> = *p;
+    view.x_batch = target;
+    view.routed_out = None;
+    shared_down(gpu, &view, true)
+}
+
 #[cfg(test)]
 mod scratch_tests {
     use super::*;
