@@ -2172,6 +2172,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "moe_down_combine_grouped_top10",
                 "moe_down_combine_grouped_top10_bf16in",
                 "moe_down_combine_grouped_top10_bf16in_zinit",
+                "slowlink_combine_pad",
+                "slowlink_combine_panel",
             ]
         );
         add!(

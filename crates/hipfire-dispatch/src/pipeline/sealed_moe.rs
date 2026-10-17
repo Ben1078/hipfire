@@ -2536,6 +2536,19 @@ pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<
     moe_program::execute(gpu, call)
 }
 
+/// [`execute_sealed`] for the S1 layer-major prepare half only: the same bound-call
+/// checks, then normalize/input basis/router/shared gate-up and activation/route
+/// for the call's own tile, and nothing of the routed tail or the shared down
+/// (see [`moe_program::execute_prepare`]).
+pub(crate) fn execute_sealed_prepare(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+) -> Result<(), DispatchError> {
+    call.validate_for_gpu(gpu)?;
+    call.note_retained_route_identity(gpu)?;
+    moe_program::execute_prepare(gpu, call)
+}
+
 /// [`execute_sealed`] for a call that directly follows `Step::Clear(clear)`
 /// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the zero fill is either taken over by
 /// the combine or launched here, first.  With the HC write `hc` (whose gates
