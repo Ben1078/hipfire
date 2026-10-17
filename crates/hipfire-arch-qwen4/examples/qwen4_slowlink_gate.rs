@@ -845,7 +845,7 @@ fn run_perf(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String
         let result = (|| -> Result<(Vec<String>, Value), String> {
             let mut times = Vec::new();
             let mut receipts = Vec::new();
-            for _ in 0..ctx.fixture.repeats {
+            for _ in 0..ctx.fixture.perf_repeats {
                 let started = Instant::now();
                 drive(ctx, &prompt.prompt_ids, 0, &[])?;
                 gpu_error(ctx.gpu.download_f32(&ctx.logits), "download prompt logits")?;
