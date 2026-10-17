@@ -200,14 +200,22 @@ pub enum SlowlinkDecline {
     UnifiedMemory,
     Unsupported(&'static str),
     /// `HIPFIRE_PREFILL_CHUNK_ROWS` asks for a chunk other than the S1 tile.
-    ExplicitChunk { rows: usize },
-    ShortContext { max_seq: usize },
+    ExplicitChunk {
+        rows: usize,
+    },
+    ShortContext {
+        max_seq: usize,
+    },
     /// Measured discrete link at or above 16 GB/s.
-    FastLink { gbps: f64 },
+    FastLink {
+        gbps: f64,
+    },
     /// The link probe failed or returned an unusable figure.
     UnmeasuredLink,
     /// Every routed expert already fits: there is no host layer to stream.
-    NoHostLayers { resident_layers: usize },
+    NoHostLayers {
+        resident_layers: usize,
+    },
     Deficit(Deficit),
     Geometry(String),
 }
@@ -281,9 +289,7 @@ fn explicit_chunk_rows(env: Option<&str>) -> Option<usize> {
 pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), SlowlinkDecline> {
     match mode {
         SlowlinkMode::Off => return Err(SlowlinkDecline::KillSwitch),
-        SlowlinkMode::Auto if !S1_AUTO_QUALIFIED => {
-            return Err(SlowlinkDecline::AutoNotQualified)
-        }
+        SlowlinkMode::Auto if !S1_AUTO_QUALIFIED => return Err(SlowlinkDecline::AutoNotQualified),
         SlowlinkMode::Force | SlowlinkMode::Auto => {}
     }
     if shape.arch != "gfx1100" {
@@ -295,10 +301,16 @@ pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), Slowli
     let unsupported = [
         (shape.expert_parallel, "expert parallelism"),
         (shape.pipeline_band, "pipeline parallelism"),
-        (!shape.packed_mq4, "recipe is not the qualified MQ4 packed layout"),
+        (
+            !shape.packed_mq4,
+            "recipe is not the qualified MQ4 packed layout",
+        ),
         (!shape.routed_experts, "no routed experts"),
         (shape.expert_keep, "expert-keep artifact"),
-        (shape.explicit_vram_layers, "explicit expert VRAM layer count"),
+        (
+            shape.explicit_vram_layers,
+            "explicit expert VRAM layer count",
+        ),
         (shape.hotset_sidecar, "ranked expert hot set"),
         (shape.whole_first, "whole-first placement policy"),
         (shape.stage_opt_out, "HIPFIRE_QWEN4_EXPERT_STAGE=0 opt-out"),
@@ -370,7 +382,11 @@ impl ModelGeometry {
     }
 
     fn wide(&self) -> Result<u64, String> {
-        checked_mul(self.hc_count as u64, self.hidden as u64, "hyper-connection width")
+        checked_mul(
+            self.hc_count as u64,
+            self.hidden as u64,
+            "hyper-connection width",
+        )
     }
 }
 
@@ -440,7 +456,8 @@ impl PanelPageLayout {
         let gate_up_expert_bytes = gate_up_layer_bytes / experts;
         let down_expert_bytes = down_layer_bytes / experts;
         let to_usize = |bytes: u64| {
-            usize::try_from(bytes).map_err(|_| "slow-link prefill expert bytes overflow".to_string())
+            usize::try_from(bytes)
+                .map_err(|_| "slow-link prefill expert bytes overflow".to_string())
         };
         let spec = crate::gpu_forward::panel_stage::PanelPoolSpec::uniform(
             ACTIVE_PAGES,
@@ -499,7 +516,11 @@ impl PanelPageLayout {
 
     /// Device bytes of one page with its pointer tables.
     pub fn device_page_bytes(&self) -> Result<u64, String> {
-        checked_add(self.page_bytes, self.table_bytes_per_page, "device page bytes")
+        checked_add(
+            self.page_bytes,
+            self.table_bytes_per_page,
+            "device page bytes",
+        )
     }
 
     /// Device bytes of the double-buffered active ring.
@@ -522,7 +543,11 @@ impl PanelPageLayout {
 
     /// Ring plus lookahead: `PanelPoolReserve::device_total`.
     pub fn total_bytes(&self) -> Result<u64, String> {
-        checked_add(self.ring_bytes()?, self.lookahead_bytes()?, "page store bytes")
+        checked_add(
+            self.ring_bytes()?,
+            self.lookahead_bytes()?,
+            "page store bytes",
+        )
     }
 
     /// Pooled HIP events the timeline keeps (host handles, no device bytes).
@@ -713,6 +738,21 @@ pub fn a4_sidecar_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64, St
     })
 }
 
+/// Device bytes of the window-size grouped-scatter Gpu scratch
+/// (`qwen4_moe_group_layout(rows * top-k, n_exp)`) the single count barrier
+/// grows, from the dispatch crate's own layout. Excluded from
+/// [`route_storage_bytes`] and [`a4_sidecar_bytes`].
+pub fn group_scatter_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64, String> {
+    hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(&route_dims(
+        geometry, rows,
+    ))
+    .map_err(|error| error.to_string())
+    .and_then(|layout| {
+        u64::try_from(layout.group_scatter_bytes())
+            .map_err(|_| "slow-link prefill group scatter overflows".to_string())
+    })
+}
+
 /// Everything the S1 profile costs beyond the incumbent's 1,536-row reserve,
 /// term by term. [`Self::total`] is the one number placement charges
 /// ([`crate::expert_residency::PlacementCharges::slowlink`]).
@@ -728,6 +768,12 @@ pub struct SlowlinkCensus {
     pub route_storage: u64,
     /// The window-wide A4 activation sidecars ([`a4_sidecar_bytes`]).
     pub a4_sidecars: u64,
+    /// The window-size grouped-scatter Gpu scratch of the single count barrier
+    /// ([`group_scatter_bytes`], `qwen4_moe_group_layout` at window slots): the
+    /// FULL window figure, charged on top of the 1536-row tile workspace the
+    /// base reserve already holds (the grown buffer frees the old one, so the
+    /// replacement peak holds both).
+    pub group_scatter: u64,
     /// The architecture-owned HC-stream arena ([`PromptArenaLayout`]).
     pub arena: u64,
     /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary stages of the target's session
@@ -739,12 +785,13 @@ pub struct SlowlinkCensus {
 
 impl SlowlinkCensus {
     /// Every term, named, in log order.
-    pub fn terms(&self) -> [(&'static str, u64); 6] {
+    pub fn terms(&self) -> [(&'static str, u64); 7] {
         [
             ("expert ring", self.ring),
             ("expert lookahead", self.lookahead),
             ("route storage", self.route_storage),
             ("A4 sidecars", self.a4_sidecars),
+            ("group scatter", self.group_scatter),
             ("HC arena", self.arena),
             ("boundary state", self.boundary_state),
         ]
@@ -752,11 +799,13 @@ impl SlowlinkCensus {
 
     /// Sum of every term, checked.
     pub fn total(&self) -> Result<u64, String> {
-        self.terms().into_iter().try_fold(0u64, |total, (name, bytes)| {
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| format!("slow-link prefill census overflows at '{name}'"))
-        })
+        self.terms()
+            .into_iter()
+            .try_fold(0u64, |total, (name, bytes)| {
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| format!("slow-link prefill census overflows at '{name}'"))
+            })
     }
 
     /// `name MiB, ...` for the placement log.
@@ -898,6 +947,7 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
             lookahead: pages.lookahead_bytes()?,
             route_storage: route_storage_bytes(&inputs.geometry, window_rows)?,
             a4_sidecars: a4_sidecar_bytes(&inputs.geometry, window_rows)?,
+            group_scatter: group_scatter_bytes(&inputs.geometry, window_rows)?,
             arena: arena.total_bytes,
             boundary_state: checked_mul(
                 S1_MAX_BOUNDARY_SNAPSHOTS as u64,
@@ -914,7 +964,10 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
     let reserve = charges
         .reserve(inputs.base_reserve)
         .map_err(SlowlinkDecline::Geometry)?;
-    let layers = if inputs.non_expert.checked_add(reserve).is_some_and(|need| need <= inputs.free)
+    let layers = if inputs
+        .non_expert
+        .checked_add(reserve)
+        .is_some_and(|need| need <= inputs.free)
     {
         crate::expert_residency::auto_vram_layers(
             inputs.free,
@@ -936,7 +989,9 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
             .checked_mul(inputs.layer_expert_bytes)
             .and_then(|bytes| bytes.checked_add(inputs.non_expert))
             .and_then(|bytes| bytes.checked_add(reserve))
-            .ok_or_else(|| SlowlinkDecline::Geometry("slow-link prefill deficit overflows".into()))?;
+            .ok_or_else(|| {
+                SlowlinkDecline::Geometry("slow-link prefill deficit overflows".into())
+            })?;
         return Err(SlowlinkDecline::Deficit(Deficit {
             resident_layers: layers,
             required_layers: S1_MIN_RESIDENT_LAYERS,
@@ -990,8 +1045,8 @@ pub fn load_admission_inputs(
 ) -> Result<AdmissionInputs, SlowlinkDecline> {
     use crate::expert_residency as residency;
     let geometry = ModelGeometry::from_config(facts.config).map_err(SlowlinkDecline::Geometry)?;
-    let (non_expert, layer_expert_bytes) =
-        residency::resident_split(facts.weights, facts.bytes_of).map_err(SlowlinkDecline::Geometry)?;
+    let (non_expert, layer_expert_bytes) = residency::resident_split(facts.weights, facts.bytes_of)
+        .map_err(SlowlinkDecline::Geometry)?;
     let baseline_layers = residency::PlacementCharges::new(layer_expert_bytes, false)
         .and_then(|charges| {
             residency::auto_placement_layers(
@@ -1220,8 +1275,7 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
         .map(|inputs| inputs.reserve.bytes())
     };
     // Beta's single incumbent helper (probes the host link once, cached).
-    let placement_chunk =
-        crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
+    let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
     Ok(LoadFacts {
         config: load.config,
         weights: load.weights,
@@ -1271,10 +1325,16 @@ pub struct RequestVerdict {
 pub enum RequestBypass {
     KillSwitch,
     AutoNotQualified,
-    TooShort { rows: usize, minimum: usize },
+    TooShort {
+        rows: usize,
+        minimum: usize,
+    },
     AllRowCapture,
     ExternalCapture,
-    TooManyBoundaries { cuts: usize, maximum: usize },
+    TooManyBoundaries {
+        cuts: usize,
+        maximum: usize,
+    },
     /// The profile's tile is not a valid chunk for this request.
     NoRows,
 }
@@ -1380,11 +1440,12 @@ mod tests {
             inputs.down_layer_bytes,
         )
         .unwrap();
-        let arena = PromptArenaLayout::new(&inputs.geometry, inputs.window_rows, S1_TILE_ROWS)
-            .unwrap();
+        let arena =
+            PromptArenaLayout::new(&inputs.geometry, inputs.window_rows, S1_TILE_ROWS).unwrap();
         pages.total_bytes().unwrap()
             + route_storage_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + a4_sidecar_bytes(&inputs.geometry, inputs.window_rows).unwrap()
+            + group_scatter_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + arena.total_bytes
             + S1_MAX_BOUNDARY_SNAPSHOTS as u64 * inputs.fixed_state_bytes
             + inputs.pending_save_bytes
@@ -1472,7 +1533,13 @@ mod tests {
             Err(SlowlinkDecline::UnmeasuredLink)
         );
         // Unusable figures classify as unmeasured, never narrow.
-        for bad in [Some(f64::NAN), Some(0.0), Some(-3.0), Some(f64::INFINITY), None] {
+        for bad in [
+            Some(f64::NAN),
+            Some(0.0),
+            Some(-3.0),
+            Some(f64::INFINITY),
+            None,
+        ] {
             assert_eq!(
                 link_verdict(HostLink::classify(false, bad)),
                 Err(SlowlinkDecline::UnmeasuredLink),
@@ -1488,17 +1555,83 @@ mod tests {
     #[test]
     fn slowlink_admission_unsupported_modes_decline_before_any_probe() {
         let cases: [(&str, LoadShape<'static>); 11] = [
-            ("ep", LoadShape { expert_parallel: true, ..shape() }),
-            ("pp", LoadShape { pipeline_band: true, ..shape() }),
-            ("recipe", LoadShape { packed_mq4: false, ..shape() }),
-            ("dense", LoadShape { routed_experts: false, ..shape() }),
-            ("keep", LoadShape { expert_keep: true, ..shape() }),
-            ("layers", LoadShape { explicit_vram_layers: true, ..shape() }),
-            ("hotset", LoadShape { hotset_sidecar: true, ..shape() }),
-            ("whole-first", LoadShape { whole_first: true, ..shape() }),
-            ("stage off", LoadShape { stage_opt_out: true, ..shape() }),
-            ("cpu", LoadShape { cpu_offload: true, ..shape() }),
-            ("npu", LoadShape { npu_trunk: true, ..shape() }),
+            (
+                "ep",
+                LoadShape {
+                    expert_parallel: true,
+                    ..shape()
+                },
+            ),
+            (
+                "pp",
+                LoadShape {
+                    pipeline_band: true,
+                    ..shape()
+                },
+            ),
+            (
+                "recipe",
+                LoadShape {
+                    packed_mq4: false,
+                    ..shape()
+                },
+            ),
+            (
+                "dense",
+                LoadShape {
+                    routed_experts: false,
+                    ..shape()
+                },
+            ),
+            (
+                "keep",
+                LoadShape {
+                    expert_keep: true,
+                    ..shape()
+                },
+            ),
+            (
+                "layers",
+                LoadShape {
+                    explicit_vram_layers: true,
+                    ..shape()
+                },
+            ),
+            (
+                "hotset",
+                LoadShape {
+                    hotset_sidecar: true,
+                    ..shape()
+                },
+            ),
+            (
+                "whole-first",
+                LoadShape {
+                    whole_first: true,
+                    ..shape()
+                },
+            ),
+            (
+                "stage off",
+                LoadShape {
+                    stage_opt_out: true,
+                    ..shape()
+                },
+            ),
+            (
+                "cpu",
+                LoadShape {
+                    cpu_offload: true,
+                    ..shape()
+                },
+            ),
+            (
+                "npu",
+                LoadShape {
+                    npu_trunk: true,
+                    ..shape()
+                },
+            ),
         ];
         for (name, load) in cases {
             assert!(
@@ -1512,7 +1645,10 @@ mod tests {
         assert_eq!(
             preflight(
                 SlowlinkMode::Force,
-                &LoadShape { unified_memory: true, ..shape() }
+                &LoadShape {
+                    unified_memory: true,
+                    ..shape()
+                }
             ),
             Err(SlowlinkDecline::UnifiedMemory)
         );
@@ -1523,7 +1659,13 @@ mod tests {
             );
         }
         assert_eq!(
-            preflight(SlowlinkMode::Force, &LoadShape { max_seq: 3072, ..shape() }),
+            preflight(
+                SlowlinkMode::Force,
+                &LoadShape {
+                    max_seq: 3072,
+                    ..shape()
+                }
+            ),
             Ok(())
         );
     }
@@ -1558,7 +1700,10 @@ mod tests {
 
     #[test]
     fn slowlink_admission_explicit_chunk_rows_must_equal_the_tile() {
-        let with = |env| LoadShape { chunk_rows_env: Some(env), ..shape() };
+        let with = |env| LoadShape {
+            chunk_rows_env: Some(env),
+            ..shape()
+        };
         assert_eq!(preflight(SlowlinkMode::Force, &with("1536")), Ok(()));
         assert_eq!(preflight(SlowlinkMode::Force, &with(" 1536 ")), Ok(()));
         // Rounded down to whole 256-row tiles like the chunk policy.
@@ -1573,7 +1718,11 @@ mod tests {
         );
         // Unusable values are unset, as in the chunk policy.
         for env in ["", "abc", "100", "-1"] {
-            assert_eq!(preflight(SlowlinkMode::Force, &with(env)), Ok(()), "{env:?}");
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &with(env)),
+                Ok(()),
+                "{env:?}"
+            );
         }
     }
 
@@ -1607,14 +1756,20 @@ mod tests {
         assert_eq!(reserve.tables as u64, 18 * pages.table_bytes_per_page);
         assert_eq!(reserve.staging as u64, pages.host_staging_bytes);
         assert_eq!(pages.total_bytes().unwrap(), reserve.device_total as u64);
-        assert_eq!(pages.ring_bytes().unwrap(), 2 * pages.device_page_bytes().unwrap());
+        assert_eq!(
+            pages.ring_bytes().unwrap(),
+            2 * pages.device_page_bytes().unwrap()
+        );
         assert_eq!(
             pages.lookahead_bytes().unwrap(),
             16 * pages.device_page_bytes().unwrap()
         );
         // Plan: ~1.401 GiB of payload beside tables and pads.
         let payload = 18 * extents;
-        assert!(payload > 1_500_000_000 && payload < 1_510_000_000, "{payload}");
+        assert!(
+            payload > 1_500_000_000 && payload < 1_510_000_000,
+            "{payload}"
+        );
         assert_eq!(pages.timeline_events(), 4 * 2048 + 2 * 64);
     }
 
@@ -1699,7 +1854,10 @@ mod tests {
         );
         // The pool's own reserve is the page store: one authority.
         let reserve = profile.pages.pool_spec().unwrap().reserve().unwrap();
-        assert_eq!(profile.pages.total_bytes().unwrap(), reserve.device_total as u64);
+        assert_eq!(
+            profile.pages.total_bytes().unwrap(),
+            reserve.device_total as u64
+        );
         assert_eq!(profile.pages.host_staging_bytes, reserve.staging as u64);
         assert_eq!(reserve.pages, 18);
         assert_eq!(
@@ -1711,6 +1869,11 @@ mod tests {
             a4_sidecar_bytes(&profile.geometry, profile.window_rows).unwrap()
         );
         assert!(profile.census.a4_sidecars > 0 && profile.census.route_storage > 0);
+        assert_eq!(
+            profile.census.group_scatter,
+            group_scatter_bytes(&profile.geometry, profile.window_rows).unwrap()
+        );
+        assert!(profile.census.group_scatter > 0);
         assert_eq!(profile.reserve_bytes().unwrap(), census_total(&inputs));
         assert_eq!(profile.tile_rows, 1536);
         assert!(profile.tile_rows <= 1536);
@@ -1779,9 +1942,14 @@ mod tests {
         let inputs = inputs(200 * GIB);
         assert!(matches!(
             admit(&inputs),
-            Err(SlowlinkDecline::NoHostLayers { resident_layers: 48 })
+            Err(SlowlinkDecline::NoHostLayers {
+                resident_layers: 48
+            })
         ));
-        assert!(!SlowlinkDecline::NoHostLayers { resident_layers: 48 }.is_capacity());
+        assert!(!SlowlinkDecline::NoHostLayers {
+            resident_layers: 48
+        }
+        .is_capacity());
     }
 
     #[test]
@@ -1810,7 +1978,10 @@ mod tests {
         assert_eq!(incumbent.reserve(123).unwrap(), 123 + incumbent.margin);
         assert!(!incumbent.describe().contains("slow-link"));
         let charged = incumbent.with_slowlink(4 * GIB);
-        assert_eq!(charged.reserve(123).unwrap(), 123 + incumbent.margin + 4 * GIB);
+        assert_eq!(
+            charged.reserve(123).unwrap(),
+            123 + incumbent.margin + 4 * GIB
+        );
         assert!(charged.describe().contains("slow-link"));
         assert!(PlacementCharges::new(layer, true)
             .unwrap()
@@ -1835,20 +2006,32 @@ mod tests {
         // Forced: from two tiles up.
         assert_eq!(
             qualify_request(SlowlinkMode::Force, &profile, &req(3071)),
-            Err(RequestBypass::TooShort { rows: 3071, minimum: 3072 })
+            Err(RequestBypass::TooShort {
+                rows: 3071,
+                minimum: 3072
+            })
         );
         assert_eq!(
             qualify_request(SlowlinkMode::Force, &profile, &req(3072)),
-            Ok(RequestVerdict { rows: 3072, windows: 1 })
+            Ok(RequestVerdict {
+                rows: 3072,
+                windows: 1
+            })
         );
         assert_eq!(
             qualify_request(SlowlinkMode::Force, &profile, &req(16384)),
-            Ok(RequestVerdict { rows: 16384, windows: 1 })
+            Ok(RequestVerdict {
+                rows: 16384,
+                windows: 1
+            })
         );
         // A prompt past the window runs superwindows and says so.
         assert_eq!(
             qualify_request(SlowlinkMode::Force, &profile, &req(16385)),
-            Ok(RequestVerdict { rows: 16385, windows: 2 })
+            Ok(RequestVerdict {
+                rows: 16385,
+                windows: 2
+            })
         );
         assert_eq!(
             qualify_request(SlowlinkMode::Off, &profile, &req(16384)),
@@ -1870,7 +2053,10 @@ mod tests {
                 qualify_request(
                     SlowlinkMode::Force,
                     &profile,
-                    &RequestShape { capture, ..req(16384) }
+                    &RequestShape {
+                        capture,
+                        ..req(16384)
+                    }
                 ),
                 Err(bypass)
             );
@@ -1879,7 +2065,11 @@ mod tests {
             assert!(qualify_request(
                 SlowlinkMode::Force,
                 &profile,
-                &RequestShape { capture, entry_pos: 4096, ..req(16384) }
+                &RequestShape {
+                    capture,
+                    entry_pos: 4096,
+                    ..req(16384)
+                }
             )
             .is_ok());
         }
@@ -1887,7 +2077,10 @@ mod tests {
             qualify_request(
                 SlowlinkMode::Force,
                 &profile,
-                &RequestShape { session_cuts: 4, ..req(16384) }
+                &RequestShape {
+                    session_cuts: 4,
+                    ..req(16384)
+                }
             )
             .unwrap()
             .windows,
@@ -1897,9 +2090,15 @@ mod tests {
             qualify_request(
                 SlowlinkMode::Force,
                 &profile,
-                &RequestShape { session_cuts: 5, ..req(16384) }
+                &RequestShape {
+                    session_cuts: 5,
+                    ..req(16384)
+                }
             ),
-            Err(RequestBypass::TooManyBoundaries { cuts: 5, maximum: 4 })
+            Err(RequestBypass::TooManyBoundaries {
+                cuts: 5,
+                maximum: 4
+            })
         );
         assert_eq!(S1_MIN_AUTO_REQUEST_ROWS, 16384);
         assert_eq!(profile.windows_for(1), 1);
@@ -1914,7 +2113,10 @@ mod tests {
         assert_eq!(dims.hidden, profile.geometry.hidden);
         assert_eq!(dims.n_exp, 512);
         assert_eq!(dims.mi, profile.geometry.moe_intermediate);
-        assert_eq!(dims.shared_intermediate, profile.geometry.shared_intermediate);
+        assert_eq!(
+            dims.shared_intermediate,
+            profile.geometry.shared_intermediate
+        );
         // At most (4 session-cut segments + 1 entry tile + the window tail) short tiles of 8 rows.
         assert_eq!(dims.k1_rows, 48);
         assert_eq!(S1_K1_TAIL_ROWS, 48);
@@ -1926,6 +2128,11 @@ mod tests {
             "census and allocation read one layout"
         );
         assert_eq!(profile.census.a4_sidecars, layout.a4_sidecar_bytes() as u64);
+        assert_eq!(profile.census.group_scatter, layout.group_scatter_bytes() as u64);
+        // Full window grouped-scatter scratch at N=16384 slots=163840, E=512:
+        // the 1536-tile's 309,248 B stays in the base reserve (replacement
+        // peak holds old + new), so the full figure is charged on top.
+        assert_eq!(profile.census.group_scatter, 3_278_848);
     }
 
     #[test]
@@ -1940,8 +2147,20 @@ mod tests {
         for (mode, load) in [
             (SlowlinkMode::Off, shape()),
             (SlowlinkMode::Auto, shape()),
-            (SlowlinkMode::Force, LoadShape { arch: "gfx1201", ..shape() }),
-            (SlowlinkMode::Force, LoadShape { explicit_vram_layers: true, ..shape() }),
+            (
+                SlowlinkMode::Force,
+                LoadShape {
+                    arch: "gfx1201",
+                    ..shape()
+                },
+            ),
+            (
+                SlowlinkMode::Force,
+                LoadShape {
+                    explicit_vram_layers: true,
+                    ..shape()
+                },
+            ),
         ] {
             let outcome = select_load_profile(mode, &load, || unreachable!("probed"), facts);
             assert_eq!(outcome, Ok(None));
