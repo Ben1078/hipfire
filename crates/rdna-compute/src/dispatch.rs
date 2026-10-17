@@ -8554,6 +8554,13 @@ impl HostAllocLease {
     pub fn holders(&self) -> usize {
         std::sync::Arc::strong_count(&self.owner)
     }
+
+    /// The physical owner as a type-erased keepalive (a clone of the shared `Arc`, no
+    /// allocation): whoever holds it keeps the `hipHostMalloc` bytes alive, exactly like an
+    /// expert tier lease, and the last holder's drop frees them once.
+    pub fn keepalive(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        self.owner.clone()
+    }
 }
 
 #[cfg(test)]
@@ -8667,6 +8674,22 @@ mod slowlink_host_lease_tests {
         assert!(t.release(key).is_none(), "double release never frees or returns twice");
         drop((first, second));
         assert_eq!(freed(key), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_type_erased_keepalive_holds_the_owner_without_a_wrapper() {
+        // `HostAllocLease::keepalive` is `owner.clone()` coerced to `Arc<dyn Any + Send + Sync>`:
+        // the same physical Arc (no extra allocation, no second owner).
+        let key = 0x8000;
+        let mut t = HostLeaseTable::new();
+        let owner = lease(&mut t, key);
+        let keep: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
+        assert_eq!(Arc::strong_count(&owner), 3, "registry + owner + keepalive share one Arc");
+        drop(owner);
+        drop(t.release(key));
+        assert_eq!(freed(key), 0, "the erased keepalive alone keeps the bytes alive");
+        drop(keep);
+        assert_eq!(freed(key), 1, "the last holder frees exactly once");
     }
 
     #[test]
