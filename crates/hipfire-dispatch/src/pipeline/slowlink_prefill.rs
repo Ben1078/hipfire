@@ -1253,6 +1253,672 @@ pub fn finish_shared(
     super::qt44_qt53_prefill::slowlink_shared_down(gpu, params, call.use_path2, &target)
 }
 
+// ───────────────────────────── real-device primitive self-tests ─────────────────────────────
+
+/// D-owned diagnostic entrypoints for the hold's primitive stage.  Each runs the PRODUCTION
+/// kernels/wrappers and [`execute_panel`] over a synthetic window on a real device and checks
+/// the result against the CPU canonical model and the monolithic GPU combine.  The caller's
+/// forward supplies a real [`PreparedChunkCall`] (its sealed tile call names the model's
+/// scratch and geometry) and a real [`ExpertPanelBinding`] (resident or a staged lease), so
+/// no private call is needed outside this crate.  Synthetic routes and values; the weights
+/// are the model's.  Nothing here runs on the CPU in place of a device check.
+pub mod selftest {
+    use super::*;
+    use rdna_compute::slab_moe::slowlink_selftest as model;
+
+    const GUARD: usize = 4096;
+    const GUARD_BYTE: u8 = 0xA5;
+
+    /// One named check of a primitive.
+    #[derive(Clone, Debug)]
+    pub struct PrimitiveCheck {
+        pub name: String,
+        pub ok: bool,
+        pub detail: String,
+    }
+
+    /// The outcome of one primitive; `ok` is the conjunction of its checks.
+    #[derive(Clone, Debug)]
+    pub struct PrimitiveReport {
+        pub name: &'static str,
+        pub ok: bool,
+        pub checks: Vec<PrimitiveCheck>,
+    }
+
+    fn json_str(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                c if (c as u32) < 0x20 => out.push(' '),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    impl PrimitiveReport {
+        fn new(name: &'static str) -> Self {
+            Self { name, ok: true, checks: Vec::new() }
+        }
+
+        fn check(&mut self, name: &str, ok: bool, detail: impl Into<String>) {
+            self.ok &= ok;
+            self.checks.push(PrimitiveCheck {
+                name: name.to_owned(),
+                ok,
+                detail: detail.into(),
+            });
+        }
+
+        pub fn to_json(&self) -> String {
+            let checks: Vec<String> = self
+                .checks
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"name\":{},\"ok\":{},\"detail\":{}}}",
+                        json_str(&c.name),
+                        c.ok,
+                        json_str(&c.detail)
+                    )
+                })
+                .collect();
+            format!(
+                "{{\"primitive\":{},\"ok\":{},\"checks\":[{}]}}",
+                json_str(self.name),
+                self.ok,
+                checks.join(",")
+            )
+        }
+    }
+
+    fn sync(gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let gpu: &Gpu = gpu;
+        match gpu.active_stream.as_ref() {
+            Some(stream) => hip(gpu.hip.stream_synchronize(stream)),
+            None => hip(gpu.hip.device_synchronize()),
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn i32_bytes(v: &[i32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn diffs(a: &[f32], b: &[f32]) -> usize {
+        a.iter().zip(b).filter(|(x, y)| !model::same(**x, **y)).count()
+    }
+
+    /// The shipped canonical combine kernels (`moe_combine_order_top10` +
+    /// `moe_down_combine_grouped_top10_bf16in`) over an assembled grouped-row buffer and a
+    /// zero accumulator.
+    #[allow(clippy::too_many_arguments)]
+    fn monolithic(
+        gpu: &mut Gpu,
+        tokens: usize,
+        hidden: usize,
+        n_exp: usize,
+        grouped_rows: usize,
+        down: &[u16],
+        inverse: &[i32],
+        ids: &[i32],
+        weights: &[f32],
+    ) -> Result<Vec<f32>, DispatchError> {
+        let down_bytes: Vec<u8> = down.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let down_t = hip(gpu.upload_raw(&down_bytes, &[down_bytes.len()]))?;
+        let inv_t = hip(gpu.upload_raw(&i32_bytes(inverse), &[inverse.len() * 4]))?;
+        let ids_t = hip(gpu.upload_raw(&i32_bytes(ids), &[ids.len() * 4]))?;
+        let w_t = hip(gpu.upload_f32(weights, &[weights.len()]))?;
+        let res_t = hip(gpu.upload_f32(&vec![0.0; tokens * hidden], &[tokens * hidden]))?;
+        let order_t = hip(gpu.alloc_tensor(&[tokens * K_TOP * 8], DType::Raw))?;
+        let result = (|| {
+            hip(gpu.moe_down_combine_grouped_top10_bf16in(
+                &down_t,
+                &inv_t,
+                &ids_t,
+                &w_t,
+                &res_t,
+                &order_t,
+                hidden,
+                grouped_rows,
+                tokens,
+                false,
+                n_exp,
+            ))?;
+            sync(gpu)?;
+            hip(gpu.download_f32(&res_t))
+        })();
+        for t in [down_t, inv_t, ids_t, w_t, res_t, order_t] {
+            let _ = gpu.free_tensor(t);
+        }
+        result
+    }
+
+    struct SynthTile {
+        k1: bool,
+        ids: Vec<i32>,
+        weights: Vec<f32>,
+        x: Vec<f32>,
+    }
+
+    impl SynthTile {
+        fn rows(&self) -> usize {
+            self.ids.len() / K_TOP
+        }
+    }
+
+    fn synth_tile(
+        rng: &mut model::Rng,
+        rows: usize,
+        hidden: usize,
+        k1: bool,
+        mut id_of: impl FnMut(usize, usize) -> i32,
+    ) -> SynthTile {
+        SynthTile {
+            k1,
+            ids: (0..rows * K_TOP).map(|s| id_of(s / K_TOP, s % K_TOP)).collect(),
+            weights: (0..rows * K_TOP).map(|_| rng.unit()).collect(),
+            x: (0..rows * hidden).map(|_| rng.unit()).collect(),
+        }
+    }
+
+    struct Window {
+        routes: PromptRouteStorage,
+        plan: LayerRoutePlan,
+        panels: Vec<PanelRange>,
+        acc: Vec<f32>,
+        /// The K2 panels' BF16 down rows assembled by grouped row.
+        down: Vec<u16>,
+        inverse: Vec<i32>,
+        canary_checks: usize,
+        canary_violations: usize,
+    }
+
+    struct WindowOut {
+        plan: LayerRoutePlan,
+        panels: Vec<PanelRange>,
+        acc: Vec<f32>,
+        down: Vec<u16>,
+        inverse: Vec<i32>,
+        canary_checks: usize,
+        canary_violations: usize,
+    }
+
+    fn guard_view(t: &GpuTensor, used: usize) -> Option<GpuTensor> {
+        let size = t.buf.size();
+        (used < size).then(|| {
+            let len = GUARD.min(size - used);
+            GpuTensor {
+                buf: t.buf.byte_view(used, len),
+                shape: vec![len],
+                dtype: DType::Raw,
+            }
+        })
+    }
+
+    /// Seed `tiles` into `routes`, then run the production pipeline: route plan, schedule,
+    /// panels (with guard canaries around both panel scratches when `canaries`), combine.
+    fn run_window_inner(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        routes: &mut PromptRouteStorage,
+        bindings: &[ExpertPanelBinding<'_>],
+        limits: PanelLimits,
+        tiles: &[SynthTile],
+        canaries: bool,
+    ) -> Result<WindowOut, DispatchError> {
+        let layout = routes.layout.clone();
+        let d = layout.dims;
+        sync(gpu)?;
+        let (mut row0, mut k1_used) = (0usize, 0usize);
+        for tile in tiles {
+            let rows = tile.rows();
+            if tile.x.len() != rows * d.hidden || tile.weights.len() != rows * K_TOP || row0 + rows > d.rows {
+                return Err(bail("a synthetic tile does not fit the window"));
+            }
+            let mut put = |view: GpuTensor, bytes: &[u8]| hip(gpu.hip.memcpy_htod(&view.buf, bytes));
+            put(routes.f32_rows(layout.x_norm, row0, rows, d.hidden), &f32_bytes(&tile.x))?;
+            put(routes.ids_view(layout.topk_ids, row0, rows), &i32_bytes(&tile.ids))?;
+            put(routes.f32_rows(layout.topk_weights, row0, rows, K_TOP), &f32_bytes(&tile.weights))?;
+            let route_ids = if tile.k1 {
+                vec![-1i32; rows * K_TOP]
+            } else {
+                tile.ids.clone()
+            };
+            put(routes.ids_view(layout.route_ids, row0, rows), &i32_bytes(&route_ids))?;
+            routes.tiles.push(TileRec { row0, rows, k1: tile.k1, k1_row0: k1_used });
+            if tile.k1 {
+                k1_used += rows;
+            }
+            row0 += rows;
+        }
+        routes.filled = row0;
+        routes.k1_used = k1_used;
+        routes.signature = Some(call.signature());
+        if row0 != d.rows {
+            return Err(bail("the synthetic tiles do not fill the window"));
+        }
+        let plan = finish_route_plan(gpu, routes, limits)?;
+        let ranges: Vec<(usize, usize)> = bindings.iter().map(|b| (b.expert_lo, b.expert_hi)).collect();
+        let panels = plan.schedule(&ranges, limits)?;
+        let mut scratch = PanelScratch::new(call, limits)?;
+        let (y_gu, y_dn) = (scratch.params.y_gate_up_grouped, scratch.params.y_down_grouped);
+        let mut down = vec![0u16; plan.total_rows * d.hidden];
+        let (mut canary_checks, mut canary_violations) = (0usize, 0usize);
+        {
+            let shared: &PromptRouteStorage = routes;
+            let mut cursor = OrderedCombineCursor::start(gpu, shared, &panels)?;
+            for panel in &panels {
+                let (gu_used, dn_used) = (panel.rows * d.mi * BF16_BYTES, panel.rows * d.hidden * BF16_BYTES);
+                let guards: Vec<GpuTensor> = if canaries && panel.rows > 0 {
+                    [guard_view(y_gu, gu_used), guard_view(y_dn, dn_used)]
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for g in &guards {
+                    hip(gpu.slowlink_fill_bytes(g, GUARD_BYTE, g.buf.size()))?;
+                }
+                execute_panel(
+                    gpu,
+                    bindings[panel.binding],
+                    plan.view(shared, panel),
+                    &mut scratch,
+                    &mut cursor,
+                )?;
+                if panel.rows > 0 {
+                    sync(gpu)?;
+                    for g in &guards {
+                        let bytes = hip(gpu.download_raw_bytes(g))?;
+                        canary_checks += bytes.len();
+                        canary_violations += bytes.iter().filter(|&&b| b != GUARD_BYTE).count();
+                    }
+                    let rows_view = GpuTensor {
+                        buf: y_dn.buf.byte_view(0, dn_used),
+                        shape: vec![dn_used],
+                        dtype: DType::Raw,
+                    };
+                    let bytes = hip(gpu.download_raw_bytes(&rows_view))?;
+                    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+                        down[panel.row_base * d.hidden + i] = u16::from_le_bytes([pair[0], pair[1]]);
+                    }
+                }
+            }
+            finish_combine(gpu, shared, &mut cursor)?;
+        }
+        sync(gpu)?;
+        let acc = hip(gpu.download_f32(routes.combined()))?;
+        let inverse_view = routes.ids_view(layout.inverse, 0, d.rows);
+        let inverse = hip(gpu.slowlink_sync_download_i32(&inverse_view, d.rows * K_TOP))?;
+        Ok(WindowOut {
+            plan,
+            panels,
+            acc,
+            down,
+            inverse,
+            canary_checks,
+            canary_violations,
+        })
+    }
+
+    fn run_window(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        bindings: &[ExpertPanelBinding<'_>],
+        limits: PanelLimits,
+        tiles: &[SynthTile],
+        canaries: bool,
+    ) -> Result<Window, DispatchError> {
+        let rows: usize = tiles.iter().map(SynthTile::rows).sum();
+        let k1_rows: usize = tiles.iter().filter(|t| t.k1).map(SynthTile::rows).sum();
+        let layout = PromptRouteLayout::new(&PromptRouteDims {
+            rows,
+            hidden: call.hidden,
+            n_exp: call.n_exp,
+            mi: call.mi,
+            shared_intermediate: 0,
+            k1_rows,
+        })?;
+        let mut routes = PromptRouteStorage::alloc(gpu, &layout)?;
+        match run_window_inner(gpu, call, &mut routes, bindings, limits, tiles, canaries) {
+            Ok(out) => Ok(Window {
+                routes,
+                plan: out.plan,
+                panels: out.panels,
+                acc: out.acc,
+                down: out.down,
+                inverse: out.inverse,
+                canary_checks: out.canary_checks,
+                canary_violations: out.canary_violations,
+            }),
+            Err(error) => {
+                let _ = sync(gpu);
+                routes.release(gpu);
+                Err(error)
+            }
+        }
+    }
+
+    /// The CPU canonical combine over the window's actual K2 grouped down rows.
+    fn cpu_canonical(window: &Window, call: &PreparedChunkCall<'_>, ids: &[i32], weights: &[f32]) -> Vec<f32> {
+        let tokens = ids.len() / K_TOP;
+        let case = model::Case {
+            tokens,
+            h: call.hidden,
+            n_exp: call.n_exp,
+            g: window.plan.total_rows,
+            start: window.plan.offsets.clone(),
+            down: window.down.clone(),
+            inv: window.inverse.clone(),
+            topk: ids.to_vec(),
+            w: weights.to_vec(),
+            init: vec![0.0; tokens * call.hidden],
+            class: vec![0; tokens],
+        };
+        model::canonical(&case)
+    }
+
+    /// `canonical_combine_exact`: the production panel/pad combine kernels over the
+    /// adversarial fixture and many partitions (within-expert splits included) equal the CPU
+    /// canonical model and the monolithic GPU combine; reversed panel order differs.
+    pub fn canonical_combine_exact(gpu: &mut Gpu, seed: u64) -> Result<PrimitiveReport, DispatchError> {
+        let mut rep = PrimitiveReport::new("canonical_combine_exact");
+        let r = hip(model::canonical_combine_exact(gpu, seed))?;
+        rep.check("panels_equal_cpu_canonical", r.mismatches_vs_cpu == 0, r.to_json());
+        rep.check(
+            "panels_equal_monolithic_gpu",
+            r.mismatches_vs_monolithic_gpu == 0,
+            format!("{} mismatches over {} partitions", r.mismatches_vs_monolithic_gpu, r.partitions),
+        );
+        rep.check(
+            "reversed_order_negative_control_differs",
+            r.reversed_order_diffs > 0,
+            format!("{} diffs", r.reversed_order_diffs),
+        );
+        Ok(rep)
+    }
+
+    /// `within_expert_panel_canary`: one hot expert with more rows than a panel may hold is
+    /// split across panels by the production schedule; guard canaries after every panel's
+    /// scratch spans stay intact, every panel respects the row bound, and the combine equals
+    /// the CPU canonical model and the monolithic GPU combine over the actual GEMM rows.
+    pub fn within_expert_panel_canary(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        let mut rep = PrimitiveReport::new("within_expert_panel_canary");
+        let (lo, hi) = (binding.expert_lo, binding.expert_hi);
+        if hi <= lo || hi > call.n_exp {
+            return Err(bail("the binding names no experts"));
+        }
+        let width = hi - lo;
+        let tokens = limits.max_grouped_rows;
+        let mut rng = model::Rng(seed | 1);
+        let tile = synth_tile(&mut rng, tokens, call.hidden, false, |tok, r| {
+            if r < 3 {
+                lo as i32
+            } else {
+                (lo + (tok * 7 + r * 3) % width) as i32
+            }
+        });
+        let (ids, weights) = (tile.ids.clone(), tile.weights.clone());
+        let window = run_window(gpu, call, &[binding], limits, &[tile], true)?;
+        let hot_rows = window.plan.counts_padded[lo] as usize;
+        rep.check(
+            "hot_expert_exceeds_one_panel",
+            hot_rows > limits.max_grouped_rows,
+            format!("hot expert {lo}: {hot_rows} rows, bound {}", limits.max_grouped_rows),
+        );
+        let hot_panels = window
+            .panels
+            .iter()
+            .filter(|p| p.rows > 0 && p.expert_lo <= lo && lo < p.expert_hi)
+            .count();
+        rep.check(
+            "hot_expert_split_across_panels",
+            hot_panels >= 2,
+            format!("{hot_panels} panels hold expert {lo}"),
+        );
+        let max_rows = window.panels.iter().map(|p| p.rows).max().unwrap_or(0);
+        rep.check(
+            "every_panel_within_hard_bound",
+            max_rows <= limits.max_grouped_rows,
+            format!("max panel rows {max_rows}"),
+        );
+        rep.check(
+            "panels_cover_every_grouped_row_once",
+            window.panels.iter().map(|p| p.rows).sum::<usize>() == window.plan.total_rows,
+            format!("{} rows over {} panels", window.plan.total_rows, window.panels.len()),
+        );
+        rep.check(
+            "scratch_guard_canaries_intact",
+            window.canary_checks > 0 && window.canary_violations == 0,
+            format!("{} guard bytes checked, {} overwritten", window.canary_checks, window.canary_violations),
+        );
+        let want = cpu_canonical(&window, call, &ids, &weights);
+        rep.check(
+            "combine_equals_cpu_canonical",
+            diffs(&window.acc, &want) == 0,
+            format!("{} mismatching elements", diffs(&window.acc, &want)),
+        );
+        if window.plan.total_rows > 0 {
+            let mono = monolithic(
+                gpu,
+                tokens,
+                call.hidden,
+                call.n_exp,
+                window.plan.total_rows,
+                &window.down,
+                &window.inverse,
+                &ids,
+                &weights,
+            )?;
+            rep.check(
+                "combine_equals_monolithic_gpu",
+                diffs(&window.acc, &mono) == 0,
+                format!("{} mismatching elements", diffs(&window.acc, &mono)),
+            );
+        }
+        window.routes.release(gpu);
+        Ok(rep)
+    }
+
+    /// The K1 short-tail scenario: a K1 tile (and, with `with_k2`, a K2 tile) over a binding
+    /// split in two halves, so the cohort runs once per half with masked ids; the K1 rows
+    /// must equal the incumbent's own unmasked K1 path over the whole binding.
+    fn k1_scenario(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+        with_k2: bool,
+        rep: &mut PrimitiveReport,
+    ) -> Result<(), DispatchError> {
+        let (lo, hi) = (binding.expert_lo, binding.expert_hi);
+        if hi - lo < 2 || hi > call.n_exp {
+            return Err(bail("the K1 scenario needs a binding of at least two experts"));
+        }
+        let mid = lo + (hi - lo) / 2;
+        let halves = [
+            ExpertPanelBinding { expert_hi: mid, ..binding },
+            ExpertPanelBinding { expert_lo: mid, ..binding },
+        ];
+        let width = hi - lo;
+        let k1_rows = 3usize.min(gpu.few_row_limit());
+        let mut rng = model::Rng(seed | 1);
+        let mut tiles = Vec::new();
+        if with_k2 {
+            tiles.push(synth_tile(&mut rng, 64, call.hidden, false, |tok, r| {
+                (lo + (tok * 11 + r * 5) % width) as i32
+            }));
+        }
+        let k1_tile = synth_tile(&mut rng, k1_rows, call.hidden, true, |tok, r| match (tok, r) {
+            (0, 0) => lo as i32,
+            (0, 1) => (hi - 1) as i32,
+            (t, 9) if t + 1 == k1_rows => -1,
+            _ => (lo + (tok * 5 + r * 3) % width) as i32,
+        });
+        let k1_ids = k1_tile.ids.clone();
+        tiles.push(k1_tile);
+        let k2_rows: usize = if with_k2 { tiles[0].rows() } else { 0 };
+        let all_ids: Vec<i32> = tiles
+            .iter()
+            .flat_map(|t| if t.k1 { vec![-1; t.ids.len()] } else { t.ids.clone() })
+            .collect();
+        let all_weights: Vec<f32> = tiles.iter().flat_map(|t| t.weights.clone()).collect();
+        let window = run_window(gpu, call, &halves, limits, &tiles, true)?;
+        let mut expected_experts: Vec<usize> = k1_ids
+            .iter()
+            .filter(|&&id| id >= 0 && (id as usize) < call.n_exp)
+            .map(|&id| id as usize)
+            .collect();
+        expected_experts.sort_unstable();
+        expected_experts.dedup();
+        rep.check(
+            "k1_experts_downloaded_at_the_one_barrier",
+            window.plan.k1_experts == expected_experts,
+            format!("{:?} vs {:?}", window.plan.k1_experts, expected_experts),
+        );
+        let k1_panels = window.panels.iter().filter(|p| p.k1).count();
+        rep.check(
+            "k1_cohort_runs_once_per_binding",
+            k1_panels == 2,
+            format!("{k1_panels} flagged panels over 2 bindings"),
+        );
+        if !with_k2 {
+            rep.check(
+                "k1_only_window_has_only_zero_row_panels",
+                window.plan.total_rows == 0
+                    && window.panels.len() == 2
+                    && window.panels.iter().all(|p| p.rows == 0 && p.k1),
+                format!("{} rows, {} panels", window.plan.total_rows, window.panels.len()),
+            );
+        } else {
+            let want = cpu_canonical(&window, call, &all_ids, &all_weights);
+            let n = k2_rows * call.hidden;
+            rep.check(
+                "k2_rows_equal_cpu_canonical_beside_the_cohort",
+                diffs(&window.acc[..n], &want[..n]) == 0,
+                format!("{} mismatching elements", diffs(&window.acc[..n], &want[..n])),
+            );
+            rep.check(
+                "scratch_guard_canaries_intact",
+                window.canary_violations == 0,
+                format!("{} of {} guard bytes overwritten", window.canary_violations, window.canary_checks),
+            );
+        }
+        // The incumbent's own K1 path over the whole binding, from the same saved input.
+        let layout = window.routes.layout.clone();
+        let d = layout.dims;
+        let tile = *window
+            .routes
+            .tiles
+            .iter()
+            .find(|t| t.k1)
+            .ok_or_else(|| bail("no K1 tile was recorded"))?;
+        let params = *call.params();
+        let mut view = params;
+        view.batch_size = tile.rows;
+        hip(gpu.memcpy_dtod_at_ordered_async(
+            &params.x_norm_batch.buf,
+            0,
+            &window.routes.region.buf,
+            layout.x_norm + tile.row0 * d.hidden * F32_BYTES,
+            tile.rows * d.hidden * F32_BYTES,
+        ))?;
+        let ids = window.routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
+        let weights = window.routes.f32_rows(layout.topk_weights, tile.row0, tile.rows, K_TOP);
+        let y0 = hip(gpu.alloc_tensor(&[tile.rows * K_TOP * d.hidden], DType::F32))?;
+        let reference = hip(gpu.zeros(&[tile.rows * d.hidden], DType::F32))?;
+        let run = (|| -> Result<Vec<f32>, DispatchError> {
+            super::super::qt44_qt53_prefill::slowlink_k1_panel(
+                gpu,
+                &view,
+                &ids,
+                binding.gate_up_table,
+                binding.down_table,
+                &y0,
+            )?;
+            hip(gpu.moe_down_combine_top10_batched(
+                &y0, &ids, &weights, &reference, d.hidden, tile.rows, d.n_exp,
+            ))?;
+            sync(gpu)?;
+            hip(gpu.download_f32(&reference))
+        })();
+        let _ = gpu.free_tensor(y0);
+        let _ = gpu.free_tensor(reference);
+        let reference = run?;
+        let got = &window.acc[tile.row0 * d.hidden..(tile.row0 + tile.rows) * d.hidden];
+        rep.check(
+            "k1_rows_equal_the_incumbent_k1_path",
+            diffs(got, &reference) == 0,
+            format!("{} mismatching elements over {} rows", diffs(got, &reference), tile.rows),
+        );
+        window.routes.release(gpu);
+        Ok(())
+    }
+
+    /// `k1_tail_cohort`: a short-tail tile beside a K2 tile, cohort run per binding against
+    /// masked ids, equals the incumbent K1 arithmetic; the K2 rows are unaffected.
+    pub fn k1_tail_cohort(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        let mut rep = PrimitiveReport::new("k1_tail_cohort");
+        k1_scenario(gpu, call, binding, limits, seed, true, &mut rep)?;
+        Ok(rep)
+    }
+
+    /// `zero_row_panel`: (a) a window where nothing routes yields exactly one zero-row
+    /// combine-only panel owning every expert and an all +0 accumulator; (b) a K1-only
+    /// window yields only zero-row K1 panels whose rows still equal the incumbent K1 path.
+    pub fn zero_row_panel(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        let mut rep = PrimitiveReport::new("zero_row_panel");
+        let mut rng = model::Rng(seed | 1);
+        let tile = synth_tile(&mut rng, 40, call.hidden, false, |_, _| -1);
+        let window = run_window(gpu, call, &[binding], limits, &[tile], true)?;
+        let only = window.panels.first().copied();
+        rep.check(
+            "empty_window_is_one_zero_row_panel_owning_every_expert",
+            window.plan.total_rows == 0
+                && window.panels.len() == 1
+                && only.is_some_and(|p| p.rows == 0 && !p.k1 && p.own_lo == 0 && p.own_hi == call.n_exp),
+            format!("{} rows, panels {:?}", window.plan.total_rows, window.panels),
+        );
+        rep.check(
+            "empty_window_accumulator_is_all_positive_zero",
+            window.acc.iter().all(|v| v.to_bits() == 0),
+            format!("{} non-+0 elements", window.acc.iter().filter(|v| v.to_bits() != 0).count()),
+        );
+        window.routes.release(gpu);
+        k1_scenario(gpu, call, binding, limits, seed ^ 0x5a5a, false, &mut rep)?;
+        Ok(rep)
+    }
+}
+
 #[cfg(test)]
 mod slowlink_panel_tests {
     use super::*;
