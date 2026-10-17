@@ -7517,9 +7517,12 @@ mod qwen4_slowlink_tests {
         }
     }
 
+    /// The real MQ4 fixture (H0 receipt `source.layer_identity`): gate/up
+    /// `[512, 1280, 2560]`, down `[512, 2560, 640]`, so hidden 2560 and expert
+    /// intermediate 640 (1,740,800 and 870,400 payload bytes per expert).
     fn geometry() -> s1::ModelGeometry {
         s1::ModelGeometry {
-            hidden: 2048,
+            hidden: 2560,
             hc_count: 4,
             num_experts: 512,
             experts_per_token: 10,

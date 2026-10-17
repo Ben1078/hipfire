@@ -1665,6 +1665,28 @@ mod tests {
         assert!(PromptArenaLayout::new(&geometry, usize::MAX / 2, S1_TILE_ROWS).is_err());
     }
 
+    /// The fixture every layout test sizes from is the real MQ4 model, not a
+    /// smaller synthetic one: the H0 MQ4 receipt's layer identity is gate/up
+    /// `[512, 1280, 2560]` and down `[512, 2560, 640]` (H2560, expert
+    /// intermediate 640, NOT 512), 1,740,800 / 870,400 payload bytes per expert.
+    #[test]
+    fn slowlink_admission_fixture_is_the_h0_mq4_layer_identity() {
+        let geometry = geometry();
+        assert_eq!(geometry.hidden, 2560);
+        assert_eq!(geometry.moe_intermediate, 640);
+        assert_eq!(geometry.num_experts, 512);
+        assert_eq!(geometry.experts_per_token, 10);
+        assert_eq!(geometry.hc_count, 4);
+        assert_eq!(geometry.shared_intermediate, 640);
+        // gate/up is [n_exp, 2 * mi, hidden], down [n_exp, hidden, mi].
+        assert_eq!(2 * geometry.moe_intermediate, 1280);
+        assert_eq!(GATE_UP_LAYER, 891_289_600);
+        assert_eq!(DOWN_LAYER, 445_644_800);
+        let pages = PanelPageLayout::new(512, GATE_UP_LAYER, DOWN_LAYER).unwrap();
+        assert_eq!(pages.gate_up_expert_bytes, 1_740_800);
+        assert_eq!(pages.down_expert_bytes, 870_400);
+    }
+
     #[test]
     fn slowlink_admission_census_equals_the_allocated_layouts() {
         let inputs = inputs(free_for(&inputs(0), 10));
