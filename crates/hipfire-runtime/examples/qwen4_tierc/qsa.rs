@@ -29,9 +29,10 @@
 //! (`__shfl_*(.., 32)`, `lane = tid & 31`, `wave = tid >> 5`), so a block's
 //! eight software waves behave as on wave32.
 //!
-//! Exactness claim (gfx942 only; other archs keep the CPU-twin tolerance
-//! checks): every parallel kernel is bitwise its `*_serial` HIP twin, scores
-//! and selection (lowest-index tie rule) and the attention output F32 bits.
+//! Serial-kernel exactness claim (gfx942 only): every parallel kernel is bitwise
+//! its `*_serial` HIP twin, scores and selection (lowest-index tie rule) and the
+//! attention output F32 bits. Open-gate attention batches on every architecture
+//! instead assert bitwise equality with n one-row public decode launches.
 //! Cases:
 //! - `*_route` call the public launchers under both scope settings and every
 //!   arm (`select_arm_name` / `attn_arm` label the arm the launcher's predicates
@@ -66,6 +67,9 @@ use rdna_compute::tensor_ops::{
     QsaKvFormat, QsaPositionBinding,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+mod attn_open_gate;
+use attn_open_gate::{attn_arm, attn_one_row_calls};
 
 pub const CASES: &[Q4Case] = &[
     Q4Case {
@@ -1825,9 +1829,9 @@ fn case_pool_rope_bf16(gpu: &mut Gpu) -> Result<String, String> {
 /// invariant prefill scope sends every count to rows16. 15/16/17/31/32 straddle
 /// the 16- and 32-row tile edges.
 const SEL_ROWS: [usize; 9] = [1, 8, 9, 15, 16, 17, 31, 32, 33];
-/// Attention row counts either side of the hg4 minimum (1 -> generic parallel,
-/// 2 -> hg4), the hg12 minimum (15 -> hg4, 16 -> hg12) and the wide-verify
-/// widths (31, 32; 17 ragged).
+/// Attention widths spanning the legacy hg4/hg12 thresholds and the wide-verify
+/// gate: scope-off rows 2..=32 use the decode policy, 33 is past the gate, and
+/// prefill scope keeps the legacy row-routed kernels.
 const ATTN_ROWS: [usize; 9] = [1, 2, 7, 15, 16, 17, 31, 32, 33];
 /// A budget past `select_from_scores`' 512-block cap: the launcher keeps the
 /// fused selector, and the past-radix-list-capacity rank-everything path runs.
@@ -2322,35 +2326,25 @@ fn attn_claim(gpu: &Gpu, label: &str, got: &[f32], serial: &[f32]) -> Result<Str
     }
 }
 
-/// The kernel the gfx942 launcher takes (label only; derived from the launcher's
-/// predicates `route_rows >= 16` + 12 heads per KV head (hg12), `route_rows >= 2`
-/// + head group % 4 (hg4), else the per-head parallel kernel).
-fn attn_arm(g: AttnGeom, rows: usize, scope: bool) -> &'static str {
-    let route_rows = if scope {
-        rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS
-    } else {
-        rows
-    };
-    if g.head_dim == 256 && g.heads == g.kv_heads * 12 && route_rows >= 16 {
-        "hg12"
-    } else if g.head_dim == 256 && (g.heads / g.kv_heads) % 4 == 0 && route_rows >= 2 {
-        "hg4"
-    } else {
-        "generic_parallel"
-    }
-}
-
 /// Public `indexed_attention_attention_batch_with_arena(.., None)` as the route
 /// calls it (`execute_indexed_attention_hc_impl`), under both
-/// `prefill_invariant_scope` settings: decode (scope off) takes the per-head
-/// parallel kernel at 1 row, hg4 at 2..15 rows and hg12 from 16; the prefill
-/// scope routes every count as 8192 rows (hg12). 2802 ctx => 700 blocks, 512
-/// chosen + tail => selected_len 2048..2050 (<= the 2304-row hg12 tile budget);
-/// 402 ctx keeps every block. Row 0 carries injected `-1` / not-yet-visible
-/// entries the kernels must skip. Per data set (uniform, realistic): CPU twin at
-/// F32_ACCUM (the twin sums in the kernels' d / selected-row order; `expf` and
-/// contraction differ in the last ulps), and on gfx942 raw F32 bits equal to
-/// `indexed_attention_attention_f32_batched_serial` HIP.
+/// `prefill_invariant_scope` settings. Decode (scope off) with 2..=`WIDE_ROWS`
+/// rows opens the verify gate (`attn_public` / `with_wide_gate`): an admitted
+/// decode call takes ONE implementation for every row count (split-K on eager
+/// gfx1151 F32 hd256 group-12 layouts, else the per-head kernels; never hg4 /
+/// hg12), so those batches must equal the n one-row public calls at
+/// `position_start + r` raw F32 bit for bit on every architecture
+/// (`attn_one_row_calls`); the arm label comes from `attn_arm`. Gate-closed
+/// calls keep the legacy checks: one row (decode), 33 rows (past the limit:
+/// hg12 for this geometry) and the prefill scope, which routes every count as
+/// 8192 rows (hg12). 2802 ctx => 700 blocks, 512 chosen + tail => selected_len
+/// 2048..2050 (<= the 2304-row hg12 tile budget); 402 ctx keeps every block.
+/// Row 0 carries injected `-1` / not-yet-visible entries the kernels must skip.
+/// Per data set (uniform, realistic), always: `serial_hip_vs_cpu`
+/// (`*_batched_serial` HIP vs the CPU twin at F32_ACCUM; the twin sums in the
+/// kernels' d / selected-row order, `expf` and contraction differ in the last
+/// ulps). Gate-closed public calls: the CPU twin at F32_ACCUM, and on gfx942
+/// raw F32 bits equal to the serial HIP.
 fn case_attention_batch(gpu: &mut Gpu) -> Result<String, String> {
     let g = QWEN4_ATTN;
     let mut checks = Vec::new();
@@ -2374,20 +2368,38 @@ fn case_attention_batch(gpu: &mut Gpu) -> Result<String, String> {
                         "{}/end{end}/rows{rows}/{}/{}",
                         kind.name(),
                         scope_name(scope),
-                        attn_arm(g, rows, scope)
+                        attn_arm(gpu, g, rows, scope, end)?
                     );
-                    checks.push(close_f32(
-                        &format!("{label}/vs_cpu"),
-                        &got,
-                        &inp.want,
-                        F32_ACCUM,
-                    ));
-                    checks.push(attn_claim(
-                        gpu,
-                        &format!("{label}/vs_serial_hip"),
-                        &got,
-                        &serial,
-                    ));
+                    if !scope && (2..=WIDE_ROWS).contains(&rows) {
+                        let one = attn_one_row_calls(
+                            gpu,
+                            &t,
+                            &inp.q,
+                            &inp.selected,
+                            g,
+                            rows,
+                            inp.position_start,
+                            end,
+                        )?;
+                        checks.push(exact_f32(
+                            &format!("{label}/bitwise_one_row_public"),
+                            &got,
+                            &one,
+                        ));
+                    } else {
+                        checks.push(close_f32(
+                            &format!("{label}/vs_cpu"),
+                            &got,
+                            &inp.want,
+                            F32_ACCUM,
+                        ));
+                        checks.push(attn_claim(
+                            gpu,
+                            &format!("{label}/vs_serial_hip"),
+                            &got,
+                            &serial,
+                        ));
+                    }
                 }
                 free_attn(gpu, t)?;
             }
@@ -2396,11 +2408,16 @@ fn case_attention_batch(gpu: &mut Gpu) -> Result<String, String> {
     all(checks)
 }
 
-/// The same public route over other geometries, against `*_batched_serial` HIP
-/// only (the CPU twin is Qwen4-shaped): Qwen4 24x2x256 (hg4 / hg12), 8x2x256
-/// (head groups of 4: hg4 only, never hg12), 6x2x256 (group of 3: no grouped
-/// kernel) and 24x2x128 (head_dim != 256: no grouped kernel). Realistic data;
-/// 2802 ctx; both scope settings.
+/// The same public route over other geometries. Open-gate decode (scope off,
+/// 2..=`WIDE_ROWS` rows: the verify gate `with_wide_gate` / `attn_public` opens)
+/// is one admitted decode implementation (split-K or per-head, never hg4 / hg12)
+/// whose n-row launch must be raw-F32 equal to the n one-row public calls
+/// (`attn_one_row_calls`) on every architecture. Gate-closed calls (1 row, 33
+/// rows, the prefill scope) keep the legacy check against `*_batched_serial`
+/// HIP (the CPU twin is Qwen4-shaped): Qwen4 24x2x256 (hg4 / hg12 / split-K),
+/// 8x2x256 (head groups of 4: hg4 only, never hg12), 6x2x256 (group of 3: no
+/// grouped kernel) and 24x2x128 (head_dim != 256: no grouped kernel). Realistic
+/// data; 2802 ctx; both scope settings.
 fn case_attention_batch_geometry(gpu: &mut Gpu) -> Result<String, String> {
     let end = 2802usize;
     let geoms = [
@@ -2449,14 +2466,24 @@ fn case_attention_batch_geometry(gpu: &mut Gpu) -> Result<String, String> {
                     "{}/rows{rows}/{}/{}",
                     g.name,
                     scope_name(scope),
-                    attn_arm(g, rows, scope)
+                    attn_arm(gpu, g, rows, scope, end)?
                 );
-                checks.push(attn_claim(
-                    gpu,
-                    &format!("{label}/vs_serial_hip"),
-                    &got,
-                    &serial,
-                ));
+                if !scope && (2..=WIDE_ROWS).contains(&rows) {
+                    let one =
+                        attn_one_row_calls(gpu, &t, &q, &selected, g, rows, position_start, end)?;
+                    checks.push(exact_f32(
+                        &format!("{label}/bitwise_one_row_public"),
+                        &got,
+                        &one,
+                    ));
+                } else {
+                    checks.push(attn_claim(
+                        gpu,
+                        &format!("{label}/vs_serial_hip"),
+                        &got,
+                        &serial,
+                    ));
+                }
             }
             free_attn(gpu, t)?;
         }
@@ -5002,7 +5029,6 @@ fn wide_attention_f32(gpu: &mut Gpu) -> Result<String, String> {
         ));
     }
     let g = QWEN4_ATTN;
-    let q_row = 2 * g.heads * g.head_dim;
     let mut fails = Vec::new();
     let mut windows = 0usize;
     for end in [2802usize, 8192] {
@@ -5027,23 +5053,7 @@ fn wide_attention_f32(gpu: &mut Gpu) -> Result<String, String> {
                 };
                 let t = upload_attn(gpu, &q, &keys, &values, &selected)?;
                 let batched = attn_public(gpu, &t, g, rows, position_start, end)?;
-                let mut one = Vec::with_capacity(rows * g.out_w());
-                for r in 0..rows {
-                    let q_t = up_f32(gpu, &q[r * q_row..(r + 1) * q_row])?;
-                    let sel_t = raw_i32(gpu, &selected[r * SEL_CAP..(r + 1) * SEL_CAP])?;
-                    one.extend(attn_public_parts(
-                        gpu,
-                        &q_t,
-                        &t.k,
-                        &t.v,
-                        &sel_t,
-                        g,
-                        1,
-                        position_start + r,
-                        end,
-                    )?);
-                    free_all(gpu, vec![q_t, sel_t])?;
-                }
+                let one = attn_one_row_calls(gpu, &t, &q, &selected, g, rows, position_start, end)?;
                 if let Err(msg) = exact_f32(
                     &format!("{}/E{end}/rows{rows}", kind.name()),
                     &batched,
