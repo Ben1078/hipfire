@@ -6355,6 +6355,139 @@ mod tests {
         }
     }
 
+    /// A real 48-layer slab plan whose per-layer arena sizes all differ
+    /// (layer `l` holds `(5 * l) % 64` MQ4 experts, the rest W3).
+    fn nonuniform_slab_plan() -> std::sync::Arc<crate::expert_arena::ExpertArenaPlan> {
+        use crate::expert_slabs::ExpertFormat;
+        let tensors = crate::expert_slab_table::full_fn_headers(|layer, expert| {
+            if expert < (layer * 5) % 64 {
+                ExpertFormat::Mq4Xts
+            } else {
+                ExpertFormat::Mq3I4
+            }
+        });
+        let table = crate::expert_slab_table::build_expert_slab_table(
+            &crate::expert_slabs::ExpertSlabsV1::fn_v1(),
+            &tensors,
+        )
+        .unwrap();
+        std::sync::Arc::new(crate::expert_arena::ExpertArenaPlan::from_table(&table).unwrap())
+    }
+
+    #[test]
+    fn slab_manifest_band_scope_keeps_own_arenas_and_pins_mtp_to_output() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let config = pinned_config();
+        let plan = nonuniform_slab_plan();
+        let base = Qwen4Manifest::build_with_recipe(
+            &config,
+            Qwen4TierRecipe::FlashNextSlab {
+                trunk_tier: DType::Q8_0,
+                mtp_source: false,
+                arenas: plan.clone(),
+            },
+        )
+        .unwrap();
+        let arena_name =
+            |layer: usize| format!("model.language_model.layers.{layer}.mlp.experts.slab_arena");
+        let is_arena = |name: &str| name.ends_with(crate::expert_arena::ARENA_SUFFIX);
+        let is_aggregate = |name: &str| {
+            name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+        };
+        // The whole-model declaration: one arena per trunk layer sized by
+        // the plan, MTP aggregates kept, no trunk aggregates.
+        let arena_bytes: BTreeSet<_> = plan.layers().iter().map(|layer| layer.bytes).collect();
+        assert_eq!(arena_bytes.len(), 48, "every layer's arena size differs");
+        for layer in 0..48 {
+            let entry = base.entry(&arena_name(layer), Some(layer)).unwrap();
+            assert_eq!(entry.dtype, DType::Raw);
+            assert_eq!(entry.logical_shape, vec![plan.layer(layer).unwrap().bytes]);
+        }
+        let mtp_aggregates: Vec<_> = base
+            .weights
+            .iter()
+            .filter(|entry| entry.name.starts_with("mtp.") && is_aggregate(&entry.name))
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(
+            mtp_aggregates,
+            [
+                "mtp.layers.0.mlp.experts.down_proj",
+                "mtp.layers.0.mlp.experts.gate_up_proj"
+            ]
+        );
+        assert!(base
+            .weights
+            .iter()
+            .all(|entry| entry.name.starts_with("mtp.") || !is_aggregate(&entry.name)));
+
+        for counts in [&[24, 24][..], &[16, 16, 16][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, 48, counts).unwrap();
+            let mut arenas_seen = BTreeSet::new();
+            let mut mtp_bands = 0;
+            for stage in 0..counts.len() {
+                let scope = Qwen4BandScope::from_placement(&config, &placement, stage).unwrap();
+                let local = base.clone().with_band_scope(&config, &scope).unwrap();
+                // Exactly this band's arenas, in layer order.
+                let kept: Vec<_> = local
+                    .weights
+                    .iter()
+                    .filter(|entry| is_arena(&entry.name))
+                    .map(|entry| (entry.name.clone(), entry.layer.unwrap()))
+                    .collect();
+                let want: Vec<_> = scope
+                    .band
+                    .clone()
+                    .map(|layer| (arena_name(layer), layer))
+                    .collect();
+                assert_eq!(kept, want, "{counts:?} band {:?}", scope.band);
+                for (name, layer) in &kept {
+                    assert!(arenas_seen.insert(name.clone()), "{name} on two bands");
+                    let entry = local.entry(name, Some(*layer)).unwrap();
+                    assert_eq!(entry.logical_shape, vec![plan.layer(*layer).unwrap().bytes]);
+                }
+                // No trunk aggregate survives; the MTP ones are output-only
+                // and pinned there.
+                let mtp: Vec<_> = local
+                    .weights
+                    .iter()
+                    .filter(|entry| entry.name.starts_with("mtp.") && is_aggregate(&entry.name))
+                    .collect();
+                assert!(local
+                    .weights
+                    .iter()
+                    .all(|entry| entry.name.starts_with("mtp.") || !is_aggregate(&entry.name)));
+                if scope.output {
+                    mtp_bands += 1;
+                    assert_eq!(
+                        mtp.iter()
+                            .map(|entry| entry.name.as_str())
+                            .collect::<Vec<_>>(),
+                        mtp_aggregates
+                    );
+                    for entry in mtp {
+                        assert_eq!(entry.placement, PlacementHint::Pin(PinTarget::Output));
+                    }
+                } else {
+                    assert!(mtp.is_empty(), "{counts:?} band {:?}", scope.band);
+                }
+                // Placements name the same arenas the band keeps.
+                let placements = base.placements_for_scope(&config, &scope, stage).unwrap();
+                check_placement_set(&local, &placements).unwrap();
+                assert_eq!(
+                    placements
+                        .iter()
+                        .filter(|placement| is_arena(&placement.name))
+                        .count(),
+                    scope.band.len()
+                );
+            }
+            assert_eq!(mtp_bands, 1);
+            assert_eq!(arenas_seen.len(), 48);
+        }
+    }
+
     #[test]
     fn output_embedding_preserves_tied_source_without_input_allocation() {
         let config = pinned_config();

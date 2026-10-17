@@ -762,6 +762,42 @@ cards and `HIPFIRE_EMULATE_GPUS` aliasing are refused.
   takes as its target; it is an input, not a measured result, and whether it fits
   is decided by the per-band budget below.
 
+#### Expert-slab builds (`mq3-xts`, `mq2-xts`)
+
+The per-expert slab builds run under `topology.pp` as well as the packed `mq4`
+artifact. The loader builds each layer's slab arena as it does on one card, and
+each card loads only its own band's layers: that band's slab arenas, fully in
+VRAM, with the same all-resident budget check as above. The MTP head's experts
+are on the output card (card 0) with the rest of the head.
+
+Which build runs on which card type is the same codec rule as on one card:
+
+| Cards (one exact arch) | Builds that load under PP |
+|---|---|
+| R9700, gfx1201 | `mq3-xts` and `mq2-xts` (and packed `mq4`) |
+| 7900 XTX, gfx1100 | `mq2-xts` (and packed `mq4`); `mq3-xts` is refused, because its MQ3 codec is not available on gfx1100, exactly as on one card |
+
+Why it matters: `mq2-xts` is about 47 GB where the packed `mq4` trunk is about
+68 GB, so it fits on fewer cards. Per card, the band holds roughly the file size
+divided by `N` (the file already carries the non-expert weights), plus the
+output card's extra for `lm_head` and the MTP head, and then the per-band
+runtime terms from the budget above (F16 shadows, QSA context, state, scratch,
+reserve). Approximate band bytes, before those runtime terms:
+
+| Build (size) | N = 2 | N = 3 | N = 4 |
+|---|---|---|---|
+| `mq2-xts` (about 47 GB) | about 24 GB | about 16 GB | about 12 GB |
+| `mq3-xts` (about 59 GB) | about 30 GB | about 20 GB | about 15 GB |
+| packed `mq4` (about 68 GB trunk) | about 34 GB | about 23 GB | about 17 GB |
+
+These are rough division figures, not a measurement; admission makes the real
+decision per rank and names a card that is short. For example, on 32 GB cards
+packed `mq4` does not fit at `N = 2` while `mq2-xts` leaves room; on 24 GB cards
+`N = 2` is too tight for any of them once the runtime terms are added. The PLE
+rows stay on the host as for every split base, so they are not part of the
+per-card figures. Slab loads are otherwise unchanged under PP: the same
+refusals apply (no host-mapped experts, no expert staging, no hotset).
+
 #### Transport: `HIPFIRE_MESH_TRANSPORT`
 
 Developer-only, read once at admission. The choice is made per directed edge
@@ -848,7 +884,6 @@ within the environment rows, the first match wins.
 | session snapshots (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`) | exactly `1`; unset or any other value is accepted |
 | the session cache disk tier (`memory.session_cache_disk_bytes`; set 0) | the budget is above `0` |
 | the NPU trunk (`fusions.npu_trunk = on` or `emulate`) | the mode resolved for the cards' arch is `on` or `emulate`; `off` and `auto` are accepted |
-| expert-slab artifacts | the model is a per-expert slab container (the `mq3-xts` / `mq2-xts` builds); PP runs the packed `mq4` artifact, whose trunk is about 68 GB (PLE rows stay on the host) |
 
 Mesh, rank, band and budget refusals use the prefix
 `qwen4: pipeline parallelism (topology.pp = N)`:

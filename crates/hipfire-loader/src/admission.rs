@@ -933,20 +933,14 @@ pub fn admit_qwen4_source(
     let host_mapped_experts = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
         .map_err(|error| format!("qwen4: {error}"))?
         .is_some();
-    if effective_mesh.pp > 1 {
-        let pp = effective_mesh.pp;
-        if host_mapped_experts {
-            return Err(qwen4_pp_unsupported(
-                pp,
-                "host-mapped routed experts (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS)",
-            ));
-        }
-        if matches!(
-            receipt.recipe(),
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
-        ) {
-            return Err(qwen4_pp_unsupported(pp, "expert-slab artifacts"));
-        }
+    // A pipeline band keeps every routed expert resident (packed aggregates
+    // or, for an expert-slab artifact, its own layers' slab arenas); no band
+    // layer is host-mapped.
+    if effective_mesh.pp > 1 && host_mapped_experts {
+        return Err(qwen4_pp_unsupported(
+            effective_mesh.pp,
+            "host-mapped routed experts (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS)",
+        ));
     }
     hipfire_arch_qwen4::admission::admit_recipe_on_device(
         receipt.recipe(),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fn-ep-gate.sh: Flash-Next (Qwen4, mq4-xts) expert-parallel gate for a host with N homogeneous
+# fn-ep-gate.sh: Flash-Next (Qwen4) expert-parallel gate for a host with N homogeneous
 # gfx1100 (7900 XTX) or gfx1201 (R9700) cards. Run it from a hipfire checkout; it builds the
 # binaries, runs a reference (one card by default) and N cards (topology.ep = N) over the same prompts,
 # compares them byte for byte, times decode/prefill, and writes a receipt you can send back.
@@ -7,9 +7,12 @@
 # streams over host-mapped staging, the output card last): a reference and PP-N run the same prompts through
 # fn_ep_oracle --pp N --canonical-state and are compared byte for byte (see "PP mode" below).
 #
-#   scripts/fn-ep-gate.sh [options] MODEL.mq4 [N] [OUT_DIR]
+#   scripts/fn-ep-gate.sh [options] MODEL [N] [OUT_DIR]
 #
-#   MODEL.mq4    Flash-Next mq4-xts model file (REQUIRED)
+#   MODEL        Flash-Next model file (REQUIRED). EP mode: the mq4-xts file. --mode pp: the packed mq4 / mq4-xts file or an
+#                expert-slab container (`*.mq3-xts`, `*.mq2-xts`). Slab files load under PP on the cards their codecs support
+#                (gfx1201: mq3-xts and mq2-xts; gfx1100: mq2-xts only). The script does not look at the file name: it
+#                passes the path through and hashes only that file (the PLE row files beside a split base are not hashed).
 #   N            EP degree (--mode pp: pipeline degree), 2..=8 (default: length of --devices, else every visible card of the chosen arch, at most 8)
 #   OUT_DIR      output directory (default: ./fn-ep-gate-<UTC timestamp>)
 #
@@ -144,7 +147,7 @@ done
 [[ -z ${POS[0]:-} ]] || MODEL=${POS[0]}
 [[ -z ${POS[1]:-} ]] || N=${POS[1]}
 [[ -z ${POS[2]:-} ]] || OUT=${POS[2]}
-[[ -n $MODEL ]] || { usage >&2; die "MODEL.mq4 is required"; }
+[[ -n $MODEL ]] || { usage >&2; die "MODEL is required"; }
 [[ -f $MODEL && -r $MODEL ]] || die "model file not readable: $MODEL"
 [[ -z $N || $N =~ ^[0-9]+$ ]] || die "N must be an integer"
 if [[ -z $DEVLIST && -n ${HIPFIRE_DEVICES:-} ]]; then

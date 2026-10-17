@@ -4351,6 +4351,118 @@ mod tests {
     }
 
     #[test]
+    fn slab_arena_band_census_charges_each_band_its_own_arenas() {
+        use crate::expert_slabs::ExpertFormat;
+        // Non-uniform arenas: layer `l` holds `(5 * l) % 64` MQ4 experts and W3 for the rest.
+        let tensors = crate::expert_slab_table::full_fn_headers(|layer, expert| {
+            if expert < (layer * 5) % 64 {
+                ExpertFormat::Mq4Xts
+            } else {
+                ExpertFormat::Mq3I4
+            }
+        });
+        let table = crate::expert_slab_table::build_expert_slab_table(
+            &crate::expert_slabs::ExpertSlabsV1::fn_v1(),
+            &tensors,
+        )
+        .unwrap();
+        let plan =
+            std::sync::Arc::new(crate::expert_arena::ExpertArenaPlan::from_table(&table).unwrap());
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build_with_recipe(
+            &config,
+            crate::weights::Qwen4TierRecipe::FlashNextSlab {
+                trunk_tier: DType::Q8_0,
+                mtp_source: false,
+                arenas: plan.clone(),
+            },
+        )
+        .expect("slab manifest");
+        // An arena's bytes are its raw length; everything else is 2 B/element.
+        let bytes_of = |entry: &WeightEntry| {
+            if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
+                Some(entry.logical_shape[0] as u64)
+            } else {
+                element_bytes(entry)
+            }
+        };
+        let arena = |layer: usize| plan.layer(layer).expect("layer").bytes as u64;
+        let mtp_bytes: u64 = manifest
+            .weights
+            .iter()
+            .filter(|entry| entry.name.starts_with("mtp.") && entry.name.contains(".mlp.experts."))
+            .map(|entry| element_bytes(entry).expect("mtp aggregate"))
+            .sum();
+        assert!(mtp_bytes > 0, "the manifest declares the MTP aggregates");
+        let distinct: std::collections::BTreeSet<_> = (0..48).map(|layer| arena(layer)).collect();
+        assert_eq!(distinct.len(), 48, "every layer's arena differs");
+
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let census = |weights: &[WeightEntry], scope: &Qwen4BandScope| {
+            band_census(
+                &config,
+                weights,
+                bytes_of,
+                scope,
+                target_state_format(),
+                &context,
+                256,
+                Full,
+            )
+            .expect("band census")
+        };
+        let single = census(&manifest.weights, &Qwen4BandScope::single(&config));
+        assert_eq!(
+            single.routed_trunk_bytes,
+            (0..48).map(arena).sum::<u64>(),
+            "the single scope charges every arena exactly"
+        );
+        assert_eq!(single.routed_mtp_bytes, mtp_bytes);
+        assert_eq!(
+            single.max_layer_routed_bytes,
+            (0..48).map(arena).max().unwrap()
+        );
+
+        for counts in [&[24usize, 24][..], &[16, 16, 16][..]] {
+            let mut trunk_sum = 0u64;
+            let mut mtp_sum = 0u64;
+            for scope in band_scopes(&config, counts) {
+                let own: Vec<u64> = scope.band.clone().map(arena).collect();
+                let scoped = manifest
+                    .clone()
+                    .with_band_scope(&config, &scope)
+                    .expect("scope-filtered manifest");
+                // The full and the scope-filtered manifest give the same census.
+                let from_full = census(&manifest.weights, &scope);
+                let from_scoped = census(&scoped.weights, &scope);
+                assert_eq!(from_full, from_scoped, "{counts:?} band {:?}", scope.band);
+                assert_eq!(
+                    from_scoped.routed_trunk_bytes,
+                    own.iter().sum::<u64>(),
+                    "{counts:?} band {:?}",
+                    scope.band
+                );
+                assert_eq!(
+                    from_scoped.max_layer_routed_bytes,
+                    own.iter().copied().max().unwrap(),
+                    "{counts:?} band {:?}",
+                    scope.band
+                );
+                assert_eq!(
+                    from_scoped.routed_mtp_bytes,
+                    if scope.output { mtp_bytes } else { 0 },
+                    "{counts:?} band {:?}",
+                    scope.band
+                );
+                trunk_sum += from_scoped.routed_trunk_bytes;
+                mtp_sum += from_scoped.routed_mtp_bytes;
+            }
+            assert_eq!(trunk_sum, single.routed_trunk_bytes, "{counts:?}");
+            assert_eq!(mtp_sum, single.routed_mtp_bytes, "{counts:?}");
+        }
+    }
+
+    #[test]
     fn band_census_refuses_expert_sharded_entries_for_a_band_but_not_single() {
         use hipfire_runtime::tp_shard::ExpertAssign;
         let config = crate::config::compact_test_config();

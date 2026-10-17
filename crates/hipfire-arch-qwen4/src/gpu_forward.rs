@@ -6215,14 +6215,11 @@ impl Qwen4GpuForward {
                 })?;
             }
             let moe_count = moe.iter().flatten().count();
-            if !single_scope
-                && moe
-                    .iter()
-                    .flatten()
-                    .any(|layer| layer.host_mapped() || layer.slab.is_some())
-            {
+            // A band keeps every routed expert resident (packed aggregates or
+            // its own layers' slab arenas): no host-mapped layer, no stage.
+            if !single_scope && moe.iter().flatten().any(|layer| layer.host_mapped()) {
                 return Err(invalid(
-                    "a pipeline-parallel band refuses host-mapped and slab expert layers",
+                    "a pipeline-parallel band refuses host-mapped expert layers",
                 ));
             }
             let cpu_layers = moe
