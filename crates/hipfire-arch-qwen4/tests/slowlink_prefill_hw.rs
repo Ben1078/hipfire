@@ -5,9 +5,10 @@
 //! S1 slow-link layer-major prefill: focused hardware tests.
 //!
 //! The `#[ignore]`d tests need a HIP GPU, a discrete narrow-link card and the
-//! canonical MQ4 Flash-Next artifact named by `HIPFIRE_SLOWLINK_HW_MODEL`,
-//! with routed experts placed by a fixed layer count
-//! (`HIPFIRE_SLOWLINK_HW_VRAM_LAYERS`, default 10; the rest host-mapped).
+//! canonical MQ4 Flash-Next artifact named by `HIPFIRE_SLOWLINK_HW_MODEL`.
+//! Placement is the loader's own: the S1 admission's joint placement (at
+//! least ten resident layers, the rest host-mapped); the tests refuse to run
+//! when the profile was not admitted.
 //! They force the route through the one production switch
 //! (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`, set before the first config read) and
 //! run only inside a fabric hold with `--test-threads=1`:
@@ -36,7 +37,6 @@ mod slowlink_receipt;
 use slowlink_receipt::*;
 
 const MODEL_ENV: &str = "HIPFIRE_SLOWLINK_HW_MODEL";
-const LAYERS_ENV: &str = "HIPFIRE_SLOWLINK_HW_VRAM_LAYERS";
 const ROWS_ENV: &str = "HIPFIRE_SLOWLINK_HW_ROWS";
 const ROUTE_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_PREFILL";
 const MAX_SEQ: usize = 16640;
@@ -98,16 +98,24 @@ fn load() -> Hw {
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name the MQ4 Flash-Next artifact"));
-    let layers = std::env::var(LAYERS_ENV)
-        .ok()
-        .map_or(10, |v| v.parse::<usize>().expect("vram layers"));
     let rows = std::env::var(ROWS_ENV)
         .ok()
         .map_or(3400, |v| v.parse::<usize>().expect("rows"));
     assert!(rows > MAX_TILE_ROWS as usize, "the prompt must exceed one tile");
     let mut gpu = Gpu::init().expect("GPU");
-    let SlowlinkLoaded { bundle, vocab, eos_token, .. } =
-        slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, Some(layers), None).expect("load");
+    let SlowlinkLoaded {
+        bundle,
+        vocab,
+        eos_token,
+        slowlink_profile,
+        resident_layers,
+        placement,
+        ..
+    } = slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, None).expect("load");
+    assert!(
+        slowlink_profile && resident_layers >= MIN_RESIDENT_LAYERS as usize,
+        "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
+    );
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     Hw { gpu, bundle, logits, vocab, eos: eos_token, rows }
 }

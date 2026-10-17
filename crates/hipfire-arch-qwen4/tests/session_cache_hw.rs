@@ -1330,9 +1330,10 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
 mod slowlink_receipt;
 
 /// S1 slow-link layer-major prefill: the session-cache chain and branch of
-/// `restored_prefill_matches_cold_on_flash_next`, with the routed experts of
-/// layers past `HIPFIRE_SESSION_CACHE_EXPERT_VRAM_LAYERS` (default 10)
-/// host-mapped and the route forced through the production switch
+/// `restored_prefill_matches_cold_on_flash_next`, with the loader's
+/// admission-first placement (the S1 profile's joint placement: at least ten
+/// resident layers, the rest host-mapped) and the route forced through the
+/// production switch
 /// (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`). Every cold and restored prefill must
 /// carry a valid S1 route receipt (a call of at most one tile may be an
 /// explicit named bypass), A is restored through its three-link chain and B
@@ -1354,19 +1355,26 @@ fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
-    let layers = std::env::var("HIPFIRE_SESSION_CACHE_EXPERT_VRAM_LAYERS")
-        .ok()
-        .map_or(10, |v| v.parse::<usize>().expect("expert vram layers"));
     let mut gpu = Gpu::init().expect("GPU");
-    let SlowlinkLoaded { mut bundle, vocab, .. } =
-        slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, Some(layers), Some(u64::MAX >> 1))
-            .expect("slowlink load");
+    let SlowlinkLoaded {
+        mut bundle,
+        vocab,
+        resident_layers,
+        placement,
+        slowlink_profile,
+        ..
+    } = slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, Some(u64::MAX >> 1))
+        .expect("slowlink load");
+    assert!(
+        slowlink_profile && resident_layers >= 10,
+        "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
+    );
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let a = prompt(0xa, 3 * chunk + 300);
     let mut b = a[..chunk].to_vec();
     b.extend(prompt(0xb, chunk + 200));
-    println!("S1 layer-major restore: chunk={chunk} expert vram layers={layers}");
+    println!("S1 layer-major restore: chunk={chunk} resident layers={resident_layers} placement={placement}");
 
     let check_route = |bundle: &Qwen4Bundle, rows: usize, what: &str| {
         let receipt = bundle.slowlink_receipt();

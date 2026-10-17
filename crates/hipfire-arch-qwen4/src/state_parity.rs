@@ -2788,152 +2788,10 @@ pub fn slowlink_logit_rows_summary(
     }))
 }
 
-/// What the shared slab-capable range loader built.
-pub struct SlowlinkLoaded {
-    pub bundle: crate::bundle::Qwen4Bundle,
-    pub vocab: usize,
-    pub eos_token: u32,
-    pub num_layers: usize,
-    /// Routed-expert tensors host-mapped by the placement (0 = all resident).
-    pub host_mapped_tensors: usize,
-    /// The fixed layer count applied, or `None` when the process placement
-    /// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, else all resident) decided.
-    pub expert_vram_layers: Option<usize>,
-    pub ple_format: String,
-    pub tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-}
-
-/// Load one real Qwen4 HFQM artifact the way `qwen4_greedy_ids` /
-/// `qwen4_kld` do: arena payloads, a fixed routed-expert layer placement
-/// with the host-mapped borrowed fallback, no MTP, no session cache, no PLE
-/// hot store. `expert_vram_layers = Some(n)` keeps layers `0..n` resident and
-/// host-maps the rest (a discrete card only); `None` defers to the process
-/// placement. The S1 selector, admission and arenas belong to the bundle's
-/// forward attach, not to this loader.
-pub fn slowlink_load_bundle(
-    gpu: &mut Gpu,
-    path: &Path,
-    max_seq: usize,
-    expert_vram_layers: Option<usize>,
-    session_cache_budget: Option<u64>,
-) -> Result<SlowlinkLoaded, String> {
-    let mut hfq = hipfire_runtime::hfq::HfqFile::open(path)
-        .map_err(|error| format!("open HFQM {}: {error}", path.display()))?;
-    let choice = hipfire_runtime::ple_sidecar::attach_validation_ple_rows(
-        &mut hfq,
-        path,
-        hipfire_config::memory::ple_format(),
-        &gpu.arch,
-    )
-    .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
-    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
-    let trunk_overlay = crate::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
-        .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
-    let scratch_mode = crate::artifact::source_forward_scratch_mode(
-        gpu,
-        &hfq,
-        &receipt.config,
-        &receipt.manifest,
-    )
-    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
-    if gpu.is_uma() {
-        hfq.drop_mmap();
-    }
-    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
-        .map_err(|error| format!("qwen4 mesh: {error}"))?;
-    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, gpu);
-    let npu_identity = crate::npu_trunk::model_index_identity(&hfq, &gpu.arch);
-    let use_ranges = gpu.is_uma();
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|error| format!("tokenizer: {error}"))?;
-    // The session-cache domain binds the artifact, tokenizer and device; it
-    // is read from the HFQ file before the source takes ownership of it.
-    let cache_domain = session_cache_budget.map(|_| {
-        hipfire_runtime::serve_contract::CacheDomain::for_model(
-            &hfq,
-            &tokenizer,
-            None,
-            "qwen4",
-            gpu.device_id,
-        )
-    });
-    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
-    let weights = match expert_vram_layers {
-        Some(layers) => {
-            if gpu.is_uma() {
-                return Err("host-mapped experts are only for discrete GPUs".to_string());
-            }
-            let mut weights = receipt.manifest.weights.clone();
-            crate::expert_residency::place_routed_experts(&mut weights, layers);
-            weights
-        }
-        None => oracle_expert_placement(gpu, &receipt.manifest.weights)?,
-    };
-    let host_mapped_tensors = weights
-        .iter()
-        .filter(|entry| entry.residency == WeightResidency::HostMapped)
-        .count();
-    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        gpu,
-        expected,
-        |entry| qwen4_oracle_payload(&source, &receipt.manifest.identity.recipe, entry, use_ranges),
-    )
-    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
-    let vocab = receipt.config.vocab_size;
-    let eos_token = receipt.config.eos_token_id;
-    let num_layers = receipt.config.num_hidden_layers;
-    let state_format = crate::resolve_state_format(
-        &hipfire_runtime::config::get().kv_mode,
-        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
-        gpu,
-        &receipt.config,
-    )?;
-    let backend = Qwen4KvBackend::automatic(gpu);
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
-        receipt.config,
-        &receipt.manifest.identity.recipe,
-        transaction,
-        &receipt.placements,
-        gpu,
-        max_seq,
-        receipt.ple,
-        receipt.ple_rows,
-        state_format,
-        backend,
-        None,
-    )
-    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
-    bundle.attach_npu_trunk_identity(npu_identity);
-    if let Some(overlay) = trunk_overlay {
-        bundle
-            .attach_trunk_overlay(overlay)
-            .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
-    }
-    bundle
-        .attach_forward(gpu, max_seq, scratch_mode)
-        .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
-    if let Some(domain) = cache_domain {
-        let cache = hipfire_runtime::session_cache::SessionCache::new(
-            domain,
-            session_cache_budget.unwrap_or(0),
-        );
-        bundle.attach_session_cache(cache);
-    }
-    Ok(SlowlinkLoaded {
-        bundle,
-        vocab,
-        eos_token,
-        num_layers,
-        host_mapped_tensors,
-        expert_vram_layers,
-        ple_format: choice.format.name().to_string(),
-        tokenizer,
-    })
-}
+// The shared single-device load (admission-first placement, S1 profile attach)
+// lives in `crate::slowlink_load`, which is not feature-gated so the `lab`
+// examples use it too.
+pub use crate::slowlink_load::{slowlink_load_bundle, SlowlinkLoaded};
 
 /// One whole-prompt production prefill per repeat from a fresh state
 /// (`prefill_final`: the selector's request path), each with its route
@@ -2944,7 +2802,6 @@ pub fn slowlink_load_bundle(
 pub fn run_slowlink_prefill_state(
     model_path: &Path,
     prompt: &[u32],
-    expert_vram_layers: Option<usize>,
     max_seq: usize,
     repeats: usize,
 ) -> Result<Value, String> {
@@ -2961,12 +2818,15 @@ pub fn run_slowlink_prefill_state(
         ));
     }
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let loaded = slowlink_load_bundle(&mut gpu, model_path, max_seq, expert_vram_layers, None)?;
+    let loaded = slowlink_load_bundle(&mut gpu, model_path, max_seq, None)?;
     let SlowlinkLoaded {
         mut bundle,
         vocab,
         num_layers,
         host_mapped_tensors,
+        resident_layers,
+        placement,
+        slowlink_profile,
         ple_format,
         ..
     } = loaded;
@@ -3013,7 +2873,9 @@ pub fn run_slowlink_prefill_state(
             "max_seq": max_seq,
             "num_layers": num_layers,
             "host_mapped_tensors": host_mapped_tensors,
-            "expert_vram_layers": expert_vram_layers,
+            "resident_layers": resident_layers,
+            "placement": placement,
+            "slowlink_profile": slowlink_profile,
             "ple_format": ple_format,
             "repeat_equal": equal,
             "runs": runs,
