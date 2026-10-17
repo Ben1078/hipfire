@@ -2122,18 +2122,24 @@ fn load_qwen4_rank_scoped(
             &shape,
             || hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu),
             || {
-                let (free, _, _, base, ..) = auto_inputs_at(s1::S1_TILE_ROWS)?;
-                let (.., incumbent, _, _) = auto_inputs_at(placement_chunk)?;
-                Ok(s1::LoadFacts {
+                s1::single_device_facts(&s1::SingleDeviceLoad {
+                    gpu: &*ctx.gpu,
                     config: &config,
                     weights: &manifest.weights,
                     bytes_of: &bytes_of,
-                    free,
-                    tile_reserve: base.bytes(),
-                    incumbent_reserve: incumbent.bytes(),
-                    state_format,
+                    backend,
+                    max_seq: ctx.max_seq,
+                    vmm_granularity,
                     native_mtp: placement_native_mtp,
-                    window_rows: s1::S1_WINDOW_ROWS.min(ctx.max_seq),
+                    mtp_kept: placement_native_mtp
+                        && crate::admission::qwen4_mtp_with_host_mapped_experts(
+                            ctx.spec,
+                            &ctx.gpu.arch,
+                            usize::from(routed_experts),
+                        ),
+                    max_k,
+                    state_format,
+                    scratch_mode,
                 })
             },
         )?

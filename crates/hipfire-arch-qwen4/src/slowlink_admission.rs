@@ -1040,6 +1040,124 @@ pub fn select_load_profile<'a>(
     })
 }
 
+/// The structural facts of a load that only its caller knows; the rest of a
+/// [`LoadShape`] is read from the process snapshot
+/// ([`LoadShape::from_process`]). Pass what is true: a load that applies a hot
+/// set or `whole-first` must say so, never `false` to get a profile.
+#[derive(Clone, Copy, Debug)]
+pub struct StructuralShape {
+    pub expert_parallel: bool,
+    pub pipeline_band: bool,
+    pub packed_mq4: bool,
+    pub routed_experts: bool,
+    pub expert_keep: bool,
+    pub hotset_sidecar: bool,
+    pub whole_first: bool,
+}
+
+impl<'a> LoadShape<'a> {
+    /// The shape of a load whose process-level controls are read from the
+    /// config snapshot exactly as the product loader reads them: an explicit
+    /// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, the `HIPFIRE_QWEN4_EXPERT_STAGE=0`
+    /// opt-out and `memory.offload_exec`. `chunk_rows_env` is the raw
+    /// `HIPFIRE_PREFILL_CHUNK_ROWS` value, when set.
+    pub fn from_process(
+        arch: &'a str,
+        unified_memory: bool,
+        structural: StructuralShape,
+        max_seq: usize,
+        chunk_rows_env: Option<&'a str>,
+    ) -> Result<Self, String> {
+        let explicit = crate::expert_residency::expert_vram_layers_from_env()
+            .map_err(|error| format!("qwen4: {error}"))?;
+        let stage = hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV).ok();
+        Ok(Self {
+            arch,
+            unified_memory,
+            expert_parallel: structural.expert_parallel,
+            pipeline_band: structural.pipeline_band,
+            packed_mq4: structural.packed_mq4,
+            routed_experts: structural.routed_experts,
+            expert_keep: structural.expert_keep,
+            explicit_vram_layers: explicit.is_some(),
+            hotset_sidecar: structural.hotset_sidecar,
+            whole_first: structural.whole_first,
+            stage_opt_out: stage.as_deref() == Some("0"),
+            cpu_offload: hipfire_config::memory::offload_exec()
+                != hipfire_config::memory::OffloadExec::Pcie,
+            chunk_rows_env,
+            max_seq,
+        })
+    }
+}
+
+/// A single-device load the S1 admission sizes: the same census inputs the
+/// product loader hands the placement
+/// ([`crate::expert_residency::placement_inputs`]).
+pub struct SingleDeviceLoad<'a> {
+    pub gpu: &'a rdna_compute::Gpu,
+    pub config: &'a Qwen4Config,
+    pub weights: &'a [hipfire_runtime::weight_manifest::WeightEntry],
+    pub bytes_of: &'a dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    pub backend: crate::Qwen4KvBackend,
+    pub max_seq: usize,
+    pub vmm_granularity: usize,
+    /// The native MTP head attaches (sizes the session fixed snapshot).
+    pub native_mtp: bool,
+    /// The head is still attached after the host-mapped placement (sizes the
+    /// reserve): `native_mtp` and the host-spill policy kept it.
+    pub mtp_kept: bool,
+    pub max_k: usize,
+    pub state_format: crate::Qwen4StateFormat,
+    pub scratch_mode: crate::gpu_forward::Qwen4ForwardScratchMode,
+}
+
+/// Exact [`LoadFacts`] of a single-device discrete load: free device memory,
+/// and the reserve at the S1 tile and at the incumbent placement chunk, both
+/// from [`crate::expert_residency::placement_inputs`] (the product's own
+/// bottom-up census; no second convention).
+pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<'a>, String> {
+    let (free, _) = load
+        .gpu
+        .device_mem_info()
+        .map_err(|error| format!("qwen4: device memory query: {error}"))?;
+    let routed_experts = !load.config.ffn.is_dense();
+    let reserve_at = |chunk_rows: usize| {
+        crate::expert_residency::placement_inputs(&crate::expert_residency::PlacementInputsArgs {
+            gpu: load.gpu,
+            config: load.config,
+            weights: load.weights,
+            bytes_of: load.bytes_of,
+            backend: load.backend,
+            use_ranges: false,
+            max_seq: load.max_seq,
+            vmm_granularity: load.vmm_granularity,
+            mtp_kept: load.mtp_kept,
+            max_k: load.max_k,
+            routed_experts,
+            state_format: load.state_format,
+            scratch_mode: load.scratch_mode,
+            ranks: 1,
+            chunk_rows,
+        })
+        .map(|inputs| inputs.reserve.bytes())
+    };
+    // Beta's single incumbent helper (probes the host link once, cached).
+    let placement_chunk =
+        crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
+    Ok(LoadFacts {
+        config: load.config,
+        weights: load.weights,
+        bytes_of: load.bytes_of,
+        free: free as u64,
+        tile_reserve: reserve_at(S1_TILE_ROWS)?,
+        incumbent_reserve: reserve_at(placement_chunk)?,
+        state_format: load.state_format,
+        native_mtp: load.native_mtp,
+        window_rows: S1_WINDOW_ROWS.min(load.max_seq),
+    })
+}
+
 /// How a request's prefill output is captured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureKind {
