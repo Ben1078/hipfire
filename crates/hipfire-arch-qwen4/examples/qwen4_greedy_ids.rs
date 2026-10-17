@@ -352,13 +352,15 @@ impl Model {
     /// without MTP, the session cache or the PLE hot store: none of them
     /// changes the numerics of a cold AR request.
     fn load(path: &Path, max_seq: usize) -> Result<Self, String> {
-        // S1 candidate arm (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`): the shared
-        // admission-first loader (the product's selection and joint
-        // placement); a pinned `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` then
-        // declines S1 and the receipt shows the incumbent. The baseline arm
-        // keeps the loader below unchanged.
+        // S1 selector (`HIPFIRE_QWEN4_SLOWLINK_PREFILL` unset or `1`): the
+        // shared admission-first loader (the product's selection and joint
+        // placement); the same selector the product uses decides, so a later
+        // automatic enablement needs no change here. A pinned
+        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` or an unset selector that
+        // declines S1 gives the incumbent placement and the receipt says so.
+        // `=0` (the kill switch) keeps the loader below unchanged.
         if hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env()
-            == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
+            != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off
         {
             let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
             let loaded = hipfire_arch_qwen4::slowlink_load::slowlink_load_bundle(
