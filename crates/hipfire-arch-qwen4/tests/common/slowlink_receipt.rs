@@ -1263,10 +1263,53 @@ pub struct MemoryLedger {
     pub owned_host_bytes: u64,
     /// How the census was derived (non-empty).
     pub census_basis: String,
+    /// Device decomposition of `owned_device_bytes` plus the safety margin.
+    pub decomposition: DeviceDecomposition,
+}
+
+/// Device census decomposition from the manifest; the four committed parts
+/// sum to `owned_device_bytes`, the safety margin is on top of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceDecomposition {
+    /// Resident model weights (non-expert + resident experts).
+    pub weights: u64,
+    /// The S1 tile census (`AutoReserve.census_total`).
+    pub s1_tile_census: u64,
+    /// S1 extras (lookahead/ring/arena/tables beyond the tile).
+    pub s1_extras: u64,
+    /// Sequential diagnostic scratch.
+    pub sequential_diag: u64,
+    /// Unchanged auto-reserve safety margin.
+    pub safety_margin: u64,
+}
+
+impl DeviceDecomposition {
+    /// Checked sum of the four committed parts (weights, tile census, extras,
+    /// sequential diagnostics); the safety margin is not part of it.
+    pub fn committed_sum(&self) -> Option<u64> {
+        self.weights
+            .checked_add(self.s1_tile_census)?
+            .checked_add(self.s1_extras)?
+            .checked_add(self.sequential_diag)
+    }
+
+    /// Non-weight bytes the guard allows: tile census + extras + sequential
+    /// diagnostics + safety margin + the fixed driver allowance (checked).
+    pub fn allowed_non_weight(&self) -> Option<u64> {
+        self.s1_tile_census
+            .checked_add(self.s1_extras)?
+            .checked_add(self.sequential_diag)?
+            .checked_add(self.safety_margin)?
+            .checked_add(UNOWNED_VRAM_ALLOWANCE_BYTES)
+    }
 }
 
 /// The owned census from `memory_ledger.{owned_device_bytes,
-/// owned_host_bytes,census_basis}`; any missing or zero figure refuses.
+/// owned_host_bytes,census_basis}` and the device decomposition
+/// `memory_ledger.{device_weights_bytes,s1_tile_census_bytes,s1_extras_bytes,
+/// sequential_diag_bytes,safety_margin_bytes}`; any missing or zero figure
+/// refuses, as does a decomposition whose checked four-part sum is not the
+/// owned device bytes. Only the primitive cell reads it.
 pub fn memory_ledger(manifest: &Value) -> Result<MemoryLedger, String> {
     let bytes = |path: &str| {
         u64_at(manifest, path).filter(|&n| n > 0).ok_or_else(|| {
@@ -1280,10 +1323,31 @@ pub fn memory_ledger(manifest: &Value) -> Result<MemoryLedger, String> {
             "manifest key memory_ledger.census_basis missing (how the owned census was derived)",
         )?
         .to_string();
+    let owned_device_bytes = bytes("memory_ledger.owned_device_bytes")?;
+    let decomposition = DeviceDecomposition {
+        weights: bytes("memory_ledger.device_weights_bytes")?,
+        s1_tile_census: bytes("memory_ledger.s1_tile_census_bytes")?,
+        s1_extras: bytes("memory_ledger.s1_extras_bytes")?,
+        sequential_diag: bytes("memory_ledger.sequential_diag_bytes")?,
+        safety_margin: bytes("memory_ledger.safety_margin_bytes")?,
+    };
+    match decomposition.committed_sum() {
+        Some(sum) if sum == owned_device_bytes => {}
+        Some(sum) => {
+            return Err(format!(
+                "memory_ledger decomposition sums to {sum} B (weights + tile census + extras + sequential diag), not owned_device_bytes {owned_device_bytes} B"
+            ))
+        }
+        None => return Err("memory_ledger decomposition sum overflows u64".to_string()),
+    }
+    if decomposition.allowed_non_weight().is_none() {
+        return Err("memory_ledger allowed non-weight bytes overflow u64".to_string());
+    }
     Ok(MemoryLedger {
-        owned_device_bytes: bytes("memory_ledger.owned_device_bytes")?,
+        owned_device_bytes,
         owned_host_bytes: bytes("memory_ledger.owned_host_bytes")?,
         census_basis,
+        decomposition,
     })
 }
 
@@ -1374,6 +1438,30 @@ pub fn memory_problems(samples: &[Value], ledger: &MemoryLedger) -> (Vec<String>
         )),
         Some(_) => {}
     }
+    // Non-weight guard: the S1 tile census replaces the incumbent historical
+    // floor only if the OBSERVED non-weight device peak stays within the
+    // census, the extras, the diagnostics, the safety margin and the driver
+    // allowance. Uses the samples above; no new GPU query.
+    let d = &ledger.decomposition;
+    let measured_non_weight = device_observed.map(|o| o.saturating_sub(d.weights));
+    let allowed_non_weight = d.allowed_non_weight();
+    let guard_result = match (measured_non_weight, allowed_non_weight) {
+        (_, None) => {
+            bad.push("allowed non-weight device bytes overflow u64".to_string());
+            "invalid"
+        }
+        (None, _) => {
+            bad.push("device non-weight guard: no device usage was observed".to_string());
+            "unobserved"
+        }
+        (Some(m), Some(a)) if m > a => {
+            bad.push(format!(
+                "measured non-weight device peak {m} B exceeds the allowed {a} B (tile census + extras + diag + safety + driver allowance): the S1 tile census is not proven to cover the historical floor; blocked, floor restore needed"
+            ));
+            "fail"
+        }
+        (Some(_), Some(_)) => "pass",
+    };
     bad.sort();
     bad.dedup();
     let receipt = json!({
@@ -1382,6 +1470,27 @@ pub fn memory_problems(samples: &[Value], ledger: &MemoryLedger) -> (Vec<String>
             "owned_device_bytes": ledger.owned_device_bytes,
             "owned_host_bytes": ledger.owned_host_bytes,
             "census_basis": ledger.census_basis,
+            "device_weights_bytes": d.weights,
+            "s1_tile_census_bytes": d.s1_tile_census,
+            "s1_extras_bytes": d.s1_extras,
+            "sequential_diag_bytes": d.sequential_diag,
+            "safety_margin_bytes": d.safety_margin,
+        },
+        "device_guard": {
+            "components": {
+                "device_weights_bytes": d.weights,
+                "s1_tile_census_bytes": d.s1_tile_census,
+                "s1_extras_bytes": d.s1_extras,
+                "sequential_diag_bytes": d.sequential_diag,
+                "safety_margin_bytes": d.safety_margin,
+                "driver_allowance_bytes": UNOWNED_VRAM_ALLOWANCE_BYTES,
+            },
+            "observed_max_device_bytes": device_observed,
+            "sampling_method": "max over discrete point samples (process drm-memory-vram, hipMemGetInfo used minus pre_load used); a measured lower bound of the peak, not a continuous driver peak",
+            "measured_non_weight_peak_bytes": measured_non_weight,
+            "allowed_non_weight_bytes": allowed_non_weight,
+            "result": guard_result,
+            "note": "measured_non_weight_peak = observed max device - weights (saturating at 0); allowed = tile census + extras + sequential diag + safety margin + driver allowance; the stricter unowned-residual check is kept",
         },
         "allowances": {
             "unowned_vram_bytes": UNOWNED_VRAM_ALLOWANCE_BYTES,

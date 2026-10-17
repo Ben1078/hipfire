@@ -1797,7 +1797,9 @@ fn run(args: &Args) -> Result<bool, String> {
                         problems,
                         json!({
                             "observed": receipt["observed"], "residual": receipt["residual"],
-                            "allowances": receipt["allowances"], "see": "evidence.memory_observations",
+                            "allowances": receipt["allowances"],
+                            "device_guard": receipt["device_guard"],
+                            "see": "evidence.memory_observations",
                         }),
                     );
                     out.insert("memory_observations".into(), receipt);
@@ -2639,11 +2641,22 @@ mod slowlink_receipt_tests {
         row
     }
 
+    fn decomposition() -> DeviceDecomposition {
+        DeviceDecomposition {
+            weights: 10 * GIB,
+            s1_tile_census: 2 * GIB,
+            s1_extras: 7 * GIB,
+            sequential_diag: GIB,
+            safety_margin: GIB / 2,
+        }
+    }
+
     fn ledger_with_host(owned_host: u64) -> MemoryLedger {
         MemoryLedger {
             owned_device_bytes: 20 * GIB,
             owned_host_bytes: owned_host,
             census_basis: "test census".into(),
+            decomposition: decomposition(),
         }
     }
 
@@ -2889,11 +2902,24 @@ mod slowlink_receipt_tests {
         let manifest = json!({"memory_ledger": {
             "owned_device_bytes": 21474836480u64, "owned_host_bytes": 85899345920u64,
             "census_basis": "A census + 2 GiB cache pool",
+            "device_weights_bytes": 10 * GIB, "s1_tile_census_bytes": 2 * GIB,
+            "s1_extras_bytes": 7 * GIB, "sequential_diag_bytes": GIB,
+            "safety_margin_bytes": GIB / 2,
         }});
         let ledger = memory_ledger(&manifest).unwrap();
         assert_eq!(ledger.owned_device_bytes, 20 * GIB);
         assert_eq!(ledger.owned_host_bytes, 80 * GIB);
-        for key in ["owned_device_bytes", "owned_host_bytes", "census_basis"] {
+        assert_eq!(ledger.decomposition, decomposition());
+        for key in [
+            "owned_device_bytes",
+            "owned_host_bytes",
+            "census_basis",
+            "device_weights_bytes",
+            "s1_tile_census_bytes",
+            "s1_extras_bytes",
+            "sequential_diag_bytes",
+            "safety_margin_bytes",
+        ] {
             let mut m = manifest.clone();
             m["memory_ledger"].as_object_mut().unwrap().remove(key);
             assert!(memory_ledger(&m).is_err(), "{key}");
@@ -2901,9 +2927,102 @@ mod slowlink_receipt_tests {
         let mut m = manifest.clone();
         m["memory_ledger"]["owned_host_bytes"] = json!(0);
         assert!(memory_ledger(&m).is_err());
+        let mut m = manifest.clone();
+        m["memory_ledger"]["safety_margin_bytes"] = json!(0);
+        assert!(memory_ledger(&m).is_err(), "zero safety margin");
+        // A decomposition whose four-part sum is not the owned bytes refuses.
+        let mut m = manifest.clone();
+        m["memory_ledger"]["s1_extras_bytes"] = json!(7 * GIB + 1);
+        let e = memory_ledger(&m).unwrap_err();
+        assert!(e.contains("not owned_device_bytes"), "{e}");
+        // The safety margin is not part of the sum.
+        let mut m = manifest.clone();
+        m["memory_ledger"]["owned_device_bytes"] = json!(20 * GIB + GIB / 2);
+        assert!(memory_ledger(&m).is_err());
+        // A sum that overflows u64 refuses rather than wrapping.
+        let mut m = manifest.clone();
+        m["memory_ledger"]["device_weights_bytes"] = json!(u64::MAX);
+        assert!(memory_ledger(&m).unwrap_err().contains("overflows"));
         let mut m = manifest;
         m["memory_ledger"]["census_basis"] = json!("  ");
         assert!(memory_ledger(&m).is_err());
+    }
+
+    #[test]
+    fn slowlink_receipt_memory_non_weight_guard_is_exact_and_keeps_the_residual_check() {
+        // allowed = tile 2 + extras 7 + diag 1 + safety 0.5 + driver 1.5 = 12 GiB.
+        let d = decomposition();
+        assert_eq!(d.committed_sum(), Some(20 * GIB));
+        assert_eq!(d.allowed_non_weight(), Some(12 * GIB));
+        let at = |observed: u64| {
+            let host = counters(70 * GIB, 0, 80 * GIB, observed, 79 * GIB);
+            let mut s = memory_with(host, host);
+            // Keep hipMemGetInfo growth below the process counter.
+            for row in s.iter_mut().filter(|r| r["label"] != SAMPLER_LABEL) {
+                row["device_free"] = json!(31 * GIB);
+            }
+            memory_problems(&s, &ledger())
+        };
+        // Within the census: the guard passes and reports plain components.
+        let (bad, receipt) = at(20 * GIB);
+        assert!(bad.is_empty(), "{bad:?}");
+        let g = &receipt["device_guard"];
+        assert_eq!(g["result"], json!("pass"));
+        assert_eq!(g["measured_non_weight_peak_bytes"], json!(10 * GIB));
+        assert_eq!(g["allowed_non_weight_bytes"], json!(12 * GIB));
+        assert_eq!(g["observed_max_device_bytes"], json!(20 * GIB));
+        assert_eq!(g["components"]["s1_tile_census_bytes"], json!(2 * GIB));
+        assert_eq!(
+            g["components"]["driver_allowance_bytes"],
+            json!(UNOWNED_VRAM_ALLOWANCE_BYTES)
+        );
+        assert!(g["sampling_method"]
+            .as_str()
+            .unwrap()
+            .contains("not a continuous"));
+        // Exactly at weights + allowed the guard still passes (the stricter
+        // residual check is what fails there).
+        let (bad, receipt) = at(22 * GIB);
+        assert_eq!(receipt["device_guard"]["result"], json!("pass"));
+        assert!(!bad.iter().any(|p| p.contains("non-weight")), "{bad:?}");
+        assert!(
+            bad.iter().any(|p| p.contains("unowned VRAM residual")),
+            "{bad:?}"
+        );
+        // One byte over fails the guard, with the residual check also failing.
+        let (bad, receipt) = at(22 * GIB + 1);
+        assert_eq!(receipt["device_guard"]["result"], json!("fail"));
+        assert_eq!(
+            receipt["device_guard"]["measured_non_weight_peak_bytes"],
+            json!(12 * GIB + 1)
+        );
+        assert!(
+            bad.iter().any(|p| p.contains("non-weight device peak")),
+            "{bad:?}"
+        );
+        assert!(
+            bad.iter().any(|p| p.contains("unowned VRAM residual")),
+            "{bad:?}"
+        );
+        // Observed below the weights is a lower bound of 0, never a wrap.
+        let (_, receipt) = at(GIB);
+        assert_eq!(
+            receipt["device_guard"]["measured_non_weight_peak_bytes"],
+            json!(0)
+        );
+        assert_eq!(receipt["device_guard"]["result"], json!("pass"));
+        // No device observation at all: the guard cannot pass.
+        let mut s = good_memory();
+        for row in s.iter_mut() {
+            row["drm_vram"] = Value::Null;
+            row["device_free"] = Value::Null;
+        }
+        let (bad, receipt) = memory_problems(&s, &ledger());
+        assert_eq!(receipt["device_guard"]["result"], json!("unobserved"));
+        assert!(
+            bad.iter().any(|p| p.contains("non-weight guard")),
+            "{bad:?}"
+        );
     }
 
     #[test]
