@@ -1,0 +1,268 @@
+{
+ "status": "Device accounting fit (Main): 25,342,029,292 B <= 24 GiB. Host census closed: host_owned 52,926,218,240 B + 2 GiB declared allowance = 55,073,701,888 B => --hostmem-gb 52. ledger-hold*.json sealed by S1Integrate after the final tip and release binary SHA.",
+ "model": {
+  "path": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4",
+  "bytes": 125288544792,
+  "GiB": 116.68405010551214,
+  "observed_on": "hipx ls -laL (read-only ssh), mtime 2026-10-02"
+ },
+ "ple_sidecar_q4": {
+  "path": "qwen3.8-flash-next-gptq3.mq4.ple-q4",
+  "bytes": 29120146432,
+  "GiB": 27.12024974822998,
+  "owner": "selected by PLE format q4 (cell env HIPFIRE_PLE_FORMAT=q4); reclaimable page cache unless the incumbent owner pins rows: NOT a nonreclaimable owner by this ledger rule until the PLE owner census says so"
+ },
+ "ple_hot_sidecars": {
+  "plehot_bytes": 320018310,
+  "plehotrows_bytes": 42925210136,
+  "note": "present beside the model; only attached by the --ple-hot / product hot-store paths, which the gate/greedy/kld cells do NOT use"
+ },
+ "host_pinned_experts_S1_fixture": {
+  "host_layers": 38,
+  "bytes": 50803507200,
+  "GiB": 47.314453125,
+  "source": "plan section 0/5: 50,803,507,200 expert bytes at the ten-resident/38-host MQ4 placement; unique pinned owners, no donor backups on S1, no duplicate mmap page-cache charge"
+ },
+ "host_pinned_table_staging": "T: 18 pages * 2 * E * 8 bytes (E = experts per page set); exact value from T's page spec, not derived here",
+ "device_charged_terms_from_A_T_D": [
+  "1536-row tile scratch",
+  "HC F32 arena + D route layout/shared/K1(48)",
+  "A4 sidecars 82,575,360 B at N=16384",
+  "ring (2 x 32-expert slots) + one 512-expert lookahead store (~1.401 GiB MQ4 payload)",
+  "4 session fixed copies",
+  "primitive selftest transient ~page + 128 MiB device + a host download page (T)"
+ ],
+ "unobserved_terms": [
+  "driver/HIP runtime overhead and event pool high-water",
+  "PLE row cache / anon heap of the loaded process (RSS anon)",
+  "tokenizer/metadata anon",
+  "session-cache host pool",
+  "kernel cache",
+  "GTT unique owners other than pinned experts"
+ ],
+ "version": 2,
+ "host_unreclaimable_terms": {
+  "pinned_expert_owners": {
+   "bytes": 52140441600,
+   "GiB": 48.5595703125,
+   "composition": "38 trunk host layers (50,803,507,200 B) + the MTP layer's 2 routed-expert tensors (1,336,934,400 B, model-index.json: mtp.layers.*.mlp.experts.{gate_up,down}_proj)",
+   "why_mtp_is_included": "the manifest declares MTP weights whenever the artifact has an MTP head, and fulfill_manifest_from_payloads fulfils every manifest entry; place_routed_experts always host-maps names starting 'mtp.'; SingleDeviceLoad.native_mtp/mtp_kept=false only drops the head's runtime state/scratch reserve (expert_residency.rs placement_inputs mtp_for), NOT the weights. The product loader behaves identically (CHANGELOG: 10 resident -> 'pinned host experts 48.6 GiB' = 39 x 1,336,934,400 B; 5 resident -> 54.9 GiB = 44 x 1,336,934,400 B).",
+   "rule": "unique physical owners counted once; pinned source pages are the file's page cache pages; no donor backups on S1",
+   "supersedes": "the plan's 50,803,507,200 B (trunk only)",
+   "receipt_limit_note": "receipt COLD_BYTES_LIMIT 50,803,507,200 stays TRUNK-ONLY (PanelSchedule bands trunk layers 0..48 and never prefetches MTP experts; host_expert_bytes_total = sweep trunk payload); it is a traffic bound, never a host-ledger substitute",
+   "per_allocation_pad_pending": {
+    "bytes": 81788928,
+    "derivation": "78 host-mapped tensor owners at 10 resident x 1 MiB raw dispatch upload pad",
+    "status": "SOURCED (S1Integrate: dispatch upload raw 1 MiB per owner); counted"
+   },
+   "physical_host_ledger_bytes_before_pad": 52140441600
+  },
+  "t_table_staging_pinned": {
+   "bytes": 147456,
+   "derivation": "T: 18 pages * 2 * E(512) * 8 B (per Integrate/T; confirm against PanelPageSpec once final)"
+  },
+  "ple_row_store_page_cache_anon": {
+   "bytes": 268435456,
+   "source": "hipfire-runtime external_rows.rs PAGE_CACHE_BYTES (anon heap)"
+  },
+  "ple_row_store_staging_anon": {
+   "bytes_upper": 16777216,
+   "source": "external_rows.rs MAX_STAGING_BUFFERS=2 x max(STAGING_BUDGET_BYTES=8 MiB, staging_rows*decoded_row_bytes); staging_rows default 0 on the validation attach path -> 8 MiB each"
+  },
+  "ple_host_stage_pageable_anon": {
+   "bytes": "tile rows (1536) x PLE row bytes; PleHostStage vec in gpu_forward.rs, exact from config.ple dims once final (pageable, not pinned)"
+  },
+  "hfq_metadata_tokenizer_index_anon": {
+   "bytes_upper": 43327488,
+   "source": "HFQ data_offset = 14,442,496 B bounds header+metadata JSON+tensor index; the metadata String, the tokenizer tables and the index Vec are each below it (read from the file header over ssh, read-only)"
+  },
+  "session_cache": {
+   "bytes": 0,
+   "source": "hipfire-runtime session_cache.rs: CheckpointPool snapshots are DEVICE buffers; the gate attaches no disk tier, so no host bounce buffer (fixture session_cache_bytes only bounds the device pool)"
+  },
+  "kernel_cache": {
+   "bytes": 0,
+   "source": "on-disk code objects (HIPFIRE_KERNEL_CACHE in the cell dir); loaded modules are device/driver terms below"
+  }
+ },
+ "excluded_reclaimable_page_cache": {
+  "ple_q4_table": "29,120,146,432 B (27.12 GiB) mq4.ple-q4 pages are read-through page cache; landed beta (ff799626e) 'memory.ple_prewarm_bytes=auto' keeps up to MemAvailable-CMA-8 GiB of the table warm on a discrete GPU with host-placed experts = reclaimable, never counted as unreclaimable",
+  "non_expert_and_resident_expert_file_pages": "read once into VRAM; reclaimable after load"
+ },
+ "device_terms": {
+  "from_authoritative_layout": "A SlowlinkCensus.terms(): expert ring, expert lookahead, route storage (D PromptRouteLayout::total_bytes), A4 sidecars (82,575,360 B at N=16384), HC arena, boundary state (4 session fixed copies); reserve == the profile's charged census.total(); exact numbers are read from the admitted profile's load log/census, not from prose (the ~1.401 GiB figure is a plan estimate)",
+  "primitive_selftest_transient": "T: ~one page + 128 MiB device D2D reader scratch (+ ping-pong) and one host download page (diagnostic only; Hold 1 `prim` cell; freed before the `state` cell)"
+ },
+ "diagnostic_primitive_terms": {
+  "source": "D selftest::diagnostic_bytes(DiagCase,&DiagGeometry{hidden,n_exp,mi,binding_experts,k1_rows},limits) at commit e49f8f8b7 (pure helper, reported by S1Integrate)",
+  "fixture": "hidden 2560, n_exp 512, moe_intermediate 640, binding_experts 32, k1_rows 3 (real metadata); from D selftest::diagnostic_bytes helper as reported by S1Integrate (supersedes the void mi=512 values)",
+  "canary_extra_device_bytes": 181824768,
+  "canary_extra_host_bytes": 351518720,
+  "sequencing": "D transients are sequential: take the MAX over cases, not the sum. T's transient (one page + 128 MiB device D2D reader scratch + ping-pong, one host download page) is a SEPARATE max (not added to D's) since cases run sequentially; exact T value needs T's current spec helper (page = PanelPageLayout.page_bytes).",
+  "persistent_after_diag": "D grow-only Gpu sidecars persist after the diagnostic (~9.26 MB) unless the production 16K buffers are already larger (then 0 extra); counted in the Hold 1 `state` cell peak as <= 9.26 MB",
+  "applies_to": "Hold 1 `prim` cell only; the `state`, `greedy-*` cells run in separate processes with no diagnostic transient",
+  "ledger_rule": "prim-cell device peak = baseline loaded peak + max(D canary_extra_device 180,350,208 B, T transient); prim-cell host peak = baseline + max(D canary_extra_host 351,518,720 B, T host download page)",
+  "invalidated_values_at_mi512": {
+   "device": 180350208,
+   "host": 351518720
+  },
+  "other_cases_bytes_device_host": {
+   "k1_tail_cohort": [
+    2423688,
+    20685040
+   ],
+   "zero_row_panel": [
+    1071552,
+    1238720
+   ]
+  },
+  "max_rule": "per-case extras are sequential: use the max (canary 181,824,768 device / 351,518,720 host dominates)",
+  "decode_diag_bytes": {
+   "host": 99041064,
+   "device": 2012120,
+   "note": "D decode diagnostic; <= the canary MAX, so the canary dominates"
+  }
+ },
+ "real_fixture_metadata": {
+  "source": "read-only ssh read of the model's HFQ metadata JSON (offset 32, 12,283,325 B) on hipx, config/text_config; matches H0 summary.source.layer_identity",
+  "hidden_size": 2560,
+  "hc_count": 4,
+  "moe_intermediate_size": 640,
+  "shared_expert_intermediate_size": 640,
+  "num_experts": 512,
+  "num_experts_per_tok": 10,
+  "num_hidden_layers": 48,
+  "mtp_layers": 1,
+  "vocab_size": 248320,
+  "per_expert_bytes": {
+   "gate_up": 1740800,
+   "down": 870400,
+   "total": 2611200,
+   "layer": 1336934400
+  },
+  "check": "38 host layers x 1,336,934,400 = 50,803,507,200 B (plan figure)"
+ },
+ "derived_terms_real_fixture_N16384": {
+  "t_page_payload_pre_pad": 83558400,
+  "t_uniform_run_slack": 32640,
+  "t_arena_tail_pad": 4096,
+  "t_page_bytes": 83595264,
+  "t_pages": 18,
+  "t_pages_payload_total_bytes": 1504714752,
+  "t_tables_device_bytes": 147456,
+  "t_tables_host_staging_bytes_pinned": 147456,
+  "t_device_total_bytes": 1504862208,
+  "hc_arena_bytes": 429793280,
+  "a4_sidecars_bytes": 82575360,
+  "route_storage_closed_form_bytes_partial": {
+   "x_norm_f32": 167772160,
+   "topk_ids": 655360,
+   "topk_weights": 655360,
+   "accumulator_f32": 167772160,
+   "route_maps_estimate": "sorted_slot G*4 + tile_ids G/16*4 + inverse N*10*4 + counts/offsets, G<=N*10+512*15=171520 -> ~1.4 MB",
+   "not_listed": "shared_hidden_bytes, shared_scalar_bytes, k1_bytes (D PromptRouteLayout) and exact counts/offsets: read PromptRouteLayout::total_bytes for N=16384"
+  },
+  "pinned_expert_owners_bytes": 50803507200,
+  "hc_arena_derivation": "align256((W+3066+tile_rows)*wide*2) with W=16384, tile_rows=1536, wide=hc_count*hidden=10240 (S1_F32_STREAM_ROWS=6*511=3066; A's changed layout, supersedes the earlier 4-branch F32 figure 671,088,640)",
+  "boundary_state": {
+   "formula": "state::session_fixed_stage_bytes: GDN 36*(48*128*(128+4)+10240*3*4)=33,619,968; QSA 12*(2048+3)*4=98,448; PLE 9*2560*4*4=368,640; feedback 40,960",
+   "one_stage_bytes": 34128016,
+   "four_stage_bytes": 136512064,
+   "gdn_state_format": "Q8 (rdna tensor_ops::state_units); QSA selected capacity = budget + ratio-1; PLE history (kernel-1)*ngram3",
+   "native_mtp_pending_hidden_bytes": 40960,
+   "verification": "integer arithmetic only (shell printf / python), from the persisted real config; not a runtime measurement"
+  },
+  "route_storage_bytes": 386070784,
+  "route_storage_source": "D 76e7f53df: real fixture N16384/H2560/E512/mi640/shared640/k1_rows48 incl. persisted k1_shared (2*shared_intermediate*4*k1_rows = 245,760 B); previous 385,825,024 B SUPERSEDED",
+  "route_storage_plus_a4_bytes": 468646144,
+  "group_scatter_workspace_bytes": 3278848,
+  "route_plus_a4_plus_scatter_bytes": 471924992,
+  "s1_extras_total_device_bytes_native_mtp_off": 2543092544,
+  "s1_extras_total_device_bytes_native_mtp_on": 2543133504,
+  "s1_extras_composition": "HC arena + T pool + (route storage + A4 + group-scatter) + 4 boundary stages",
+  "note": "exact closed-form/source-owned terms from the persisted real config (model-config.json, model-index.json) and the cited source; the admitted profile's census is the authority",
+  "device_census_s1_extras": {
+   "t_pool_device_total": 1504862208,
+   "route_storage": 386070784,
+   "a4_sidecars": 82575360,
+   "hc_arena": 429793280,
+   "sum": 2406580480,
+   "group_scatter_workspace": 3278848,
+   "boundary_state_four_stages": 136512064,
+   "s1_extras_total_native_mtp_off": 2543092544,
+   "s1_extras_total_native_mtp_on": 2543133504
+  }
+ },
+ "device_mtp_weights_note": "MTP non-expert weights (fc_*, head, layers non-expert) are fulfilled resident on the device and counted in resident_split non_expert (base reserve census) whether or not native MTP attaches; this equals the product's behaviour.",
+ "measurement_policy": {
+  "ruling": "Main: the former 'unobserved driver term needs a prior matching run' block is OBSOLETE. The ledger is the exact source-owned census + the 2 GiB device cache pool + the pending working set, PLUS two fixed ALLOWANCES.",
+  "allowances_are_declared_not_measured": {
+   "device_vram_bytes": 1610612736,
+   "host_bytes": 2147483648
+  },
+  "enforcement": "Hold 1 FIRST cell (prim) is instrumented: sysfs vram_used/gtt_used before/after and per-sample VmRSS/VmPin/RssAnon of the cell's process; holds/check_residual.py FAILS the hold (and blocks every later cell) when measured peak minus the declared owned census exceeds the allowance. The gate-side hipMemGetInfo before/after receipt is owned by CacheReceipt (gate/common); it is not required by this script.",
+  "declared_ledger_file": "ledger-hold{N}.json (see ledger-template.json); --print-memory reads ONLY a final declared numeric ledger"
+ },
+ "provenance": {
+  "model_config_sha256": "09bdc80f4f47dab77700880add826259a4cf6b0c2e9809219ed96b63d5af4a08",
+  "model_index_sha256": "0da73ebaf81137a16bfb83f138fc092febfb158a63b74bc342cddd895625706a",
+  "source_commits": {
+   "D": "76e7f53df",
+   "A": "c383fc445/f6b3301cf (+later)",
+   "note": "frozen with the final ledger"
+  }
+ },
+ "main_ruling_card_reservation": {
+  "ruling": "--mem-gb 24: the WHOLE exclusive XTX is reserved (no ceil-of-ledger declaration). The ledger is an ACCOUNTING FIT, not a declaration.",
+  "committed_core_bytes": 23513603564,
+  "core_terms": {
+   "weights": 18733399296,
+   "forward": 1839888260,
+   "state": 68514080,
+   "qsa": 281149440,
+   "workspace": 47559944,
+   "s1_extras": 2543092544
+  },
+  "sequential_t_diag_bytes": 217812992,
+  "device_owned_bytes_core_plus_diag": 23731416556,
+  "driver_allowance_bytes_declared_not_measured": 1610612736,
+  "accounting_total_bytes": 25342029292,
+  "card_bytes_24GiB": 25769803776,
+  "residual_bytes": 427774484,
+  "session_cache": "2 GiB is a BUDGET CAP, not a commitment: recorded, never added to the owned census or the reservation",
+  "pending_working_set_ceiling_bytes": 620021760,
+  "pending_note": "pressure proof ceiling, NOT a charged commitment: recorded, never added",
+  "host": "host_owned + the 2 GiB host allowance ceilinged for --hostmem-gb: final host_owned provided by S1Integrate",
+  "s1_tile_reserve_ruling": {
+   "ruling": "Main approved: the S1-only tile reserve is the census total 2,237,111,724 B (= forward 1,839,888,260 + state 68,514,080 + QSA 281,149,440 + workspace 47,559,944), replacing the historical 5,517,207,808 B; the incumbent keeps its bytes unchanged. A measured scratch/driver guard is the mandatory first primitive.",
+   "device_weights_bytes": 18733399296,
+   "s1_tile_census_bytes": 2237111724,
+   "s1_extras_bytes": 2543092544,
+   "sequential_diag_bytes": 217812992,
+   "safety_margin_bytes": 536870912,
+   "checked_sum_first_four_equals_device_owned_bytes": 23731416556,
+   "guard": "max(device) - weights <= (tile + extras + diag) + safety + driver allowance; the stricter total residual (max(device) - device_owned <= driver allowance) is retained",
+   "safety_margin_note": "admission safety margin, no device allocation; not added twice to the committed fit (512 MiB; also the first-cell guard term; the stricter owned+driver fit is retained)"
+  }
+ },
+ "host_census_closed": {
+  "terms_bytes": {
+   "host_weights_39_layers_incl_mtp": 52140441600,
+   "host_map_owner_pad_78_x_1MiB": 81788928,
+   "ple_decoded_staging": 83886080,
+   "ple_page_cache": 268435456,
+   "t_pinned_tables": 147456,
+   "max_sequential_diagnostic_readback_d_canary": 351518720
+  },
+  "host_owned_bytes": 52926218240,
+  "host_allowance_bytes_declared_not_measured": 2147483648,
+  "host_total_bytes": 55073701888,
+  "hostmem_gb_ceil": 52,
+  "device_weights": {
+   "non_expert": 5364055296,
+   "resident_10_layers_experts": 18733399296,
+   "f16_shadow_1298923520_not_charged_on_xtx": "gfx1201-only path"
+  },
+  "census_basis": "host census (CPU header utility + source): 39 host expert layers incl MTP 52,140,441,600 + 78 raw host-map owner pads x 1 MiB 81,788,928 + PLE decoded staging 2*8192*16 heads*160*2 = 83,886,080 (assembled before the profile at the existing 8192 host capacity, not 1536) + PLE page cache 268,435,456 + T pinned tables 147,456 + MAX sequential diagnostic readback = D canary 351,518,720 (T page 83,595,264 and the other D cases are lower; never summed) = host_owned 52,926,218,240; device non-expert 5,364,055,296, 10-resident experts 18,733,399,296 (HFQ manifest-admitted CPU utility); the 1,298,923,520 B F16 shadow is gfx1201-only and NOT charged on the XTX"
+ }
+}

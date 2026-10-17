@@ -1,0 +1,32 @@
+{
+ "schema": "s1.model_identity.v1",
+ "note": "CACHED hashes: no 125 GB hash was computed. A cached record is valid only while the live stat (size, inode, mtime_ns) equals this file's; make_manifest.py checks that against prep-identity.json.",
+ "model": {
+  "path": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4",
+  "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+  "size_bytes": 125288544792,
+  "inode": 8292918,
+  "mtime_ns": 1790928378750535607,
+  "cached_receipts_on_hipx": [
+   "/home/kaden/pm-wave/integrate041j/gptq3.sha256 (2026-10-02 08:09:58, 3.6 min after the file mtime)",
+   "/home/kaden/pm-wave/qwen4a8/ModelGates/artifact.sha256 (2026-10-02)",
+   "/home/kaden/pm-wave/item3s34/kld/fn.sha256 (2026-10-09)",
+   "/home/kaden/pm-wave/fn-batch-s5/runs/model.sha256 (2026-10-10)",
+   "/home/kaden/pm-wave/fn-batch-s7b/runs/model.sha256 (2026-10-11)",
+   "/home/kaden/pm-wave/fn-batch-c8/runs/model2.sha256 (2026-10-11)"
+  ],
+  "agreement": "all six cached receipts name the same path and the same digest; the file mtime (2026-10-02 08:06:18) precedes every one of them"
+ },
+ "ple_sidecar": {
+  "path": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4.ple-q4",
+  "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+  "size_bytes": 29120146432,
+  "inode": 11562837,
+  "mtime_ns": 1791684308379843506,
+  "cached_receipts_on_hipx": [
+   "/home/kaden/pm-wave/mtp-trunc/runs/ple-q4.sha256 (2026-10-15, path agent-turn/models/qwen3.8-flash-next-gptq3.mq4.ple-q4)",
+   "/home/kaden/pm-wave/consumer24/loader-home-zab/prep.sha256 and loader-gate/pullsmoke/rehash.sha256 (2026-10-16)"
+  ],
+  "agreement": "the hashed paths are hard links of the SAME inode 11562837 (stat on hipx) as the staged sidecar, last modified 2026-10-11 02:05:08, before the earliest receipt"
+ }
+}

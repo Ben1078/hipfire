@@ -1,0 +1,26 @@
+{
+ "hold": "N",
+ "census_final": false,
+ "device_core_bytes": 23513603564,
+ "device_owned_bytes": 23731416556,
+ "device_allowance_bytes": 1610612736,
+ "card_bytes": 25769803776,
+ "session_cache_budget_cap_bytes_not_committed": 2147483648,
+ "pending_working_set_ceiling_bytes_not_charged": 620021760,
+ "host_owned_bytes": 52926218240,
+ "host_allowance_bytes": 2147483648,
+ "allowances_are_declared_not_measured": true,
+ "census_basis": "host census (CPU header utility + source): 39 host expert layers incl MTP 52,140,441,600 + 78 raw host-map owner pads x 1 MiB 81,788,928 + PLE decoded staging 2*8192*16 heads*160*2 = 83,886,080 (assembled before the profile at the existing 8192 host capacity, not 1536) + PLE page cache 268,435,456 + T pinned tables 147,456 + MAX sequential diagnostic readback = D canary 351,518,720 (T page 83,595,264 and the other D cases are lower; never summed) = host_owned 52,926,218,240; device non-expert 5,364,055,296, 10-resident experts 18,733,399,296 (HFQ manifest-admitted CPU utility); the 1,298,923,520 B F16 shadow is gfx1201-only and NOT charged on the XTX",
+ "provenance": {
+  "model_config_sha256": "09bdc80f4f47dab77700880add826259a4cf6b0c2e9809219ed96b63d5af4a08",
+  "model_index_sha256": "0da73ebaf81137a16bfb83f138fc092febfb158a63b74bc342cddd895625706a",
+  "source_tip": null,
+  "binary_sha256": null
+ },
+ "device_weights_bytes": 18733399296,
+ "s1_tile_census_bytes": 2237111724,
+ "s1_extras_bytes": 2543092544,
+ "sequential_diag_bytes": 217812992,
+ "safety_margin_bytes": 536870912,
+ "safety_margin_note": "admission safety margin, no device allocation; not added twice to the committed fit"
+}
