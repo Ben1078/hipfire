@@ -1329,6 +1329,10 @@ pub struct Gpu {
     /// reconstructed. Stored as `usize` (not a raw pointer) to leave `Gpu`'s
     /// auto-traits exactly as they were for the VMM arena map.
     host_mapped: HashMap<usize, usize>,
+    /// S1: host-mapped allocations whose physical ownership is shared with a stream-held
+    /// lease ([`Gpu::lease_host_owner`]). Empty (no allocation, no lock) on every other path;
+    /// keys are a subset of `host_mapped`'s.
+    host_leases: HostLeaseTable<hip_bridge::HostAllocOwner>,
     /// Host-mapped error block of the bounded device spin waits
     /// (`crate::device_wait`). Allocated by the first launch of such a kernel
     /// and kept for the `Gpu`'s lifetime, because captured graphs bake in its
@@ -2188,6 +2192,7 @@ impl Gpu {
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
             host_mapped: HashMap::new(),
+            host_leases: HostLeaseTable::new(),
             device_wait: None,
             router_fault: None,
             active_stream: None,
@@ -5576,6 +5581,46 @@ impl Gpu {
         self.host_mapped.len()
     }
 
+    /// Host-mapped allocations whose last-holder ownership was shared with an S1 lease and
+    /// that this `Gpu` still records (zero outside S1).
+    pub fn leased_host_count(&self) -> usize {
+        // bind_thread: skip — pure length read, touches no device state.
+        self.host_leases.len()
+    }
+
+    /// Share the physical ownership of a host-mapped OWNER tensor (the tensor returned by
+    /// the host-mapped allocation, not a view of it) with the caller: the returned lease keeps
+    /// the `hipHostMalloc` allocation alive until it and every clone are dropped, even after
+    /// [`Self::free_tensor`] or this `Gpu`'s drop released the registry's own reference.
+    /// The first call per allocation adopts it (once); later calls clone the same owner.
+    /// Nothing changes for allocations never leased. The caller must have drained every GPU
+    /// access before dropping the last lease.
+    pub fn lease_host_owner(&mut self, tensor: &GpuTensor) -> HipResult<HostAllocLease> {
+        self.bind_thread()?;
+        if !tensor.buf.is_host_mapped() {
+            return Err(HipError::new(0, "lease_host_owner: not a host-mapped tensor"));
+        }
+        let key = tensor.buf.as_ptr() as usize;
+        let host_ptr = *self.host_mapped.get(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("lease_host_owner: 0x{key:x} is not a registered host-mapped owner"),
+            )
+        })?;
+        let hip = &self.hip;
+        let owner = self.host_leases.lease_with(key, || {
+            // SAFETY: `host_ptr` is the registry's own `hipHostMalloc` pointer for `key`, not
+            // yet freed; `lease_with` adopts a key at most once, and from then on the
+            // registry's frees go through `host_leases` (free_tensor / release_registered_*),
+            // never `host_free`.
+            unsafe { hip.adopt_host_allocation(host_ptr as *mut std::ffi::c_void) }
+        })?;
+        Ok(HostAllocLease {
+            owner,
+            device_alias: key,
+        })
+    }
+
     /// Allocate this GPU's bounded-wait error block (`crate::device_wait`)
     /// if it does not exist yet. Allocation (`hipDeviceGetAttribute`,
     /// `hipHostMalloc`, `hipHostGetDevicePointer`) is not capture-safe, so
@@ -5736,6 +5781,13 @@ impl Gpu {
         // leak that `host_mapped_count()` could no longer report.
         let keys: Vec<usize> = self.host_mapped.keys().copied().collect();
         for key in keys {
+            // Leased by S1: release the registry's reference; a lease still held by a
+            // stream (or a quarantined ring page) frees it when it drops, never this loop.
+            if let Some(owner) = self.host_leases.release(key) {
+                self.host_mapped.remove(&key);
+                drop(owner);
+                continue;
+            }
             let host_ptr = self.host_mapped[&key];
             match self.hip.host_free(host_ptr as *mut std::ffi::c_void) {
                 Ok(()) => {
@@ -7086,6 +7138,13 @@ impl Gpu {
                     &format!("host-mapped tensor at 0x{key:x} has no registered host pointer"),
                 )
             })?;
+            // An S1-leased allocation: drop the registry's reference only. The last holder
+            // (a stream-held lease, else this release) runs the one hipHostFree.
+            if let Some(owner) = self.host_leases.release(key) {
+                debug_assert_eq!(owner.host_ptr() as usize, host_ptr);
+                drop(owner);
+                return Ok(());
+            }
             return self.hip.host_free(host_ptr as *mut std::ffi::c_void);
         }
         if self.vmm_arenas.contains_key(&key) {
@@ -8429,6 +8488,202 @@ impl Drop for Gpu {
                 }
             }
         }
+    }
+}
+
+/// The registry of host-mapped allocations whose physical ownership S1 shares with stream-held
+/// leases: `key` (the device alias of the owner tensor) -> the shared owner.  Generic over the
+/// owner so the lifecycle is tested on the CPU with a fake; `Gpu` uses
+/// `hip_bridge::HostAllocOwner`.  Empty on every non-S1 path (`HashMap::new` allocates
+/// nothing and a lookup in an empty map takes no lock).
+pub(crate) struct HostLeaseTable<O> {
+    map: HashMap<usize, std::sync::Arc<O>>,
+}
+
+impl<O> HostLeaseTable<O> {
+    pub(crate) fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// The shared owner of `key`: the existing one (no second adoption), else the result of
+    /// `adopt`, registered.  A failed adoption leaves the table unchanged.
+    pub(crate) fn lease_with(
+        &mut self,
+        key: usize,
+        adopt: impl FnOnce() -> HipResult<O>,
+    ) -> HipResult<std::sync::Arc<O>> {
+        if let Some(owner) = self.map.get(&key) {
+            return Ok(std::sync::Arc::clone(owner));
+        }
+        let owner = std::sync::Arc::new(adopt()?);
+        self.map.insert(key, std::sync::Arc::clone(&owner));
+        Ok(owner)
+    }
+
+    /// Drop the registry's record of `key` and return its reference, if the allocation was
+    /// ever leased.  `None` means NOT leased (or already released): the caller frees directly,
+    /// exactly as before S1.  The returned reference is dropped by the caller; the physical
+    /// free runs when the last holder (this one, or any stream-held lease) drops.
+    pub(crate) fn release(&mut self, key: usize) -> Option<std::sync::Arc<O>> {
+        if self.map.is_empty() {
+            return None;
+        }
+        self.map.remove(&key)
+    }
+}
+
+/// A stream-held share of one host-mapped allocation ([`Gpu::lease_host_owner`]): keeps the
+/// `hipHostMalloc` bytes alive until every clone drops, whatever happens to the `Gpu` or the
+/// tensor that owns the allocation.  Dropping the last holder frees it once.
+#[derive(Clone)]
+pub struct HostAllocLease {
+    owner: std::sync::Arc<hip_bridge::HostAllocOwner>,
+    device_alias: usize,
+}
+
+impl HostAllocLease {
+    /// Device alias of the owner tensor this lease was taken from (the kernels' pointer).
+    pub fn device_alias(&self) -> usize {
+        self.device_alias
+    }
+
+    /// The host pointer of the allocation.
+    pub fn host_ptr(&self) -> *mut std::ffi::c_void {
+        self.owner.host_ptr()
+    }
+
+    /// Holders of the physical allocation (leases plus, while recorded, the `Gpu` registry).
+    pub fn holders(&self) -> usize {
+        std::sync::Arc::strong_count(&self.owner)
+    }
+}
+
+#[cfg(test)]
+mod slowlink_host_lease_tests {
+    use super::HostLeaseTable;
+    use std::sync::{Arc, Mutex};
+
+    static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// The fake owner: freed exactly when its last `Arc` drops.
+    struct FakeOwner(usize);
+
+    impl Drop for FakeOwner {
+        fn drop(&mut self) {
+            FREED.lock().unwrap_or_else(|e| e.into_inner()).push(self.0);
+        }
+    }
+
+    fn freed(key: usize) -> usize {
+        FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&k| k == key)
+            .count()
+    }
+
+    fn lease(t: &mut HostLeaseTable<FakeOwner>, key: usize) -> Arc<FakeOwner> {
+        t.lease_with(key, || Ok(FakeOwner(key))).unwrap()
+    }
+
+    #[test]
+    fn slowlink_host_lease_unleased_allocation_is_freed_directly() {
+        // No lease: `release` returns None, so free_tensor / Gpu drop run the unchanged
+        // immediate hipHostFree path; the table never grows.
+        let mut t: HostLeaseTable<FakeOwner> = HostLeaseTable::new();
+        assert!(t.release(0x2000).is_none());
+        assert_eq!(t.len(), 0);
+        let _held = lease(&mut t, 0x2001);
+        assert!(t.release(0x2000).is_none(), "another key is unaffected");
+    }
+
+    #[test]
+    fn slowlink_host_lease_outlives_free_tensor() {
+        let key = 0x3000;
+        let mut t = HostLeaseTable::new();
+        let stream_lease = lease(&mut t, key);
+        // free_tensor: the registry drops its reference; the lease keeps the bytes alive.
+        drop(t.release(key).expect("leased"));
+        assert_eq!(freed(key), 0, "no immediate free while a lease is held");
+        assert_eq!(t.len(), 0);
+        drop(stream_lease);
+        assert_eq!(freed(key), 1, "the last holder frees exactly once");
+    }
+
+    #[test]
+    fn slowlink_host_lease_outlives_gpu_drop() {
+        let (a, b) = (0x4000, 0x4010);
+        let mut t = HostLeaseTable::new();
+        let la = lease(&mut t, a);
+        let _lb_dropped = lease(&mut t, b);
+        drop(_lb_dropped);
+        // Gpu drop: release_registered_host_mapped drains every record without freeing.
+        for key in [a, b] {
+            drop(t.release(key));
+        }
+        drop(t);
+        assert_eq!(freed(a), 0, "a stream-held lease survives the Gpu");
+        assert_eq!(freed(b), 1, "an allocation nobody holds is freed by the drain itself");
+        drop(la);
+        assert_eq!(freed(a), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_quarantine_then_drain_frees_after_the_ring_drains() {
+        let key = 0x5000;
+        let mut t = HostLeaseTable::new();
+        // A quarantined ring page and a lease still held by an in-flight stream.
+        let quarantined = lease(&mut t, key);
+        let in_flight = lease(&mut t, key);
+        drop(t.release(key));
+        assert_eq!(freed(key), 0);
+        // The failed ring is quarantined: the owner (the source tensor) is released first.
+        drop(in_flight);
+        assert_eq!(freed(key), 0, "quarantine keeps the pinned source alive");
+        // `drain` syncs the streams, then releases the pages' leases.
+        drop(quarantined);
+        assert_eq!(freed(key), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_adopts_once_and_second_release_is_none() {
+        let key = 0x6000;
+        let mut t = HostLeaseTable::new();
+        let mut adoptions = 0;
+        let first = t
+            .lease_with(key, || {
+                adoptions += 1;
+                Ok(FakeOwner(key))
+            })
+            .unwrap();
+        let second = t
+            .lease_with(key, || {
+                adoptions += 1;
+                Ok(FakeOwner(key))
+            })
+            .unwrap();
+        assert_eq!(adoptions, 1, "a second lease clones the owner, never re-adopts");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(t.release(key).is_some());
+        assert!(t.release(key).is_none(), "double release never frees or returns twice");
+        drop((first, second));
+        assert_eq!(freed(key), 1);
+    }
+
+    #[test]
+    fn slowlink_host_lease_failed_adoption_leaves_the_table_unchanged() {
+        let key = 0x7000;
+        let mut t: HostLeaseTable<FakeOwner> = HostLeaseTable::new();
+        let err = t.lease_with(key, || Err(hip_bridge::HipError::new(1, "adopt")));
+        assert!(err.is_err());
+        assert_eq!(t.len(), 0);
+        assert!(t.release(key).is_none());
+        assert_eq!(freed(key), 0);
     }
 }
 
