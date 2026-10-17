@@ -59,6 +59,8 @@ pub mod reference_forward;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_mtp;
 pub mod slowlink_admission;
+/// Admission-first single-device load shared by the S1 validation tools.
+pub mod slowlink_load;
 mod slowlink_prefill;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]

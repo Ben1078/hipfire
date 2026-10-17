@@ -1376,8 +1376,8 @@ impl Qwen4MoeLayerRuntime {
             return None;
         }
         Some((
-            checked_bytes(expert.gate_up.m, expert.gate_up.row_stride)?,
-            checked_bytes(expert.down.m, expert.down.row_stride)?,
+            crate::projection::checked_bytes(expert.gate_up.m, expert.gate_up.row_stride)?,
+            crate::projection::checked_bytes(expert.down.m, expert.down.row_stride)?,
         ))
     }
 
@@ -7450,7 +7450,11 @@ impl Qwen4GpuForward {
                             .as_deref(),
                     ) && ep.as_ref().is_some_and(|state| state.tile.is_some()))
                 {
-                    if single_scope {
+                    // An S1 load charged its own page ring instead of the G2
+                    // stage (`PlacementCharges::slowlink` with `staged = false`):
+                    // no donor or slab stage buffer is created beside it, and a
+                    // request S1 declines reads the host-mapped experts in place.
+                    if single_scope && bundle.slowlink_profile().is_none() {
                         expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe, max_chunk)?;
                     }
                 }
@@ -8188,6 +8192,32 @@ impl Qwen4GpuForward {
     /// earlier forward uploaded.
     pub(crate) fn slowlink_note_ids_rewritten(&mut self) {
         self.uploaded_id_rows = 0;
+    }
+
+    /// Device bytes of the forward's own mixer-tile scratch (every owned slot
+    /// of the plan): the S1 receipt's `reserve.tile`.
+    pub(crate) fn slowlink_tile_scratch_bytes(&self) -> u64 {
+        self.scratch
+            .slots
+            .iter()
+            .filter(|slot| slot.owner.is_none())
+            .filter_map(|slot| slot.bytes().ok())
+            .map(|bytes| bytes as u64)
+            .sum()
+    }
+
+    /// One named production-primitive check on this forward's admitted S1
+    /// transport and dispatch owners (`Qwen4Bundle::slowlink_primitive_selftest`
+    /// is the public facade). Returns exactly
+    /// `{"name","status":"pass"|"fail","mismatches","detail"}` from measured
+    /// device results; `Err` for a case that cannot run, never a default pass.
+    pub(crate) fn slowlink_primitive_selftest(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        name: &str,
+    ) -> Result<serde_json::Value, Qwen4GpuForwardError> {
+        crate::slowlink_prefill::primitive_selftest(self, bundle, gpu, name)
     }
 
     /// Teardown only: free the forward right before the bundle weights it

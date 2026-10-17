@@ -7861,9 +7861,6 @@ impl Qwen4MtpDrafter {
             && start_pos < prompt_tokens.len()
             && Self::bundle(target)?.slowlink_capture_eligible().is_ok()
         {
-            Self::bundle(target)?
-                .slowlink_save_pending(ops.gpu()?, pending)
-                .map_err(|error| error.to_string())?;
             let aborted = std::cell::Cell::new(false);
             let mut sink = |gpu: &mut Gpu,
                             bundle: &mut Qwen4Bundle,
@@ -7918,6 +7915,7 @@ impl Qwen4MtpDrafter {
             let outcome = Self::bundle(target)?.slowlink_try_capture(
                 ops.gpu()?,
                 &prompt_tokens[start_pos..],
+                pending,
                 &mut sink,
             );
             match outcome {
@@ -7933,8 +7931,13 @@ impl Qwen4MtpDrafter {
                         return Ok(PrefillOutcome::Aborted);
                     }
                     // The transaction restored target and head to the entry
-                    // state; put the entry `pending` hidden back with them.
+                    // state; put the entry `pending` hidden back with them,
+                    // but only from a backup taken for the window the state
+                    // was restored to (each window saves before its begin).
                     let message = error.to_string();
+                    if !Self::bundle(target)?.slowlink_pending_restorable() {
+                        return Err(message);
+                    }
                     let restored = Self::bundle(target)?.slowlink_restore_pending(ops.gpu()?, pending);
                     return Err(match restored {
                         Ok(()) => message,

@@ -288,6 +288,15 @@ pub(crate) fn prompt_window_end(entry: usize, end: usize, pending: &[usize], max
         .unwrap_or(end)
 }
 
+/// Whether the MTP `pending` backup applies to a state sitting at `position`:
+/// it was taken (`saved`) for exactly that window entry. The backup is
+/// refreshed before EVERY window's transaction begins, so after a window
+/// restores its entry state the matching backup is that window's own and
+/// never an earlier window's (whose `pending` is the hidden of another row).
+pub(crate) fn pending_backup_applies(saved: bool, saved_for: Option<usize>, position: usize) -> bool {
+    saved && saved_for == Some(position)
+}
+
 /// PLE token history after `tokens` follow `entry`.
 pub(crate) fn ple_history_after(entry: PleHistory, tokens: &[u32]) -> PleHistory {
     let mut history = entry;
@@ -498,6 +507,12 @@ pub(crate) struct SlowlinkOwner {
     injection_consumed: bool,
     /// Entry `pending` hidden of an MTP request, restored on failure.
     pending_save: Option<GpuTensor>,
+    /// The entry `pending` hidden was copied into `pending_save` by THIS
+    /// request's selected transaction (never before the selector's verdict).
+    pending_saved: bool,
+    /// The state position the backup was taken at (the entry of the window it
+    /// guards): a backup is valid only for a state at exactly that position.
+    pending_for: Option<usize>,
 }
 
 impl SlowlinkOwner {
@@ -682,6 +697,8 @@ impl Qwen4Bundle {
         self.slowlink.receipt_fresh = false;
         self.slowlink.bypass = None;
         self.slowlink.injection_consumed = false;
+        self.slowlink.pending_saved = false;
+        self.slowlink.pending_for = None;
     }
 
     /// Record the incumbent route's receipt (no-op when the orchestrator
@@ -830,9 +847,13 @@ impl Qwen4Bundle {
 
     /// MTP target capture through the selector. `Ok(Some(seed))` when the
     /// request ran layer-major (`seed` = the final row's argmax); `Ok(None)`
-    /// leaves it to the incumbent per-chunk loop.
+    /// leaves it to the incumbent per-chunk loop, with no allocation, copy or
+    /// other S1 work done. `pending` (the drafter's `pending` hidden) is
+    /// handed to the orchestrator through `PromptOutput::Capture::pending`:
+    /// it backs it up with [`Self::slowlink_save_pending`] only AFTER the
+    /// request was selected and before its first phase.
     pub(crate) fn slowlink_try_capture(
-        &mut self, gpu: &mut Gpu, tokens: &[u32],
+        &mut self, gpu: &mut Gpu, tokens: &[u32], pending: &GpuTensor,
         sink: &mut dyn FnMut(&mut Gpu, &mut Qwen4Bundle, crate::slowlink_prefill::PromptTile<'_>) -> Result<(), String>,
     ) -> Result<Option<u32>, BundleError> {
         let (logits, top1) = match (self.spec_logits.as_ref(), self.spec_top1.as_ref()) {
@@ -845,7 +866,11 @@ impl Qwen4Bundle {
                 ))
             }
         };
-        let output = crate::slowlink_prefill::PromptOutput::Capture { sink, head: Some((&logits, &top1)) };
+        let output = crate::slowlink_prefill::PromptOutput::Capture {
+            sink,
+            head: Some((&logits, &top1)),
+            pending: Some(pending),
+        };
         if !self.slowlink_dispatch(gpu, tokens, output, SlowlinkScope::capture())? {
             return Ok(None);
         }
@@ -861,16 +886,36 @@ impl Qwen4Bundle {
 
     /// Keep the entry `pending` hidden of an MTP request so a failure can
     /// put it back (the drafter owns `pending`; the copy is stream ordered).
+    /// Called by the orchestrator once, after the request was selected and
+    /// before its first phase.
     pub(crate) fn slowlink_save_pending(&mut self, gpu: &mut Gpu, pending: &GpuTensor) -> Result<(), BundleError> {
         if self.slowlink.pending_save.is_none() {
             self.slowlink.pending_save =
                 Some(gpu.zeros(&pending.shape, pending.dtype).map_err(BundleError::Hip)?);
         }
         let saved = self.slowlink.pending_save.as_ref().expect("allocated above");
-        copy_whole(gpu, pending, saved)
+        copy_whole(gpu, pending, saved)?;
+        self.slowlink.pending_saved = true;
+        self.slowlink.pending_for = Some(self.state.position);
+        Ok(())
     }
 
+    /// The backup taken for the window now at the live position is available:
+    /// a state restored to a window's entry restores exactly that window's
+    /// `pending` (the hidden of `entry - 1`), never an earlier window's.
+    pub(crate) fn slowlink_pending_restorable(&self) -> bool {
+        pending_backup_applies(self.slowlink.pending_saved, self.slowlink.pending_for, self.state.position)
+    }
+
+    /// Put the backed-up `pending` hidden back; an error when no backup was
+    /// taken for the window the state now sits at (so an unselected request,
+    /// or a later window, cannot restore stale bytes).
     pub(crate) fn slowlink_restore_pending(&mut self, gpu: &mut Gpu, pending: &GpuTensor) -> Result<(), BundleError> {
+        if !self.slowlink_pending_restorable() {
+            return Err(BundleError::Forward(
+                "no MTP pending hidden was saved for the window the state was restored to".into(),
+            ));
+        }
         let saved = self
             .slowlink
             .pending_save
@@ -963,6 +1008,14 @@ impl Qwen4Bundle {
             .ok_or_else(|| BundleError::Forward("slow-link window exceeds the context capacity".into()))?;
         if scope.head && self.mtp_position()? != entry {
             return Err(BundleError::Forward("slow-link window: the MTP head is not at the entry position".into()));
+        }
+        // Each window backs its entry `pending` up before it begins (the
+        // orchestrator saves before EVERY begin): a window whose entry has no
+        // backup would restore another window's hidden on failure.
+        if scope.head && !pending_backup_applies(self.slowlink.pending_saved, self.slowlink.pending_for, entry) {
+            return Err(BundleError::Forward(
+                "slow-link window: the MTP pending hidden was not saved for this window's entry".into(),
+            ));
         }
         let cuts = if scope.cuts { prompt_cuts_in(entry, end, &self.prompt_txn_pending()) } else { Vec::new() };
         let book = CutBook::new(
@@ -1475,6 +1528,30 @@ mod slowlink_txn_tests {
         Sink(usize),
     }
 
+    /// The drafter-side backup of `pending` (`slowlink_save_pending`), taken
+    /// before EVERY window's begin.
+    #[derive(Clone, Copy)]
+    struct Saved {
+        saved: bool,
+        for_position: Option<usize>,
+        pending: Option<usize>,
+    }
+
+    impl Saved {
+        fn take(m: &M) -> Self {
+            Self { saved: true, for_position: Some(m.position), pending: m.pending }
+        }
+
+        /// `mtp_spec`'s error path, run after the transaction restored the
+        /// target and head: `pending` comes back only from a backup that
+        /// applies to the position the owners were restored to.
+        fn restore_into(&self, m: &mut M) {
+            if pending_backup_applies(self.saved, self.for_position, m.position) {
+                m.pending = self.pending;
+            }
+        }
+    }
+
     struct Win<'a> {
         all: &'a [u32],
         entry: usize,
@@ -1598,7 +1675,11 @@ mod slowlink_txn_tests {
                 Ok(())
             }
             Err(error) => {
+                // The transaction restores target and head; `pending` is the
+                // drafter's and comes back only through its own backup.
+                let drafter_pending = m.pending;
                 *m = entry_state;
+                m.pending = drafter_pending;
                 for stage in stages.iter_mut() {
                     stage.position = None;
                 }
@@ -1758,9 +1839,11 @@ mod slowlink_txn_tests {
                 let mut m = entry_m.clone();
                 let mut stages = Vec::new();
                 let mut out = Vec::new();
+                let saved = Saved::take(&m);
                 let error = run_window(&ctx, &mut m, &mut stages, &w, inject, &mut out)
                     .expect_err("the injected failure surfaces");
                 assert!(!error.is_empty());
+                saved.restore_into(&mut m);
                 assert_eq!(m, entry_m, "entry {entry} head {head} {inject:?}: every owner restored");
                 assert!(out.is_empty(), "{inject:?}: nothing is published by an aborted window");
                 assert!(stages.iter().all(|stage| stage.position.is_none()));
@@ -1770,6 +1853,60 @@ mod slowlink_txn_tests {
                 assert_eq!(m.snapshot(), reference(&ctx, &cold, &all, end).snapshot());
             }
         }
+    }
+
+    #[test]
+    fn session_pair_window_two_failure_restores_the_window_two_entry_pending() {
+        // A request longer than the cut budget is two windows. The backup is
+        // refreshed before each window's begin, so a failure in window 2
+        // restores target, head AND `pending` to window 2's entry (the hidden
+        // of row 3071), not to the request's entry.
+        let ctx = ctx();
+        let all = tokens(9000);
+        let mut m = M::new(&ctx);
+        let mut stages = Vec::new();
+        let mut out = Vec::new();
+        let pending1: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > 0).collect();
+        let end1 = prompt_window_end(0, all.len(), &pending1, PROMPT_TXN_MAX_CUTS);
+        assert_eq!(end1, 3072);
+        let saved1 = Saved::take(&m);
+        assert!(pending_backup_applies(saved1.saved, saved1.for_position, 0));
+        let w1 = Win { all: &all, entry: 0, end: end1, boundaries: pending1, head: true };
+        run_window(&ctx, &mut m, &mut stages, &w1, Inject::None, &mut out).expect("window 1 commits");
+        assert_eq!((m.position, m.head_pos, m.pending), (3072, 3072, Some(3071)));
+
+        let pending2: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > 3072).collect();
+        let end2 = prompt_window_end(3072, all.len(), &pending2, PROMPT_TXN_MAX_CUTS);
+        assert_eq!(end2, all.len());
+        let w2 = Win { all: &all, entry: 3072, end: end2, boundaries: pending2, head: true };
+        // Window 2 saves its own entry `pending` before it begins.
+        let saved2 = Saved::take(&m);
+        assert!(pending_backup_applies(saved2.saved, saved2.for_position, 3072));
+        // The request-start backup does not apply to window 2: a begin
+        // without a fresh save is refused before any mutation.
+        assert!(!pending_backup_applies(saved1.saved, saved1.for_position, 3072));
+        let entry2 = m.clone();
+        let published_before = out.len();
+        for inject in [Inject::AfterLayer(0), Inject::DuringPanel(ctx.gdn_slot.len() - 1), Inject::Sink(1), Inject::BeforeCommit] {
+            let mut failed = entry2.clone();
+            run_window(&ctx, &mut failed, &mut stages, &w2, inject, &mut out).expect_err("window 2 fails");
+            saved2.restore_into(&mut failed);
+            assert_eq!(failed, entry2, "{inject:?}: target, head and pending are window 2's entry");
+            assert_eq!(failed.pending, Some(3071));
+            assert_eq!(out.len(), published_before, "{inject:?}: the failed window published nothing");
+        }
+        // With only the request-start backup the head's `pending` would stay
+        // at what window 2's first tile left in it: the inconsistent state
+        // the per-window refresh and the begin check exist to prevent.
+        let mut stale = entry2.clone();
+        run_window(&ctx, &mut stale, &mut stages, &w2, Inject::Sink(1), &mut out).expect_err("window 2 fails");
+        saved1.restore_into(&mut stale);
+        assert_ne!(stale, entry2);
+        // The retry from window 2's entry is a clean window.
+        run_window(&ctx, &mut m, &mut stages, &w2, Inject::None, &mut out).expect("window 2 commits");
+        let cold = M::new(&ctx);
+        assert_eq!(m.snapshot(), reference(&ctx, &cold, &all, all.len()).snapshot());
+        assert_eq!((m.head_pos, m.pending), (all.len(), Some(all.len() - 1)));
     }
 
     #[test]
