@@ -583,6 +583,13 @@ impl Model {
             path.display(),
             gpu.arch
         );
+        let resolved_format = bundle.state_format();
+        eprintln!(
+            "[qwen4_kld] resolved kv_mode={:?} qsa_state={:?} gdn_state={:?}",
+            hipfire_runtime::config::get().kv_mode,
+            resolved_format.qsa,
+            resolved_format.gdn
+        );
         Ok(Self {
             gpu,
             bundle,
