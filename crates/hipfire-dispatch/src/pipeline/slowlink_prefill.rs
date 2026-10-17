@@ -1720,6 +1720,209 @@ pub mod selftest {
         model::canonical(&case)
     }
 
+    // ── the diagnostics' own memory ledger (pure; no device) ──
+
+    /// Which diagnostic a byte ledger describes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DiagCase {
+        CanonicalCombine,
+        WithinExpertCanary,
+        K1TailCohort,
+        ZeroRowPanel,
+    }
+
+    /// Geometry of the call and binding the diagnostics run over.
+    #[derive(Clone, Copy, Debug)]
+    pub struct DiagGeometry {
+        pub hidden: usize,
+        pub n_exp: usize,
+        /// Expert intermediate width (`mi`, the call's `down_k`).
+        pub mi: usize,
+        /// Experts of the supplied binding (`expert_hi - expert_lo`).
+        pub binding_experts: usize,
+        /// K1 tile rows (`3.min(few_row_limit)`; the diagnostics use at most 3).
+        pub k1_rows: usize,
+    }
+
+    /// Unique-owner peak bytes of one diagnostic EXTRA to the model's own tensors: the panel
+    /// y scratches and the K1 scratches belong to the call and are charged by A.  Device
+    /// parts are what the diagnostic (or the Gpu scratch it grows) allocates; host parts are
+    /// its `Vec`s and transient conversion/readback buffers.
+    #[derive(Clone, Debug, Default)]
+    pub struct DiagBytes {
+        pub device_peak: usize,
+        pub host_peak: usize,
+        pub device_parts: Vec<(&'static str, usize)>,
+        pub host_parts: Vec<(&'static str, usize)>,
+    }
+
+    fn sum_parts(parts: &[(&'static str, usize)]) -> usize {
+        parts.iter().map(|p| p.1).sum()
+    }
+
+    /// Bytes of one synthetic window run by `run_window` (route region, grouped-scatter and A4
+    /// scratch on the device; seeded tiles, assembled rows, accumulator and inverse map on the
+    /// host) with `rows` tokens of which `k1_rows` are the K1 cohort, and at most `grouped`
+    /// padded K2 rows.
+    fn window_bytes(
+        g: &DiagGeometry,
+        limits: PanelLimits,
+        rows: usize,
+        k1_rows: usize,
+        grouped: usize,
+        dev: &mut Vec<(&'static str, usize)>,
+        host: &mut Vec<(&'static str, usize)>,
+    ) -> Result<(), DispatchError> {
+        let layout = PromptRouteLayout::new(&PromptRouteDims {
+            rows,
+            hidden: g.hidden,
+            n_exp: g.n_exp,
+            mi: g.mi,
+            shared_intermediate: 0,
+            k1_rows,
+        })?;
+        let slots = rows * K_TOP;
+        dev.push(("route_region", layout.total_bytes()));
+        dev.push((
+            "grouped_scatter_scratch (Gpu, grow-only)",
+            rdna_compute::scratch::qwen4_moe_group_layout(slots, g.n_exp).bytes,
+        ));
+        dev.push(("a4_sidecars (Gpu, grow-only)", layout.a4_sidecar_bytes()));
+        // Host: the seeded tiles (x, ids, weights) stay alive for the whole run; `f32_bytes`
+        // adds a transient copy of x while it uploads.
+        host.push(("tiles_x_f32", rows * g.hidden * F32_BYTES));
+        host.push(("tiles_ids_and_weights", 2 * slots * I32_BYTES));
+        host.push(("x_upload_transient", rows * g.hidden * F32_BYTES));
+        host.push(("assembled_down_bf16", grouped * g.hidden * BF16_BYTES));
+        host.push(("accumulator_f32", rows * g.hidden * F32_BYTES));
+        host.push(("inverse_map", slots * I32_BYTES));
+        host.push((
+            "panel_readback_transient",
+            limits.max_grouped_rows.min(grouped.max(1)) * g.hidden * BF16_BYTES,
+        ));
+        Ok(())
+    }
+
+    /// Host bytes of [`cpu_canonical`] (its `Case` clones the assembled rows, map, ids,
+    /// weights and a zero init) plus its output.
+    fn cpu_canonical_bytes(g: &DiagGeometry, rows: usize, grouped: usize) -> usize {
+        let slots = rows * K_TOP;
+        grouped * g.hidden * BF16_BYTES
+            + (g.n_exp + 1) * std::mem::size_of::<usize>()
+            + 3 * slots * I32_BYTES
+            + rows * g.hidden * F32_BYTES
+            + rows * std::mem::size_of::<usize>()
+            + rows * g.hidden * F32_BYTES
+    }
+
+    /// Device and host bytes of `monolithic`: the down rows, inverse, ids, weights, zero
+    /// accumulator and rank-order scratch uploaded at once; host conversion buffers and the
+    /// readback.
+    fn monolithic_bytes(g: &DiagGeometry, rows: usize, grouped: usize) -> (usize, usize) {
+        let slots = rows * K_TOP;
+        let device = grouped * g.hidden * BF16_BYTES
+            + 3 * slots * I32_BYTES
+            + rows * g.hidden * F32_BYTES
+            + slots * 8;
+        let host = grouped * g.hidden * BF16_BYTES
+            + 2 * slots * I32_BYTES
+            + 2 * rows * g.hidden * F32_BYTES;
+        (device, host)
+    }
+
+    /// Authoritative unique-owner peak of one diagnostic, from the source above (device
+    /// bytes the diagnostic or the Gpu scratch it grows allocates; host `Vec`s and transient
+    /// buffers).  Cases that run windows in sequence take the maximum, not the sum.
+    pub fn diagnostic_bytes(
+        case: DiagCase,
+        g: &DiagGeometry,
+        limits: PanelLimits,
+    ) -> Result<DiagBytes, DispatchError> {
+        limits.validate()?;
+        if g.binding_experts == 0 || g.hidden == 0 || g.n_exp == 0 {
+            return Err(bail("empty diagnostic geometry"));
+        }
+        let active = g.binding_experts.min(g.n_exp);
+        let upper = |slots: usize| (slots + MOE_GROUPED_BLOCK_M.saturating_sub(1) * active.min(slots)) / 16 * 16;
+        let mut out = DiagBytes::default();
+        match case {
+            DiagCase::CanonicalCombine => {
+                let c = model::make_case(0, 6);
+                let (t, h, rows) = (c.tokens, c.h, c.g);
+                out.device_parts = vec![
+                    ("down_rows_bf16", rows * h * BF16_BYTES),
+                    ("inverse_ids_weights", 3 * t * K_TOP * I32_BYTES),
+                    ("residual_and_accumulator_f32", 2 * t * h * F32_BYTES),
+                    ("order_scratch", t * K_TOP * 8),
+                ];
+                out.host_parts = vec![
+                    ("case_rows_map_ids_weights", rows * h * BF16_BYTES + 3 * t * K_TOP * I32_BYTES),
+                    ("case_init_and_cpu_canonical", 2 * t * h * F32_BYTES),
+                    ("upload_byte_copies", rows * h * BF16_BYTES + 2 * t * K_TOP * I32_BYTES),
+                    ("monolithic_reversed_and_panelled_results", 3 * t * h * F32_BYTES),
+                    ("init_bytes", t * h * F32_BYTES),
+                ];
+            }
+            DiagCase::WithinExpertCanary => {
+                let rows = limits.max_grouped_rows;
+                let grouped = upper(rows * K_TOP);
+                let mut dev = Vec::new();
+                let mut host = Vec::new();
+                window_bytes(g, limits, rows, 0, grouped, &mut dev, &mut host)?;
+                let (mono_dev, mono_host) = monolithic_bytes(g, rows, grouped);
+                // Device: the window stays alive while the monolithic reference runs.
+                dev.push(("monolithic_reference", mono_dev));
+                // Host: the call keeps ids/weights clones; `want` stays alive across the
+                // monolithic step, whose transient buffers come after the CPU model's.
+                host.push(("ids_weights_clones", 2 * rows * K_TOP * I32_BYTES));
+                host.push(("cpu_canonical_want", rows * g.hidden * F32_BYTES));
+                let cpu_phase = cpu_canonical_bytes(g, rows, grouped) - rows * g.hidden * F32_BYTES;
+                host.push(("max(cpu_model_case_clones, monolithic_host_transients)", cpu_phase.max(mono_host)));
+                out.device_parts = dev;
+                out.host_parts = host;
+            }
+            DiagCase::K1TailCohort => {
+                let k1 = g.k1_rows;
+                let rows = 64 + k1;
+                let grouped = upper(64 * K_TOP);
+                let mut dev = Vec::new();
+                let mut host = Vec::new();
+                window_bytes(g, limits, rows, k1, grouped, &mut dev, &mut host)?;
+                dev.push((
+                    "k1_reference_y0_and_accumulator",
+                    k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
+                ));
+                host.push(("cpu_model_case_clones_and_output", cpu_canonical_bytes(g, rows, grouped)));
+                host.push(("k1_reference_readback", k1 * g.hidden * F32_BYTES));
+                out.device_parts = dev;
+                out.host_parts = host;
+            }
+            DiagCase::ZeroRowPanel => {
+                // Window A (nothing routes, 40 tokens) is released before window B (K1-only);
+                // the larger of the two is the peak.
+                let k1 = g.k1_rows;
+                let (mut dev_a, mut host_a) = (Vec::new(), Vec::new());
+                window_bytes(g, limits, 40, 0, 0, &mut dev_a, &mut host_a)?;
+                let (mut dev_b, mut host_b) = (Vec::new(), Vec::new());
+                window_bytes(g, limits, k1, k1, 0, &mut dev_b, &mut host_b)?;
+                dev_b.push((
+                    "k1_reference_y0_and_accumulator",
+                    k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
+                ));
+                host_b.push(("k1_reference_readback", k1 * g.hidden * F32_BYTES));
+                if sum_parts(&dev_a) >= sum_parts(&dev_b) {
+                    out.device_parts = dev_a;
+                } else {
+                    out.device_parts = dev_b;
+                }
+                out.host_parts = if sum_parts(&host_a) >= sum_parts(&host_b) { host_a } else { host_b };
+            }
+        }
+        out.device_peak = sum_parts(&out.device_parts);
+        out.host_peak = sum_parts(&out.host_parts);
+        Ok(out)
+    }
+
     /// `canonical_combine_exact`: the production panel/pad combine kernels over the
     /// adversarial fixture and many partitions (within-expert splits included) equal the CPU
     /// canonical model and the monolithic GPU combine; reversed panel order differs.
