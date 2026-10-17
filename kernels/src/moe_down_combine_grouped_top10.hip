@@ -347,3 +347,15 @@ extern "C" __global__ __launch_bounds__(256) void slowlink_mask_ids(
     const int v = ids[i];
     out[i] = (v >= lo && v < hi) ? v : -1;
 }
+
+// S1 single count barrier: fold the K1 short-tail cohort's per-expert slot counts into the
+// stable grouping's padded-count words (K2 padded count < 2^20 in the low bits, K1 slot
+// count in bits 20..30), so one 512-word readback carries both.  Integer atomic adds are
+// order-independent; ids outside [0, n_exp) are unrouted and add nothing.
+extern "C" __global__ __launch_bounds__(256) void slowlink_fold_k1_counts(
+    const int* __restrict__ ids, int* __restrict__ counts, int n, int n_exp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int v = ids[i];
+    if (v >= 0 && v < n_exp) atomicAdd(&counts[v], 1 << 20);
+}
