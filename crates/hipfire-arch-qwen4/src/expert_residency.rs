@@ -279,6 +279,46 @@ pub fn resident_split_ranks(
     Ok((non_expert, layer_experts + layer_arena_max))
 }
 
+/// Gate/up and down payload bytes of the largest trunk layer of a packed
+/// (one tensor per projection per layer) manifest, separately: what the S1
+/// expert page layout splits over the layer's experts
+/// ([`crate::slowlink_admission::PanelPageLayout::new`]). The MTP layer is not
+/// a trunk layer and is excluded, like [`resident_split`]. A manifest with no
+/// packed projection pair is an error: S1 never sizes an arena layout.
+pub fn routed_layer_payload_split(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<(u64, u64), String> {
+    let mut per_layer: std::collections::BTreeMap<usize, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for entry in weights {
+        if entry.residency.is_external()
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+            || entry.name.starts_with("mtp.")
+        {
+            continue;
+        }
+        let gate_up = entry.name.ends_with(".mlp.experts.gate_up_proj");
+        let down = entry.name.ends_with(".mlp.experts.down_proj");
+        let Some(layer) = entry.layer.filter(|_| gate_up || down) else {
+            continue;
+        };
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        let slot = per_layer.entry(layer).or_default();
+        let target = if gate_up { &mut slot.0 } else { &mut slot.1 };
+        *target = target
+            .checked_add(bytes)
+            .ok_or_else(|| "routed layer payload byte census overflows".to_string())?;
+    }
+    let gate_up = per_layer.values().map(|bytes| bytes.0).max().unwrap_or(0);
+    let down = per_layer.values().map(|bytes| bytes.1).max().unwrap_or(0);
+    if gate_up == 0 || down == 0 {
+        return Err("manifest has no packed routed gate/up and down expert payload".to_string());
+    }
+    Ok((gate_up, down))
+}
+
 /// Stored dtype of the language head, which the native MTP draft head ranks
 /// with.
 pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DType> {
@@ -1780,6 +1820,10 @@ pub fn dedicated_slab_stage(stage_enabled: bool, slab_recipe: bool, expert_paral
 /// - `stage`: the two dedicated long-prefill stage buffers of a slab load,
 ///   `2 * (largest layer payload + ARENA_TAIL_PAD_BYTES)`
 ///   ([`dedicated_slab_stage`]); 0 when none are allocated.
+/// - `slowlink`: the S1 slow-link prefill profile's complete census
+///   ([`crate::slowlink_admission::SlowlinkCensus::total`]: tile arena, expert
+///   page store, panel scratch, boundary state); 0 on every load that does
+///   not select S1, which keeps that load's reserve and log byte for byte.
 ///
 /// The hot set path does not use this: it subtracts its own margin and
 /// tier-plan stage ([`expert_hotset_budget`], [`expert_tier_stage_bytes`]).
@@ -1787,6 +1831,7 @@ pub fn dedicated_slab_stage(stage_enabled: bool, slab_recipe: bool, expert_paral
 pub struct PlacementCharges {
     pub margin: u64,
     pub stage: u64,
+    pub slowlink: u64,
 }
 
 impl PlacementCharges {
@@ -1804,24 +1849,42 @@ impl PlacementCharges {
         Ok(Self {
             margin: EXPERT_HOTSET_VRAM_MARGIN_BYTES,
             stage,
+            slowlink: 0,
         })
     }
 
-    /// `base` ([`auto_vram_reserve`]) plus both charges.
+    /// These charges plus the S1 profile's census `bytes`.
+    pub fn with_slowlink(self, bytes: u64) -> Self {
+        Self {
+            slowlink: bytes,
+            ..self
+        }
+    }
+
+    /// `base` ([`auto_vram_reserve`]) plus every charge.
     pub fn reserve(&self, base: u64) -> Result<u64, String> {
         base.checked_add(self.margin)
             .and_then(|bytes| bytes.checked_add(self.stage))
+            .and_then(|bytes| bytes.checked_add(self.slowlink))
             .ok_or_else(|| "auto expert VRAM reserve with placement charges overflows".to_string())
     }
 
     /// The charges for the placement log, in MiB.
     pub fn describe(&self) -> String {
         const MIB: u64 = 1 << 20;
-        format!(
+        let base = format!(
             "{} MiB safety margin + {} MiB long-prefill stage buffers",
             self.margin / MIB,
             self.stage / MIB
-        )
+        );
+        if self.slowlink == 0 {
+            base
+        } else {
+            format!(
+                "{base} + {} MiB slow-link prefill (S1) arena, expert pages and boundary state",
+                self.slowlink / MIB
+            )
+        }
     }
 }
 
@@ -3719,7 +3782,8 @@ mod tests {
             off,
             PlacementCharges {
                 margin: 512 << 20,
-                stage: 0
+                stage: 0,
+                slowlink: 0,
             }
         );
         assert_eq!(off.reserve(base).unwrap(), base + (512 << 20));
@@ -6421,5 +6485,31 @@ mod tests {
         let mut all_host = xtx_manifest();
         place_routed_experts(&mut all_host, 48);
         assert!(host_placed_trunk_layers(&all_host).is_empty());
+    }
+
+    #[test]
+    fn slowlink_payload_split_is_the_largest_trunk_layer_per_projection() {
+        let mut big = entry("model.language_model.layers.1.mlp.experts.gate_up_proj", 1);
+        big.logical_shape = vec![8, 4, 256];
+        let mut mtp = entry("mtp.layers.0.mlp.experts.gate_up_proj", 0);
+        mtp.logical_shape = vec![64, 4, 256];
+        let weights = vec![
+            entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("model.language_model.layers.0.mlp.experts.down_proj", 0),
+            big,
+            entry("model.language_model.layers.1.mlp.experts.down_proj", 1),
+            entry("model.language_model.layers.1.self_attn.q_proj.weight", 1),
+            mtp,
+        ];
+        // 2 bytes per element: [4,4,256] = 8192, [8,4,256] = 16384; the MTP
+        // layer and non-expert tensors are not a trunk layer's payload.
+        assert_eq!(
+            routed_layer_payload_split(&weights, element_bytes),
+            Ok((16384, 8192))
+        );
+        assert!(routed_layer_payload_split(&weights[4..5], element_bytes).is_err());
+        assert!(routed_layer_payload_split(&[], element_bytes).is_err());
+        // A missing payload size is an error, never zero.
+        assert!(routed_layer_payload_split(&weights, |_| None).is_err());
     }
 }
