@@ -1019,6 +1019,125 @@ mod test {
         }
     }
 
+    /// Serial, uncached single-row arithmetic of [`gemv_shared_sourced`]: every
+    /// `(job, weight row, token)` element is one [`dot_row_simd`] call — what
+    /// [`gemv`] computes for that activation row — in the batched row-major
+    /// layout (`out[r * n + t]`, jobs concatenated).
+    fn single_row_reference<S: SharedJobSource>(
+        m: usize,
+        k: usize,
+        out: &mut [f32],
+        src: &S,
+        requested: Option<bool>,
+    ) {
+        let mut base = 0usize;
+        for j in 0..src.jobs() {
+            let n = src.n(j);
+            let q = src.quant(j);
+            let rb = row_bytes(q, k);
+            let use_simd = simd::row_dot_enabled(q, requested);
+            for r in 0..m {
+                let row = &src.packed(j)[r * rb..];
+                for t in 0..n {
+                    out[base + r * n + t] = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                }
+            }
+            base += m * n;
+        }
+    }
+
+    /// D2 admits verify windows of 2..4 rows. A routed expert selected by `w`
+    /// window rows is ONE grouped job of `n = w` activation rows; each row's
+    /// bytes must equal a one-row (`n = 1`) job and independent `gemv` at every
+    /// token position, with the Σx cache seeing aliased pointers (identical
+    /// tokens sharing one buffer), distinct pointers with identical content, and
+    /// distinct content; and the grouped path must equal the serial uncached
+    /// reference.
+    #[test]
+    fn gemv_shared_window_rows_match_one_row_at_every_position() {
+        struct Window<'a> {
+            q: CpuQuant,
+            packed: &'a [u8],
+            rows: &'a [&'a [f32]],
+        }
+        impl SharedJobSource for Window<'_> {
+            fn jobs(&self) -> usize {
+                1
+            }
+            fn n(&self, _: usize) -> usize {
+                self.rows.len()
+            }
+            fn quant(&self, _: usize) -> CpuQuant {
+                self.q
+            }
+            fn packed(&self, _: usize) -> &[u8] {
+                self.packed
+            }
+            fn xs_row(&self, _: usize, t: usize) -> &[f32] {
+                self.rows[t]
+            }
+        }
+        let (m, k) = (37usize, 1024usize);
+        let base = x_of(k);
+        let copies: Vec<Vec<f32>> = (0..4).map(|_| base.clone()).collect();
+        let distinct: Vec<Vec<f32>> = (0..4)
+            .map(|t| base.iter().map(|v| v * (1.0 + 0.37 * t as f32) - 0.01 * t as f32).collect())
+            .collect();
+        for requested in [Some(false), None] {
+            for q in [
+                CpuQuant::Mq4G256,
+                CpuQuant::Mq6G256,
+                CpuQuant::Mq4G256V2,
+                CpuQuant::Mq4G128V2,
+                CpuQuant::Mq3G256Lloyd,
+                CpuQuant::Mfp4G32E8,
+            ] {
+                let packed = weights(q, m, k);
+                let one_row = |x: &[f32]| {
+                    let mut y = vec![0.0f32; m];
+                    let src = Window { q, packed: &packed, rows: &[x] };
+                    gemv_shared_sourced(m, k, &mut y, &src, requested);
+                    let mut g = vec![0.0f32; m];
+                    gemv_with_simd(q, &packed, m, k, x, &mut g, requested);
+                    assert_eq!(
+                        y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{q:?} requested={requested:?}: one-row shared job != gemv"
+                    );
+                    y
+                };
+                for width in 2..=4usize {
+                    // Rows alias one buffer / copy one token / differ.
+                    let aliased: Vec<&[f32]> = vec![&copies[0][..]; width];
+                    let copied: Vec<&[f32]> = copies[..width].iter().map(|v| &v[..]).collect();
+                    let varied: Vec<&[f32]> = distinct[..width].iter().map(|v| &v[..]).collect();
+                    for (name, rows) in [("aliased", aliased), ("copied", copied), ("varied", varied)] {
+                        let src = Window { q, packed: &packed, rows: &rows };
+                        let mut out = vec![0.0f32; m * width];
+                        gemv_shared_sourced(m, k, &mut out, &src, requested);
+                        let mut reference = vec![0.0f32; m * width];
+                        single_row_reference(m, k, &mut reference, &src, requested);
+                        assert_eq!(
+                            out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            "{q:?} {name} width={width} requested={requested:?}: grouped != serial uncached reference"
+                        );
+                        for t in 0..width {
+                            let y = one_row(rows[t]);
+                            for r in 0..m {
+                                assert_eq!(
+                                    out[r * width + t].to_bits(),
+                                    y[r].to_bits(),
+                                    "{q:?} {name} width={width} requested={requested:?}: row {r} token {t} != one-row"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn gemv_matches_the_f64_reference() {
         for (m, k) in [(3usize, 512usize), (1, 4096)] {

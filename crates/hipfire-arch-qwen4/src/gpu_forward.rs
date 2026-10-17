@@ -6156,8 +6156,23 @@ impl Qwen4GpuForward {
                     .map(cpu_splice::CpuTierOwners::cold_experts)
                     .sum();
                 let slots = split_layers * bundle.config.num_experts;
+                // The same frozen plan hash scopes host_exec_identity/split_digest.
+                // Report the assignment, not merely its hot/cold slot counts.
+                let partition_digest = moe
+                    .iter()
+                    .find(|layer| layer.cpu_split.is_some())
+                    .and_then(|layer| layer.tier.as_ref())
+                    .map(|lease| {
+                        let mut hex = String::with_capacity(64);
+                        for byte in lease.logical_digest() {
+                            use std::fmt::Write as _;
+                            let _ = write!(hex, "{byte:02x}");
+                        }
+                        hex
+                    })
+                    .unwrap_or_else(|| "unarmed".to_owned());
                 eprintln!(
-                    "  [moe-cpu-split] qwen4: {split_layers}/{tier_layers} hot-set layers armed for the CPU tier split (static slot placement across armed layers: {} hot / {cold} cold expert slots of {slots}; dynamic per-token route hot/cold counts are reported by the executor); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe; layers whose host spans could not be resolved stay on PCIe",
+                    "  [moe-cpu-split] qwen4: {split_layers}/{tier_layers} hot-set layers armed for the CPU tier split (static slot placement across armed layers: {} hot / {cold} cold expert slots of {slots}; dynamic per-token route hot/cold counts are reported by the executor); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe; layers whose host spans could not be resolved stay on PCIe; partition_digest={partition_digest}",
                     slots - cold,
                     hipfire_dispatch::cpu_exec::splice_pool_threads()
                 );
