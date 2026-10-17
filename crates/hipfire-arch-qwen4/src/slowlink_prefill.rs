@@ -3935,12 +3935,19 @@ mod slowlink_overlap {
         assert_eq!(core.stats().acquired, 0);
         assert!((0..16).all(|group| schedule.ticket(10, group).is_some()));
         assert!(schedule.ticket(11, 0).is_none());
-        // Entering layer 10 enqueues nothing more: its groups are already on the
-        // way, the lookahead pages stay busy until their readers retire, and the
-        // two active pages are reserved for the current layer's missing groups.
+        // Compute reaches layer 10: its mixer and counts are still ahead, yet
+        // the two pages the current layer does not hold already carry the first
+        // two groups of layer 11 (every current-layer group holds a page, so no
+        // page is reserved for pending current work).
         schedule.enter_layer(&mut core, &(), 10).unwrap();
-        assert_eq!(core.stats().enqueued, 16);
-        assert!(schedule.ticket(11, 0).is_none());
+        assert_eq!(
+            core.stats().enqueued,
+            18,
+            "16 current + 2 next-layer pages, no acquire yet"
+        );
+        assert_eq!(core.stats().acquired, 0);
+        assert!(schedule.ticket(11, 0).is_some() && schedule.ticket(11, 1).is_some());
+        assert!(schedule.ticket(11, 2).is_none(), "the page store is full");
         // The walk retires layer 10's groups; every freed page is refilled with
         // the NEXT layer's group right away, so layer 11's whole payload is
         // enqueued before layer 11 is entered (before its counts barrier).
