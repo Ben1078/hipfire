@@ -1919,7 +1919,11 @@ mod tests {
         const HISTORICAL: u64 = 5_517_207_808;
         let reserve = AutoReserve::new(Some(HISTORICAL), census).unwrap();
         assert_eq!(reserve.census_total, 2_237_111_724, "base tile census");
-        assert_eq!(reserve.bytes(), HISTORICAL, "the floor wins for the incumbent");
+        assert_eq!(
+            reserve.bytes(),
+            HISTORICAL,
+            "the floor wins for the incumbent"
+        );
         // S1 reads the census alone; every other load reads bytes() exactly.
         assert_eq!(reserve.placement_bytes(true), 2_237_111_724);
         assert_eq!(reserve.placement_bytes(false), reserve.bytes());
@@ -2009,14 +2013,22 @@ mod tests {
                 SlowlinkMode::Force,
                 &shape(),
                 || link,
-                || -> Result<LoadFacts<'static>, String> { unreachable!("facts built for {link:?}") },
+                || -> Result<LoadFacts<'static>, String> {
+                    unreachable!("facts built for {link:?}")
+                },
             );
             assert_eq!(outcome, Ok(None), "{link:?}");
         }
         for (mode, load) in [
             (SlowlinkMode::Off, shape()),
             (SlowlinkMode::Auto, shape()),
-            (SlowlinkMode::Force, LoadShape { npu_trunk: true, ..shape() }),
+            (
+                SlowlinkMode::Force,
+                LoadShape {
+                    npu_trunk: true,
+                    ..shape()
+                },
+            ),
         ] {
             let outcome = select_load_profile(
                 mode,
