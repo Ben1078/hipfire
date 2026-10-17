@@ -492,6 +492,52 @@ impl PanelPoolSpec {
     }
 }
 
+/// Worst-case page bytes lost to run packing: each extent may start its own run
+/// (64 runs for a 32-expert group), and each run loses at most
+/// `(EXTENT_ALIGN - 1)` to rounding the cursor plus `(EXTENT_ALIGN - 1)` to
+/// keeping the source's alignment phase.
+pub(crate) const UNIFORM_RUN_SLACK: usize = 2 * MAX_GROUP_EXPERTS * 2 * (EXTENT_ALIGN - 1);
+
+impl PanelPoolSpec {
+    /// Spec for a layer set whose experts all have `gate_up_expert_bytes` of
+    /// gate/up and `down_expert_bytes` of down payload. The page holds any
+    /// group of `experts_per_slot` experts however the host extents are
+    /// placed: `experts_per_slot * (gate_up + down)` plus [`UNIFORM_RUN_SLACK`].
+    /// This is the single authority for the charged reserve: the census and
+    /// the allocation both read [`Self::reserve`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn uniform(
+        active_slots: usize,
+        lookahead_pages: usize,
+        experts_per_slot: usize,
+        num_experts: usize,
+        gate_up_expert_bytes: usize,
+        down_expert_bytes: usize,
+        timeline_records: usize,
+        timeline_layers: usize,
+    ) -> R<Self> {
+        if gate_up_expert_bytes == 0 || down_expert_bytes == 0 {
+            return Err(invalid("panel pool experts have an empty projection"));
+        }
+        let payload_bytes = gate_up_expert_bytes
+            .checked_add(down_expert_bytes)
+            .and_then(|per| per.checked_mul(experts_per_slot))
+            .and_then(|bytes| bytes.checked_add(UNIFORM_RUN_SLACK))
+            .ok_or_else(|| invalid("panel pool payload bytes overflow"))?;
+        let spec = Self {
+            active_slots,
+            lookahead_pages,
+            experts_per_slot,
+            num_experts,
+            payload_bytes,
+            timeline_records,
+            timeline_layers,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
 // ── tickets, statistics, timeline ────────────────────────────────────
 
 /// Names one filled page content: `(slot, epoch, layer, group, codec)`.
@@ -2601,6 +2647,37 @@ mod slowlink_ring {
         assert_eq!(ring.backend.ops.len(), ops);
         assert!(!ring.is_quarantined());
         assert_eq!(ring.free.len(), 1, "the page stayed free");
+    }
+
+    #[test]
+    fn slowlink_ring_uniform_spec_bounds_every_possible_group_layout() {
+        let (gu, dn) = (1_740_800usize, 870_400usize);
+        let spec = PanelPoolSpec::uniform(2, 16, 32, 512, gu, dn, 0, 0).unwrap();
+        assert_eq!(spec.payload_bytes, 32 * (gu + dn) + UNIFORM_RUN_SLACK);
+        // Worst case: every one of the 64 extents is its own run at the worst
+        // source alignment; the page still holds it plus the tail pad.
+        let experts: Vec<Option<ExpertSource>> = (0..512)
+            .map(|id| {
+                let base = HOST + id * (gu + dn + 4096) + 255;
+                Some(ExpertSource {
+                    codec: PanelCodec(1),
+                    gate_up: ExpertExtent { addr: base, len: gu },
+                    down: ExpertExtent { addr: base + gu + 2048, len: dn },
+                })
+            })
+            .collect();
+        // SAFETY: never dereferenced.
+        let s = unsafe {
+            LayerExpertSources::new(0, HOST, 512 * (gu + dn + 4096) + 4096, experts, Arc::new(0u8))
+        }
+        .unwrap();
+        let group: Vec<usize> = (0..32).collect();
+        let layout = plan_group_layout(&group, &s).unwrap();
+        assert_eq!(layout.runs.len(), 64);
+        assert!(layout.used + ARENA_TAIL_PAD_BYTES <= spec.page_bytes().unwrap());
+        assert!(PanelPoolSpec::uniform(2, 16, 33, 512, gu, dn, 0, 0).is_err());
+        assert!(PanelPoolSpec::uniform(2, 16, 32, 512, usize::MAX, dn, 0, 0).is_err());
+        assert!(PanelPoolSpec::uniform(2, 16, 32, 512, 0, dn, 0, 0).is_err());
     }
 
     #[test]
