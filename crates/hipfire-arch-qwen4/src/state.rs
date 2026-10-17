@@ -2293,6 +2293,62 @@ impl Qwen4State {
             .checked_add(per_request)
     }
 
+    /// Exact device bytes of ONE slow-link boundary stage: the fixed parts of
+    /// the whole-model session layout (`Self::session_layout` order) with no
+    /// padding. Derived from the same element counts as
+    /// [`Self::device_bytes_scoped`] and the allocations of
+    /// [`Self::new_with_backend_scoped`] (GDN recurrent in the state's own
+    /// storage plus F32 conv per linear layer, one `i32` selection per QSA
+    /// layer, the F32 PLE convolution history and the F32 HC feedback), and
+    /// equal to what `Qwen4Bundle::prompt_txn_stage_bytes` allocates.
+    pub(crate) fn session_fixed_stage_bytes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+    ) -> Option<u64> {
+        let f32_bytes = std::mem::size_of::<f32>();
+        let recurrent = format
+            .gdn
+            .state_units(
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+            )
+            .checked_mul(format.gdn.dtype().size())?;
+        let conv_channels = config
+            .linear_num_key_heads
+            .checked_mul(config.linear_key_head_dim)?
+            .checked_mul(2)?
+            .checked_add(
+                config
+                    .linear_num_value_heads
+                    .checked_mul(config.linear_value_head_dim)?,
+            )?;
+        let conv = conv_channels
+            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
+            .checked_mul(f32_bytes)?;
+        let selected = config
+            .qsa_selected_capacity()
+            .checked_mul(std::mem::size_of::<i32>())?;
+        let ple = config
+            .ple_conv_history_rows()
+            .checked_mul(config.hidden_size)?
+            .checked_mul(config.hc_count)?
+            .checked_mul(f32_bytes)?;
+        let feedback = config
+            .hc_count
+            .checked_mul(config.hidden_size)?
+            .checked_mul(f32_bytes)?;
+        let (gdn_layers, qsa_layers) =
+            scope_layer_counts(config, &Qwen4BandScope::single(config));
+        recurrent
+            .checked_add(conv)?
+            .checked_mul(gdn_layers)?
+            .checked_add(selected.checked_mul(qsa_layers)?)?
+            .checked_add(ple)?
+            .checked_add(feedback)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+
     /// A snapshot ticket of this state's arena is outstanding.
     pub(crate) fn snapshot_active(&self) -> bool {
         self.snapshot_arena.active && !self.snapshot_arena.retained
