@@ -2099,6 +2099,10 @@ fn load_qwen4_rank_scoped(
             stage_opt_out: stage_env.as_deref() == Some("0"),
             cpu_offload: hipfire_config::memory::offload_exec()
                 != hipfire_config::memory::OffloadExec::Pcie,
+            npu_trunk: s1::npu_trunk_selected(
+                &ctx.gpu.arch,
+                hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()?,
+            ),
             chunk_rows_env: chunk_rows_env.as_deref(),
             max_seq: ctx.max_seq,
         };
@@ -7490,6 +7494,7 @@ mod qwen4_slowlink_tests {
             whole_first: false,
             stage_opt_out: false,
             cpu_offload: false,
+            npu_trunk: false,
             chunk_rows_env: None,
             max_seq: 16640,
         }

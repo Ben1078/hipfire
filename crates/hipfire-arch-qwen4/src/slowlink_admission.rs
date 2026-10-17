@@ -133,6 +133,14 @@ impl SlowlinkMode {
     }
 }
 
+/// Whether the NPU trunk engine is selected for `arch` under `mode`: the same
+/// resolution the forward uses ([`crate::npu_trunk::NpuTrunkMode::resolve`]).
+/// S1 declines a selected NPU before any reserve, so a pair route never meets
+/// the layer-major schedule.
+pub fn npu_trunk_selected(arch: &str, mode: crate::npu_trunk::NpuTrunkMode) -> bool {
+    !mode.resolve(arch).is_off()
+}
+
 /// What the loader knows about a load before it sizes any placement.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadShape<'a> {
@@ -154,6 +162,11 @@ pub struct LoadShape<'a> {
     pub stage_opt_out: bool,
     /// `memory.offload_exec` is not `pcie` (CPU splice or pass-back).
     pub cpu_offload: bool,
+    /// The NPU trunk engine is selected (`HIPFIRE_QWEN4_NPU_TRUNK` resolved for
+    /// this arch is not `off`: `auto` resolves to off outside gfx1151, an
+    /// explicit `on`/`emulate` selects it anywhere). Read from the config
+    /// snapshot ([`npu_trunk_selected`]); no device is opened or probed.
+    pub npu_trunk: bool,
     /// Raw `HIPFIRE_PREFILL_CHUNK_ROWS`, when set.
     pub chunk_rows_env: Option<&'a str>,
     pub max_seq: usize,
@@ -290,6 +303,7 @@ pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), Slowli
         (shape.whole_first, "whole-first placement policy"),
         (shape.stage_opt_out, "HIPFIRE_QWEN4_EXPERT_STAGE=0 opt-out"),
         (shape.cpu_offload, "memory.offload_exec splice"),
+        (shape.npu_trunk, "NPU trunk selected"),
     ];
     if let Some((_, what)) = unsupported.into_iter().find(|(hit, _)| *hit) {
         return Err(SlowlinkDecline::Unsupported(what));
@@ -574,16 +588,42 @@ pub struct PromptArenaLayout {
     pub total_bytes: u64,
 }
 
+/// Largest tile (in rows) whose streams stay F32: one row below the BF16 stream
+/// predicate's threshold ([`rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]).
+/// A change of that threshold changes the arena, never silently narrows it.
+pub const S1_F32_TILE_ROWS_MAX: usize = rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1;
+
+/// Rows of one window whose tiles can be F32 under the BF16-stream predicate:
+/// the window's final tile, one tile per [`S1_MAX_BOUNDARY_SNAPSHOTS`] session
+/// cut segment boundary and the resumed entry head, each at most
+/// [`S1_F32_TILE_ROWS_MAX`] rows: `(4 + 2) * 511 = 3066`. A tile of 512 or more
+/// rows is BF16 on the production predicate; a plan that needs more F32 rows
+/// bypasses before any mutation.
+pub const S1_F32_STREAM_ROWS: usize = (S1_MAX_BOUNDARY_SNAPSHOTS + 2) * S1_F32_TILE_ROWS_MAX;
+
 impl PromptArenaLayout {
     /// The layout of a window of `rows` prompt rows.
     pub fn new(geometry: &ModelGeometry, rows: usize, tile_rows: usize) -> Result<Self, String> {
         if rows == 0 || tile_rows == 0 {
             return Err("slow-link prefill arena has no rows".to_string());
         }
-        let f32_bytes = 4u64;
+        // Each tile's streams are packed at their OWN tag width: BF16 (2 bytes)
+        // for a tile of at least `QWEN4_F16_WMMA_MIN_TOKENS` rows on the
+        // production predicate (`Gpu::qwen4_bf16_streams`), F32 below it. The
+        // F32 tiles are the cut-bounded heads and tails of at most
+        // `S1_F32_STREAM_ROWS` rows per window; each costs 2 bytes per element
+        // more than BF16. One more tile of BF16 elements is slack: stream ops
+        // validate an F32-typed view of `rows * wide` elements, which reaches
+        // past a BF16 region by at most its own size.
+        let bf16_bytes = 2u64;
+        let wide = geometry.wide()?;
+        let tagged_rows = (rows as u64)
+            .checked_add(S1_F32_STREAM_ROWS as u64)
+            .and_then(|total| total.checked_add(tile_rows as u64))
+            .ok_or_else(|| "slow-link prefill arena rows overflow".to_string())?;
         let hc_streams = checked_mul(
-            checked_mul(rows as u64, geometry.wide()?, "arena row bytes")?,
-            f32_bytes,
+            checked_mul(tagged_rows, wide, "arena row bytes")?,
+            bf16_bytes,
             "arena bytes",
         )?;
         let sizes: [u64; ARENA_FIELDS.len()] = [hc_streams];
@@ -1110,6 +1150,11 @@ impl<'a> LoadShape<'a> {
             stage_opt_out: stage.as_deref() == Some("0"),
             cpu_offload: hipfire_config::memory::offload_exec()
                 != hipfire_config::memory::OffloadExec::Pcie,
+            npu_trunk: npu_trunk_selected(
+                arch,
+                crate::npu_trunk::NpuTrunkMode::from_env()
+                    .map_err(|error| format!("qwen4: {error}"))?,
+            ),
             chunk_rows_env,
             max_seq,
         })
@@ -1293,6 +1338,7 @@ mod tests {
             whole_first: false,
             stage_opt_out: false,
             cpu_offload: false,
+            npu_trunk: false,
             chunk_rows_env: None,
             max_seq: 16640,
         }
@@ -1434,7 +1480,7 @@ mod tests {
 
     #[test]
     fn slowlink_admission_unsupported_modes_decline_before_any_probe() {
-        let cases: [(&str, LoadShape<'static>); 10] = [
+        let cases: [(&str, LoadShape<'static>); 11] = [
             ("ep", LoadShape { expert_parallel: true, ..shape() }),
             ("pp", LoadShape { pipeline_band: true, ..shape() }),
             ("recipe", LoadShape { packed_mq4: false, ..shape() }),
@@ -1445,6 +1491,7 @@ mod tests {
             ("whole-first", LoadShape { whole_first: true, ..shape() }),
             ("stage off", LoadShape { stage_opt_out: true, ..shape() }),
             ("cpu", LoadShape { cpu_offload: true, ..shape() }),
+            ("npu", LoadShape { npu_trunk: true, ..shape() }),
         ];
         for (name, load) in cases {
             assert!(
@@ -1472,6 +1519,34 @@ mod tests {
             preflight(SlowlinkMode::Force, &LoadShape { max_seq: 3072, ..shape() }),
             Ok(())
         );
+    }
+
+    #[test]
+    fn slowlink_admission_selected_npu_truth_table() {
+        use crate::npu_trunk::NpuTrunkMode::{Auto, Emulate, Off, On};
+        // `auto` resolves to off outside gfx1151, so the default never selects
+        // the NPU on the S1 arch; an explicit `on` or `emulate` does, anywhere.
+        for arch in ["gfx1100", "gfx1201", "gfx906", "gfx1030", "gfx942"] {
+            assert!(!npu_trunk_selected(arch, Off), "{arch}");
+            assert!(!npu_trunk_selected(arch, Auto), "{arch}");
+            assert!(npu_trunk_selected(arch, On), "{arch}");
+            assert!(npu_trunk_selected(arch, Emulate), "{arch}");
+        }
+        assert!(npu_trunk_selected("gfx1151", Auto));
+        assert!(!npu_trunk_selected("gfx1151", Off));
+        // A selected NPU is an incumbent decline on an otherwise qualified
+        // gfx1100 load, before any probe or reserve.
+        let npu = |mode| LoadShape {
+            npu_trunk: npu_trunk_selected("gfx1100", mode),
+            ..shape()
+        };
+        assert_eq!(preflight(SlowlinkMode::Force, &npu(Auto)), Ok(()));
+        for mode in [On, Emulate] {
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &npu(mode)),
+                Err(SlowlinkDecline::Unsupported("NPU trunk selected"))
+            );
+        }
     }
 
     #[test]
