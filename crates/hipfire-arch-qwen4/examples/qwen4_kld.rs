@@ -275,13 +275,16 @@ impl Model {
         ple_hot: Option<u64>,
         pin: &HotsetPin,
     ) -> Result<Self, String> {
-        // S1 candidate arm (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`): the shared
-        // admission-first loader, so the profile and its joint placement are
-        // the product's. Pinned hot sets and the PLE hot store are other
-        // routes and are refused with it; the baseline arm keeps the loader
-        // below unchanged.
-        if hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env()
-            == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
+        // S1 selector (`HIPFIRE_QWEN4_SLOWLINK_PREFILL` unset or `1`): the
+        // shared admission-first loader, so the profile and its joint
+        // placement are the product's and the same selector decides (a later
+        // automatic enablement needs no change here). Pinned hot sets and the
+        // PLE hot store are other routes: forced `1` refuses them, an unset
+        // selector keeps the loader below. `=0` keeps it unchanged too.
+        let s1_mode = hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env();
+        let hot_flags = ple_hot.is_some() || pin.budget_mib.is_some() || pin.sidecar.is_some();
+        if s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
+            || (s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Auto && !hot_flags)
         {
             if ple_hot.is_some() || pin.budget_mib.is_some() || pin.sidecar.is_some() {
                 return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 excludes --ple-hot, --hotset and --hot-budget-mib".into());
