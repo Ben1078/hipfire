@@ -2518,12 +2518,14 @@ fn load_qwen4_rank_scoped(
                     .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                     .unwrap_or_default();
                 // The reserve is the larger of the historical formula and the
-                // census (every term itemised below); the safety margin and
+                // census (every term itemised below), except for an admitted
+                // S1 load, which sizes from the census alone
+                // (`AutoReserve::placement_bytes`); the safety margin and
                 // (slab only) the dedicated long-prefill stage buffers are
                 // charged on top.
                 let charges = placement_charges(layer_experts, true)?;
                 let charged = charges
-                    .reserve(auto.bytes())
+                    .reserve(auto.placement_bytes(slowlink_profile.is_some()))
                     .map_err(|error| format!("qwen4: {error}"))?;
                 eprintln!(
                         "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved (base {}; {} MiB native MTP{gather_note}; plus {}), {} MiB per expert layer",
@@ -2546,7 +2548,7 @@ fn load_qwen4_rank_scoped(
                         layer_experts,
                         config.num_hidden_layers,
                         moe_layers,
-                        auto.bytes(),
+                        auto.placement_bytes(slowlink_profile.is_some()),
                         &charges,
                         borrowed_stage_donors,
                     )
@@ -2560,7 +2562,7 @@ fn load_qwen4_rank_scoped(
                         non_expert,
                         layer_experts,
                         config.num_hidden_layers,
-                        auto.bytes(),
+                        auto.placement_bytes(slowlink_profile.is_some()),
                         &charges,
                     )
                     .map_err(|error| format!("qwen4: {error}"))?

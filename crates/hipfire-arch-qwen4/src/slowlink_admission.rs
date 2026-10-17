@@ -832,7 +832,9 @@ pub struct AdmissionInputs {
     pub gate_up_layer_bytes: u64,
     pub down_layer_bytes: u64,
     pub trunk_layers: usize,
-    /// [`crate::expert_residency::AutoReserve::bytes`] at [`S1_TILE_ROWS`].
+    /// [`crate::expert_residency::AutoReserve::census_total`] at
+    /// [`S1_TILE_ROWS`]: the S1 base reserve (census alone; the S1 terms and
+    /// the safety margin are charged on top).
     pub base_reserve: u64,
     /// Layers the incumbent placement at the requested chunk would keep with
     /// the safety margin and no dedicated G2 stage charge (log only; see
@@ -1039,10 +1041,13 @@ pub struct LoadFacts<'a> {
     pub bytes_of: &'a dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
     /// Free device bytes the placement is sized from.
     pub free: u64,
-    /// [`crate::expert_residency::AutoReserve::bytes`] at [`S1_TILE_ROWS`].
+    /// [`crate::expert_residency::AutoReserve::census_total`] at
+    /// [`S1_TILE_ROWS`] (`placement_bytes(true)`): the S1 profile's base
+    /// reserve is the bottom-up census alone, never the historical floor.
     pub tile_reserve: u64,
-    /// The same at the incumbent placement chunk (sizes the logged baseline
-    /// layer count only).
+    /// [`crate::expert_residency::AutoReserve::bytes`] (the incumbent's
+    /// historical-floor-or-census figure) at the incumbent placement chunk
+    /// (sizes the logged baseline layer count only).
     pub incumbent_reserve: u64,
     pub state_format: crate::Qwen4StateFormat,
     pub native_mtp: bool,
@@ -1292,7 +1297,7 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
             ranks: 1,
             chunk_rows,
         })
-        .map(|inputs| inputs.reserve.bytes())
+        .map(|inputs| inputs.reserve)
     };
     // Beta's single incumbent helper (probes the host link once, cached).
     let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
@@ -1301,8 +1306,11 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
         weights: load.weights,
         bytes_of: load.bytes_of,
         free: free as u64,
-        tile_reserve: reserve_at(S1_TILE_ROWS)?,
-        incumbent_reserve: reserve_at(placement_chunk)?,
+        // S1 sizes its 1,536-row tile from the bottom-up census alone
+        // (`AutoReserve::placement_bytes(true)`); the incumbent/log baseline
+        // keeps `bytes()`, the larger of the historical floor and the census.
+        tile_reserve: reserve_at(S1_TILE_ROWS)?.placement_bytes(true),
+        incumbent_reserve: reserve_at(placement_chunk)?.placement_bytes(false),
         state_format: load.state_format,
         native_mtp: load.native_mtp,
         window_rows: S1_WINDOW_ROWS.min(load.max_seq),
@@ -1873,6 +1881,151 @@ mod tests {
         assert!(PromptArenaLayout::new(&geometry, 0, S1_TILE_ROWS).is_err());
         assert!(PromptArenaLayout::new(&geometry, 1, 0).is_err());
         assert!(PromptArenaLayout::new(&geometry, usize::MAX / 2, S1_TILE_ROWS).is_err());
+    }
+
+    /// The real 24 GiB XTX fixture: with the S1 tile sized from the bottom-up
+    /// census alone, ten layers stay resident beside the S1 terms; sized from
+    /// the historical floor (5,517,207,808 B, a stale measured formula) the
+    /// same card is a deficit. Free VRAM is 24 GiB less a 1.5 GiB driver and
+    /// runtime allowance. Uses the real `ReserveCensus`/`AutoReserve` types
+    /// with the measured terms of the 1,536-row tile (forward 1,839,888,260,
+    /// state 68,514,080, QSA context 281,149,440, workspace 47,559,944; base
+    /// census 2,237,111,724) and the real non-expert and per-layer expert bytes.
+    #[test]
+    fn slowlink_residency_real_fixture_keeps_ten_layers_only_from_the_census_base() {
+        use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        use rdna_compute::tensor_ops::QsaKvFormat;
+        const GIB: u64 = 1 << 30;
+        let config = crate::config::compact_test_config();
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+        workspace[0].1 = 47_559_944;
+        let census = ReserveCensus {
+            qsa_context: 281_149_440,
+            state: 68_514_080,
+            forward: 1_839_888_260,
+            f16_shadows: 0,
+            workspace,
+            qsa_selector: 0,
+            mtp: 0,
+            gather: 0,
+            runtime: 0,
+        };
+        const HISTORICAL: u64 = 5_517_207_808;
+        let reserve = AutoReserve::new(Some(HISTORICAL), census).unwrap();
+        assert_eq!(reserve.census_total, 2_237_111_724, "base tile census");
+        assert_eq!(reserve.bytes(), HISTORICAL, "the floor wins for the incumbent");
+        // S1 reads the census alone; every other load reads bytes() exactly.
+        assert_eq!(reserve.placement_bytes(true), 2_237_111_724);
+        assert_eq!(reserve.placement_bytes(false), reserve.bytes());
+
+        let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
+        let inputs = |base_reserve: u64| AdmissionInputs {
+            geometry: ModelGeometry::from_config(&config).unwrap(),
+            free: 24 * GIB - 3 * GIB / 2,
+            non_expert: 5_364_055_296,
+            layer_expert_bytes: 1_336_934_400,
+            gate_up_layer_bytes: GATE_UP_LAYER,
+            down_layer_bytes: DOWN_LAYER,
+            trunk_layers: config.num_hidden_layers,
+            base_reserve,
+            baseline_layers: 0,
+            fixed_state_bytes: stage,
+            pending_save_bytes: 0,
+            checkpoint_stride_rows: 8192,
+            window_rows: S1_WINDOW_ROWS,
+            link_gbps: 7.09,
+        };
+        assert_eq!(GATE_UP_LAYER + DOWN_LAYER, 1_336_934_400);
+        // The S1 extras on the real fixture (no MTP) and the safety margin.
+        let (_, _, extras) = census_of(&inputs(0)).unwrap();
+        assert_eq!(extras.total().unwrap(), 2_543_092_544);
+        assert_eq!(
+            crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+            536_870_912
+        );
+
+        // Census base: exactly ten residents, tile 1,536.
+        let profile = admit(&inputs(reserve.placement_bytes(true))).expect("census base admits");
+        assert_eq!(profile.resident_layers, 10);
+        assert_eq!(profile.tile_rows, 1536);
+        // Historical base: the same card is refused with its exact deficit.
+        match admit(&inputs(reserve.placement_bytes(false))) {
+            Err(SlowlinkDecline::Deficit(deficit)) => {
+                assert_eq!(deficit.resident_layers, 7);
+                assert_eq!(deficit.required_layers, S1_MIN_RESIDENT_LAYERS);
+                assert!(deficit.deficit_bytes > 0);
+            }
+            other => panic!("the historical floor must be a deficit, got {other:?}"),
+        }
+    }
+
+    /// Every non-S1 load (the incumbent, fast links, unified memory, every
+    /// opt-out: `slowlink == false`) resolves the byte-identical reserve it
+    /// always did, whether the historical floor wins, the census wins, or the
+    /// floor is retired; only an admitted S1 profile reads the census alone.
+    #[test]
+    fn slowlink_residency_non_s1_loads_keep_the_incumbent_reserve() {
+        use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        let census = |bytes: u64| {
+            let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+            workspace[0].1 = bytes;
+            ReserveCensus {
+                qsa_context: 0,
+                state: 0,
+                forward: 0,
+                f16_shadows: 0,
+                workspace,
+                qsa_selector: 0,
+                mtp: 0,
+                gather: 0,
+                runtime: 0,
+            }
+        };
+        for (historical, census_bytes) in [
+            (Some(5_517_207_808u64), 2_237_111_724u64), // floor wins
+            (Some(1 << 30), 3 << 30),                   // census wins
+            (None, 2_237_111_724),                      // floor retired (gfx1201)
+        ] {
+            let reserve = AutoReserve::new(historical, census(census_bytes)).unwrap();
+            assert_eq!(reserve.placement_bytes(false), reserve.bytes());
+            assert_eq!(reserve.placement_bytes(true), census_bytes);
+        }
+        // Fast, unified and unmeasured links, a killed selector and an NPU
+        // never reach the S1 reserve: the facts (free-memory query and both
+        // reserves) are not even built, so no budget is read.
+        for link in [
+            HostLink::Discrete { gbps: 16.0 },
+            HostLink::Discrete { gbps: 26.0 },
+            HostLink::Unified,
+            HostLink::Unmeasured,
+        ] {
+            let outcome = select_load_profile(
+                SlowlinkMode::Force,
+                &shape(),
+                || link,
+                || -> Result<LoadFacts<'static>, String> { unreachable!("facts built for {link:?}") },
+            );
+            assert_eq!(outcome, Ok(None), "{link:?}");
+        }
+        for (mode, load) in [
+            (SlowlinkMode::Off, shape()),
+            (SlowlinkMode::Auto, shape()),
+            (SlowlinkMode::Force, LoadShape { npu_trunk: true, ..shape() }),
+        ] {
+            let outcome = select_load_profile(
+                mode,
+                &load,
+                || unreachable!("probed"),
+                || -> Result<LoadFacts<'static>, String> { unreachable!("facts built") },
+            );
+            assert_eq!(outcome, Ok(None));
+        }
     }
 
     /// Hold 1 residency ledger on the REAL compact Flash-Next config (the
