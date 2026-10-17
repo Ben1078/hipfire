@@ -56,9 +56,7 @@ pub(crate) const MAX_GROUP_EXPERTS: usize = 32;
 pub(crate) const MAX_TABLE_EXPERTS: usize = 1024;
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
-    value
-        .checked_add(align - 1)
-        .map(|v| v & !(align - 1))
+    value.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 
 // ── sources ──────────────────────────────────────────────────────────
@@ -235,15 +233,7 @@ impl LayerExpertSources {
     ) -> R<Self> {
         let out = translate_alias(layer, gate_up, down, experts)?;
         // SAFETY: forwarded from this function's contract.
-        unsafe {
-            Self::new_split(
-                layer,
-                (gate_up.0, gate_up.2),
-                (down.0, down.2),
-                out,
-                owner,
-            )
-        }
+        unsafe { Self::new_split(layer, (gate_up.0, gate_up.2), (down.0, down.2), out, owner) }
     }
 
     pub(crate) fn layer(&self) -> usize {
@@ -341,10 +331,7 @@ pub(crate) struct ExpertGroupPlan {
 impl ExpertGroupPlan {
     /// The immutable full-layer schedule: every present expert in ascending
     /// order, a new group at each codec change or every `experts_per_slot`.
-    pub(crate) fn partition(
-        sources: &LayerExpertSources,
-        experts_per_slot: usize,
-    ) -> R<Vec<Self>> {
+    pub(crate) fn partition(sources: &LayerExpertSources, experts_per_slot: usize) -> R<Vec<Self>> {
         if experts_per_slot == 0 || experts_per_slot > MAX_GROUP_EXPERTS {
             return Err(invalid(format!(
                 "panel group size {experts_per_slot} is outside 1..={MAX_GROUP_EXPERTS}"
@@ -356,7 +343,9 @@ impl ExpertGroupPlan {
                 continue;
             };
             match out.last_mut() {
-                Some(last) if last.codec == expert.codec && last.experts.len() < experts_per_slot => {
+                Some(last)
+                    if last.codec == expert.codec && last.experts.len() < experts_per_slot =>
+                {
                     last.experts.push(id)
                 }
                 _ => {
@@ -599,7 +588,9 @@ impl PanelPoolSpec {
         if self.payload_bytes == 0 {
             return Err(invalid("panel pool payload is empty"));
         }
-        self.reserve().map(|_| ()).ok_or_else(|| invalid("panel pool byte size overflows"))
+        self.reserve()
+            .map(|_| ())
+            .ok_or_else(|| invalid("panel pool byte size overflows"))
     }
 
     /// The bytes this pool charges, `None` on overflow.
@@ -861,8 +852,13 @@ pub(crate) trait PanelBackend {
     /// and table copies no longer read host memory.
     fn await_copy_done(&mut self, ctx: &Self::Ctx, slot: usize) -> R<()>;
     /// Copy stream: wait the slot's free event (if one was ever recorded).
-    fn copy_begin(&mut self, ctx: &Self::Ctx, slot: usize, wait_free: bool, rec: Option<usize>)
-        -> R<()>;
+    fn copy_begin(
+        &mut self,
+        ctx: &Self::Ctx,
+        slot: usize,
+        wait_free: bool,
+        rec: Option<usize>,
+    ) -> R<()>;
     fn copy_payload(
         &mut self,
         ctx: &Self::Ctx,
@@ -972,7 +968,52 @@ pub(crate) struct RingCore<B: PanelBackend> {
     stats: PanelStats,
     records: Vec<SpanRec>,
     marks: Vec<LayerMark>,
-    backend: B,
+    /// Never dropped implicitly while device work may be queued: see the
+    /// `Drop` impl.
+    backend: std::mem::ManuallyDrop<B>,
+    /// Any device operation was issued since the last SUCCESSFUL drain. A
+    /// retired/free logical state is not GPU completion, so only a completed
+    /// [`Self::drain`] clears this.
+    dirty: bool,
+    backend_taken: bool,
+}
+
+impl<B: PanelBackend> Drop for RingCore<B> {
+    fn drop(&mut self) {
+        if self.backend_taken {
+            return;
+        }
+        if self.dirty {
+            // Device work may still read the pool, tables and pinned sources
+            // and the owner may not hold a `Gpu` to drain with: leak the
+            // backend (never dropped: `ManuallyDrop`) and every retained
+            // source owner rather than free memory in flight.
+            for page in &mut self.pages {
+                if let Some(owner) = page.retained.take() {
+                    std::mem::forget(owner);
+                }
+            }
+            return;
+        }
+        // SAFETY: not taken (checked above) and dropped exactly once, here;
+        // no work was issued since the last completed drain (or ever).
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.backend) };
+    }
+}
+
+impl<B: PanelBackend> RingCore<B> {
+    /// Hand the backend to its owner for explicit release. Only after a
+    /// completed drain; the core then never drops it.
+    pub(crate) fn take_backend(&mut self) -> R<B> {
+        if self.dirty || self.backend_taken {
+            return Err(invalid(
+                "panel ring backend can only be taken after a completed drain",
+            ));
+        }
+        self.backend_taken = true;
+        // SAFETY: taken at most once (flag above); `Drop` skips it afterwards.
+        Ok(unsafe { std::mem::ManuallyDrop::take(&mut self.backend) })
+    }
 }
 
 impl<B: PanelBackend> RingCore<B> {
@@ -991,7 +1032,9 @@ impl<B: PanelBackend> RingCore<B> {
             stats: PanelStats::default(),
             records: Vec::with_capacity(spec.timeline_records),
             marks: Vec::with_capacity(spec.timeline_layers),
-            backend,
+            backend: std::mem::ManuallyDrop::new(backend),
+            dirty: false,
+            backend_taken: false,
         })
     }
 
@@ -1044,9 +1087,13 @@ impl<B: PanelBackend> RingCore<B> {
             }
         }
         match (self.current, current) {
-            (Some(_), None) => return Err(invalid("panel window cannot return to no current layer")),
+            (Some(_), None) => {
+                return Err(invalid("panel window cannot return to no current layer"))
+            }
             (Some(old), Some(new)) if new < old => {
-                return Err(invalid(format!("panel window moves back from layer {old} to {new}")))
+                return Err(invalid(format!(
+                    "panel window moves back from layer {old} to {new}"
+                )))
             }
             _ => {}
         }
@@ -1090,6 +1137,9 @@ impl<B: PanelBackend> RingCore<B> {
 
     /// Run a mutating device sequence; a failure quarantines the ring.
     fn run<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        // From here on the device may hold queued work that reads this
+        // ring's pages, tables and pinned sources.
+        self.dirty = true;
         let result = f(self);
         if result.is_err() {
             self.poisoned = true;
@@ -1197,7 +1247,11 @@ impl<B: PanelBackend> RingCore<B> {
             None
         };
         self.run(|core| core.fill(ctx, slot, epoch, group, sources, &layout, rec))?;
-        match self.cursors.iter_mut().find(|(layer, _)| *layer == group.layer) {
+        match self
+            .cursors
+            .iter_mut()
+            .find(|(layer, _)| *layer == group.layer)
+        {
             Some(entry) => entry.1 = group.group,
             None => self.cursors.push((group.layer, group.group)),
         }
@@ -1265,7 +1319,8 @@ impl<B: PanelBackend> RingCore<B> {
         fill_tables(layout, &group.experts, base, gate_up, down)?;
         self.backend.copy_begin(ctx, slot, wait_free, rec)?;
         for run in &layout.runs {
-            self.backend.copy_payload(ctx, slot, run.src, run.dst, run.len)?;
+            self.backend
+                .copy_payload(ctx, slot, run.src, run.dst, run.len)?;
         }
         self.backend
             .copy_zero(ctx, slot, layout.used, ARENA_TAIL_PAD_BYTES)?;
@@ -1275,8 +1330,7 @@ impl<B: PanelBackend> RingCore<B> {
         self.stats.enqueued += 1;
         self.stats.submitted_payload_bytes += layout.submitted_bytes() as u64;
         self.stats.extent_bytes += layout.extent_bytes as u64;
-        self.stats.table_bytes +=
-            (2 * self.spec.num_experts * std::mem::size_of::<u64>()) as u64;
+        self.stats.table_bytes += (2 * self.spec.num_experts * std::mem::size_of::<u64>()) as u64;
         Ok(())
     }
 
@@ -1381,6 +1435,8 @@ impl<B: PanelBackend> RingCore<B> {
             self.poisoned = true;
             return Err(error);
         }
+        // Both streams completed: nothing queued by this ring is in flight.
+        self.dirty = false;
         for page in &mut self.pages {
             page.state = PageState::Free;
             page.retained = None;
@@ -1595,7 +1651,10 @@ impl PanelSchedule {
         layer: usize,
     ) -> R<usize> {
         let expected = self.next_index().ok_or_else(|| {
-            invalid(format!("panel schedule has no layer after {:?}", self.current))
+            invalid(format!(
+                "panel schedule has no layer after {:?}",
+                self.current
+            ))
         })?;
         if self.layers[expected].sources.layer() != layer {
             return Err(invalid(format!(
@@ -1665,6 +1724,40 @@ impl PanelSchedule {
 
 // ── HIP backend and public ring ──────────────────────────────────────
 
+/// The pool's pinned host staging for the per-page pointer tables.
+///
+/// `hip_bridge::PinnedHostBuffer` holds a raw `hipHostMalloc` pointer and is
+/// therefore not `Send`; `Qwen4GpuForward` (and with it the architecture model
+/// object) must be, so the ring's owner asserts the narrow invariant here
+/// instead of widening anything in `hip-bridge` or the bundle.
+struct PinnedStaging(hip_bridge::PinnedHostBuffer);
+
+// SAFETY: `PinnedStaging` is the unique owner of its hipHostMalloc allocation:
+// nothing aliases or caches the pointer, and the only host access is
+// `as_bytes_mut` through `&mut self`, so moving the owner to another thread
+// cannot create concurrent access. The allocation does not move with its
+// owner and the HIP library it frees through is thread-agnostic and kept
+// alive by the buffer itself. Device-side reads of the staging (the async
+// table uploads) are fenced by the ring: the next write to a page's staging
+// waits on that page's `ready` event on the host (`await_copy_done`), and
+// `drain` / `free_gpu` synchronize both streams before the buffer can be
+// dropped (a failed drain leaks it rather than freeing it). Deliberately NOT
+// `Sync`: concurrent host access is unsupported.
+unsafe impl Send for PinnedStaging {}
+
+impl PinnedStaging {
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.0.as_bytes_mut()
+    }
+}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<HipPanelBackend>();
+    assert_send::<ExpertPanelRing>();
+    assert_send::<PanelSchedule>();
+};
+
 /// Real device resources of the pool.
 pub(crate) struct HipPanelBackend {
     copy: hip_bridge::Stream,
@@ -1674,7 +1767,7 @@ pub(crate) struct HipPanelBackend {
     ready: Vec<hip_bridge::Event>,
     free: Vec<hip_bridge::Event>,
     /// Pinned host staging of every page's two pointer tables.
-    staging: hip_bridge::PinnedHostBuffer,
+    staging: PinnedStaging,
     table_len: usize,
     base: Option<hip_bridge::Event>,
     /// Four per record: copy start/end, compute begin/end.
@@ -1694,7 +1787,7 @@ impl HipPanelBackend {
         let reserve = spec
             .reserve()
             .ok_or_else(|| invalid("panel pool byte size overflows"))?;
-        let staging = gpu.hip.host_buffer(reserve.staging)?;
+        let staging = PinnedStaging(gpu.hip.host_buffer(reserve.staging)?);
         gpu.ensure_capture_stream()?;
         let copy = gpu.hip.stream_create_non_blocking()?;
         let mut backend = Self {
@@ -1732,10 +1825,14 @@ impl HipPanelBackend {
                 gpu.hip.memset(&tensor.buf, 0, table_bytes)?;
                 tables.push(tensor);
             }
-            self.ready
-                .push(gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?);
-            self.free
-                .push(gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?);
+            self.ready.push(
+                gpu.hip
+                    .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+            );
+            self.free.push(
+                gpu.hip
+                    .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+            );
         }
         if spec.timeline_records > 0 || spec.timeline_layers > 0 {
             self.base = Some(gpu.hip.event_create()?);
@@ -1825,13 +1922,22 @@ impl PanelBackend for HipPanelBackend {
             gpu.hip.stream_wait_event(&self.copy, &self.free[slot])?;
         }
         if let Some(rec) = rec {
-            gpu.hip
-                .event_record(self.timeline_event(TimelineEvent::CopyStart(rec))?, Some(&self.copy))?;
+            gpu.hip.event_record(
+                self.timeline_event(TimelineEvent::CopyStart(rec))?,
+                Some(&self.copy),
+            )?;
         }
         Ok(())
     }
 
-    fn copy_payload(&mut self, gpu: &Gpu, slot: usize, src: usize, dst: usize, len: usize) -> R<()> {
+    fn copy_payload(
+        &mut self,
+        gpu: &Gpu,
+        slot: usize,
+        src: usize,
+        dst: usize,
+        len: usize,
+    ) -> R<()> {
         // SAFETY: `src..src+len` was checked against the layer's pinned host
         // range in `LayerExpertSources::new`; the ring retains the owner until
         // this copy is known complete.
@@ -1869,8 +1975,10 @@ impl PanelBackend for HipPanelBackend {
 
     fn copy_end(&mut self, gpu: &Gpu, slot: usize, rec: Option<usize>) -> R<()> {
         if let Some(rec) = rec {
-            gpu.hip
-                .event_record(self.timeline_event(TimelineEvent::CopyEnd(rec))?, Some(&self.copy))?;
+            gpu.hip.event_record(
+                self.timeline_event(TimelineEvent::CopyEnd(rec))?,
+                Some(&self.copy),
+            )?;
         }
         gpu.hip.event_record(&self.ready[slot], Some(&self.copy))?;
         Ok(())
@@ -1881,8 +1989,10 @@ impl PanelBackend for HipPanelBackend {
         let starved = !gpu.hip.event_query(&self.ready[slot])?;
         gpu.hip.stream_wait_event(compute, &self.ready[slot])?;
         if let Some(rec) = rec {
-            gpu.hip
-                .event_record(self.timeline_event(TimelineEvent::ComputeBegin(rec))?, Some(compute))?;
+            gpu.hip.event_record(
+                self.timeline_event(TimelineEvent::ComputeBegin(rec))?,
+                Some(compute),
+            )?;
         }
         Ok(starved)
     }
@@ -1890,8 +2000,10 @@ impl PanelBackend for HipPanelBackend {
     fn compute_release(&mut self, gpu: &Gpu, slot: usize, rec: Option<usize>) -> R<()> {
         let compute = compute_stream(gpu)?;
         if let Some(rec) = rec {
-            gpu.hip
-                .event_record(self.timeline_event(TimelineEvent::ComputeEnd(rec))?, Some(compute))?;
+            gpu.hip.event_record(
+                self.timeline_event(TimelineEvent::ComputeEnd(rec))?,
+                Some(compute),
+            )?;
         }
         gpu.hip.event_record(&self.free[slot], Some(compute))?;
         Ok(())
@@ -2098,11 +2210,11 @@ impl ExpertPanelRing {
     /// Drain, then free the pool. A failed drain leaks the device and pinned
     /// memory rather than freeing what the device may still use.
     pub(crate) fn free_gpu(mut self, gpu: &mut Gpu) -> R<()> {
-        if let Err(error) = self.core.drain(&*gpu) {
-            std::mem::forget(self);
-            return Err(error);
-        }
-        self.core.backend.release(gpu)
+        // A failed drain returns here with `self` still dirty: its `Drop`
+        // leaks the pool and every retained source instead of freeing them.
+        self.core.drain(&*gpu)?;
+        let backend = self.core.take_backend()?;
+        backend.release(gpu)
     }
 }
 
@@ -2137,7 +2249,10 @@ fn verify_page_image(
         .checked_add(ARENA_TAIL_PAD_BYTES)
         .ok_or_else(|| fail("payload length overflows".into()))?;
     if image.len() < need {
-        return Err(fail(format!("image of {} bytes is shorter than {need}", image.len())));
+        return Err(fail(format!(
+            "image of {} bytes is shorter than {need}",
+            image.len()
+        )));
     }
     if gate_up_table.len() != sources.num_experts() || down_table.len() != sources.num_experts() {
         return Err(fail(format!(
@@ -2161,7 +2276,9 @@ fn verify_page_image(
     for (name, table) in [("gate_up", gate_up_table), ("down", down_table)] {
         for (id, &entry) in table.iter().enumerate() {
             if !in_group[id] && entry != 0 {
-                return Err(fail(format!("{name} table entry {id} is nonzero outside the group")));
+                return Err(fail(format!(
+                    "{name} table entry {id} is nonzero outside the group"
+                )));
             }
             check.table_entries += 1;
         }
@@ -2178,7 +2295,10 @@ fn verify_page_image(
                 .ok()
                 .and_then(|entry| entry.checked_sub(page_base))
                 .ok_or_else(|| {
-                    fail(format!("expert {id} {name} entry {:#x} is below the page", table[id]))
+                    fail(format!(
+                        "expert {id} {name} entry {:#x} is below the page",
+                        table[id]
+                    ))
                 })?;
             let end = offset
                 .checked_add(extent.len)
@@ -2191,8 +2311,13 @@ fn verify_page_image(
                 })?;
             // SAFETY: the extent was bounds-checked against the pinned host
             // range of `sources`, which its owner keeps alive and unmodified.
-            let source = unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) };
-            if let Some(at) = source.iter().zip(&image[offset..end]).position(|(a, b)| a != b) {
+            let source =
+                unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) };
+            if let Some(at) = source
+                .iter()
+                .zip(&image[offset..end])
+                .position(|(a, b)| a != b)
+            {
                 return Err(fail(format!(
                     "expert {id} {name} byte {at} differs from the pinned source"
                 )));
@@ -2279,7 +2404,10 @@ pub(crate) fn primitive_selftest(
             schedule.layers.len()
         )));
     }
-    let groups: usize = schedule.layers[..layers].iter().map(|l| l.groups.len()).sum();
+    let groups: usize = schedule.layers[..layers]
+        .iter()
+        .map(|l| l.groups.len())
+        .sum();
     if groups < 2 * reserve.pages {
         return Err(invalid(format!(
             "panel selftest: {groups} groups cannot reuse each of {} pages twice; need at least {} (use more layers)",
@@ -2456,7 +2584,9 @@ fn run_selftest(
                 )));
             }
             if ring.core.is_quarantined() {
-                return Err(invalid("panel selftest: a refused stale ticket quarantined the ring"));
+                return Err(invalid(
+                    "panel selftest: a refused stale ticket quarantined the ring",
+                ));
             }
             report.stale_ticket_rejections += 1;
             // Refill the freed page while the delayed reader is still queued.
@@ -2490,6 +2620,119 @@ mod slowlink_ring {
     use super::*;
     use std::collections::HashMap;
 
+    fn counted() -> (RingCore<Mock>, Arc<std::sync::atomic::AtomicUsize>) {
+        let mock = Mock::new(1);
+        let drops = Arc::clone(&mock.dropped);
+        (RingCore::new(spec(1, 0), mock).unwrap(), drops)
+    }
+
+    fn backend_drops(drops: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        drops.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// One group enqueued, read and retired: logically free, GPU unproven.
+    fn used_ring(owner: &Arc<u8>) -> (RingCore<Mock>, Arc<std::sync::atomic::AtomicUsize>) {
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let s = sources_with(0, any, |_| 1);
+        let (mut ring, drops) = counted();
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let t = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        ring.acquire(&(), t).unwrap();
+        ring.retire(&(), t).unwrap();
+        (ring, drops)
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_of_an_unused_ring_releases_the_backend() {
+        let (ring, drops) = counted();
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 1);
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_after_undrained_work_leaks_backend_and_sources() {
+        let owner = Arc::new(0u8);
+        let (ring, drops) = used_ring(&owner);
+        // Retired and logically free, but never proven complete on the GPU.
+        assert_eq!(Arc::strong_count(&owner), 2, "the page retains the source owner");
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 0, "the pool/tables/staging were leaked");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "the retained source owner was leaked, not released"
+        );
+        // Even a window start (a queued event record) makes the ring dirty.
+        let (mut started, drops) = counted();
+        started.begin_window(&()).unwrap();
+        drop(started);
+        assert_eq!(backend_drops(&drops), 0);
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_after_successful_drain_releases_everything() {
+        let owner = Arc::new(0u8);
+        let (mut ring, drops) = used_ring(&owner);
+        ring.drain(&()).unwrap();
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 1);
+        assert_eq!(Arc::strong_count(&owner), 1, "drain released the retained owner");
+        // Work after a drain makes it dirty again.
+        let (mut again, drops) = counted();
+        again.begin_window(&()).unwrap();
+        again.drain(&()).unwrap();
+        again.begin_window(&()).unwrap();
+        drop(again);
+        assert_eq!(backend_drops(&drops), 0);
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_after_failed_drain_or_failed_enqueue_leaks() {
+        let owner = Arc::new(0u8);
+        let (mut ring, drops) = used_ring(&owner);
+        ring.backend.fail_drain = true;
+        assert!(ring.drain(&()).is_err());
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 0);
+        assert_eq!(Arc::strong_count(&owner), 2);
+        // A device failure mid-enqueue (quarantine) leaks too.
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let s = sources_with(0, any, |_| 1);
+        let (mut ring, drops) = counted();
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        ring.backend.fail_at = Some(ring.backend.ops.len() + 2);
+        assert!(ring.enqueue(&(), &group(&s, 0), &s).is_err());
+        assert!(ring.is_quarantined());
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 0);
+    }
+
+    #[test]
+    fn slowlink_ring_backend_is_taken_only_after_a_completed_drain() {
+        let owner = Arc::new(0u8);
+        let (mut ring, drops) = used_ring(&owner);
+        assert!(ring.take_backend().is_err(), "dirty ring cannot hand out its backend");
+        ring.drain(&()).unwrap();
+        let backend = ring.take_backend().unwrap();
+        assert!(ring.take_backend().is_err(), "taken once");
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 0, "the core never drops a taken backend");
+        drop(backend);
+        assert_eq!(backend_drops(&drops), 1, "the new owner drops it exactly once");
+    }
+
+    #[test]
+    fn slowlink_ring_transport_owners_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PinnedStaging>();
+        assert_send::<HipPanelBackend>();
+        assert_send::<ExpertPanelRing>();
+        assert_send::<PanelSchedule>();
+        assert_send::<LayerExpertSources>();
+    }
+
     const GU: usize = 4096;
     const DN: usize = 2048;
     const HOST: usize = 0x7000_0000;
@@ -2519,6 +2762,15 @@ mod slowlink_ring {
         /// Fail the nth (0-based) op.
         fail_at: Option<usize>,
         fail_drain: bool,
+        /// Counts backend drops: a leaked backend never increments it.
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl Mock {
@@ -2533,6 +2785,7 @@ mod slowlink_ring {
                 starved: false,
                 fail_at: None,
                 fail_drain: false,
+                dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -2564,14 +2817,27 @@ mod slowlink_ring {
         fn await_copy_done(&mut self, _: &(), slot: usize) -> R<()> {
             self.op(Op::AwaitCopyDone(slot))
         }
-        fn copy_begin(&mut self, _: &(), slot: usize, wait_free: bool, rec: Option<usize>) -> R<()> {
+        fn copy_begin(
+            &mut self,
+            _: &(),
+            slot: usize,
+            wait_free: bool,
+            rec: Option<usize>,
+        ) -> R<()> {
             self.op(Op::Begin(slot, wait_free))?;
             if let Some(r) = rec {
                 self.stamp(TimelineEvent::CopyStart(r));
             }
             Ok(())
         }
-        fn copy_payload(&mut self, _: &(), slot: usize, src: usize, dst: usize, len: usize) -> R<()> {
+        fn copy_payload(
+            &mut self,
+            _: &(),
+            slot: usize,
+            src: usize,
+            dst: usize,
+            len: usize,
+        ) -> R<()> {
             self.op(Op::Payload(slot, src, dst, len))
         }
         fn copy_zero(&mut self, _: &(), slot: usize, dst: usize, len: usize) -> R<()> {
@@ -2659,7 +2925,10 @@ mod slowlink_ring {
                 let base = HOST + id * (GU + DN);
                 Some(ExpertSource {
                     codec: PanelCodec(codec(id)),
-                    gate_up: ExpertExtent { addr: base, len: GU },
+                    gate_up: ExpertExtent {
+                        addr: base,
+                        len: GU,
+                    },
                     down: ExpertExtent {
                         addr: base + GU,
                         len: DN,
@@ -2668,7 +2937,8 @@ mod slowlink_ring {
             })
             .collect();
         // SAFETY: the mock backend never dereferences a source address.
-        unsafe { LayerExpertSources::new(layer, HOST, EXPERTS * (GU + DN), experts, owner) }.unwrap()
+        unsafe { LayerExpertSources::new(layer, HOST, EXPERTS * (GU + DN), experts, owner) }
+            .unwrap()
     }
 
     fn sources(layer: usize) -> LayerExpertSources {
@@ -2697,16 +2967,28 @@ mod slowlink_ring {
         assert_eq!(first.slot, second.slot);
         assert!(second.epoch > first.epoch);
         let text = err_text(ring.acquire(&(), first).unwrap_err());
-        assert!(text.contains("stale panel ticket") && text.contains("epoch"), "{text}");
+        assert!(
+            text.contains("stale panel ticket") && text.contains("epoch"),
+            "{text}"
+        );
         assert!(ring.retire(&(), first).is_err());
         // Forged fields with the right epoch are each refused, state untouched.
         for (forged, needle) in [
             (PanelTicket { layer: 4, ..second }, "layer"),
             (PanelTicket { group: 9, ..second }, "group"),
-            (PanelTicket { codec: PanelCodec(7), ..second }, "codec"),
+            (
+                PanelTicket {
+                    codec: PanelCodec(7),
+                    ..second
+                },
+                "codec",
+            ),
         ] {
             let text = err_text(ring.acquire(&(), forged).unwrap_err());
-            assert!(text.contains("stale panel ticket") && text.contains(needle), "{text}");
+            assert!(
+                text.contains("stale panel ticket") && text.contains(needle),
+                "{text}"
+            );
         }
         ring.acquire(&(), second).unwrap();
         // Double retire / acquire of a retired ticket.
@@ -2741,7 +3023,11 @@ mod slowlink_ring {
             .rposition(|o| matches!(o, Op::Begin(s, _) if *s == b.slot))
             .unwrap();
         assert!(release < begin);
-        assert_eq!(ops[begin], Op::Begin(b.slot, true), "reuse waits the free event");
+        assert_eq!(
+            ops[begin],
+            Op::Begin(b.slot, true),
+            "reuse waits the free event"
+        );
         // The first fill of a page never waits a free event nobody recorded.
         assert!(ops.contains(&Op::Begin(a.slot, false)));
     }
@@ -2777,7 +3063,10 @@ mod slowlink_ring {
         assert_eq!(layout.runs[0].len, 4 * (GU + DN));
         assert_eq!(layout.submitted_bytes(), layout.extent_bytes);
         assert_eq!(layout.used, layout.runs[0].dst + 4 * (GU + DN));
-        assert_eq!(layout.runs[0].dst % EXTENT_ALIGN, layout.runs[0].src % EXTENT_ALIGN);
+        assert_eq!(
+            layout.runs[0].dst % EXTENT_ALIGN,
+            layout.runs[0].src % EXTENT_ALIGN
+        );
         let mut gu = vec![u64::MAX; EXPERTS];
         let mut dn = vec![u64::MAX; EXPERTS];
         let base = 0x2_0000_0000usize;
@@ -2801,21 +3090,31 @@ mod slowlink_ring {
         let experts = vec![
             Some(ExpertSource {
                 codec: PanelCodec(1),
-                gate_up: ExpertExtent { addr: HOST + 10_000, len: 1000 },
-                down: ExpertExtent { addr: HOST + 11_000, len: 500 },
+                gate_up: ExpertExtent {
+                    addr: HOST + 10_000,
+                    len: 1000,
+                },
+                down: ExpertExtent {
+                    addr: HOST + 11_000,
+                    len: 500,
+                },
             }),
             None,
             Some(ExpertSource {
                 codec: PanelCodec(1),
-                gate_up: ExpertExtent { addr: HOST + 100_000, len: 777 },
-                down: ExpertExtent { addr: HOST + 200_001, len: 33 },
+                gate_up: ExpertExtent {
+                    addr: HOST + 100_000,
+                    len: 777,
+                },
+                down: ExpertExtent {
+                    addr: HOST + 200_001,
+                    len: 33,
+                },
             }),
         ];
         // SAFETY: never dereferenced.
-        let s = unsafe {
-            LayerExpertSources::new(0, HOST, 1 << 20, experts, Arc::new(0u8))
-        }
-        .unwrap();
+        let s =
+            unsafe { LayerExpertSources::new(0, HOST, 1 << 20, experts, Arc::new(0u8)) }.unwrap();
         let layout = plan_group_layout(&[0, 2], &s).unwrap();
         assert_eq!(layout.runs.len(), 3);
         for run in &layout.runs {
@@ -2836,8 +3135,14 @@ mod slowlink_ring {
     fn slowlink_ring_layout_overlap_is_copied_once_and_overflow_is_refused() {
         let experts = vec![Some(ExpertSource {
             codec: PanelCodec(1),
-            gate_up: ExpertExtent { addr: HOST, len: 1000 },
-            down: ExpertExtent { addr: HOST + 600, len: 1000 },
+            gate_up: ExpertExtent {
+                addr: HOST,
+                len: 1000,
+            },
+            down: ExpertExtent {
+                addr: HOST + 600,
+                len: 1000,
+            },
         })];
         // SAFETY: never dereferenced.
         let s = unsafe { LayerExpertSources::new(0, HOST, 4096, experts, Arc::new(0u8)) }.unwrap();
@@ -2849,7 +3154,10 @@ mod slowlink_ring {
         // Extent length overflowing the address space.
         let bad = vec![Some(ExpertSource {
             codec: PanelCodec(1),
-            gate_up: ExpertExtent { addr: usize::MAX - 4, len: 100 },
+            gate_up: ExpertExtent {
+                addr: usize::MAX - 4,
+                len: 100,
+            },
             down: ExpertExtent { addr: HOST, len: 8 },
         })];
         // SAFETY: construction must fail before anything is read.
@@ -2865,15 +3173,43 @@ mod slowlink_ring {
                     0,
                     HOST,
                     1 << 20,
-                    vec![Some(ExpertSource { codec: PanelCodec(1), gate_up, down })],
+                    vec![Some(ExpertSource {
+                        codec: PanelCodec(1),
+                        gate_up,
+                        down,
+                    })],
                     Arc::new(0u8),
                 )
             }
         };
-        let ok = ExpertExtent { addr: HOST, len: 256 };
-        assert!(mk(ok, ExpertExtent { addr: HOST + 256, len: 256 }).is_ok());
-        assert!(mk(ok, ExpertExtent { addr: HOST - 256, len: 256 }).is_err());
-        assert!(mk(ok, ExpertExtent { addr: HOST + (1 << 20) - 255, len: 256 }).is_err());
+        let ok = ExpertExtent {
+            addr: HOST,
+            len: 256,
+        };
+        assert!(mk(
+            ok,
+            ExpertExtent {
+                addr: HOST + 256,
+                len: 256
+            }
+        )
+        .is_ok());
+        assert!(mk(
+            ok,
+            ExpertExtent {
+                addr: HOST - 256,
+                len: 256
+            }
+        )
+        .is_err());
+        assert!(mk(
+            ok,
+            ExpertExtent {
+                addr: HOST + (1 << 20) - 255,
+                len: 256
+            }
+        )
+        .is_err());
         assert!(mk(ok, ExpertExtent { addr: HOST, len: 0 }).is_err());
         // SAFETY: as above.
         assert!(unsafe { LayerExpertSources::new(0, HOST, 1, Vec::new(), Arc::new(0u8)) }.is_err());
@@ -2914,7 +3250,14 @@ mod slowlink_ring {
             x.gate_up_addr = bad;
             // SAFETY: construction must fail.
             assert!(unsafe {
-                LayerExpertSources::from_alias(0, HOST, alias_base, 1 << 20, &[Some(x)], Arc::new(0u8))
+                LayerExpertSources::from_alias(
+                    0,
+                    HOST,
+                    alias_base,
+                    1 << 20,
+                    &[Some(x)],
+                    Arc::new(0u8),
+                )
             }
             .is_err());
         }
@@ -2928,8 +3271,14 @@ mod slowlink_ring {
         assert_eq!(groups[0].experts.as_slice(), &[0, 1, 2, 3]);
         assert_eq!(groups[1].experts.as_slice(), &[4, 5]);
         assert_eq!(groups[2].experts.as_slice(), &[6, 7, 8, 9]);
-        assert!(groups.iter().enumerate().all(|(i, g)| g.group as usize == i && g.layer == 5));
-        let all: Vec<usize> = groups.iter().flat_map(|g| g.experts.iter().copied()).collect();
+        assert!(groups
+            .iter()
+            .enumerate()
+            .all(|(i, g)| g.group as usize == i && g.layer == 5));
+        let all: Vec<usize> = groups
+            .iter()
+            .flat_map(|g| g.experts.iter().copied())
+            .collect();
         assert_eq!(all, (0..EXPERTS).collect::<Vec<_>>());
         assert!(ExpertGroupPlan::partition(&s, 0).is_err());
         assert!(ExpertGroupPlan::partition(&s, 33).is_err());
@@ -2940,7 +3289,10 @@ mod slowlink_ring {
         let mut mixed = groups[1].clone();
         mixed.experts.push(6);
         assert!(ring.enqueue(&(), &mixed, &s).is_err());
-        assert!(!ring.is_quarantined(), "a validation failure mutates nothing");
+        assert!(
+            !ring.is_quarantined(),
+            "a validation failure mutates nothing"
+        );
         assert!(ring.backend.ops.len() == 1, "only the window base op ran");
     }
 
@@ -2954,7 +3306,11 @@ mod slowlink_ring {
         ring.begin_window(&()).unwrap();
         ring.set_layers(Some(0), None).unwrap();
         let t = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
-        assert_eq!(Arc::strong_count(&owner), 3, "the page retains the source owner");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            3,
+            "the page retains the source owner"
+        );
         ring.acquire(&(), t).unwrap();
         ring.retire(&(), t).unwrap();
         // Retired but not yet known complete on the host: still retained.
@@ -2976,12 +3332,19 @@ mod slowlink_ring {
             .iter()
             .rposition(|o| *o == Op::Tables(t.slot))
             .unwrap();
-        assert!(wait < tables, "staging is rewritten only after the old copy completed");
+        assert!(
+            wait < tables,
+            "staging is rewritten only after the old copy completed"
+        );
         assert_eq!(Arc::strong_count(&s2_owner), 3);
         ring.acquire(&(), t2).unwrap();
         ring.retire(&(), t2).unwrap();
         ring.drain(&()).unwrap();
-        assert_eq!(Arc::strong_count(&s2_owner), 2, "drain releases the retained owner");
+        assert_eq!(
+            Arc::strong_count(&s2_owner),
+            2,
+            "drain releases the retained owner"
+        );
     }
 
     #[test]
@@ -2998,7 +3361,11 @@ mod slowlink_ring {
         ring.backend.fail_at = Some(at);
         assert!(ring.enqueue(&(), &group(&s, 1), &s).is_err());
         assert!(ring.is_quarantined());
-        assert_eq!(Arc::strong_count(&owner), 4, "owners stay held while quarantined");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            4,
+            "owners stay held while quarantined"
+        );
         for result in [
             ring.try_enqueue(&(), &group(&s, 2), &s).map(|_| ()),
             ring.acquire(&(), ok),
@@ -3016,7 +3383,11 @@ mod slowlink_ring {
         ring.backend.fail_drain = false;
         ring.drain(&()).unwrap();
         assert!(!ring.is_quarantined());
-        assert_eq!(Arc::strong_count(&owner), 2, "drain released every retained owner");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "drain released every retained owner"
+        );
         // Outstanding tickets are stale; the ring works again.
         assert!(ring.acquire(&(), ok).is_err());
         ring.begin_window(&()).unwrap();
@@ -3081,10 +3452,16 @@ mod slowlink_ring {
         assert!(t3.slot < 2);
         let ops_before = ring.backend.ops.len();
         ring.acquire(&(), tickets[0]).unwrap();
-        assert_eq!(&ring.backend.ops[ops_before..], &[Op::Acquire(tickets[0].slot)]);
+        assert_eq!(
+            &ring.backend.ops[ops_before..],
+            &[Op::Acquire(tickets[0].slot)]
+        );
         // A group that was already transferred cannot be transferred again.
         let text = err_text(ring.enqueue(&(), &group(&l1, 1), &l1).unwrap_err());
-        assert!(text.contains("again") || text.contains("out of order"), "{text}");
+        assert!(
+            text.contains("again") || text.contains("out of order"),
+            "{text}"
+        );
         // Current layer enqueue without a current layer is refused up front.
         let mut early = core(2, 2);
         early.begin_window(&()).unwrap();
@@ -3134,7 +3511,11 @@ mod slowlink_ring {
         for (current, s, g) in [(1, &a, 0), (2, &b, 7)] {
             ring.set_layers(Some(current), None).unwrap();
             let t = ring.enqueue(&(), &group(s, g), s).unwrap();
-            seen.push((t, ring.backend.tables[t.slot].0.clone(), ring.backend.page_base(t.slot)));
+            seen.push((
+                t,
+                ring.backend.tables[t.slot].0.clone(),
+                ring.backend.page_base(t.slot),
+            ));
             ring.acquire(&(), t).unwrap();
             ring.retire(&(), t).unwrap();
         }
@@ -3143,7 +3524,10 @@ mod slowlink_ring {
         assert_eq!(seen[0].2, seen[1].2);
         assert_ne!(seen[0].0.epoch, seen[1].0.epoch);
         assert_ne!(seen[0].0.codec, seen[1].0.codec);
-        assert_ne!(seen[0].1, seen[1].1, "the new group's tables name its own bytes");
+        assert_ne!(
+            seen[0].1, seen[1].1,
+            "the new group's tables name its own bytes"
+        );
         // The old layer's ticket cannot be acquired at the same address.
         assert!(ring.acquire(&(), seen[0].0).is_err());
     }
@@ -3175,7 +3559,9 @@ mod slowlink_ring {
             let mut state = 0x9E37_79B9_7F4A_7C15u64;
             let bytes = (0..EXPERTS * (GU + DN) + 4096)
                 .map(|_| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     (state >> 33) as u8 | 1
                 })
                 .collect();
@@ -3189,7 +3575,10 @@ mod slowlink_ring {
                     Some(ExpertSource {
                         codec: PanelCodec(1),
                         gate_up: ExpertExtent { addr: at, len: GU },
-                        down: ExpertExtent { addr: at + GU, len: DN },
+                        down: ExpertExtent {
+                            addr: at + GU,
+                            len: DN,
+                        },
                     })
                 })
                 .collect();
@@ -3305,7 +3694,10 @@ mod slowlink_ring {
         let report = selftest_epoch_summary(&seen);
         assert_eq!(report.distinct_addresses, 3);
         assert_eq!(report.repeated_address_epochs, 2);
-        assert_eq!((report.min_epochs_per_address, report.max_epochs_per_address), (1, 3));
+        assert_eq!(
+            (report.min_epochs_per_address, report.max_epochs_per_address),
+            (1, 3)
+        );
         let empty = selftest_epoch_summary(&HashMap::new());
         assert_eq!(empty.distinct_addresses, 0);
         assert_eq!(empty.min_epochs_per_address, 0);
@@ -3352,24 +3744,23 @@ mod slowlink_ring {
         // two copies even though their CPU addresses touch.
         let touching = vec![Some(ExpertSource {
             codec: PanelCodec(1),
-            gate_up: ExpertExtent { addr: HOST, len: GU },
-            down: ExpertExtent { addr: HOST + GU, len: DN },
+            gate_up: ExpertExtent {
+                addr: HOST,
+                len: GU,
+            },
+            down: ExpertExtent {
+                addr: HOST + GU,
+                len: DN,
+            },
         })];
         // SAFETY: never dereferenced.
-        let one = unsafe {
-            LayerExpertSources::new(0, HOST, GU + DN, touching.clone(), Arc::new(0u8))
-        }
-        .unwrap();
+        let one =
+            unsafe { LayerExpertSources::new(0, HOST, GU + DN, touching.clone(), Arc::new(0u8)) }
+                .unwrap();
         assert_eq!(plan_group_layout(&[0], &one).unwrap().runs.len(), 1);
         // SAFETY: never dereferenced.
         let split = unsafe {
-            LayerExpertSources::new_split(
-                0,
-                (HOST, GU),
-                (HOST + GU, DN),
-                touching,
-                Arc::new(0u8),
-            )
+            LayerExpertSources::new_split(0, (HOST, GU), (HOST + GU, DN), touching, Arc::new(0u8))
         }
         .unwrap();
         assert_eq!(plan_group_layout(&[0], &split).unwrap().runs.len(), 2);
@@ -3402,18 +3793,18 @@ mod slowlink_ring {
         // Direct extents are checked against their own range only.
         let swapped = vec![Some(ExpertSource {
             codec: PanelCodec(1),
-            gate_up: ExpertExtent { addr: HOST + GU, len: DN },
-            down: ExpertExtent { addr: HOST, len: GU },
+            gate_up: ExpertExtent {
+                addr: HOST + GU,
+                len: DN,
+            },
+            down: ExpertExtent {
+                addr: HOST,
+                len: GU,
+            },
         })];
         // SAFETY: construction must fail.
         assert!(unsafe {
-            LayerExpertSources::new_split(
-                0,
-                (HOST, GU),
-                (HOST + GU, DN),
-                swapped,
-                Arc::new(0u8),
-            )
+            LayerExpertSources::new_split(0, (HOST, GU), (HOST + GU, DN), swapped, Arc::new(0u8))
         }
         .is_err());
     }
@@ -3430,14 +3821,26 @@ mod slowlink_ring {
                 let base = HOST + id * (gu + dn + 4096) + 255;
                 Some(ExpertSource {
                     codec: PanelCodec(1),
-                    gate_up: ExpertExtent { addr: base, len: gu },
-                    down: ExpertExtent { addr: base + gu + 2048, len: dn },
+                    gate_up: ExpertExtent {
+                        addr: base,
+                        len: gu,
+                    },
+                    down: ExpertExtent {
+                        addr: base + gu + 2048,
+                        len: dn,
+                    },
                 })
             })
             .collect();
         // SAFETY: never dereferenced.
         let s = unsafe {
-            LayerExpertSources::new(0, HOST, 512 * (gu + dn + 4096) + 4096, experts, Arc::new(0u8))
+            LayerExpertSources::new(
+                0,
+                HOST,
+                512 * (gu + dn + 4096) + 4096,
+                experts,
+                Arc::new(0u8),
+            )
         }
         .unwrap();
         let group: Vec<usize> = (0..32).collect();
@@ -3476,12 +3879,30 @@ mod slowlink_ring {
         assert!((1.40..1.50).contains(&gib), "payload {gib} GiB");
         // Invalid or overflowing geometry never reaches an allocation.
         for bad in [
-            PanelPoolSpec { active_slots: 0, ..spec },
-            PanelPoolSpec { experts_per_slot: 33, ..spec },
-            PanelPoolSpec { num_experts: 0, ..spec },
-            PanelPoolSpec { payload_bytes: 0, ..spec },
-            PanelPoolSpec { payload_bytes: usize::MAX, ..spec },
-            PanelPoolSpec { lookahead_pages: usize::MAX / 2, ..spec },
+            PanelPoolSpec {
+                active_slots: 0,
+                ..spec
+            },
+            PanelPoolSpec {
+                experts_per_slot: 33,
+                ..spec
+            },
+            PanelPoolSpec {
+                num_experts: 0,
+                ..spec
+            },
+            PanelPoolSpec {
+                payload_bytes: 0,
+                ..spec
+            },
+            PanelPoolSpec {
+                payload_bytes: usize::MAX,
+                ..spec
+            },
+            PanelPoolSpec {
+                lookahead_pages: usize::MAX / 2,
+                ..spec
+            },
         ] {
             assert!(bad.validate().is_err());
         }
@@ -3497,8 +3918,15 @@ mod slowlink_ring {
         // Two active + four lookahead pages.
         let mut ring = core(2, 4);
         let issued = schedule.prime(&mut ring, &()).unwrap();
-        assert_eq!(issued, 4, "only the lookahead pages fill before layer 2 computes");
-        assert!(ring.backend.ops.iter().all(|o| !matches!(o, Op::Acquire(_))));
+        assert_eq!(
+            issued, 4,
+            "only the lookahead pages fill before layer 2 computes"
+        );
+        assert!(ring
+            .backend
+            .ops
+            .iter()
+            .all(|o| !matches!(o, Op::Acquire(_))));
         let mut order = Vec::new();
         let mut prefetched_before_last = false;
         for layer in [2usize, 5, 6] {
@@ -3523,8 +3951,14 @@ mod slowlink_ring {
         assert_eq!(stats.discarded, 0);
         // The cross-layer prefetch happened: layer 5's first group was already
         // transferred while layer 2's last group was still to be consumed.
-        assert!(prefetched_before_last, "layer L+1 copies start before layer L finishes");
-        assert!(schedule.enter_layer(&mut ring, &(), 6).is_err(), "no layer after the last");
+        assert!(
+            prefetched_before_last,
+            "layer L+1 copies start before layer L finishes"
+        );
+        assert!(
+            schedule.enter_layer(&mut ring, &(), 6).is_err(),
+            "no layer after the last"
+        );
         assert!(schedule.ticket(5, 3).is_some());
         // Mismatched layer is refused.
         let mut again = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
@@ -3568,7 +4002,10 @@ mod slowlink_ring {
         ring.acquire(&(), b).unwrap();
         assert_eq!(ring.stats().copy_starved_stalls, 1);
         assert_eq!(ring.stats().acquired, 2);
-        assert_eq!(ring.stats().acquired_payload_bytes, ring.stats().submitted_payload_bytes);
+        assert_eq!(
+            ring.stats().acquired_payload_bytes,
+            ring.stats().submitted_payload_bytes
+        );
     }
 
     #[test]
@@ -3594,7 +4031,11 @@ mod slowlink_ring {
             span(2, 20.0, 40.0, None),
             span(3, 45.0, 60.0, None),
         ];
-        let layers = [LayerSpanMs { layer: 1, begin: 10.0, end: 30.0 }];
+        let layers = [LayerSpanMs {
+            layer: 1,
+            begin: 10.0,
+            end: 30.0,
+        }];
         let o = summarize_overlap(&spans, &layers, &stats);
         // (L1 compute, L2 copy 5..15): 5 ms; (L1, 20..40): 10 ms.
         assert_eq!(o.cross_layer_intersections, 3);
