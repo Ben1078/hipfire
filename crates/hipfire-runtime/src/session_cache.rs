@@ -431,6 +431,36 @@ impl Parked {
     }
 }
 
+/// Read-only occupancy of one [`SessionCache`]'s DEVICE-owned snapshot memory,
+/// from the cache's own bookkeeping (no estimate, no GPU query). Every owned
+/// device buffer is counted in exactly one byte field, so `pool_bytes +
+/// pending_bytes + resident_bytes + deferred_release_bytes + parked_bytes`
+/// is the cache's device footprint. Disk-tier snapshots are never counted
+/// (a demotion lowers `pool_bytes` and raises `evictions_total`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionCacheUsage {
+    /// Published device pool snapshots (what [`SessionCache::stored_bytes`] returns).
+    pub pool_bytes: u64,
+    /// The pool's device byte budget.
+    pub budget_bytes: u64,
+    /// Captured this turn and not yet published: pending pool snapshots plus
+    /// the pending resident and pending tail buffers.
+    pub pending_bytes: u64,
+    /// Published resident and tail buffers (outside the pool budget).
+    pub resident_bytes: u64,
+    /// Displaced snapshots and buffers waiting for the next `begin`/`clear`
+    /// to free them.
+    pub deferred_release_bytes: u64,
+    /// The parked conversation's buffer plus its own resident and tail
+    /// buffers (distinct from `resident_bytes`).
+    pub parked_bytes: u64,
+    /// Device snapshots that left the pool through the cache's eviction path
+    /// (`evict_device`: capacity, memory guard, context growth, clear),
+    /// whether demoted to disk or dropped. Counts actual removals, never
+    /// policy decisions.
+    pub evictions_total: u64,
+}
+
 pub struct SessionCache {
     pool: CheckpointPool<StoredSnapshot>,
     domain: CacheDomain,
@@ -457,6 +487,8 @@ pub struct SessionCache {
     disk: Option<disk::DiskTier>,
     /// The committed conversation parked around side requests (module docs).
     parked: Option<Parked>,
+    /// Device snapshots that left the pool through `evict_device`.
+    evictions_total: u64,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -469,6 +501,14 @@ fn layout(part_bytes: impl IntoIterator<Item = usize>) -> (Vec<usize>, usize) {
         end = offset + bytes;
     }
     (offsets, end)
+}
+
+/// Device bytes a snapshot owns; a disk snapshot owns none.
+fn device_bytes(snapshot: &StoredSnapshot) -> u64 {
+    match snapshot.location {
+        SnapshotLocation::Device(_) => snapshot.bytes,
+        SnapshotLocation::Disk { .. } => 0,
+    }
 }
 
 fn free_device(gpu: &mut Gpu, buf: DeviceBuffer) {
@@ -612,6 +652,7 @@ impl SessionCache {
             release_bufs: Vec::new(),
             disk: None,
             parked: None,
+            evictions_total: 0,
         }
     }
 
@@ -762,13 +803,20 @@ impl SessionCache {
         free_buffer(gpu, snapshot);
     }
 
+    /// Pure bookkeeping of a device snapshot that already left the pool for
+    /// `evict_device`: unlink it from its parent and count the removal.
+    fn note_device_eviction(&mut self, snapshot: &StoredSnapshot) {
+        if let Some(parent) = &snapshot.parent {
+            self.unlink(parent);
+        }
+        self.evictions_total = self.evictions_total.saturating_add(1);
+    }
+
     /// A published device snapshot leaves the device tier: demote it to disk
     /// when there is a disk tier (or drop its disk descendants when that
     /// fails), then free it.
     fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot, growth: u64) {
-        if let Some(parent) = &snapshot.parent {
-            self.unlink(parent);
-        }
+        self.note_device_eviction(&snapshot);
         if let Some(disk) = &mut self.disk {
             if let Err(reason) = disk.demote(gpu, &key, &snapshot, growth) {
                 eprintln!(
@@ -1747,6 +1795,34 @@ impl SessionCache {
     /// Bytes of every published snapshot.
     pub fn stored_bytes(&self) -> u64 {
         self.pool.total_bytes()
+    }
+
+    /// Device bytes owned per bookkeeping category, and the eviction count.
+    /// Pure read of the cache's own fields: no GPU access, no allocation.
+    pub fn usage(&self) -> SessionCacheUsage {
+        let resident = |slot: &Option<Resident>| slot.as_ref().map_or(0, |r| r.buf.size() as u64);
+        let pending = self.pending.iter().map(|entry| device_bytes(&entry.1));
+        let deferred = self.release.iter().map(device_bytes);
+        SessionCacheUsage {
+            pool_bytes: self.pool.total_bytes(),
+            budget_bytes: self.pool.max_bytes(),
+            pending_bytes: saturating_total(pending.chain([
+                resident(&self.resident_pending),
+                resident(&self.tail_pending),
+            ])),
+            resident_bytes: saturating_total([resident(&self.resident), resident(&self.tail)]),
+            deferred_release_bytes: saturating_total(
+                deferred.chain(self.release_bufs.iter().map(|buf| buf.size() as u64)),
+            ),
+            parked_bytes: self.parked.as_ref().map_or(0, |parked| {
+                saturating_total([
+                    parked.buf.size() as u64,
+                    resident(&parked.resident),
+                    resident(&parked.tail),
+                ])
+            }),
+            evictions_total: self.evictions_total,
+        }
     }
 
     /// Free every snapshot; with a disk tier attached, published snapshots
@@ -5381,5 +5457,132 @@ mod tests {
         assert!(mesh.planned().is_some());
         assert!(mesh.evict_oldest(&mut bands));
         assert!(mesh.planned().is_none());
+    }
+
+    /// Pull the LRU pool snapshot and run the bookkeeping `evict_device`
+    /// runs for it (`note_device_eviction`), minus the GPU free.
+    fn evict_lru_bookkeeping(cache: &mut SessionCache) -> bool {
+        match cache.pool.pop_lru() {
+            Some((_, snapshot)) => {
+                cache.note_device_eviction(&snapshot);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn slowlink_session_cache_usage_counts_every_owner_once() {
+        let hist = [1u32, 2, 3, 4];
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        assert_eq!(
+            cache.usage(),
+            SessionCacheUsage {
+                pool_bytes: 0,
+                budget_bytes: 1 << 20,
+                pending_bytes: 0,
+                resident_bytes: 0,
+                deferred_release_bytes: 0,
+                parked_bytes: 0,
+                evictions_total: 0,
+            }
+        );
+
+        publish(&mut cache, "scope", true, &hist, 2);
+        publish(&mut cache, "scope", true, &hist, 3);
+        let resident_key = (
+            cache.domain.scoped("scope"),
+            3u64,
+            prefix_fingerprint(&hist[..3]),
+        );
+        let make_resident = |bytes: usize| Resident {
+            key: resident_key.clone(),
+            buf: fake_buf(bytes),
+            fixed_bytes: Vec::new(),
+            rows: Vec::new(),
+            meta: Vec::new(),
+            cold_exact: true,
+        };
+        cache.resident = Some(make_resident(100));
+        cache.tail = Some(make_resident(200));
+        cache.resident_pending = Some(make_resident(300));
+        cache.tail_pending = Some(make_resident(400));
+        cache.pending.push((resident_key.clone(), fake_snapshot(4)));
+        cache.release.push(fake_snapshot(5));
+        cache.release_bufs.push(fake_buf(500));
+        cache.parked = Some(Parked {
+            buf: fake_buf(1000),
+            plan: ParkPlan {
+                fixed_bytes: Vec::new(),
+                segments: Vec::new(),
+                offsets: Vec::new(),
+                total: 0,
+            },
+            meta: Vec::new(),
+            live_rows: Vec::new(),
+            scope: "scope".to_string(),
+            route: AR,
+            position: 3,
+            through: 3,
+            live_cold_exact: true,
+            resident: Some(make_resident(2000)),
+            tail: Some(make_resident(4000)),
+        });
+
+        let usage = cache.usage();
+        assert_eq!(usage.pool_bytes, 2 * 4096);
+        assert_eq!(usage.pool_bytes, cache.stored_bytes());
+        assert_eq!(usage.budget_bytes, 1 << 20);
+        assert_eq!(usage.pending_bytes, 4096 + 300 + 400);
+        assert_eq!(usage.resident_bytes, 100 + 200);
+        assert_eq!(usage.deferred_release_bytes, 4096 + 500);
+        assert_eq!(usage.parked_bytes, 1000 + 2000 + 4000);
+        assert_eq!(usage.evictions_total, 0);
+        // Reading usage is pure.
+        assert_eq!(cache.usage(), usage);
+    }
+
+    #[test]
+    fn slowlink_session_cache_eviction_counter_counts_only_pool_removals() {
+        let hist = [1u32, 2, 3, 4];
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        publish(&mut cache, "scope", true, &hist, 2);
+        publish(&mut cache, "scope", true, &hist, 3);
+        // A linked child pins its parent: the parent is never an LRU victim.
+        let parent = (
+            capture_domain(&cache.domain.scoped("scope"), true),
+            2u64,
+            prefix_fingerprint(&hist[..2]),
+        );
+        cache.link(&parent);
+        let before = cache.usage();
+        assert_eq!((before.pool_bytes, before.evictions_total), (2 * 4096, 0));
+
+        // Publishing leaves the counter alone: it is not an `evict_device` removal.
+        publish(&mut cache, "scope", true, &hist, 4);
+        let published = cache.usage();
+        assert_eq!(published.evictions_total, 0);
+        assert_eq!(published.pool_bytes, 3 * 4096);
+
+        assert!(evict_lru_bookkeeping(&mut cache));
+        let after_one = cache.usage();
+        assert_eq!(after_one.evictions_total, 1);
+        assert_eq!(after_one.pool_bytes, 2 * 4096);
+
+        assert!(evict_lru_bookkeeping(&mut cache));
+        let after_two = cache.usage();
+        assert_eq!(after_two.evictions_total, 2);
+        assert_eq!(after_two.pool_bytes, 4096);
+        // Only the pinned parent remains: nothing is evictable, nothing counts.
+        assert!(!evict_lru_bookkeeping(&mut cache));
+        assert_eq!(cache.usage(), after_two);
+
+        // A child snapshot leaving through the eviction path unpins its parent.
+        let mut child = fake_snapshot(4);
+        child.parent = Some(parent.clone());
+        cache.note_device_eviction(&child);
+        assert_eq!(cache.usage().evictions_total, 3);
+        assert!(cache.children.is_empty());
+        assert!(!cache.pool.is_pinned(&parent.0, parent.1, parent.2));
     }
 }

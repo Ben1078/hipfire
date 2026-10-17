@@ -7938,10 +7938,13 @@ impl Qwen4MtpDrafter {
                     if !Self::bundle(target)?.slowlink_pending_restorable() {
                         return Err(message);
                     }
-                    let restored = Self::bundle(target)?.slowlink_restore_pending(ops.gpu()?, pending);
+                    let restored =
+                        Self::bundle(target)?.slowlink_restore_pending(ops.gpu()?, pending);
                     return Err(match restored {
                         Ok(()) => message,
-                        Err(restore) => format!("{message}; pending hidden restore failed: {restore}"),
+                        Err(restore) => {
+                            format!("{message}; pending hidden restore failed: {restore}")
+                        }
                     });
                 }
             }
