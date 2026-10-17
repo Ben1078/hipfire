@@ -1119,11 +1119,11 @@ impl<B: PanelBackend> RingCore<B> {
         Ok(())
     }
 
-    fn classify(&self, layer: usize) -> R<Class> {
+    fn classify(&self, layer: usize, scheduled: bool) -> R<Class> {
         if Some(layer) == self.current {
             Ok(Class::Current)
         } else if Some(layer) == self.next {
-            if self.spec.lookahead_pages == 0 {
+            if self.spec.lookahead_pages == 0 && !scheduled {
                 return Err(invalid("panel pool has no lookahead pages"));
             }
             Ok(Class::Lookahead)
@@ -1155,8 +1155,31 @@ impl<B: PanelBackend> RingCore<B> {
         group: &ExpertGroupPlan,
         sources: &LayerExpertSources,
     ) -> R<Option<PanelTicket>> {
+        self.try_enqueue_inner(ctx, group, sources, false)
+    }
+
+    /// [`Self::try_enqueue`] for [`PanelSchedule`]: its ordering guarantees the
+    /// current layer is fully enqueued before any next-layer group, so the next
+    /// layer may also take the active slots the current layer leaves idle (and a
+    /// pool without lookahead pages still prefetches).
+    fn try_enqueue_scheduled(
+        &mut self,
+        ctx: &B::Ctx,
+        group: &ExpertGroupPlan,
+        sources: &LayerExpertSources,
+    ) -> R<Option<PanelTicket>> {
+        self.try_enqueue_inner(ctx, group, sources, true)
+    }
+
+    fn try_enqueue_inner(
+        &mut self,
+        ctx: &B::Ctx,
+        group: &ExpertGroupPlan,
+        sources: &LayerExpertSources,
+        scheduled: bool,
+    ) -> R<Option<PanelTicket>> {
         self.check_live()?;
-        let class = self.classify(group.layer)?;
+        let class = self.classify(group.layer, scheduled)?;
         if sources.layer() != group.layer {
             return Err(invalid(format!(
                 "panel group layer {} enqueued with sources of layer {}",
@@ -1219,6 +1242,10 @@ impl<B: PanelBackend> RingCore<B> {
         }
         let position = match class {
             Class::Current => (!self.free.is_empty()).then_some(0),
+            // The schedule enqueues a next-layer group only after every group of
+            // the current layer holds a page, so no active slot is reserved for
+            // pending current-layer work: any free page serves.
+            Class::Lookahead if scheduled => (!self.free.is_empty()).then_some(0),
             Class::Lookahead => self
                 .free
                 .iter()
@@ -1679,7 +1706,7 @@ impl PanelSchedule {
             let layer = &mut self.layers[index];
             while layer.next_group < layer.groups.len() {
                 let group = layer.next_group;
-                match core.try_enqueue(ctx, &layer.groups[group], &layer.sources)? {
+                match core.try_enqueue_scheduled(ctx, &layer.groups[group], &layer.sources)? {
                     Some(ticket) => {
                         layer.tickets[group] = Some(ticket);
                         layer.next_group += 1;
@@ -3919,8 +3946,8 @@ mod slowlink_ring {
         let mut ring = core(2, 4);
         let issued = schedule.prime(&mut ring, &()).unwrap();
         assert_eq!(
-            issued, 4,
-            "only the lookahead pages fill before layer 2 computes"
+            issued, 6,
+            "with no compute layer yet the whole pool prefetches the first host layer"
         );
         assert!(ring
             .backend
@@ -3966,6 +3993,45 @@ mod slowlink_ring {
         again.prime(&mut ring2, &()).unwrap();
         assert!(again.enter_layer(&mut ring2, &(), 5).is_err());
         assert!(PanelSchedule::new(vec![sources(5), sources(2)], 4).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_scheduled_next_layer_uses_the_active_slots_the_current_layer_does_not_hold() {
+        // 18 pages: layer 1's 16 groups prefetch before any compute, so on entry
+        // the two active slots are idle and already carry layer 2's first groups.
+        let mut schedule = PanelSchedule::new(vec![sources(1), sources(2)], 4).unwrap();
+        let mut ring = core(2, 16);
+        assert_eq!(schedule.prime(&mut ring, &()).unwrap(), 16);
+        assert!(schedule.ticket(2, 0).is_none(), "layer 2 is not next before compute starts");
+        schedule.enter_layer(&mut ring, &(), 1).unwrap();
+        assert_eq!(ring.stats().enqueued, 18);
+        assert_eq!(ring.stats().acquired, 0);
+        assert!(schedule.ticket(2, 0).is_some() && schedule.ticket(2, 1).is_some());
+        assert!(schedule.ticket(2, 2).is_none(), "the page store is full");
+        // Layer 1's groups all precede layer 2's: copies are issued in order.
+        let ends: Vec<usize> = ring
+            .backend
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::End(slot) => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 18);
+        // A pool with no lookahead pages still prefetches through the schedule.
+        let mut small = PanelSchedule::new(vec![sources(1), sources(2)], 4).unwrap();
+        let mut tiny = core(2, 0);
+        assert_eq!(small.prime(&mut tiny, &()).unwrap(), 2);
+        // The direct ring API keeps the active slots reserved for the current layer.
+        let mut direct = core(2, 3);
+        direct.begin_window(&()).unwrap();
+        direct.set_layers(None, Some(1)).unwrap();
+        let s = sources(1);
+        for g in 0..3 {
+            assert!(direct.enqueue(&(), &group(&s, g), &s).unwrap().slot >= 2);
+        }
+        assert_eq!(direct.try_enqueue(&(), &group(&s, 3), &s).unwrap(), None);
     }
 
     #[test]
