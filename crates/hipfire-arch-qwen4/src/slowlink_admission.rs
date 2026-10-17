@@ -327,6 +327,7 @@ pub struct ModelGeometry {
     pub num_experts: usize,
     pub experts_per_token: usize,
     pub moe_intermediate: usize,
+    pub shared_intermediate: usize,
 }
 
 impl ModelGeometry {
@@ -339,7 +340,7 @@ impl ModelGeometry {
                         num_experts,
                         experts_per_token,
                         intermediate,
-                        ..
+                        shared_intermediate: shared,
                     },
                 ..
             } => Ok(Self {
@@ -348,6 +349,7 @@ impl ModelGeometry {
                 num_experts,
                 experts_per_token,
                 moe_intermediate: intermediate,
+                shared_intermediate: shared,
             }),
             _ => Err("slow-link prefill needs a routed-expert (MoE) profile".to_string()),
         }
@@ -617,12 +619,26 @@ impl PromptArenaLayout {
     }
 }
 
-fn route_dims(geometry: &ModelGeometry, rows: usize) -> hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteDims {
+/// Window rows that can land in K1 short-tail tiles (at most the historic
+/// `FEW_ROW_ROUTE_ROWS` rows each): the final tile of each of the
+/// [`S1_MAX_BOUNDARY_SNAPSHOTS`] + 1 session-cut segments plus one short entry
+/// tile of a resumed prompt, so at most 48 rows. A plan whose short tiles
+/// exceed this is a pre-mutation bypass.
+pub const S1_K1_TAIL_ROWS: usize =
+    (S1_MAX_BOUNDARY_SNAPSHOTS + 2) * rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
+
+/// The dispatch crate's route-storage dimensions of a window of `rows` rows.
+pub fn route_dims(
+    geometry: &ModelGeometry,
+    rows: usize,
+) -> hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteDims {
     hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteDims {
         rows,
         hidden: geometry.hidden,
         n_exp: geometry.num_experts,
         mi: geometry.moe_intermediate,
+        shared_intermediate: geometry.shared_intermediate,
+        k1_rows: S1_K1_TAIL_ROWS,
     }
 }
 
@@ -765,6 +781,22 @@ impl SlowlinkProfile {
     /// last possibly short).
     pub fn windows_for(&self, rows: usize) -> usize {
         rows.div_ceil(self.window_rows)
+    }
+
+    /// The dispatch crate's route-storage dimensions at this window
+    /// ([`route_dims`]): what the forward passes to
+    /// `PromptRouteLayout::new` and `PromptRouteStorage::alloc`, the same call
+    /// the census made.
+    pub fn route_dims(&self) -> hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteDims {
+        route_dims(&self.geometry, self.window_rows)
+    }
+
+    /// The expert page pool spec the forward constructs its ring from
+    /// ([`PanelPageLayout::pool_spec`]), the same spec the census read.
+    pub(crate) fn pool_spec(
+        &self,
+    ) -> Result<crate::gpu_forward::panel_stage::PanelPoolSpec, String> {
+        self.pages.pool_spec()
     }
 
     /// Pinned host bytes the profile adds beside the host-mapped experts: the
@@ -1482,5 +1514,27 @@ mod tests {
         assert_eq!(S1_MIN_AUTO_REQUEST_ROWS, 16384);
         assert_eq!(profile.windows_for(1), 1);
         assert_eq!(profile.windows_for(32768), 2);
+    }
+
+    #[test]
+    fn slowlink_admission_route_dims_are_the_census_dims() {
+        let profile = profile_at_ten();
+        let dims = profile.route_dims();
+        assert_eq!(dims.rows, profile.window_rows);
+        assert_eq!(dims.hidden, profile.geometry.hidden);
+        assert_eq!(dims.n_exp, 512);
+        assert_eq!(dims.mi, profile.geometry.moe_intermediate);
+        assert_eq!(dims.shared_intermediate, profile.geometry.shared_intermediate);
+        // At most (4 session-cut segments + 1 entry tile + the window tail) short tiles of 8 rows.
+        assert_eq!(dims.k1_rows, 48);
+        assert_eq!(S1_K1_TAIL_ROWS, 48);
+        let layout =
+            hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(&dims).unwrap();
+        assert_eq!(
+            profile.census.route_storage,
+            layout.total_bytes() as u64,
+            "census and allocation read one layout"
+        );
+        assert_eq!(profile.census.a4_sidecars, layout.a4_sidecar_bytes() as u64);
     }
 }

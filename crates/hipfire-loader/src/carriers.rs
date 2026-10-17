@@ -7594,6 +7594,7 @@ mod qwen4_slowlink_tests {
             num_experts: 512,
             experts_per_token: 10,
             moe_intermediate: 640,
+            shared_intermediate: 640,
         }
     }
 
