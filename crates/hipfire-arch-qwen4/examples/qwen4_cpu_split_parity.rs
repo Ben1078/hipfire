@@ -46,6 +46,9 @@
 //! (median / min / mean, steps `--warmup-steps` and later). Final logits of every step
 //! must be bit-identical across all runs of the natural placement (full capture, overlapped
 //! timing, serial timing).
+//! Timing JSON retains every step hash and reports same-schedule repeats separately
+//! from cross-schedule comparisons. Fewer than two runs per schedule leaves the
+//! repeat gate `not_checked` (not a pass); admission requires `--timing-rounds 2`.
 //!
 //! Usage:
 //!   HIPFIRE_OFFLOAD_EXEC=cpu \
@@ -141,12 +144,18 @@ fn parse_args() -> R<Args> {
     let mut json = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
-        let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value\n{USAGE}"));
+        let mut value = |name: &str| {
+            it.next()
+                .ok_or_else(|| format!("{name} needs a value\n{USAGE}"))
+        };
         let num = |name: &str, v: String| v.parse::<usize>().map_err(|x| format!("{name}: {x}"));
         match arg.as_str() {
             "--hot-budget-mib" => {
-                hot_budget_mib =
-                    Some(value("--hot-budget-mib")?.parse().map_err(|x| format!("--hot-budget-mib: {x}"))?)
+                hot_budget_mib = Some(
+                    value("--hot-budget-mib")?
+                        .parse()
+                        .map_err(|x| format!("--hot-budget-mib: {x}"))?,
+                )
             }
             "--hotset" => hotset = Some(PathBuf::from(value("--hotset")?)),
             "--layers" => {
@@ -160,7 +169,11 @@ fn parse_args() -> R<Args> {
                     LayerSel::List(
                         list.split(',')
                             .filter(|v| !v.trim().is_empty())
-                            .map(|v| v.trim().parse::<usize>().map_err(|x| format!("--layers '{v}': {x}")))
+                            .map(|v| {
+                                v.trim()
+                                    .parse::<usize>()
+                                    .map_err(|x| format!("--layers '{v}': {x}"))
+                            })
                             .collect::<R<Vec<_>>>()?,
                     )
                 };
@@ -175,18 +188,23 @@ fn parse_args() -> R<Args> {
             "--no-endpoints" => endpoints = false,
             "--no-timing" => timing = false,
             "--json" => json = Some(PathBuf::from(value("--json")?)),
-            other if other.starts_with("--") => return Err(format!("unknown argument {other}\n{USAGE}")),
+            other if other.starts_with("--") => {
+                return Err(format!("unknown argument {other}\n{USAGE}"))
+            }
             other => positional.push(other.to_string()),
         }
     }
     let [model, text] =
         <[String; 2]>::try_from(positional).map_err(|_| format!("need MODEL and TEXT\n{USAGE}"))?;
-    let hot_budget_mib = hot_budget_mib.ok_or_else(|| format!("--hot-budget-mib is required\n{USAGE}"))?;
+    let hot_budget_mib =
+        hot_budget_mib.ok_or_else(|| format!("--hot-budget-mib is required\n{USAGE}"))?;
     if hot_budget_mib == 0 {
         return Err("--hot-budget-mib must be > 0".into());
     }
     if rows == 0 || rows > MAX_SPLIT_ROWS {
-        return Err(format!("--rows {rows}: the split serves 1..={MAX_SPLIT_ROWS} rows"));
+        return Err(format!(
+            "--rows {rows}: the split serves 1..={MAX_SPLIT_ROWS} rows"
+        ));
     }
     if greedy && rows != 1 {
         return Err("--greedy feeds one argmax token per step: it needs --rows 1".into());
@@ -200,7 +218,10 @@ fn parse_args() -> R<Args> {
         return Err("--steps must be >= 1".into());
     }
     if timing && (timing_rounds == 0 || warmup_steps >= steps) {
-        return Err("--timing-rounds must be >= 1 and --warmup-steps < --steps (or pass --no-timing)".into());
+        return Err(
+            "--timing-rounds must be >= 1 and --warmup-steps < --steps (or pass --no-timing)"
+                .into(),
+        );
     }
     Ok(Args {
         model: PathBuf::from(model),
@@ -285,12 +306,18 @@ fn hex(bytes: &[u8]) -> String {
 fn load(args: &Args, max_seq: usize) -> R<Model> {
     let path = args.model.as_path();
     let mut hfq = HfqFile::open(path).map_err(|x| format!("open HFQM {}: {x}", path.display()))?;
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|x| format!("tokenizer: {x}"))?;
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|x| format!("tokenizer: {x}"))?;
     let mut gpu = Gpu::init().map_err(e)?;
     if gpu.is_uma() {
-        return Err(format!("device {} is unified memory: the hot set needs a discrete GPU", gpu.arch));
+        return Err(format!(
+            "device {} is unified memory: the hot set needs a discrete GPU",
+            gpu.arch
+        ));
     }
-    if !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled() || hipfire_dispatch::cpu_exec::passback_enabled() {
+    if !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+        || hipfire_dispatch::cpu_exec::passback_enabled()
+    {
         return Err(format!(
             "memory.offload_exec is '{}': the D2 split needs HIPFIRE_OFFLOAD_EXEC=cpu (not passback)",
             hipfire_config::memory::offload_exec()
@@ -301,16 +328,25 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         path,
         hipfire_config::memory::ple_format(),
         &gpu.arch,
-        ResolvePolicy { derive_missing_q4: false, progress: None },
+        ResolvePolicy {
+            derive_missing_q4: false,
+            progress: None,
+        },
     )
     .map_err(|x| format!("qwen4 PLE rows: {x}"))?;
     eprintln!("qwen4_cpu_split_parity: ple rows: {}", choice.format.name());
-    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(|x| format!("qwen4 admission: {x}"))?;
-    let trunk_overlay = hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
-        .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
-    let scratch_mode =
-        hipfire_arch_qwen4::artifact::source_forward_scratch_mode(&gpu, &hfq, &receipt.config, &receipt.manifest)
-            .map_err(e)?;
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        .map_err(|x| format!("qwen4 admission: {x}"))?;
+    let trunk_overlay =
+        hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
+            .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(e)?;
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
     let mesh = DeviceMesh::single().map_err(|x| format!("qwen4 mesh: {x}"))?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
@@ -326,14 +362,21 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         expert_parallel: false,
         explicit_vram_layers: false,
         source: match &receipt.manifest.identity.recipe {
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => hotsets::HotsetSource::Aggregate,
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => hotsets::HotsetSource::SlabArena,
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => hotsets::HotsetSource::StockFp8,
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
+                hotsets::HotsetSource::Aggregate
+            }
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => {
+                hotsets::HotsetSource::SlabArena
+            }
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => {
+                hotsets::HotsetSource::StockFp8
+            }
             _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
         },
     };
     let sidecar_path = hotsets::preflight(&policy, path, &env).map_err(|skip| {
-        skip.log_line(&policy.sidecar_path(path)).unwrap_or_else(|| skip.to_string())
+        skip.log_line(&policy.sidecar_path(path))
+            .unwrap_or_else(|| skip.to_string())
     })?;
     let base = hotsets::HotsetBase::from_hfq(&hfq)?;
     let sidecar = hotsets::HotsetSidecar::load_bound(
@@ -345,7 +388,11 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     )
     .map_err(|skip| skip.to_string())?;
     receipt.manifest.check_expert_tiers().map_err(e)?;
-    let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(&hfq, &receipt.config, &receipt.manifest)?;
+    let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )?;
     let budget = args.hot_budget_mib << 20;
     let plan = plan_expert_tiers_from_slabs(&slabs, sidecar.rank(), budget).map_err(e)?;
     hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
@@ -359,24 +406,34 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     let mut need = 0usize;
     for layer in 0..layers {
         for expert in 0..experts {
-            let (gate_up, down) = plan
-                .source(layer, expert)
-                .ok_or_else(|| format!("tier plan has no source spans for layer {layer} expert {expert}"))?;
+            let (gate_up, down) = plan.source(layer, expert).ok_or_else(|| {
+                format!("tier plan has no source spans for layer {layer} expert {expert}")
+            })?;
             for span in [gate_up, down] {
                 need = need.max(span.end().ok_or("source span end overflows")?);
             }
         }
     }
     let (map_base, map_len) = {
-        let all = hfq.data_range(0, need).ok_or("the artifact mapping does not cover the plan's source spans")?;
+        let all = hfq
+            .data_range(0, need)
+            .ok_or("the artifact mapping does not cover the plan's source spans")?;
         (all.as_ptr() as usize, all.len())
     };
-    let shadow = Arc::new(HfqShadow { base: map_base, len: map_len, plan: plan.clone() });
+    let shadow = Arc::new(HfqShadow {
+        base: map_base,
+        len: map_len,
+        plan: plan.clone(),
+    });
     // Self-check: the shadow serves exactly the bytes the tier owners were filled from.
     for (layer, expert) in [(0usize, 0usize), (layers - 1, experts - 1)] {
-        let got = shadow.expert(layer, expert).ok_or("shadow cannot serve a probe expert")?;
+        let got = shadow
+            .expert(layer, expert)
+            .ok_or("shadow cannot serve a probe expert")?;
         let (gate_up, _) = plan.source(layer, expert).ok_or("probe span")?;
-        let direct = hfq.data_range(gate_up.offset, gate_up.len).ok_or("probe range")?;
+        let direct = hfq
+            .data_range(gate_up.offset, gate_up.len)
+            .ok_or("probe range")?;
         if got.gate_up != direct {
             return Err("shadow resolver disagrees with the artifact mapping".into());
         }
@@ -385,7 +442,8 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     // ── manifest: trunk experts are tier-owned, the MTP layer's stay host-mapped ──
     let mut manifest = receipt.manifest;
     let mut placements = receipt.placements;
-    let mtp_moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut manifest.weights, layers);
+    let mtp_moved =
+        hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut manifest.weights, layers);
     manifest = manifest.with_expert_tiers().map_err(e)?;
     {
         let keep: BTreeSet<_> = manifest.resident_keys().collect();
@@ -398,36 +456,52 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         args.hot_budget_mib,
         &plan_digest[..16],
     );
-    let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(&mut gpu, plan.clone(), &|offset, len| {
-        let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow".to_string())?;
-        let len = usize::try_from(len).map_err(|_| "hotset source length overflow".to_string())?;
-        hfq.data_range(offset, len)
-            .ok_or_else(|| format!("source span {offset}+{len} is outside the artifact mapping"))
-    })
+    let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
+        &mut gpu,
+        plan.clone(),
+        &|offset, len| {
+            let offset =
+                usize::try_from(offset).map_err(|_| "hotset source offset overflow".to_string())?;
+            let len =
+                usize::try_from(len).map_err(|_| "hotset source length overflow".to_string())?;
+            hfq.data_range(offset, len).ok_or_else(|| {
+                format!("source span {offset}+{len} is outside the artifact mapping")
+            })
+        },
+    )
     .map_err(|x| format!("expert tier materialize: {x}"))?;
     lease
         .bind_hotset_sidecar_sha256(sidecar.sha256())
         .map_err(|x| format!("hotset numerical identity: {x}"))?;
 
     let source = HfqModelSource::from_hfq(hfq);
-    let transaction = fulfill_manifest_from_payloads(&manifest.weights, &mesh, layers, &mut gpu, expected, |entry| {
-        if let Some(payload) =
-            hipfire_arch_qwen4::expert_arena::recipe_arena_payload(&source, &manifest.identity.recipe, entry)
-        {
-            return payload;
-        }
-        if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
-            let (info, bytes) = source
-                .tensor_data(&entry.name)
-                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
-            return Ok(SourcePayload::Borrowed { info, bytes });
-        }
-        source
-            .tensor_range(&entry.name)
-            .map_err(|x| x.to_string())?
-            .map(SourcePayload::Range)
-            .ok_or_else(|| format!("missing tensor '{}'", entry.name))
-    })
+    let transaction = fulfill_manifest_from_payloads(
+        &manifest.weights,
+        &mesh,
+        layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
+            source
+                .tensor_range(&entry.name)
+                .map_err(|x| x.to_string())?
+                .map(SourcePayload::Range)
+                .ok_or_else(|| format!("missing tensor '{}'", entry.name))
+        },
+    )
     .map_err(|x| format!("qwen4 manifest fulfillment: {x}"))?;
     let vocab = receipt.config.vocab_size;
     let state_format = hipfire_arch_qwen4::resolve_state_format(
@@ -453,11 +527,28 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     .map_err(|x| format!("qwen4 bundle assembly: {x}"))?;
     bundle.attach_npu_trunk_identity(npu_identity);
     if let Some(overlay) = trunk_overlay {
-        bundle.attach_trunk_overlay(overlay).map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
+        bundle
+            .attach_trunk_overlay(overlay)
+            .map_err(|x| format!("qwen4 trunk overlay: {x}"))?;
     }
-    bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(|x| format!("qwen4 forward setup: {x}"))?;
-    eprintln!("qwen4_cpu_split_parity: loaded {} on {} (vocab {vocab})", path.display(), gpu.arch);
-    Ok(Model { gpu, bundle, tokenizer, vocab, shadow, hot_experts, plan_digest, _source: source })
+    bundle
+        .attach_forward(&mut gpu, max_seq, scratch_mode)
+        .map_err(|x| format!("qwen4 forward setup: {x}"))?;
+    eprintln!(
+        "qwen4_cpu_split_parity: loaded {} on {} (vocab {vocab})",
+        path.display(),
+        gpu.arch
+    );
+    Ok(Model {
+        gpu,
+        bundle,
+        tokenizer,
+        vocab,
+        shadow,
+        hot_experts,
+        plan_digest,
+        _source: source,
+    })
 }
 
 // ── arithmetic helpers ───────────────────────────────────────────────
@@ -489,7 +580,10 @@ fn combine(
 }
 
 fn bit_mismatch(a: &[f32], b: &[f32]) -> u64 {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() as u64
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count() as u64
 }
 
 /// Accumulated distance of `a` to a reference `r`.
@@ -597,17 +691,28 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
         || rec.d2_expanded.len() != slots * dim
         || rec.gpu_expanded.len() != slots * dim
     {
-        return Err(format!("layer {}: parity record has inconsistent extents", rec.layer));
+        return Err(format!(
+            "layer {}: parity record has inconsistent extents",
+            rec.layer
+        ));
     }
 
     // All-CPU D1 arithmetic of every valid slot from the original bytes.
-    let host_slots: Vec<u32> = (0..slots).filter(|&s| valid_id(rec.ids[s], n_experts)).map(|s| s as u32).collect();
+    let host_slots: Vec<u32> = (0..slots)
+        .filter(|&s| valid_id(rec.ids[s], n_experts))
+        .map(|s| s as u32)
+        .collect();
     let resolved: Vec<CpuMoeExpert<'_>> = host_slots
         .iter()
         .map(|&s| {
             shadow
                 .expert(rec.layer, rec.ids[s as usize] as usize)
-                .ok_or_else(|| format!("layer {}: no original bytes for expert {}", rec.layer, rec.ids[s as usize]))
+                .ok_or_else(|| {
+                    format!(
+                        "layer {}: no original bytes for expert {}",
+                        rec.layer, rec.ids[s as usize]
+                    )
+                })
         })
         .collect::<R<_>>()?;
     let mut cpu_expanded = vec![f32::NAN; slots * dim];
@@ -628,7 +733,16 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
     .map_err(|x| format!("layer {}: all-CPU reference: {x:?}", rec.layer))?;
 
     let target = |expanded: &[f32]| {
-        combine(dim, rows, top_k, n_experts, &rec.ids, &rec.weights, expanded, &rec.target_in)
+        combine(
+            dim,
+            rows,
+            top_k,
+            n_experts,
+            &rec.ids,
+            &rec.weights,
+            expanded,
+            &rec.target_in,
+        )
     };
     let twin = target(&rec.d2_expanded);
     let t_cpu = target(&cpu_expanded);
@@ -657,16 +771,28 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
             None => agg.invalid_slots += 1,
             Some(0) => {
                 agg.hot_slots += 1;
-                agg.hot_slot_mismatch += bit_mismatch(&rec.d2_expanded[range.clone()], &rec.gpu_expanded[range.clone()]);
-                agg.hot_slots_vs_cpu.add(&rec.d2_expanded[range.clone()], &cpu_expanded[range.clone()]);
+                agg.hot_slot_mismatch += bit_mismatch(
+                    &rec.d2_expanded[range.clone()],
+                    &rec.gpu_expanded[range.clone()],
+                );
+                agg.hot_slots_vs_cpu.add(
+                    &rec.d2_expanded[range.clone()],
+                    &cpu_expanded[range.clone()],
+                );
                 nonfinite += finite(&rec.d2_expanded[range.clone()])
                     + finite(&rec.gpu_expanded[range.clone()])
                     + finite(&cpu_expanded[range]);
             }
             Some(_) => {
                 agg.cold_slots += 1;
-                agg.cold_slot_mismatch += bit_mismatch(&rec.d2_expanded[range.clone()], &cpu_expanded[range.clone()]);
-                agg.cold_slots_vs_gpu.add(&rec.d2_expanded[range.clone()], &rec.gpu_expanded[range.clone()]);
+                agg.cold_slot_mismatch += bit_mismatch(
+                    &rec.d2_expanded[range.clone()],
+                    &cpu_expanded[range.clone()],
+                );
+                agg.cold_slots_vs_gpu.add(
+                    &rec.d2_expanded[range.clone()],
+                    &rec.gpu_expanded[range.clone()],
+                );
                 nonfinite += finite(&rec.d2_expanded[range.clone()])
                     + finite(&rec.gpu_expanded[range.clone()])
                     + finite(&cpu_expanded[range]);
@@ -715,8 +841,47 @@ struct PassOut {
     digests: Vec<String>,
 }
 
+/// Zero-based first divergent step, including a missing step in either run.
+fn first_digest_mismatch(a: &[String], b: &[String]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
+}
+
+struct TimingRun {
+    name: String,
+    round: usize,
+    schedule: Schedule,
+    digests: Vec<String>,
+}
+
+/// Same-schedule pairs are repeats; different schedules are a separate diagnostic.
+fn timing_comparisons(runs: &[TimingRun], same_schedule: bool) -> (Vec<Value>, bool) {
+    let mut comparisons = Vec::new();
+    let mut all_match = true;
+    for (i, a) in runs.iter().enumerate() {
+        for b in &runs[i + 1..] {
+            if (a.schedule == b.schedule) != same_schedule {
+                continue;
+            }
+            let first = first_digest_mismatch(&a.digests, &b.digests);
+            all_match &= first.is_none();
+            comparisons.push(json!({
+                "a": a.name, "b": b.name, "matching": first.is_none(),
+                "first_mismatch_step": first,
+            }));
+        }
+    }
+    (comparisons, all_match)
+}
+
 fn argmax(row: &[f32]) -> u32 {
-    row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap_or(0)
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 /// One AR pass: reset, prefill `prompt_rows` on the wide route, then `steps` narrow
@@ -752,7 +917,12 @@ fn run_pass(
         .map_err(|x| format!("{}: prefill: {x}", spec.name))?;
     let stray = m.bundle.split_take_parity_records();
     if !stray.is_empty() {
-        return Err(format!("{}: the split ran inside the {}-row prefill ({} records)", spec.name, args.prompt_rows, stray.len()));
+        return Err(format!(
+            "{}: the split ran inside the {}-row prefill ({} records)",
+            spec.name,
+            args.prompt_rows,
+            stray.len()
+        ));
     }
     let mut next_token = if args.greedy {
         let first = m.gpu.download_f32(&row1).map_err(e)?;
@@ -787,7 +957,10 @@ fn run_pass(
         }
         digests.push(format!("{:x}", digest.finalize()));
         let recs = m.bundle.split_take_parity_records();
-        if recs.len() != layers.len() || recs.iter().map(|r| r.layer).collect::<BTreeSet<_>>() != layers.iter().copied().collect() {
+        if recs.len() != layers.len()
+            || recs.iter().map(|r| r.layer).collect::<BTreeSet<_>>()
+                != layers.iter().copied().collect()
+        {
             return Err(format!(
                 "{}: step {step}: expected one parity record per selected layer ({} layers), got layers {:?}",
                 spec.name,
@@ -795,7 +968,10 @@ fn run_pass(
                 recs.iter().map(|r| r.layer).collect::<Vec<_>>()
             ));
         }
-        if let Some(bad) = recs.iter().find(|r| r.rows != args.rows || r.endpoint != spec.endpoint) {
+        if let Some(bad) = recs
+            .iter()
+            .find(|r| r.rows != args.rows || r.endpoint != spec.endpoint)
+        {
             return Err(format!(
                 "{}: step {step}: layer {} record has rows {} endpoint {:?}, expected rows {} endpoint {:?}",
                 spec.name, bad.layer, bad.rows, bad.endpoint, args.rows, spec.endpoint
@@ -855,7 +1031,11 @@ impl TimingAgg {
 
     fn stats(&self) -> Value {
         let mut w = self.wall.clone();
-        let mean = if w.is_empty() { 0.0 } else { w.iter().sum::<u64>() as f64 / w.len() as f64 };
+        let mean = if w.is_empty() {
+            0.0
+        } else {
+            w.iter().sum::<u64>() as f64 / w.len() as f64
+        };
         let min = w.iter().copied().min().unwrap_or(0);
         json!({
             "calls": self.n,
@@ -886,15 +1066,32 @@ struct Gate {
 }
 
 fn gate(gates: &mut Vec<Gate>, name: impl Into<String>, ok: bool, detail: impl Into<String>) {
-    let g = Gate { name: name.into(), ok, detail: detail.into() };
-    println!("  GATE {} {}: {}", if g.ok { "PASS" } else { "FAIL" }, g.name, g.detail);
+    let g = Gate {
+        name: name.into(),
+        ok,
+        detail: detail.into(),
+    };
+    println!(
+        "  GATE {} {}: {}",
+        if g.ok { "PASS" } else { "FAIL" },
+        g.name,
+        g.detail
+    );
     gates.push(g);
 }
 
 fn print_layers(aggs: &BTreeMap<usize, LayerAgg>) {
     println!(
         "  {:>5} {:>5} {:>9} {:>14} {:>23} {:>23} {:>23} {:>23} {:>23}",
-        "layer", "calls", "hot/cold", "rows h/c/m", "D2~CPU abs/rel", "D2~GPU abs/rel", "CPU~GPU abs/rel", "coldslot~GPU", "hotslot~CPU"
+        "layer",
+        "calls",
+        "hot/cold",
+        "rows h/c/m",
+        "D2~CPU abs/rel",
+        "D2~GPU abs/rel",
+        "CPU~GPU abs/rel",
+        "coldslot~GPU",
+        "hotslot~CPU"
     );
     for (layer, a) in aggs {
         println!(
@@ -941,10 +1138,16 @@ fn full_pass(
     layers: &[usize],
 ) -> R<(BTreeMap<usize, LayerAgg>, PassOut)> {
     let shadow = m.shadow.clone();
-    let mut aggs: BTreeMap<usize, LayerAgg> = layers.iter().map(|&l| (l, LayerAgg::default())).collect();
+    let mut aggs: BTreeMap<usize, LayerAgg> =
+        layers.iter().map(|&l| (l, LayerAgg::default())).collect();
     let out = run_pass(m, args, spec, tokens, layers, |_, recs| {
         for rec in &recs {
-            analyze(rec, &shadow, aggs.get_mut(&rec.layer).ok_or("record for an unselected layer")?)?;
+            analyze(
+                rec,
+                &shadow,
+                aggs.get_mut(&rec.layer)
+                    .ok_or("record for an unselected layer")?,
+            )?;
         }
         Ok(())
     })?;
@@ -975,31 +1178,48 @@ fn bitwise_gates(gates: &mut Vec<Gate>, run: &str, aggs: &BTreeMap<usize, LayerA
         gates,
         format!("{run}: hot slots bitwise vs all-GPU tail"),
         sum(|a| a.hot_slot_mismatch) == 0,
-        format!("{} slots, {} mismatching elements", sum(|a| a.hot_slots), sum(|a| a.hot_slot_mismatch)),
+        format!(
+            "{} slots, {} mismatching elements",
+            sum(|a| a.hot_slots),
+            sum(|a| a.hot_slot_mismatch)
+        ),
     );
     gate(
         gates,
         format!("{run}: cold slots bitwise vs all-CPU D1 arithmetic"),
         sum(|a| a.cold_slot_mismatch) == 0,
-        format!("{} slots, {} mismatching elements", sum(|a| a.cold_slots), sum(|a| a.cold_slot_mismatch)),
+        format!(
+            "{} slots, {} mismatching elements",
+            sum(|a| a.cold_slots),
+            sum(|a| a.cold_slot_mismatch)
+        ),
     );
     gate(
         gates,
         format!("{run}: all-hot rows bitwise vs all-GPU target"),
         sum(|a| a.hot_row_mismatch) == 0,
-        format!("{} rows, {} mismatching elements", sum(|a| a.rows_hot), sum(|a| a.hot_row_mismatch)),
+        format!(
+            "{} rows, {} mismatching elements",
+            sum(|a| a.rows_hot),
+            sum(|a| a.hot_row_mismatch)
+        ),
     );
     gate(
         gates,
         format!("{run}: all-cold rows bitwise vs all-CPU target"),
         sum(|a| a.cold_row_mismatch) == 0,
-        format!("{} rows, {} mismatching elements", sum(|a| a.rows_cold), sum(|a| a.cold_row_mismatch)),
+        format!(
+            "{} rows, {} mismatching elements",
+            sum(|a| a.rows_cold),
+            sum(|a| a.cold_row_mismatch)
+        ),
     );
 }
 
 fn real_main() -> R<bool> {
     let args = parse_args()?;
-    let text = std::fs::read_to_string(&args.text).map_err(|x| format!("read {}: {x}", args.text.display()))?;
+    let text = std::fs::read_to_string(&args.text)
+        .map_err(|x| format!("read {}: {x}", args.text.display()))?;
     let need_tokens = args.offset + args.prompt_rows + args.steps * args.rows;
     let max_seq = need_tokens.next_multiple_of(256).max(512);
     let mut m = load(&args, max_seq)?;
@@ -1028,7 +1248,9 @@ fn real_main() -> R<bool> {
         LayerSel::First(n) => armed.iter().copied().take(*n).collect(),
         LayerSel::List(list) => {
             if let Some(bad) = list.iter().find(|l| !armed.contains(l)) {
-                return Err(format!("--layers: layer {bad} is not armed for the split (armed: {armed:?})"));
+                return Err(format!(
+                    "--layers: layer {bad} is not armed for the split (armed: {armed:?})"
+                ));
             }
             list.clone()
         }
@@ -1079,7 +1301,11 @@ fn real_main() -> R<bool> {
         aggs.values().for_each(|a| d.merge(f(a)));
         d
     };
-    let (w_cpu, w_gpu, w_ref) = (worst(|a| &a.d2_vs_cpu), worst(|a| &a.d2_vs_gpu), worst(|a| &a.cpu_vs_gpu));
+    let (w_cpu, w_gpu, w_ref) = (
+        worst(|a| &a.d2_vs_cpu),
+        worst(|a| &a.d2_vs_gpu),
+        worst(|a| &a.cpu_vs_gpu),
+    );
     println!(
         "  WORST D2 vs all-CPU {} (rel L2 {:.3e}), D2 vs all-GPU {} (rel L2 {:.3e}), all-CPU vs all-GPU {} (rel L2 {:.3e})",
         w_cpu.short(), w_cpu.rel_l2(), w_gpu.short(), w_gpu.rel_l2(), w_ref.short(), w_ref.rel_l2()
@@ -1092,15 +1318,25 @@ fn real_main() -> R<bool> {
 
     // ── endpoints ────────────────────────────────────────────────────
     if args.endpoints {
-        for (name, endpoint) in [("all-hot", SplitEndpoint::AllHot), ("all-cold", SplitEndpoint::AllCold)] {
+        for (name, endpoint) in [
+            ("all-hot", SplitEndpoint::AllHot),
+            ("all-cold", SplitEndpoint::AllCold),
+        ] {
             println!("RUN {name} (placement endpoint forced inside the executor, full capture)");
-            let spec = PassSpec { name: name.into(), mode: SplitParityMode::Full, endpoint, schedule: Schedule::Overlapped };
+            let spec = PassSpec {
+                name: name.into(),
+                mode: SplitParityMode::Full,
+                endpoint,
+                schedule: Schedule::Overlapped,
+            };
             let (aggs, out) = full_pass(&mut m, &args, &spec, &tokens, &layers)?;
             print_layers(&aggs);
             bitwise_gates(&mut gates, name, &aggs, args.steps);
             let valid_rows: u64 = aggs.values().map(|a| a.rows).sum();
             let (side_rows, side) = match endpoint {
-                SplitEndpoint::AllHot => (aggs.values().map(|a| a.rows_hot).sum::<u64>(), "all-GPU"),
+                SplitEndpoint::AllHot => {
+                    (aggs.values().map(|a| a.rows_hot).sum::<u64>(), "all-GPU")
+                }
                 _ => (aggs.values().map(|a| a.rows_cold).sum::<u64>(), "all-CPU"),
             };
             let empty: u64 = aggs.values().map(|a| a.rows_empty).sum();
@@ -1123,10 +1359,14 @@ fn real_main() -> R<bool> {
             "RUN timing: serial (GPU tail drained, then CPU slots) vs overlapped, ABBA x {} rounds, steps >= {} counted",
             args.timing_rounds, args.warmup_steps
         );
-        let mut over: BTreeMap<usize, TimingAgg> = layers.iter().map(|&l| (l, TimingAgg::default())).collect();
-        let mut serial: BTreeMap<usize, TimingAgg> = layers.iter().map(|&l| (l, TimingAgg::default())).collect();
+        let mut over: BTreeMap<usize, TimingAgg> =
+            layers.iter().map(|&l| (l, TimingAgg::default())).collect();
+        let mut serial: BTreeMap<usize, TimingAgg> =
+            layers.iter().map(|&l| (l, TimingAgg::default())).collect();
         let mut digests_ok = true;
         let mut mismatched = Vec::new();
+        let mut timing_runs = Vec::new();
+        let mut timing_runs_json = Vec::new();
         for round in 0..args.timing_rounds {
             let order = if round % 2 == 0 {
                 [Schedule::Overlapped, Schedule::Serial]
@@ -1135,17 +1375,31 @@ fn real_main() -> R<bool> {
             };
             for schedule in order {
                 let spec = PassSpec {
-                    name: format!("timing-{}-r{round}", if schedule == Schedule::Serial { "serial" } else { "overlapped" }),
+                    name: format!(
+                        "timing-{}-r{round}",
+                        if schedule == Schedule::Serial {
+                            "serial"
+                        } else {
+                            "overlapped"
+                        }
+                    ),
                     mode: SplitParityMode::Timing,
                     endpoint: SplitEndpoint::Natural,
                     schedule,
                 };
                 let warmup = args.warmup_steps;
-                let target = if schedule == Schedule::Serial { &mut serial } else { &mut over };
+                let target = if schedule == Schedule::Serial {
+                    &mut serial
+                } else {
+                    &mut over
+                };
                 let out = run_pass(&mut m, &args, &spec, &tokens, &layers, |step, recs| {
                     if step >= warmup {
                         for rec in &recs {
-                            target.get_mut(&rec.layer).ok_or("record for an unselected layer")?.add(&rec.timing);
+                            target
+                                .get_mut(&rec.layer)
+                                .ok_or("record for an unselected layer")?
+                                .add(&rec.timing);
                         }
                     }
                     Ok(())
@@ -1154,6 +1408,20 @@ fn real_main() -> R<bool> {
                     digests_ok = false;
                     mismatched.push(spec.name.clone());
                 }
+                let first = first_digest_mismatch(&out.digests, &natural_out.digests);
+                timing_runs_json.push(json!({
+                    "run": spec.name, "round": round,
+                    "serial": schedule == Schedule::Serial,
+                    "schedule": if schedule == Schedule::Serial { "serial" } else { "overlapped" },
+                    "logits_sha256": out.digests,
+                    "matching_natural": first.is_none(), "first_mismatch_step": first,
+                }));
+                timing_runs.push(TimingRun {
+                    name: spec.name,
+                    round,
+                    schedule,
+                    digests: out.digests,
+                });
             }
         }
         println!(
@@ -1197,21 +1465,75 @@ fn real_main() -> R<bool> {
                 format!("runs differing from the natural full run: {mismatched:?}")
             },
         );
+        let (repeat_comparisons, repeats_match) = timing_comparisons(&timing_runs, true);
+        let (schedule_comparisons, schedules_match) = timing_comparisons(&timing_runs, false);
+        let repeats_checked = [Schedule::Overlapped, Schedule::Serial]
+            .iter()
+            .all(|schedule| {
+                timing_runs
+                    .iter()
+                    .filter(|r| r.schedule == *schedule)
+                    .map(|r| r.round)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    >= 2
+            });
+        let repeat_status = if !repeats_match {
+            "fail"
+        } else if repeats_checked {
+            "pass"
+        } else {
+            "not_checked"
+        };
+        if repeats_checked || !repeats_match {
+            gate(
+                &mut gates,
+                "timing: same-schedule repeat logits bit-identical",
+                repeats_match,
+                format!(
+                    "{} same-schedule comparisons; see timing.repeat_comparisons",
+                    repeat_comparisons.len()
+                ),
+            );
+        } else {
+            println!("  GATE NOT_CHECKED timing: same-schedule repeat logits bit-identical: requires at least two rounds per schedule");
+        }
         gate(
             &mut gates,
             "timing: samples",
-            over.values().chain(serial.values()).all(|t| t.n as usize == args.timing_rounds * (args.steps - args.warmup_steps)),
-            format!("{} calls per layer per schedule", args.timing_rounds * (args.steps - args.warmup_steps)),
+            over.values()
+                .chain(serial.values())
+                .all(|t| t.n as usize == args.timing_rounds * (args.steps - args.warmup_steps)),
+            format!(
+                "{} calls per layer per schedule",
+                args.timing_rounds * (args.steps - args.warmup_steps)
+            ),
         );
         runs_json.push(json!({
             "run": "timing", "rounds": args.timing_rounds, "warmup_steps": args.warmup_steps,
+            "runs": timing_runs_json,
+            "repeat_gate": {
+                "status": repeat_status,
+                "pass": if repeat_status == "not_checked" { None } else { Some(repeats_match) },
+                "required_runs_per_schedule": 2,
+            },
+            "repeat_comparisons": repeat_comparisons,
+            "serial_vs_overlapped": {
+                "status": if schedule_comparisons.is_empty() { "not_checked" } else if schedules_match { "pass" } else { "fail" },
+                "comparisons": schedule_comparisons,
+            },
             "layers": layer_rows,
             "pooled": {"overlapped_wall_median_ns": om, "serial_wall_median_ns": sm},
         }));
     }
 
     let all_ok = gates.iter().all(|g| g.ok);
-    println!("SUMMARY {} ({} gates, {} failed)", if all_ok { "PASS" } else { "FAIL" }, gates.len(), gates.iter().filter(|g| !g.ok).count());
+    println!(
+        "SUMMARY {} ({} gates, {} failed)",
+        if all_ok { "PASS" } else { "FAIL" },
+        gates.len(),
+        gates.iter().filter(|g| !g.ok).count()
+    );
     if let Some(path) = &args.json {
         let doc = json!({
             "tool": "qwen4_cpu_split_parity",
@@ -1244,5 +1566,68 @@ fn main() {
             eprintln!("qwen4_cpu_split_parity: {m}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hashes(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn first_digest_divergence_and_length_mismatch() {
+        assert_eq!(
+            first_digest_mismatch(&hashes(&["a", "b"]), &hashes(&["a", "b"])),
+            None
+        );
+        assert_eq!(
+            first_digest_mismatch(&hashes(&["a", "b"]), &hashes(&["x", "b"])),
+            Some(0)
+        );
+        assert_eq!(
+            first_digest_mismatch(&hashes(&["a", "b"]), &hashes(&["a", "x"])),
+            Some(1)
+        );
+        assert_eq!(
+            first_digest_mismatch(&hashes(&["a"]), &hashes(&["a", "b"])),
+            Some(1)
+        );
+        assert_eq!(
+            first_digest_mismatch(&hashes(&["a", "b"]), &hashes(&["a"])),
+            Some(1)
+        );
+        assert_eq!(first_digest_mismatch(&[], &hashes(&["a"])), Some(0));
+        assert_eq!(first_digest_mismatch(&[], &[]), None);
+    }
+
+    #[test]
+    fn repeat_comparison_separates_schedules() {
+        let mut runs = Vec::new();
+        for round in 0..2 {
+            for (schedule, hash) in [(Schedule::Overlapped, "o"), (Schedule::Serial, "s")] {
+                runs.push(TimingRun {
+                    name: format!("run-{}", runs.len()),
+                    round,
+                    schedule,
+                    digests: hashes(&[hash]),
+                });
+            }
+        }
+        let (repeats, matching) = timing_comparisons(&runs, true);
+        assert!(matching);
+        assert_eq!(repeats.len(), 2);
+        let (cross, matching) = timing_comparisons(&runs, false);
+        assert!(!matching);
+        assert_eq!(cross.len(), 4);
+        runs[2].digests.push("extra".into());
+        let (repeats, matching) = timing_comparisons(&runs, true);
+        assert!(!matching);
+        assert_eq!(repeats[0]["first_mismatch_step"], json!(1));
+        let (pairs, matching) = timing_comparisons(&runs[..2], true);
+        assert!(pairs.is_empty());
+        assert!(matching); // No evidence: caller must report not_checked, not pass.
     }
 }
