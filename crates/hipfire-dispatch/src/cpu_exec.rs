@@ -3516,40 +3516,52 @@ mod moe_splice_tests {
         dout
     }
 
-    /// One ten-slot, one-row route under all 1024 host/GPU masks: the host
-    /// values are installed into the GPU expanded layout (masked and invalid
-    /// slots hold the kernel's zeros, then invalid slots are NaN-poisoned) and
-    /// the canonical combine runs ONCE with the original route. Its bytes must
-    /// equal the combine over the unsplit values for every mask. Returns whether
-    /// a two-partial (GPU arm first, then host arm) accumulation ever differed,
-    /// which proves the fixture can see an ordering error.
-    fn run_mask_case(ids: [i32; 10], w: [f32; 10]) -> bool {
-        let (rows, top_k, n_exp) = (1usize, 10usize, 12usize);
+    /// `rows` tokens of `top_k` slots (`ids`/`w` are `[rows * top_k]`, `x` is
+    /// `[rows, HS_DIM]`) under the given host/GPU slot masks (bit `s` = slot
+    /// `s` is cold/host). The host values are installed into the GPU expanded
+    /// layout (masked and invalid slots hold the kernel's zeros, then invalid
+    /// slots are NaN-poisoned) and the canonical combine runs ONCE over the
+    /// window with the original route. Every row's bytes must equal BOTH the
+    /// combine over the unsplit window AND the one-row AR combine (`rows = 1`
+    /// host-slot values + combine of that row alone) — the row-invariance
+    /// contract D2 admits widths 2..4 under. Returns whether a two-partial
+    /// (GPU arm first, then host arm) accumulation ever differed, which proves
+    /// the fixture can see an ordering error.
+    fn run_mask_case_rows(
+        rows: usize,
+        top_k: usize,
+        ids: &[i32],
+        w: &[f32],
+        x: &[f32],
+        masks: &[u64],
+    ) -> bool {
+        let (slots, n_exp) = (rows * top_k, 12usize);
+        assert!(slots <= 64 && ids.len() == slots && w.len() == slots && x.len() == rows * HS_DIM);
         let fx = host_fixture(n_exp);
-        let x = x_of(rows * HS_DIM);
         let valid = |s: usize| route_id_valid(ids[s], n_exp);
         let range = |s: usize| s * HS_DIM..(s + 1) * HS_DIM;
-        let every: Vec<u32> = (0..10u32).filter(|&s| valid(s as usize)).collect();
-        let mut full = stale(10 * HS_DIM);
-        let full_route = masked_route(&ids, &every);
+        let every: Vec<u32> = (0..slots as u32).filter(|&s| valid(s as usize)).collect();
+        let mut full = stale(slots * HS_DIM);
+        let full_route = masked_route(ids, &every);
         hs_run(
             None,
             rows,
             top_k,
             n_exp,
-            &ids,
+            ids,
             Some(&full_route),
             &every,
-            &fx.spans(&ids, &every),
-            &x,
+            &fx.spans(ids, &every),
+            x,
             &mut full,
         )
         .unwrap();
-        for s in 0..10 {
+        for s in 0..slots {
             if valid(s) {
+                let row = s / top_k;
                 assert_eq!(
                     bits(&full[range(s)]),
-                    bits(&slot_reference(&fx, ids[s], &x)),
+                    bits(&slot_reference(&fx, ids[s], &x[row * HS_DIM..(row + 1) * HS_DIM])),
                     "slot {s} != scalar reference"
                 );
             } else {
@@ -3557,40 +3569,86 @@ mod moe_splice_tests {
             }
         }
         let residual0: Vec<f32> = (0..HS_DIM).map(|c| 1.0 + 0.013 * c as f32).collect();
-        let mut reference = residual0.clone();
-        moe_canonical_combine_reference(
-            HS_DIM, rows, top_k, n_exp, &ids, &w, &full, &mut reference,
-        );
+        let mut reference = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            reference[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+        }
+        moe_canonical_combine_reference(HS_DIM, rows, top_k, n_exp, ids, w, &full, &mut reference);
+        // One-row AR per token: its own host-slot run and its own combine.
+        let mut ar = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            let r_ids = &ids[t * top_k..(t + 1) * top_k];
+            let r_host: Vec<u32> =
+                (0..top_k as u32).filter(|&s| route_id_valid(r_ids[s as usize], n_exp)).collect();
+            let mut r_full = stale(top_k * HS_DIM);
+            hs_run(
+                None,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                None,
+                &r_host,
+                &fx.spans(r_ids, &r_host),
+                &x[t * HS_DIM..(t + 1) * HS_DIM],
+                &mut r_full,
+            )
+            .unwrap();
+            for &s in &r_host {
+                assert_eq!(
+                    bits(&r_full[s as usize * HS_DIM..(s as usize + 1) * HS_DIM]),
+                    bits(&full[range(t * top_k + s as usize)]),
+                    "row {t} slot {s}: window host value != one-row AR"
+                );
+            }
+            let mut row = residual0.clone();
+            moe_canonical_combine_reference(
+                HS_DIM,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                &w[t * top_k..(t + 1) * top_k],
+                &r_full,
+                &mut row,
+            );
+            ar[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&row);
+            assert_eq!(
+                bits(&row),
+                bits(&reference[t * HS_DIM..(t + 1) * HS_DIM]),
+                "row {t}: one-row AR combine != window combine of the unsplit values"
+            );
+        }
         let mut partial_differs = false;
-        for mask in 0u32..1024 {
-            let host: Vec<u32> = (0..10u32)
+        for &mask in masks {
+            let host: Vec<u32> = (0..slots as u32)
                 .filter(|&s| (mask >> s) & 1 == 1 && valid(s as usize))
                 .collect();
-            let gpu_route = masked_route(&ids, &host);
-            let mut host_out = stale(10 * HS_DIM);
+            let gpu_route = masked_route(ids, &host);
+            let mut host_out = stale(slots * HS_DIM);
             hs_run(
                 None,
                 rows,
                 top_k,
                 n_exp,
-                &ids,
+                ids,
                 Some(&gpu_route),
                 &host,
-                &fx.spans(&ids, &host),
-                &x,
+                &fx.spans(ids, &host),
+                x,
                 &mut host_out,
             )
             .unwrap();
             // GPU arm: valid unmasked slots carry their value; masked and
             // invalid slots are the kernel's zero stores.
-            let mut expanded = vec![0.0f32; 10 * HS_DIM];
-            for s in 0..10 {
+            let mut expanded = vec![0.0f32; slots * HS_DIM];
+            for s in 0..slots {
                 if valid(s) && !host.contains(&(s as u32)) {
                     expanded[range(s)].copy_from_slice(&full[range(s)]);
                 }
             }
             // Slot install, after the GPU down.
-            for s in 0..10usize {
+            for s in 0..slots {
                 if host.contains(&(s as u32)) {
                     assert_eq!(
                         bits(&host_out[range(s)]),
@@ -3605,37 +3663,71 @@ mod moe_splice_tests {
                     );
                 }
             }
-            for s in 0..10 {
+            for s in 0..slots {
                 if !valid(s) {
                     expanded[range(s)].fill(f32::NAN);
                 }
             }
-            let mut got = residual0.clone();
-            moe_canonical_combine_reference(
-                HS_DIM, rows, top_k, n_exp, &ids, &w, &expanded, &mut got,
-            );
+            let mut got = vec![0.0f32; rows * HS_DIM];
+            for t in 0..rows {
+                got[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+            }
+            moe_canonical_combine_reference(HS_DIM, rows, top_k, n_exp, ids, w, &expanded, &mut got);
             assert_eq!(bits(&got), bits(&reference), "mask {mask:#b}: split join != unsplit");
+            assert_eq!(bits(&got), bits(&ar), "mask {mask:#b}: split join != per-row one-row AR");
 
             // Two-partial: the GPU arm reduces first (host slots masked to -1),
             // then the host arm reduces over its result.
             let mut host_only = ids.to_vec();
-            for s in 0..10 {
+            for s in 0..slots {
                 if !host.contains(&(s as u32)) {
                     host_only[s] = -1;
                 }
             }
-            let mut two = residual0.clone();
+            let mut two = vec![0.0f32; rows * HS_DIM];
+            for t in 0..rows {
+                two[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+            }
             moe_canonical_combine_reference(
-                HS_DIM, rows, top_k, n_exp, &gpu_route, &w, &expanded, &mut two,
+                HS_DIM, rows, top_k, n_exp, &gpu_route, w, &expanded, &mut two,
             );
             moe_canonical_combine_reference(
-                HS_DIM, rows, top_k, n_exp, &host_only, &w, &expanded, &mut two,
+                HS_DIM, rows, top_k, n_exp, &host_only, w, &expanded, &mut two,
             );
             if bits(&two) != bits(&reference) {
                 partial_differs = true;
             }
         }
         partial_differs
+    }
+
+    /// One ten-slot, one-row route under all 1024 host/GPU masks.
+    fn run_mask_case(ids: [i32; 10], w: [f32; 10]) -> bool {
+        let masks: Vec<u64> = (0..1024).collect();
+        run_mask_case_rows(1, 10, &ids, &w, &x_of(HS_DIM), &masks)
+    }
+
+    /// Deterministic LCG masks for windows too wide to enumerate; the all-cold,
+    /// all-hot and per-row-only / per-row-excluded masks are always included.
+    fn sampled_masks(slots: usize, top_k: usize, n: usize) -> Vec<u64> {
+        let all = if slots == 64 { u64::MAX } else { (1u64 << slots) - 1 };
+        let mut row0 = 0u64;
+        for s in 0..top_k {
+            row0 |= 1 << s;
+        }
+        let mut masks = vec![0, all];
+        for t in 0..slots / top_k {
+            masks.push(row0 << (t * top_k));
+            masks.push(all & !(row0 << (t * top_k)));
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while masks.len() < n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            masks.push((state >> 7) & all);
+        }
+        masks
     }
 
     /// Interleaved ids, a repeated id, cancelling and extreme weights (a ±1e30
@@ -3660,6 +3752,321 @@ mod moe_splice_tests {
             run_mask_case(ids, w),
             "fixture cannot distinguish a two-partial combine from the canonical one"
         );
+    }
+
+    /// A 2..4-row, ten-slot-per-row window under sampled host/GPU masks
+    /// (per-row cold subsets differ inside one window), distinct and identical
+    /// tokens, with and without invalid slots. Rows repeat experts across ranks
+    /// and across rows.
+    fn multirow_join(rows: usize, n_masks: usize, identical_tokens: bool, with_invalid: bool) {
+        let top_k = 10;
+        let base_ids: [[i32; 10]; 4] = [
+            [7, 2, 9, 2, 8, 5, 0, 5, 3, 4],
+            [2, 7, 5, 9, 0, 8, 3, 4, 5, 2],
+            [9, 9, 1, 11, 6, 6, 10, 2, 7, 0],
+            [4, 3, 5, 0, 8, 9, 2, 7, 2, 5],
+        ];
+        let base_w: [[f32; 10]; 4] = [
+            [0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0],
+            [0.25, -1.0e30, 0.4, 1.0e30, 0.15, -1.0e37, 3.0e-39, 1.0e37, 0.7, 0.01],
+            [0.125, 0.3, -0.2, 0.9, 1.0e30, -1.0e30, 0.6, 0.05, 1.0e37, -1.0e37],
+            [0.45, 0.35, 0.2, -0.0, 0.0, 0.33, 0.66, -0.5, 1.0e-30, 2.0],
+        ];
+        let mut ids = Vec::new();
+        let mut w = Vec::new();
+        for t in 0..rows {
+            let mut row = base_ids[t];
+            let mut wr = base_w[t];
+            if with_invalid {
+                row[(1 + 3 * t) % 10] = -1;
+                wr[(1 + 3 * t) % 10] = f32::NAN;
+                row[(4 + 5 * t) % 10] = 40;
+                wr[(4 + 5 * t) % 10] = f32::INFINITY;
+            }
+            ids.extend_from_slice(&row);
+            w.extend_from_slice(&wr);
+        }
+        let mut x = x_of(rows * HS_DIM);
+        if identical_tokens {
+            for t in 1..rows {
+                let (head, tail) = x.split_at_mut(t * HS_DIM);
+                tail[..HS_DIM].copy_from_slice(&head[..HS_DIM]);
+            }
+        }
+        let slots = rows * top_k;
+        let masks = if rows == 1 {
+            (0..1024u64).collect()
+        } else {
+            sampled_masks(slots, top_k, n_masks)
+        };
+        assert!(
+            run_mask_case_rows(rows, top_k, &ids, &w, &x, &masks),
+            "fixture cannot distinguish a two-partial combine from the canonical one"
+        );
+    }
+
+    #[test]
+    fn canonical_join_multirow_windows_match_one_row_ar_for_sampled_masks() {
+        for rows in 2..=4usize {
+            for identical in [false, true] {
+                for invalid in [false, true] {
+                    multirow_join(rows, 1024, identical, invalid);
+                }
+            }
+        }
+    }
+
+    /// Exhaustive 2^10 masks over a two-row, five-slot window (every cold
+    /// subset of both rows), with a repeated expert inside and across rows.
+    #[test]
+    fn canonical_join_two_row_window_is_byte_identical_for_all_1024_masks() {
+        let ids = [7, 2, 7, 2, 5, 2, 7, 5, -1, 40];
+        let w = [0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, f32::NAN, f32::INFINITY];
+        let masks: Vec<u64> = (0..1024).collect();
+        for identical in [false, true] {
+            let mut x = x_of(2 * HS_DIM);
+            if identical {
+                let (a, b) = x.split_at_mut(HS_DIM);
+                b.copy_from_slice(a);
+            }
+            assert!(
+                run_mask_case_rows(2, 5, &ids, &w, &x, &masks),
+                "fixture cannot distinguish a two-partial combine from the canonical one"
+            );
+        }
+    }
+
+    // ── D2 row-invariance oracle across formats ────────────────────────────
+
+    /// An expert pool in format `q` of shape `(dim, mi)`; gate_up and down share
+    /// the format (D2's placement is per expert, and a graded split is its own
+    /// case in `graded_multirow_matches_per_expert_gemv`).
+    struct QFix {
+        q: CpuQuant,
+        dim: usize,
+        mi: usize,
+        gu: Vec<Vec<u8>>,
+        dn: Vec<Vec<u8>>,
+    }
+
+    fn qfix(q: CpuQuant, dim: usize, mi: usize, n_exp: usize) -> QFix {
+        QFix {
+            q,
+            dim,
+            mi,
+            gu: (0..n_exp).map(|e| weight_bytes(q, 2 * mi, dim, 3100 + 173 * e)).collect(),
+            dn: (0..n_exp).map(|e| weight_bytes(q, dim, mi, 7700 + 311 * e)).collect(),
+        }
+    }
+
+    impl QFix {
+        fn expert(&self, id: i32) -> CpuMoeExpert<'_> {
+            CpuMoeExpert {
+                gate_up_quant: self.q,
+                gate_up: &self.gu[id as usize],
+                down_quant: self.q,
+                down: &self.dn[id as usize],
+            }
+        }
+
+        fn run(
+            &self,
+            rows: usize,
+            top_k: usize,
+            ids: &[i32],
+            host: &[u32],
+            x: &[f32],
+            out: &mut [f32],
+        ) {
+            let spans: Vec<_> = host.iter().map(|&s| self.expert(ids[s as usize])).collect();
+            moe_cpu_host_slot_outputs(
+                self.dim, self.mi, rows, top_k, self.gu.len(), ids, None, host, &spans, x, false,
+                out,
+            )
+            .unwrap();
+        }
+
+        /// Plain per-slot reference: single-row `gemv` projections with the
+        /// GPU's BF16 points and raw F32 down output.
+        fn reference(&self, id: i32, x_row: &[f32]) -> Vec<f32> {
+            let e = id as usize;
+            let mut gv = vec![0.0f32; 2 * self.mi];
+            gemv(self.q, &self.gu[e], 2 * self.mi, self.dim, x_row, &mut gv);
+            for g in gv.iter_mut() {
+                *g = bf16_rt(*g);
+            }
+            let mut hid = vec![0.0f32; self.mi];
+            silu_mul(&gv, &mut hid);
+            for h in hid.iter_mut() {
+                *h = bf16_rt(*h);
+            }
+            match self.q.input_rotation() {
+                InputRotation::FwhtG128V2 => rotate_x_128_v2(&mut hid),
+                InputRotation::FwhtG256 => rotate_x(&mut hid),
+                InputRotation::None => {}
+            }
+            let mut dout = vec![0.0f32; self.dim];
+            gemv(self.q, &self.dn[e], self.dim, self.mi, &hid, &mut dout);
+            dout
+        }
+    }
+
+    /// D2 admits windows of 2..4 rows; each token's host slots (the cold
+    /// experts of ITS route) and the canonically joined row must be byte
+    /// identical to the one-row AR of that token at every row position, across
+    /// formats (cached-Σx MQ4/MQ6 and uncached), identical vs distinct tokens,
+    /// repeated experts across rows, changing cold sets, invalid slots, accepted
+    /// prefix replays (narrower windows, run in both orders so a wide window's
+    /// scratch is reused by a narrow one) and AR calls in between.
+    #[test]
+    fn d2_window_rows_are_byte_identical_to_one_row_ar_for_every_position() {
+        let (top_k, n_exp) = (3usize, 8usize);
+        let scenarios: [[[i32; 3]; 4]; 4] = [
+            [[2, 0, 4]; 4],
+            [[2, 0, 4], [0, 4, 2], [4, 2, 1], [1, 2, 0]],
+            [[2, -1, 4], [40, 0, 4], [2, 0, -1], [-1, -1, 3]],
+            [[0, 1, 1], [3, 4, 5], [6, 7, 0], [1, 3, 5]],
+        ];
+        // Cold experts per call (bit e = expert e is cold).
+        let cold_sets = [0xFFu8, 0x55, 0xAA, 0x05, 0x00, 0x24, 0x81, 0x1B];
+        let shapes = [
+            (CpuQuant::Mq4G128V2, 256usize, 128usize),
+            (CpuQuant::Mq4G256, 256, 256),
+            (CpuQuant::Mq6G256, 256, 256),
+            (CpuQuant::Mq4G256V2, 256, 256),
+        ];
+        for (q, dim, mi) in shapes {
+            let fx = qfix(q, dim, mi, n_exp);
+            let wts: Vec<f32> = (0..12)
+                .map(|s| (0.11 + 0.063 * s as f32) * if s % 3 == 1 { -1.0 } else { 1.0 })
+                .collect();
+            for (si, scenario) in scenarios.iter().enumerate() {
+                for identical in [false, true] {
+                    let mut x = x_of(4 * dim);
+                    if identical {
+                        for t in 1..4 {
+                            let (head, tail) = x.split_at_mut(t * dim);
+                            tail[..dim].copy_from_slice(&head[..dim]);
+                        }
+                    }
+                    for &cold in &cold_sets {
+                        let is_host = |id: i32| {
+                            route_id_valid(id, n_exp) && (cold >> id) & 1 == 1
+                        };
+                        // One-row AR per token (its own call, its own cold slots).
+                        let ar: Vec<(Vec<u32>, Vec<f32>)> = (0..4)
+                            .map(|t| {
+                                let r_ids = &scenario[t];
+                                let host: Vec<u32> = (0..top_k as u32)
+                                    .filter(|&s| is_host(r_ids[s as usize]))
+                                    .collect();
+                                let mut out = stale(top_k * dim);
+                                fx.run(1, top_k, r_ids, &host, &x[t * dim..(t + 1) * dim], &mut out);
+                                (host, out)
+                            })
+                            .collect();
+                        let mut window_outs: Vec<(usize, Vec<f32>)> = Vec::new();
+                        for width in [2usize, 3, 4, 3, 2] {
+                            let ids: Vec<i32> = scenario[..width].iter().flatten().copied().collect();
+                            let host: Vec<u32> = (0..(width * top_k) as u32)
+                                .filter(|&s| is_host(ids[s as usize]))
+                                .collect();
+                            let mut out = stale(width * top_k * dim);
+                            fx.run(width, top_k, &ids, &host, &x[..width * dim], &mut out);
+                            let ctx = format!(
+                                "{q:?} scenario {si} identical={identical} cold={cold:#04x} width={width}"
+                            );
+                            for t in 0..width {
+                                for j in 0..top_k {
+                                    let s = t * top_k + j;
+                                    let range = s * dim..(s + 1) * dim;
+                                    if host.contains(&(s as u32)) {
+                                        let one = &ar[t].1[j * dim..(j + 1) * dim];
+                                        assert_eq!(
+                                            bits(&out[range.clone()]),
+                                            bits(one),
+                                            "{ctx}: row {t} rank {j} host value != one-row AR"
+                                        );
+                                        assert_eq!(
+                                            bits(&out[range]),
+                                            bits(&fx.reference(ids[s], &x[t * dim..(t + 1) * dim])),
+                                            "{ctx}: row {t} rank {j} != scalar reference"
+                                        );
+                                    } else {
+                                        assert!(all_stale(&out[range]), "{ctx}: slot {s} written");
+                                    }
+                                }
+                            }
+                            // Accepted-prefix replay: a narrower window over the
+                            // same leading rows reproduces the wider one's bytes.
+                            for (pw, pout) in &window_outs {
+                                let n = (*pw).min(width) * top_k * dim;
+                                assert_eq!(
+                                    bits(&out[..n]),
+                                    bits(&pout[..n]),
+                                    "{ctx}: width {width} prefix != width {pw}"
+                                );
+                            }
+                            window_outs.push((width, out.clone()));
+
+                            // Canonical join: GPU arm values for non-host valid
+                            // slots (scalar reference), host slots from the
+                            // window, invalid slots NaN; combined over the
+                            // window vs per-row one-row AR joins.
+                            let residual: Vec<f32> =
+                                (0..dim).map(|c| 1.0 + 0.013 * c as f32).collect();
+                            let mut expanded = vec![0.0f32; width * top_k * dim];
+                            let mut ar_expanded = vec![vec![0.0f32; top_k * dim]; width];
+                            for t in 0..width {
+                                for j in 0..top_k {
+                                    let s = t * top_k + j;
+                                    let id = ids[s];
+                                    let dst = s * dim..(s + 1) * dim;
+                                    let r_dst = j * dim..(j + 1) * dim;
+                                    if !route_id_valid(id, n_exp) {
+                                        expanded[dst].fill(f32::NAN);
+                                        ar_expanded[t][r_dst].fill(f32::NAN);
+                                    } else if is_host(id) {
+                                        expanded[dst.clone()].copy_from_slice(&out[dst]);
+                                        ar_expanded[t][r_dst.clone()]
+                                            .copy_from_slice(&ar[t].1[r_dst]);
+                                    } else {
+                                        let v = fx.reference(id, &x[t * dim..(t + 1) * dim]);
+                                        expanded[dst].copy_from_slice(&v);
+                                        ar_expanded[t][r_dst].copy_from_slice(&v);
+                                    }
+                                }
+                            }
+                            let mut joined = vec![0.0f32; width * dim];
+                            for t in 0..width {
+                                joined[t * dim..(t + 1) * dim].copy_from_slice(&residual);
+                            }
+                            moe_canonical_combine_reference(
+                                dim, width, top_k, n_exp, &ids, &wts, &expanded, &mut joined,
+                            );
+                            for t in 0..width {
+                                let mut row = residual.clone();
+                                moe_canonical_combine_reference(
+                                    dim,
+                                    1,
+                                    top_k,
+                                    n_exp,
+                                    &scenario[t],
+                                    &wts[t * top_k..(t + 1) * top_k],
+                                    &ar_expanded[t],
+                                    &mut row,
+                                );
+                                assert_eq!(
+                                    bits(&joined[t * dim..(t + 1) * dim]),
+                                    bits(&row),
+                                    "{ctx}: row {t} joined != one-row AR join"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Same slot ⇒ same bytes, whatever the window grouping, host-slot order,

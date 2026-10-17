@@ -72,7 +72,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const USAGE: &str = "usage: qwen4_wide_verify --model M.hfq (--prompt-file P.txt | --prompt-files a.txt,b.txt) --rows 1,2,...,32 --out OUT.json [--iters 5] [--n-ctx 8192] [--block greedy|prompt] [--accepts ends|all|none] [--arms base,wide16,wide32] [--trace]";
+const USAGE: &str = "usage: qwen4_wide_verify --model M.hfq (--prompt-file P.txt | --prompt-files a.txt,b.txt) --rows 1,2,...,32 --out OUT.json [--iters 5] [--n-ctx 8192] [--block greedy|prompt] [--accepts ends|all|none] [--arms base,wide16,wide32] [--hot-budget-mib N] [--hotset SIDECAR] [--row-capture on|off] [--trace]";
 
 /// The delimiter kernel of `--trace`: a one-block elementwise kernel
 /// (`kernels/src/logit_softcap.hip`) launched only by the Gemma/Glimmer
@@ -97,7 +97,7 @@ enum BlockMode {
 enum Accepts {
     /// accept_len in {0, n-1}.
     Ends,
-    /// accept_len in 0..n.
+    /// accept_len in 0..n: seed-inclusive consumed prefix lengths 1..=n.
     All,
     /// No commit_prefix arms (no re-prefills).
     None,
@@ -168,6 +168,9 @@ struct Args {
     accepts: Accepts,
     arms: Vec<Arm>,
     trace: bool,
+    hot_budget_mib: Option<u64>,
+    hotset: Option<PathBuf>,
+    row_capture: bool,
 }
 
 fn parse_rows(spec: &str) -> Result<Vec<usize>, String> {
@@ -218,6 +221,9 @@ fn parse_args() -> Result<Args, String> {
     let mut accepts = Accepts::Ends;
     let mut arms = vec![Arm::base()];
     let mut trace = false;
+    let mut hot_budget_mib = None;
+    let mut hotset = None;
+    let mut row_capture = true;
     let mut i = 0;
     while i < argv.len() {
         let flag = argv[i].as_str();
@@ -232,6 +238,19 @@ fn parse_args() -> Result<Args, String> {
             .as_str();
         match flag {
             "--model" => model = Some(PathBuf::from(value)),
+            "--hot-budget-mib" => {
+                let mib: u64 = value.parse().map_err(|_| format!("bad --hot-budget-mib '{value}'"))?;
+                if mib == 0 || mib.checked_mul(1 << 20).is_none() {
+                    return Err("--hot-budget-mib must be nonzero and fit in bytes".into());
+                }
+                hot_budget_mib = Some(mib);
+            }
+            "--hotset" => hotset = Some(PathBuf::from(value)),
+            "--row-capture" => row_capture = match value {
+                "on" => true,
+                "off" => false,
+                _ => return Err("--row-capture takes on|off".into()),
+            },
             // `--prompt-file` is the single-element alias of `--prompt-files`.
             "--prompt-file" | "--prompt-files" => {
                 prompt_files = Some(
@@ -278,6 +297,9 @@ fn parse_args() -> Result<Args, String> {
     if iters == 0 {
         return Err("--iters must be >= 1".into());
     }
+    if hotset.is_some() && hot_budget_mib.is_none() {
+        return Err("--hotset requires a nonzero --hot-budget-mib".into());
+    }
     let prompt_files =
         prompt_files.ok_or_else(|| format!("--prompt-file(s) is required\n{USAGE}"))?;
     if prompt_files.is_empty() {
@@ -294,6 +316,9 @@ fn parse_args() -> Result<Args, String> {
         accepts,
         arms,
         trace,
+        hot_budget_mib,
+        hotset,
+        row_capture,
     })
 }
 
@@ -326,7 +351,7 @@ impl Model {
     /// the loader's forward scratch plan, UMA mmap drop, optional
     /// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, `attach_forward`. No MTP head, no
     /// session cache.
-    fn load(path: &Path, n_ctx: usize) -> Result<Self, String> {
+    fn load(path: &Path, n_ctx: usize, hot_budget_mib: Option<u64>, hotset: Option<&Path>) -> Result<Self, String> {
         let model_bytes = std::fs::metadata(path)
             .map_err(|e| format!("stat {}: {e}", path.display()))?
             .len();
@@ -348,7 +373,7 @@ impl Model {
             },
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
-        let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        let mut receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
             .map_err(|e| format!("qwen4 admission: {e}"))?;
         // `<model>.trunk-overlay` (QT44 trunk tensors + the A4 default), bound
         // to this base while it is open and applied by `attach_forward`.
@@ -408,6 +433,74 @@ impl Model {
             &receipt.manifest,
         )
         .map_err(es)?;
+        // Use the same bound sidecar, slab plan and tier owners as cpu_split_parity.
+        // The fixed budget freezes one partition for all AR/verify/commit passes.
+        let tier_lease = if let Some(mib) = hot_budget_mib {
+            use hipfire_arch_qwen4::expert_hotset as hotsets;
+            if gpu.is_uma()
+                || !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+                || hipfire_dispatch::cpu_exec::passback_enabled()
+            {
+                return Err("D2 hotset requires a discrete GPU and HIPFIRE_OFFLOAD_EXEC=cpu (not passback)".into());
+            }
+            if hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()?.is_some() {
+                return Err("fixed hotset conflicts with HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS".into());
+            }
+            let policy = match hotset {
+                Some(path) => hotsets::HotsetPolicy::Explicit(path.to_path_buf()),
+                None => hotsets::HotsetPolicy::from_env()?,
+            };
+            let env = hotsets::HotsetEnv {
+                gpu_arch: &gpu.arch,
+                unified_memory: false,
+                expert_parallel: false,
+                explicit_vram_layers: false,
+                source: match &receipt.manifest.identity.recipe {
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => hotsets::HotsetSource::Aggregate,
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => hotsets::HotsetSource::SlabArena,
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => hotsets::HotsetSource::StockFp8,
+                    _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
+                },
+            };
+            let sidecar_path = hotsets::preflight(&policy, path, &env)
+                .map_err(|skip| skip.log_line(&policy.sidecar_path(path)).unwrap_or_else(|| skip.to_string()))?;
+            let base = hotsets::HotsetBase::from_hfq(&hfq)?;
+            let sidecar = hotsets::HotsetSidecar::load_bound(
+                &sidecar_path, receipt.config.num_hidden_layers,
+                receipt.config.num_experts, receipt.config.num_experts_per_tok, &base,
+            ).map_err(|skip| skip.to_string())?;
+            receipt.manifest.check_expert_tiers().map_err(es)?;
+            let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
+                &hfq, &receipt.config, &receipt.manifest,
+            )?;
+            let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
+                &slabs, sidecar.rank(), mib * (1 << 20),
+            ).map_err(es)?;
+            hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
+            plan.check_executable(&gpu.arch).map_err(es)?;
+            hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                &mut receipt.manifest.weights, receipt.config.num_hidden_layers,
+            );
+            receipt.manifest = receipt.manifest.with_expert_tiers().map_err(es)?;
+            {
+                let keep: BTreeSet<_> = receipt.manifest.resident_keys().collect();
+                receipt.placements.retain(|p| keep.contains(&(p.name.as_str(), p.layer)));
+            }
+            let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
+                &mut gpu, std::sync::Arc::new(plan), &|offset, len| {
+                    let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow".to_string())?;
+                    let len = usize::try_from(len).map_err(|_| "hotset source length overflow".to_string())?;
+                    hfq.data_range(offset, len)
+                        .ok_or_else(|| format!("source span {offset}+{len} is outside the artifact mapping"))
+                },
+            ).map_err(|e| format!("expert tier materialize: {e}"))?;
+            lease.bind_hotset_sidecar_sha256(sidecar.sha256()).map_err(es)?;
+            eprintln!("qwen4_wide_verify: hotset {} sha256 {} fixed budget {mib} MiB",
+                sidecar_path.display(), sidecar.sha256());
+            Some(lease)
+        } else {
+            None
+        };
         let uma = gpu.is_uma();
         if uma {
             hfq.drop_mmap();
@@ -495,7 +588,7 @@ impl Model {
             receipt.ple_rows,
             state_format,
             backend,
-            None,
+            tier_lease,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle.attach_npu_trunk_identity(npu_identity);
@@ -507,6 +600,10 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, n_ctx, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
+        if hot_budget_mib.is_some() && (bundle.split_layers().is_empty() || bundle.split_digest().is_none()) {
+            return Err("requested D2 hotset split did not arm".into());
+        }
+        eprintln!("qwen4_wide_verify: split_digest {:?}", bundle.split_digest());
         eprintln!(
             "qwen4_wide_verify: loaded {} ({:.2} GB) on {} (vocab {vocab}), trunk overlay {}",
             path.display(),
@@ -1195,7 +1292,7 @@ fn run() -> Result<bool, String> {
         );
     }
 
-    let mut m = Model::load(&args.model, args.n_ctx)?;
+    let mut m = Model::load(&args.model, args.n_ctx, args.hot_budget_mib, args.hotset.as_deref())?;
     let prompts: Vec<Vec<u32>> = prompt_texts.iter().map(|t| m.tokenizer.encode(t)).collect();
     for (path, prompt) in args.prompt_files.iter().zip(&prompts) {
         if prompt.is_empty() {
@@ -1212,8 +1309,13 @@ fn run() -> Result<bool, String> {
     }
     let vocab = m.vocab;
     let ring_supported = oracle::dev_row_capture_supported(&m.bundle, &m.gpu);
-    oracle::dev_arm_row_capture(&mut m.bundle, &mut m.gpu, max_rows)?;
+    if args.row_capture {
+        oracle::dev_arm_row_capture(&mut m.bundle, &mut m.gpu, max_rows)?;
+    }
     let ring_rows = oracle::dev_row_capture_rows(&m.bundle);
+    if !args.row_capture && ring_rows != 0 {
+        return Err("--row-capture off requested but a capture ring is already allocated".into());
+    }
     eprintln!(
         "qwen4_wide_verify: GDN row-capture ring {ring_rows} rows (route supports capture: {ring_supported})"
     );
@@ -1265,6 +1367,9 @@ fn run() -> Result<bool, String> {
         "ple_rows_source": rig.m.info.ple_rows_source,
         "trunk_overlay_applied": rig.m.info.overlay_applied,
         "expert_vram_layers": rig.m.info.expert_vram_layers,
+        "hot_budget_mib": args.hot_budget_mib,
+        "hotset": args.hotset.as_ref().map(|p| p.display().to_string()),
+        "split_digest": rig.m.bundle.split_digest(),
         "model_path": model_path,
         "model_bytes": rig.m.info.model_bytes,
         "hipfire_env": hipfire_env,
@@ -1278,6 +1383,8 @@ fn run() -> Result<bool, String> {
         "rows": args.rows,
         "row_capture_supported": ring_supported,
         "row_capture_ring_rows": ring_rows,
+        "row_capture_requested": args.row_capture,
+        "accepted_prefix_semantics": "accept_len in 0..n accepted drafts; seed-inclusive consumed prefix lengths 1..=n",
         "verify_route": "Qwen4Bundle::verify_block_rows via SpecTarget (spec_forward_rows, prefill_scope=false); timing uses the resident (no pick readback) variant",
     });
 
