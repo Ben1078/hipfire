@@ -1590,24 +1590,33 @@ impl Gpu {
             weights.buf.as_ptr(),
             acc.buf.as_ptr(),
         );
-        let words = [
+        let (hv, tv, nx, gr) = (
             hidden as i32,
             tokens as i32,
             n_experts as i32,
             grouped_rows as i32,
+        );
+        let (rb, pr, olo, ohi) = (
             row_base as i32,
             panel_rows as i32,
             own_lo as i32,
             own_hi as i32,
-        ];
-        let mut params: Vec<*mut c_void> = vec![
+        );
+        let mut params = [
             &yp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
             &ap as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &rb as *const _ as *mut c_void,
+            &pr as *const _ as *mut c_void,
+            &olo as *const _ as *mut c_void,
+            &ohi as *const _ as *mut c_void,
         ];
-        params.extend(words.iter().map(|w| w as *const i32 as *mut c_void));
         let bytes = panel_rows * hidden * 2 + 2 * tokens * hidden * 4;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
         let result = self.launch_maybe_blob(
@@ -1623,9 +1632,14 @@ impl Gpu {
                 b.push_ptr(tp);
                 b.push_ptr(wp);
                 b.push_ptr(ap);
-                for w in words {
-                    b.push_i32(w);
-                }
+                b.push_i32(hv);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b.push_i32(gr);
+                b.push_i32(rb);
+                b.push_i32(pr);
+                b.push_i32(olo);
+                b.push_i32(ohi);
                 b
             },
         );
