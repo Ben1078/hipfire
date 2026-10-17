@@ -747,8 +747,8 @@ pub struct AdmissionInputs {
     pub baseline_layers: usize,
     /// Bytes of ONE boundary stage: the target's session fixed parts (GDN
     /// recurrent and conv, QSA selections, PLE conv, hyper feedback; no context
-    /// rows, no MTP head), [`crate::bundle::session_snapshot_bytes`] at `p = 0`
-    /// with `native_mtp = false`.
+    /// rows, no MTP head), unpadded:
+    /// [`crate::state::Qwen4State::session_fixed_stage_bytes`].
     pub fixed_state_bytes: u64,
     /// Entry `pending` hidden copy of a native-MTP request (0 for AR).
     pub pending_save_bytes: u64,
@@ -961,13 +961,14 @@ pub fn load_admission_inputs(
         residency::routed_layer_payload_split(facts.weights, facts.bytes_of)
             .map_err(SlowlinkDecline::Geometry)?;
     // One boundary stage = the TARGET's session fixed parts only (the head's
-    // rows are not staged), each part aligned to the cache's 256-byte packing:
-    // `session_snapshot_bytes` at `p = 0` without the native MTP head. Each
-    // new boundary stage is charged once.
+    // rows are not staged), exactly what `Qwen4Bundle::prompt_txn_stage_bytes`
+    // allocates ([`crate::state::Qwen4State::session_fixed_stage_bytes`], the
+    // unpadded sum of the same fixed-part allocator). Each new boundary stage
+    // is charged once.
     let fixed_state_bytes =
-        crate::bundle::session_snapshot_bytes(facts.config, facts.state_format, false, 0)
+        crate::state::Qwen4State::session_fixed_stage_bytes(facts.config, facts.state_format)
             .ok_or_else(|| {
-                SlowlinkDecline::Geometry("session fixed snapshot bytes overflow".into())
+                SlowlinkDecline::Geometry("session fixed stage bytes overflow".into())
             })?;
     // A native-MTP request also saves the entry `pending` hidden (one F32 wide
     // row, `hc_count * hidden * 4`) for rollback: a NEW buffer beyond the
