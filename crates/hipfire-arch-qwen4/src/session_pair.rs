@@ -670,7 +670,7 @@ pub(crate) struct LiveTxn {
 pub(crate) enum StoredReceipt {
     Json(Value),
     Incumbent {
-        reason: Option<String>,
+        reason: Option<std::borrow::Cow<'static, str>>,
         entry: usize,
         windows: Vec<(usize, usize)>,
         tile_rows: usize,
@@ -688,7 +688,7 @@ pub(crate) struct SlowlinkOwner {
     next_id: u64,
     receipt: Option<StoredReceipt>,
     receipt_fresh: bool,
-    bypass: Option<String>,
+    bypass: Option<std::borrow::Cow<'static, str>>,
     injection: Option<SlowlinkFailPoint>,
     injection_consumed: bool,
     /// Entry `pending` hidden of an MTP request, restored on failure.
@@ -844,9 +844,9 @@ impl Qwen4Bundle {
 
     /// Start a request's verdict with the incumbent route already decided
     /// for `reason` (before any S1 work).
-    pub(crate) fn slowlink_note_bypass(&mut self, reason: &str) {
+    pub(crate) fn slowlink_note_bypass(&mut self, reason: impl Into<std::borrow::Cow<'static, str>>) {
         self.slowlink_begin_request();
-        self.slowlink.bypass = Some(reason.to_string());
+        self.slowlink.bypass = Some(reason.into());
     }
 
     /// Production-primitive self-test on the loaded bundle's real admitted S1
@@ -2772,6 +2772,35 @@ mod slowlink_txn_tests {
         assert_eq!(receipt["reserve"]["total"], 0);
         assert_eq!(receipt["bypass_reason"], "selector declined");
         assert!(incumbent_receipt_json("env0", None, 0, &[], 0)["bypass_reason"].is_null());
+    }
+
+    #[test]
+    fn session_pair_bypass_reasons_borrow_static_labels_and_move_dynamic_ones() {
+        use std::borrow::Cow;
+        let mut owner = SlowlinkOwner::default();
+        // A static label is stored borrowed: no allocation on the default-off path.
+        owner.bypass = Some("no admitted slow-link profile".into());
+        assert!(matches!(owner.bypass, Some(Cow::Borrowed(_))));
+        // A dynamic diagnostic is moved in, never copied.
+        let dynamic = format!("request end {} exceeds the context capacity {}", 9, 8);
+        let address = dynamic.as_ptr();
+        owner.bypass = Some(dynamic.into());
+        let Some(Cow::Owned(moved)) = owner.bypass.take() else {
+            panic!("a dynamic reason is stored owned");
+        };
+        assert_eq!(moved.as_ptr(), address, "moved, not copied");
+        assert!(owner.bypass.is_none(), "the reason is taken once");
+        // The stored incumbent receipt carries the same borrowed label.
+        let stored = StoredReceipt::Incumbent {
+            reason: Some(Cow::Borrowed("selector declined")),
+            entry: 0,
+            windows: Vec::new(),
+            tile_rows: 1536,
+        };
+        let StoredReceipt::Incumbent { reason, .. } = stored else {
+            unreachable!("built as an incumbent receipt");
+        };
+        assert!(matches!(reason, Some(Cow::Borrowed(_))));
     }
 
     #[test]
