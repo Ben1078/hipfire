@@ -2682,9 +2682,17 @@ mod slowlink_ring {
         let owner = Arc::new(0u8);
         let (ring, drops) = used_ring(&owner);
         // Retired and logically free, but never proven complete on the GPU.
-        assert_eq!(Arc::strong_count(&owner), 2, "the page retains the source owner");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "the page retains the source owner"
+        );
         drop(ring);
-        assert_eq!(backend_drops(&drops), 0, "the pool/tables/staging were leaked");
+        assert_eq!(
+            backend_drops(&drops),
+            0,
+            "the pool/tables/staging were leaked"
+        );
         assert_eq!(
             Arc::strong_count(&owner),
             2,
@@ -2704,7 +2712,11 @@ mod slowlink_ring {
         ring.drain(&()).unwrap();
         drop(ring);
         assert_eq!(backend_drops(&drops), 1);
-        assert_eq!(Arc::strong_count(&owner), 1, "drain released the retained owner");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "drain released the retained owner"
+        );
         // Work after a drain makes it dirty again.
         let (mut again, drops) = counted();
         again.begin_window(&()).unwrap();
@@ -2740,14 +2752,25 @@ mod slowlink_ring {
     fn slowlink_ring_backend_is_taken_only_after_a_completed_drain() {
         let owner = Arc::new(0u8);
         let (mut ring, drops) = used_ring(&owner);
-        assert!(ring.take_backend().is_err(), "dirty ring cannot hand out its backend");
+        assert!(
+            ring.take_backend().is_err(),
+            "dirty ring cannot hand out its backend"
+        );
         ring.drain(&()).unwrap();
         let backend = ring.take_backend().unwrap();
         assert!(ring.take_backend().is_err(), "taken once");
         drop(ring);
-        assert_eq!(backend_drops(&drops), 0, "the core never drops a taken backend");
+        assert_eq!(
+            backend_drops(&drops),
+            0,
+            "the core never drops a taken backend"
+        );
         drop(backend);
-        assert_eq!(backend_drops(&drops), 1, "the new owner drops it exactly once");
+        assert_eq!(
+            backend_drops(&drops),
+            1,
+            "the new owner drops it exactly once"
+        );
     }
 
     #[test]
@@ -4002,7 +4025,10 @@ mod slowlink_ring {
         let mut schedule = PanelSchedule::new(vec![sources(1), sources(2)], 4).unwrap();
         let mut ring = core(2, 16);
         assert_eq!(schedule.prime(&mut ring, &()).unwrap(), 16);
-        assert!(schedule.ticket(2, 0).is_none(), "layer 2 is not next before compute starts");
+        assert!(
+            schedule.ticket(2, 0).is_none(),
+            "layer 2 is not next before compute starts"
+        );
         schedule.enter_layer(&mut ring, &(), 1).unwrap();
         assert_eq!(ring.stats().enqueued, 18);
         assert_eq!(ring.stats().acquired, 0);
