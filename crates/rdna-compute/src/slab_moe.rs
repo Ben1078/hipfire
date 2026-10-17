@@ -2476,8 +2476,8 @@ mod tests {
 /// CPU models of the S1 ordered panel combine (`slowlink_combine_panel` + `slowlink_combine_pad`)
 /// against the canonical monolithic BF16-row combine (`moe_combine_order_top10` +
 /// `moe_down_combine_grouped_top10_bf16in`).  No HIP.
-#[cfg(test)]
-mod slowlink_combine_tests {
+pub mod slowlink_selftest {
+    #![allow(dead_code)]
     use super::slowlink_panel_owns;
 
     const K: usize = 10;
@@ -2485,23 +2485,23 @@ mod slowlink_combine_tests {
     const CLASSES: usize = 12;
     const HIDDEN: usize = 24;
 
-    struct Rng(u64);
+    pub struct Rng(pub u64);
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub fn next(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0
         }
-        fn below(&mut self, n: usize) -> usize {
+        pub fn below(&mut self, n: usize) -> usize {
             (self.next() % n as u64) as usize
         }
-        fn unit(&mut self) -> f32 {
+        pub fn unit(&mut self) -> f32 {
             ((self.next() >> 40) as f32) / (1u64 << 24) as f32 * 2.0 - 1.0
         }
     }
 
-    fn rbf(x: f32) -> f32 {
+    pub fn rbf(x: f32) -> f32 {
         if x.is_nan() {
             return f32::NAN;
         }
@@ -2512,27 +2512,33 @@ mod slowlink_combine_tests {
             f32::from_bits(u & 0xffff_0000)
         }
     }
-    fn bf(x: f32) -> u16 {
+    pub fn bf(x: f32) -> u16 {
         (rbf(x).to_bits() >> 16) as u16
     }
-    fn wd(b: u16) -> f32 {
+    pub fn wd(b: u16) -> f32 {
         f32::from_bits((b as u32) << 16)
     }
-    fn same(a: f32, b: f32) -> bool {
+    pub fn same(a: f32, b: f32) -> bool {
         a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
     }
 
-    struct Case {
-        tokens: usize,
+    /// A combine fixture: window grouped rows (pad16 per expert) with BF16 down rows,
+    /// route slots, weights and initial accumulators.
+    pub struct Case {
+        pub tokens: usize,
+        pub h: usize,
+        pub n_exp: usize,
         /// Window grouped rows (pad16 per expert).
-        g: usize,
-        /// First grouped row of every expert, `[EXPERTS + 1]`.
-        start: Vec<usize>,
-        down: Vec<u16>,
-        inv: Vec<i32>,
-        topk: Vec<i32>,
-        w: Vec<f32>,
-        init: Vec<f32>,
+        pub g: usize,
+        /// First grouped row of every expert, `[n_exp + 1]`.
+        pub start: Vec<usize>,
+        pub down: Vec<u16>,
+        pub inv: Vec<i32>,
+        pub topk: Vec<i32>,
+        pub w: Vec<f32>,
+        pub init: Vec<f32>,
+        /// Adversarial class of every token (`[tokens]`).
+        pub class: Vec<usize>,
     }
 
     fn palette(class: usize, rng: &mut Rng) -> u16 {
@@ -2580,7 +2586,7 @@ mod slowlink_combine_tests {
 
     /// Every adversarial class, grouped the way the stable scatter groups (`(expert, slot)`
     /// order, each expert padded to 16), with some valid ids whose grouped row is invalid.
-    fn make_case(seed: u64, tokens_per_class: usize) -> Case {
+    pub fn make_case(seed: u64, tokens_per_class: usize) -> Case {
         let mut rng = Rng(seed | 1);
         let tokens = CLASSES * tokens_per_class;
         let mut topk = vec![0i32; tokens * K];
@@ -2651,7 +2657,7 @@ mod slowlink_combine_tests {
                 _ => rbf(-3.0e38),
             })
             .collect();
-        Case { tokens, g, start, down, inv, topk, w, init }
+        Case { tokens, h: HIDDEN, n_exp: EXPERTS, g, start, down, inv, topk, w, init, class: class_of }
     }
 
     /// The ten (grouped row or -1, BF16 weight) slots of a token in
@@ -2661,7 +2667,7 @@ mod slowlink_combine_tests {
         let mut used = [false; K];
         for r in 0..K {
             let id = c.topk[base + r];
-            used[r] = !(0..EXPERTS as i32).contains(&id);
+            used[r] = !(0..c.n_exp as i32).contains(&id);
         }
         let mut out = [(-1i32, 0.0f32); K];
         for slot in out.iter_mut() {
@@ -2684,17 +2690,20 @@ mod slowlink_combine_tests {
         out
     }
 
-    fn canonical(c: &Case) -> Vec<f32> {
-        let mut out = vec![0f32; c.tokens * HIDDEN];
+    /// The canonical monolithic BF16-row combine on the CPU (`hidden` and `n_exp` come from
+    /// the case): residual rounded to BF16, then the ten ranks in ascending expert id.
+    pub fn canonical(c: &Case) -> Vec<f32> {
+        let h = c.h;
+        let mut out = vec![0f32; c.tokens * h];
         for tok in 0..c.tokens {
             let slots = order_slots(c, tok);
-            for col in 0..HIDDEN {
-                let mut acc = rbf(c.init[tok * HIDDEN + col]);
+            for col in 0..h {
+                let mut acc = rbf(c.init[tok * h + col]);
                 for &(row, wt) in &slots {
-                    let y = if row >= 0 { wd(c.down[row as usize * HIDDEN + col]) } else { 0.0 };
+                    let y = if row >= 0 { wd(c.down[row as usize * h + col]) } else { 0.0 };
                     acc = rbf(acc + rbf(rbf(y) * wt));
                 }
-                out[tok * HIDDEN + col] = acc;
+                out[tok * h + col] = acc;
             }
         }
         out
@@ -2929,5 +2938,141 @@ mod slowlink_combine_tests {
             assert_eq!(diffs(&got[..HIDDEN], &want[..HIDDEN]), 0, "cuts {cuts:?}");
             assert!(got[..HIDDEN].iter().all(|v| v.to_bits() == 0));
         }
+    }
+
+    /// Result of [`canonical_combine_exact`].
+    #[derive(Clone, Debug, Default)]
+    pub struct CombineExactReport {
+        pub tokens: usize,
+        pub grouped_rows: usize,
+        pub partitions: usize,
+        pub panel_launches: usize,
+        /// Elements of the panelled GPU combine that differ from the CPU canonical model
+        /// (subnormal-class tokens excluded, see `subnormal_informational`).
+        pub mismatches_vs_cpu: usize,
+        /// Elements that differ from the monolithic GPU kernel
+        /// (`moe_down_combine_grouped_top10_bf16in`), every class included.
+        pub mismatches_vs_monolithic_gpu: usize,
+        pub subnormal_informational: usize,
+        /// Negative control: the reversed panel order must differ from the monolithic kernel.
+        pub reversed_order_diffs: usize,
+        pub ok: bool,
+    }
+
+    impl CombineExactReport {
+        pub fn to_json(&self) -> String {
+            format!(
+                "{{\"tokens\":{},\"grouped_rows\":{},\"partitions\":{},\"panel_launches\":{},\
+                 \"mismatches_vs_cpu\":{},\"mismatches_vs_monolithic_gpu\":{},\
+                 \"subnormal_informational\":{},\"reversed_order_diffs\":{},\"ok\":{}}}",
+                self.tokens,
+                self.grouped_rows,
+                self.partitions,
+                self.panel_launches,
+                self.mismatches_vs_cpu,
+                self.mismatches_vs_monolithic_gpu,
+                self.subnormal_informational,
+                self.reversed_order_diffs,
+                self.ok
+            )
+        }
+    }
+
+    /// Real-device check of the production `slowlink_combine_panel` / `slowlink_combine_pad`
+    /// kernels on the adversarial fixture (every class: duplicates, invalid ids, invalid
+    /// rows with valid ids, overflow, absorption, RNE ties, signed zeros, subnormals) over
+    /// many panel partitions, within-expert splits included, against both the CPU canonical
+    /// model and the monolithic GPU combine.  Uses only the production wrappers.
+    pub fn canonical_combine_exact(
+        gpu: &mut crate::dispatch::Gpu,
+        seed: u64,
+    ) -> hip_bridge::HipResult<CombineExactReport> {
+        use crate::dispatch::DType;
+        let case = make_case(seed, 6);
+        let (h, t, g) = (case.h, case.tokens, case.g);
+        let bytes_u16: Vec<u8> = case.down.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes_i32 = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let down_t = gpu.upload_raw(&bytes_u16, &[bytes_u16.len()])?;
+        let inv_bytes = bytes_i32(&case.inv);
+        let inv_t = gpu.upload_raw(&inv_bytes, &[inv_bytes.len()])?;
+        let topk_bytes = bytes_i32(&case.topk);
+        let topk_t = gpu.upload_raw(&topk_bytes, &[topk_bytes.len()])?;
+        let w_t = gpu.upload_f32(&case.w, &[case.w.len()])?;
+        let res_t = gpu.upload_f32(&case.init, &[case.init.len()])?;
+        let order_t = gpu.alloc_tensor(&[t * K * 8], DType::Raw)?;
+        let acc_t = gpu.alloc_tensor(&[t * h], DType::F32)?;
+        let sync = |gpu: &mut crate::dispatch::Gpu| gpu.hip.device_synchronize();
+        // The monolithic reference: the shipped kernels, exactly as the incumbent launches them.
+        gpu.moe_down_combine_grouped_top10_bf16in(
+            &down_t, &inv_t, &topk_t, &w_t, &res_t, &order_t, h, g, t, false, case.n_exp,
+        )?;
+        sync(gpu)?;
+        let mono = gpu.download_f32(&res_t)?;
+        let cpu = canonical(&case);
+        let mut report = CombineExactReport {
+            tokens: t,
+            grouped_rows: g,
+            ..Default::default()
+        };
+        let mut rng = Rng(seed ^ 0x9e37_79b9);
+        let parts = partitions(&case, &mut rng);
+        report.partitions = parts.len();
+        let init: Vec<u8> = case.init.iter().flat_map(|&v| rbf(v).to_le_bytes()).collect();
+        let mut run = |gpu: &mut crate::dispatch::Gpu,
+                       cuts: &[usize],
+                       ascending: bool|
+         -> hip_bridge::HipResult<(Vec<f32>, usize)> {
+            gpu.hip.memcpy_htod(&acc_t.buf, &init)?;
+            let ps = panels(&case, cuts);
+            let order: Vec<usize> = if ascending {
+                (0..ps.len()).collect()
+            } else {
+                (0..ps.len()).rev().collect()
+            };
+            for &i in &order {
+                let (base, rows, own) = ps[i];
+                let y = crate::dispatch::GpuTensor {
+                    buf: down_t.buf.byte_view(base * h * 2, rows * h * 2),
+                    shape: vec![rows * h],
+                    dtype: DType::BF16,
+                };
+                gpu.slowlink_combine_panel(
+                    &y, &inv_t, &topk_t, &w_t, &acc_t, h, t, case.n_exp, g, base, rows, own.0, own.1,
+                )?;
+            }
+            gpu.slowlink_combine_pad(&topk_t, &acc_t, h, t, case.n_exp)?;
+            gpu.hip.device_synchronize()?;
+            Ok((gpu.download_f32(&acc_t)?, order.len()))
+        };
+        for cuts in &parts {
+            let (got, launches) = run(gpu, cuts, true)?;
+            report.panel_launches += launches;
+            for (i, (a, b)) in got.iter().zip(&mono).enumerate() {
+                if !same(*a, *b) {
+                    report.mismatches_vs_monolithic_gpu += 1;
+                }
+                let _ = i;
+            }
+            for (i, (a, b)) in got.iter().zip(&cpu).enumerate() {
+                if !same(*a, *b) {
+                    if case.class[i / h] == 11 {
+                        report.subnormal_informational += 1;
+                    } else {
+                        report.mismatches_vs_cpu += 1;
+                    }
+                }
+            }
+        }
+        let tile_cuts: Vec<usize> = (0..=g.div_ceil(16)).map(|i| (i * 16).min(g)).collect();
+        let (reversed, _) = run(gpu, &tile_cuts, false)?;
+        report.reversed_order_diffs = reversed.iter().zip(&mono).filter(|(a, b)| !same(**a, **b)).count();
+        for tensor in [down_t, inv_t, topk_t, w_t, res_t, order_t, acc_t] {
+            let _ = gpu.free_tensor(tensor);
+        }
+        report.ok = report.mismatches_vs_cpu == 0
+            && report.mismatches_vs_monolithic_gpu == 0
+            && report.reversed_order_diffs > 0
+            && report.panel_launches > 0;
+        Ok(report)
     }
 }
