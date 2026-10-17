@@ -2101,7 +2101,20 @@ mod tests {
         assert_eq!(profile.tile_rows, 1536);
         assert!(profile.tile_rows <= 1536);
         assert_eq!(profile.window_rows, 16384);
-        assert_eq!(profile.census.terms().len(), 6);
+        // Seven charged terms, every one itemised in log order.
+        let names: Vec<&str> = profile.census.terms().iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "expert ring",
+                "expert lookahead",
+                "route storage",
+                "A4 sidecars",
+                "group scatter",
+                "HC arena",
+                "boundary state",
+            ]
+        );
         assert!(profile.describe().contains("10 resident layers"));
     }
 
