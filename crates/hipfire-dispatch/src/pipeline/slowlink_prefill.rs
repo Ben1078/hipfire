@@ -1998,6 +1998,7 @@ pub mod selftest {
         limits: PanelLimits,
         tiles: &[SynthTile],
         canaries: bool,
+        decode: Option<&PreparedChunkCall<'_>>,
     ) -> Result<WindowOut, DispatchError> {
         let layout = routes.layout.clone();
         let d = layout.dims;
@@ -2050,8 +2051,14 @@ pub mod selftest {
         routes.k1_used = k1_used;
         routes.first_arm = Some((call.arm_signature(), call.k2));
         routes.k2_arm = call.k2.then(|| call.arm_signature()[5]);
+        // A real decode tile (the incumbent's one-row decode call) prepares through the
+        // production `prepare_routes` after the synthetic tiles.
+        if let Some(decode_call) = decode {
+            prepare_routes(gpu, decode_call, routes)?;
+            row0 += decode_call.rows;
+        }
         if row0 != d.rows {
-            return Err(bail("the synthetic tiles do not fill the window"));
+            return Err(bail("the tiles do not fill the window"));
         }
         let plan = finish_route_plan(gpu, routes, limits)?;
         let ranges: Vec<(usize, usize)> = bindings
@@ -2060,6 +2067,9 @@ pub mod selftest {
             .collect();
         let panels = plan.schedule(&ranges, limits)?;
         let mut scratch = PanelScratch::new(call, limits)?;
+        if let Some(decode_call) = decode {
+            scratch.add_decode_tile(decode_call)?;
+        }
         let (y_gu, y_dn) = (
             scratch.params.y_gate_up_grouped,
             scratch.params.y_down_grouped,
@@ -2136,19 +2146,32 @@ pub mod selftest {
         limits: PanelLimits,
         tiles: &[SynthTile],
         canaries: bool,
+        decode: Option<&PreparedChunkCall<'_>>,
     ) -> Result<Window, DispatchError> {
-        let rows: usize = tiles.iter().map(SynthTile::rows).sum();
-        let k1_rows: usize = tiles.iter().filter(|t| t.k1).map(SynthTile::rows).sum();
+        let decode_rows = decode.map_or(0, |d| d.rows);
+        let rows: usize = tiles.iter().map(SynthTile::rows).sum::<usize>() + decode_rows;
+        let k1_rows: usize =
+            tiles.iter().filter(|t| t.k1).map(SynthTile::rows).sum::<usize>() + decode_rows;
         let layout = PromptRouteLayout::new(&PromptRouteDims {
             rows,
             hidden: call.hidden,
             n_exp: call.n_exp,
             mi: call.mi,
-            shared_intermediate: 0,
+            // A real decode tile saves its shared gate/up and selector.
+            shared_intermediate: decode.map_or(0, |d| d.shared_intermediate),
             k1_rows,
         })?;
         let mut routes = PromptRouteStorage::alloc(gpu, &layout)?;
-        match run_window_inner(gpu, call, &mut routes, bindings, limits, tiles, canaries) {
+        match run_window_inner(
+            gpu,
+            call,
+            &mut routes,
+            bindings,
+            limits,
+            tiles,
+            canaries,
+            decode,
+        ) {
             Ok(out) => Ok(Window {
                 routes,
                 plan: out.plan,
@@ -2472,7 +2495,7 @@ pub mod selftest {
             }
         });
         let (ids, weights) = (tile.ids.clone(), tile.weights.clone());
-        let window = run_window(gpu, call, &[binding], limits, &[tile], true)?;
+        let window = run_window(gpu, call, &[binding], limits, &[tile], true, None)?;
         let hot_rows = window.plan.counts_padded[lo] as usize;
         rep.check(
             "hot_expert_exceeds_one_panel",
@@ -2603,7 +2626,7 @@ pub mod selftest {
             })
             .collect();
         let all_weights: Vec<f32> = tiles.iter().flat_map(|t| t.weights.clone()).collect();
-        let window = run_window(gpu, call, &halves, limits, &tiles, true)?;
+        let window = run_window(gpu, call, &halves, limits, &tiles, true, None)?;
         let mut expected_experts: Vec<usize> = k1_ids
             .iter()
             .filter(|&&id| id >= 0 && (id as usize) < call.n_exp)
@@ -2727,6 +2750,201 @@ pub mod selftest {
         Ok(rep)
     }
 
+    /// Window rows the K2 anchor tile of [`decode_tail_cohort`] occupies: the caller builds
+    /// the decode call's [`PreparedChunkCall`] with `row0` equal to this.
+    pub const DECODE_TAIL_ANCHOR_ROWS: usize = 64;
+
+    /// `decode_tail_cohort`: the incumbent's REAL one-row decode call (built by the caller as
+    /// the model builds it, its input state, scratch and weights in place) beside a synthetic
+    /// K2 tile, over a binding split in two halves so the decode K1 stack runs per half on ids
+    /// masked to it.  Checks, bitwise: the decode row of the window equals the incumbent's own
+    /// decode stages (gate/up, fused activation with the shared expert, down, canonical
+    /// combine, shared down) run unmasked over the SAME restored ids/input/shared state
+    /// against the whole binding; the K2 rows equal the CPU canonical combine; the K1 experts
+    /// and per-binding cohort launches are what the real route needs.  The binding MUST hold
+    /// every expert the decode call's router selects (the resident all-expert binding).
+    /// `anchor` is any K2 prefill tile call of the layer (its scratch/geometry).
+    pub fn decode_tail_cohort(
+        gpu: &mut Gpu,
+        anchor: &PreparedChunkCall<'_>,
+        decode_call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        let mut rep = PrimitiveReport::new("decode_tail_cohort");
+        if anchor.decode || !anchor.k2 || !decode_call.decode {
+            return Err(bail(
+                "decode_tail_cohort needs a K2 prefill anchor call and a one-row decode call",
+            ));
+        }
+        if decode_call.row0 != DECODE_TAIL_ANCHOR_ROWS
+            || decode_call.hidden != anchor.hidden
+            || decode_call.n_exp != anchor.n_exp
+            || decode_call.mi != anchor.mi
+        {
+            return Err(bail(format!(
+                "the decode call must sit at window row {DECODE_TAIL_ANCHOR_ROWS} with the anchor's geometry"
+            )));
+        }
+        let (lo, hi) = (binding.expert_lo, binding.expert_hi);
+        if hi - lo < 2 || hi > anchor.n_exp {
+            return Err(bail("the decode tail test needs a binding of at least two experts"));
+        }
+        let mid = lo + (hi - lo) / 2;
+        let halves = [
+            ExpertPanelBinding { expert_hi: mid, ..binding },
+            ExpertPanelBinding { expert_lo: mid, ..binding },
+        ];
+        let width = hi - lo;
+        let mut rng = model::Rng(seed | 1);
+        let k2_tile = synth_tile(&mut rng, DECODE_TAIL_ANCHOR_ROWS, anchor.hidden, false, |tok, r| {
+            (lo + (tok * 11 + r * 5) % width) as i32
+        });
+        let (k2_ids, k2_weights) = (k2_tile.ids.clone(), k2_tile.weights.clone());
+        let window = run_window(
+            gpu,
+            anchor,
+            &halves,
+            limits,
+            &[k2_tile],
+            true,
+            Some(decode_call),
+        )?;
+        let layout = window.routes.layout.clone();
+        let d = layout.dims;
+        let rec = *window
+            .routes
+            .tiles
+            .iter()
+            .find(|t| t.decode)
+            .ok_or_else(|| bail("the decode tile was not recorded"))?;
+        // What the real router selected for the decode row, from the saved route.
+        let ids_view = window.routes.ids_view(layout.topk_ids, rec.row0, 1);
+        let routed = hip(gpu.slowlink_sync_download_i32(&ids_view, K_TOP))?;
+        let mut expected: Vec<usize> = routed
+            .iter()
+            .filter(|&&id| id >= 0 && (id as usize) < d.n_exp)
+            .map(|&id| id as usize)
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        rep.check(
+            "decode_row_experts_read_back_at_the_one_barrier",
+            window.plan.k1_experts == expected && !expected.is_empty(),
+            format!("{:?} vs {:?}", window.plan.k1_experts, expected),
+        );
+        let touched = [(lo, mid), (mid, hi)]
+            .iter()
+            .filter(|&&(a, b)| expected.iter().any(|&e| e >= a && e < b))
+            .count();
+        let flagged = window.panels.iter().filter(|p| p.k1).count();
+        rep.check(
+            "decode_cohort_runs_once_per_touched_binding",
+            flagged == touched && flagged > 0,
+            format!("{flagged} flagged panels, {touched} touched halves"),
+        );
+        rep.check(
+            "scratch_guard_canaries_intact",
+            window.canary_violations == 0,
+            format!("{} of {} guard bytes overwritten", window.canary_violations, window.canary_checks),
+        );
+        // The K2 anchor rows against the CPU canonical combine (the decode row carries no
+        // K2 ids).
+        let mut all_ids = k2_ids;
+        all_ids.extend([-1i32; K_TOP]);
+        let mut all_weights = k2_weights;
+        all_weights.extend([0.0f32; K_TOP]);
+        let want = cpu_canonical(&window, anchor, &all_ids, &all_weights);
+        let n = DECODE_TAIL_ANCHOR_ROWS * d.hidden;
+        rep.check(
+            "k2_rows_equal_cpu_canonical_beside_the_decode_tile",
+            diffs(&window.acc[..n], &want[..n]) == 0,
+            format!("{} mismatching elements", diffs(&window.acc[..n], &want[..n])),
+        );
+        // The incumbent's own decode stages over the same ids/input/shared state.
+        let params = *decode_call.decode_params();
+        let selection = decode_selection(decode_call);
+        let shared = params
+            .shared
+            .as_ref()
+            .ok_or_else(|| bail("the decode call carries no shared expert"))?;
+        let input = decode_activation_input(&params, selection);
+        let smi = d.shared_intermediate;
+        let saved = layout.k1_shared + rec.k1_row0 * 2 * smi * F32_BYTES;
+        let region = &window.routes.region.buf;
+        let restore = |gpu: &Gpu, dst: &hip_bridge::DeviceBuffer, src_off: usize, bytes: usize| {
+            hip(gpu.memcpy_dtod_at_ordered_async(dst, 0, region, src_off, bytes))
+        };
+        restore(gpu, &input.buf, layout.x_norm + rec.row0 * d.hidden * F32_BYTES, d.hidden * F32_BYTES)?;
+        restore(
+            gpu,
+            &params.topk_indices.buf,
+            layout.topk_ids + rec.row0 * K_TOP * I32_BYTES,
+            K_TOP * I32_BYTES,
+        )?;
+        restore(
+            gpu,
+            &params.topk_weights.buf,
+            layout.topk_weights + rec.row0 * K_TOP * F32_BYTES,
+            K_TOP * F32_BYTES,
+        )?;
+        restore(gpu, &shared.gate_out.buf, saved, smi * F32_BYTES)?;
+        restore(gpu, &shared.up_out.buf, saved + smi * F32_BYTES, smi * F32_BYTES)?;
+        restore(gpu, &shared.scalar.buf, layout.shared_scalar + rec.row0 * F32_BYTES, F32_BYTES)?;
+        let mut p = params;
+        p.expert_gate_up_ptrs = binding.gate_up_table;
+        p.expert_down_ptrs = binding.down_table;
+        let gate = super::super::slice_moe_f32_view(shared.gate_out, 0, smi);
+        let up = super::super::slice_moe_f32_view(shared.up_out, 0, smi);
+        let target = hip(gpu.zeros(&[d.hidden], DType::F32))?;
+        let reference = (|| -> Result<Vec<f32>, DispatchError> {
+            super::super::decode_gate_up_stage(gpu, &p, selection.resolution, input, false, selection.route)?;
+            super::super::decode_activation_stage(
+                gpu,
+                &p,
+                selection.resolution,
+                selection.route,
+                Some((&gate, &up)),
+            )?;
+            super::super::decode_down_stage(
+                gpu,
+                &p,
+                selection.resolution,
+                p.x_residual,
+                false,
+                false,
+                false,
+                false,
+                false,
+                selection.route,
+            )?;
+            super::super::decode_combine_stage(gpu, &p, &target, selection.route)?;
+            super::super::decode_shared_down_stage(
+                decode_call.call.dispatch_ctx(),
+                gpu,
+                &p,
+                &gate,
+                &up,
+                &target,
+                selection.router_shared_fuse,
+                selection.route,
+            )?;
+            sync(gpu)?;
+            hip(gpu.download_f32(&target))
+        })();
+        let _ = gpu.free_tensor(target);
+        let reference = reference?;
+        let got = &window.acc[rec.row0 * d.hidden..(rec.row0 + 1) * d.hidden];
+        rep.check(
+            "decode_row_equals_the_incumbent_decode_stages",
+            diffs(got, &reference) == 0,
+            format!("{} mismatching elements of {}", diffs(got, &reference), d.hidden),
+        );
+        window.routes.release(gpu);
+        Ok(rep)
+    }
+
     /// `zero_row_panel`: (a) a window where nothing routes yields exactly one zero-row
     /// combine-only panel owning every expert and an all +0 accumulator; (b) a K1-only
     /// window yields only zero-row K1 panels whose rows still equal the incumbent K1 path.
@@ -2740,7 +2958,7 @@ pub mod selftest {
         let mut rep = PrimitiveReport::new("zero_row_panel");
         let mut rng = model::Rng(seed | 1);
         let tile = synth_tile(&mut rng, 40, call.hidden, false, |_, _| -1);
-        let window = run_window(gpu, call, &[binding], limits, &[tile], true)?;
+        let window = run_window(gpu, call, &[binding], limits, &[tile], true, None)?;
         let only = window.panels.first().copied();
         rep.check(
             "empty_window_is_one_zero_row_panel_owning_every_expert",
