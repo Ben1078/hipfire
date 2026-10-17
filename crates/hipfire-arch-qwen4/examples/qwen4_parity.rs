@@ -3862,7 +3862,12 @@ fn run_quality_candidate(
     let mut hfq = HfqFile::open(model_path)
         .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(&mut hfq, model_path, hipfire_config::memory::ple_format(), &gpu.arch)
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(
+        &mut hfq,
+        model_path,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+    )
     .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.
@@ -4405,7 +4410,9 @@ fn parse_slowlink_state_fixture(value: &Value) -> Result<SlowlinkStateFixture, S
     }
     let repeats = unsigned("repeats")?.unwrap_or(3);
     if repeats < 2 {
-        return Err("slowlink-state repeats must be at least 2 (determinism needs a repeat)".to_string());
+        return Err(
+            "slowlink-state repeats must be at least 2 (determinism needs a repeat)".to_string(),
+        );
     }
     Ok(SlowlinkStateFixture {
         prompt_ids,

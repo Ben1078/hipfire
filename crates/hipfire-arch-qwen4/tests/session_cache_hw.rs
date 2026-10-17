@@ -1366,7 +1366,10 @@ fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
         } else {
             validate_forced_short(receipt.as_ref(), &limits)
         };
-        assert!(problems.is_empty(), "{what}: route receipt problems {problems:?}\n{receipt:?}");
+        assert!(
+            problems.is_empty(),
+            "{what}: route receipt problems {problems:?}\n{receipt:?}"
+        );
     };
 
     let cold_a = run(&mut bundle, &mut gpu, &logits, &a, 0);
@@ -1375,11 +1378,18 @@ fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
     check_route(&bundle, b.len(), "cold B");
     for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
         let reused = bundle.session_plan(tokens, SessionRoute::Ar);
-        assert_eq!(reused, links * chunk, "plan must offer {name}'s {links}-chunk snapshot");
+        assert_eq!(
+            reused,
+            links * chunk,
+            "plan must offer {name}'s {links}-chunk snapshot"
+        );
         let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
         check_route(&bundle, tokens.len() - reused, &format!("restored {name}"));
         assert_same_state(&format!("S1 AR {name}"), &cold.0, &digests);
-        assert!(warm_logits == cold.1, "S1 AR {name}: restored final logits differ from cold");
+        assert!(
+            warm_logits == cold.1,
+            "S1 AR {name}: restored final logits differ from cold"
+        );
         assert_eq!(warm_ids, cold.2, "S1 AR {name}");
     }
     gpu.free_tensor(logits).expect("free logits");

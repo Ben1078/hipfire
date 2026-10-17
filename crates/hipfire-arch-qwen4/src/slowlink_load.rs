@@ -138,13 +138,9 @@ fn load_inner(
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let trunk_overlay = crate::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
         .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
-    let scratch_mode = crate::artifact::source_forward_scratch_mode(
-        gpu,
-        &hfq,
-        &receipt.config,
-        &receipt.manifest,
-    )
-    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     let unified = gpu.is_uma();
     if unified {
         hfq.drop_mmap();
@@ -170,9 +166,11 @@ fn load_inner(
     });
     let recipe = receipt.manifest.identity.recipe.clone();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    // The cached process snapshot, as the product reads developer knobs.
+    let state_quant = hipfire_config::developer_var("HIPFIRE_STATE_QUANT").unwrap_or_default();
     let state_format = crate::resolve_state_format(
         &hipfire_runtime::config::get().kv_mode,
-        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        &state_quant,
         gpu,
         &receipt.config,
     )?;
@@ -264,10 +262,7 @@ fn load_inner(
             Some(p) => p.resident_layers,
             None => {
                 // The incumbent's automatic placement at its own chunk.
-                let chunk = crate::gpu_forward::qwen4_prefill_chunk_placement_requested(
-                    &load.gpu.arch,
-                    max_seq,
-                );
+                let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, max_seq);
                 let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
                     gpu: load.gpu,
                     config: load.config,
