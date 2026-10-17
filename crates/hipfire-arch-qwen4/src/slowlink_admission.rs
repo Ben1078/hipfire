@@ -908,6 +908,138 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
     })
 }
 
+/// What a load knows once it has the manifest, the free device memory and the
+/// two reserves, all of which the incumbent placement already computes. The
+/// product loader and every example/gate build this the same way, so one
+/// admission decides for all of them.
+pub struct LoadFacts<'a> {
+    pub config: &'a Qwen4Config,
+    pub weights: &'a [hipfire_runtime::weight_manifest::WeightEntry],
+    pub bytes_of: &'a dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    /// Free device bytes the placement is sized from.
+    pub free: u64,
+    /// [`crate::expert_residency::AutoReserve::bytes`] at [`S1_TILE_ROWS`].
+    pub tile_reserve: u64,
+    /// The same at the incumbent placement chunk (sizes the logged baseline
+    /// layer count only).
+    pub incumbent_reserve: u64,
+    pub state_format: crate::Qwen4StateFormat,
+    pub native_mtp: bool,
+    pub window_rows: usize,
+}
+
+/// [`AdmissionInputs`] from [`LoadFacts`] and the measured narrow `link_gbps`:
+/// the non-expert and per-layer expert bytes from the manifest, the packed
+/// gate/up and down payload split, the exact session fixed snapshot bytes and
+/// the baseline layer count.
+pub fn load_admission_inputs(
+    facts: &LoadFacts<'_>,
+    link_gbps: f64,
+) -> Result<AdmissionInputs, SlowlinkDecline> {
+    use crate::expert_residency as residency;
+    let geometry = ModelGeometry::from_config(facts.config).map_err(SlowlinkDecline::Geometry)?;
+    let (non_expert, layer_expert_bytes) =
+        residency::resident_split(facts.weights, facts.bytes_of).map_err(SlowlinkDecline::Geometry)?;
+    let baseline_layers = residency::PlacementCharges::new(layer_expert_bytes, false)
+        .and_then(|charges| {
+            residency::auto_placement_layers(
+                facts.free,
+                non_expert,
+                layer_expert_bytes,
+                facts.config.num_hidden_layers,
+                facts.incumbent_reserve,
+                &charges,
+            )
+        })
+        .unwrap_or(0);
+    let (gate_up_layer_bytes, down_layer_bytes) =
+        residency::routed_layer_payload_split(facts.weights, facts.bytes_of)
+            .map_err(SlowlinkDecline::Geometry)?;
+    // One session fixed-state snapshot (no context rows): the exact bytes each
+    // new boundary snapshot copies, charged once.
+    let fixed_state_bytes = crate::bundle::session_snapshot_bytes(
+        facts.config,
+        facts.state_format,
+        facts.native_mtp,
+        0,
+    )
+    .ok_or_else(|| SlowlinkDecline::Geometry("session fixed snapshot bytes overflow".into()))?;
+    Ok(AdmissionInputs {
+        geometry,
+        free: facts.free,
+        non_expert,
+        layer_expert_bytes,
+        gate_up_layer_bytes,
+        down_layer_bytes,
+        trunk_layers: facts.config.num_hidden_layers,
+        base_reserve: facts.tile_reserve,
+        baseline_layers,
+        fixed_state_bytes,
+        window_rows: facts.window_rows,
+        link_gbps,
+    })
+}
+
+/// Select the S1 profile for a load, or `Ok(None)` for the incumbent. Probe-free
+/// checks run first; `link` (the host-link probe) runs only for a load that
+/// passed them, and `inputs` (the memory query and census inputs) only for a
+/// link that is narrow, so every other load does no S1 work and keeps its
+/// placement byte for byte. A forced selector fails the load only on a capacity
+/// refusal of an otherwise eligible load (exact byte deficit); every other
+/// decline is the incumbent. Run it BEFORE the placement is sized: the profile
+/// carries the charge ([`PlacementCharges::with_slowlink`]) and the resident
+/// layers the placement must keep.
+///
+/// [`PlacementCharges::with_slowlink`]: crate::expert_residency::PlacementCharges::with_slowlink
+pub fn select_profile(
+    mode: SlowlinkMode,
+    shape: &LoadShape<'_>,
+    link: impl FnOnce() -> HostLink,
+    inputs: impl FnOnce(f64) -> Result<AdmissionInputs, SlowlinkDecline>,
+) -> Result<Option<SlowlinkProfile>, String> {
+    let decline = match preflight(mode, shape) {
+        Err(decline) => decline,
+        Ok(()) => match link_verdict(link())
+            .and_then(inputs)
+            .and_then(|inputs| admit(&inputs))
+        {
+            Ok(profile) => {
+                eprintln!("  qwen4 {}", profile.describe());
+                return Ok(Some(profile));
+            }
+            Err(decline) => decline,
+        },
+    };
+    if mode == SlowlinkMode::Force && decline.is_capacity() {
+        return Err(format!(
+            "qwen4: {SLOWLINK_PREFILL_ENV}=1 cannot be admitted: {decline}"
+        ));
+    }
+    if decline != SlowlinkDecline::AutoNotQualified {
+        eprintln!(
+            "  qwen4 slow-link prefill (S1): not selected ({decline}); incumbent placement unchanged"
+        );
+    }
+    Ok(None)
+}
+
+/// [`select_profile`] with [`load_admission_inputs`]: the one call the product
+/// loader and the examples/gates make. `facts` runs only for a narrow link (it
+/// queries free memory and builds the reserves), `link` only after the
+/// probe-free checks passed. Returns the profile (with its resident layer
+/// count) before any placement is sized.
+pub fn select_load_profile<'a>(
+    mode: SlowlinkMode,
+    shape: &LoadShape<'_>,
+    link: impl FnOnce() -> HostLink,
+    facts: impl FnOnce() -> Result<LoadFacts<'a>, String>,
+) -> Result<Option<SlowlinkProfile>, String> {
+    select_profile(mode, shape, link, |link_gbps| {
+        let facts = facts().map_err(SlowlinkDecline::Geometry)?;
+        load_admission_inputs(&facts, link_gbps)
+    })
+}
+
 /// How a request's prefill output is captured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureKind {
@@ -1536,5 +1668,58 @@ mod tests {
             "census and allocation read one layout"
         );
         assert_eq!(profile.census.a4_sidecars, layout.a4_sidecar_bytes() as u64);
+    }
+
+    #[test]
+    fn slowlink_admission_shared_helper_builds_nothing_for_a_load_that_cannot_select() {
+        use std::cell::Cell;
+        let facts_built = Cell::new(false);
+        let facts = || -> Result<LoadFacts<'static>, String> {
+            facts_built.set(true);
+            Err("facts must not be built".to_string())
+        };
+        // Killed, unqualified-auto and ineligible loads: no probe, no facts.
+        for (mode, load) in [
+            (SlowlinkMode::Off, shape()),
+            (SlowlinkMode::Auto, shape()),
+            (SlowlinkMode::Force, LoadShape { arch: "gfx1201", ..shape() }),
+            (SlowlinkMode::Force, LoadShape { explicit_vram_layers: true, ..shape() }),
+        ] {
+            let outcome = select_load_profile(mode, &load, || unreachable!("probed"), facts);
+            assert_eq!(outcome, Ok(None));
+            assert!(!facts_built.get());
+        }
+        // A measured fast link probes once and still builds no facts.
+        for link in [
+            HostLink::Discrete { gbps: 16.0 },
+            HostLink::Discrete { gbps: 26.0 },
+            HostLink::Unified,
+            HostLink::Unmeasured,
+        ] {
+            let probes = Cell::new(0);
+            let outcome = select_load_profile(
+                SlowlinkMode::Force,
+                &shape(),
+                || {
+                    probes.set(probes.get() + 1);
+                    link
+                },
+                facts,
+            );
+            assert_eq!(outcome, Ok(None), "{link:?}");
+            assert_eq!(probes.get(), 1);
+            assert!(!facts_built.get(), "{link:?}");
+        }
+        // A narrow link asks for the facts, and a facts failure is a capacity
+        // refusal of an eligible forced load, never a silent incumbent.
+        let error = select_load_profile(
+            SlowlinkMode::Force,
+            &shape(),
+            || HostLink::Discrete { gbps: 7.09 },
+            facts,
+        )
+        .unwrap_err();
+        assert!(facts_built.get());
+        assert!(error.contains("facts must not be built"), "{error}");
     }
 }
