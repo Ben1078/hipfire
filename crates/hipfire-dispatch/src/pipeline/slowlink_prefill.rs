@@ -195,6 +195,7 @@ pub struct PromptRouteLayout {
     shared_scalar: usize,
     k1_y0: usize,
     k1_ids: usize,
+    k1_shared: usize,
     total: usize,
 }
 
@@ -246,6 +247,7 @@ impl PromptRouteLayout {
         })?;
         let k1_y0 = field(mul(mul(mul(d.k1_rows, K_TOP)?, d.hidden)?, F32_BYTES)?)?;
         let k1_ids = field(mul(mul(d.k1_rows, K_TOP)?, I32_BYTES)?)?;
+        let k1_shared = field(mul(mul(mul(d.k1_rows, 2)?, d.shared_intermediate)?, F32_BYTES)?)?;
         Ok(Self {
             dims: d,
             grouped_rows,
@@ -263,6 +265,7 @@ impl PromptRouteLayout {
             shared_scalar,
             k1_y0,
             k1_ids,
+            k1_shared,
             total: next,
         })
     }
@@ -336,9 +339,13 @@ impl PromptRouteLayout {
             self.dims.rows * F32_BYTES
         }
     }
-    /// Unweighted F32 down rows of the K1 cohort plus its masked-id scratch.
+    /// Unweighted F32 down rows of the K1 cohort, its masked-id scratch and, per K1 row, the
+    /// saved pre-activation shared gate/up (`2 * I` F32: a one-row decode tile's shared
+    /// activation is fused into its routed activation and recomputed from them).
     pub fn k1_bytes(&self) -> usize {
-        self.dims.k1_rows * K_TOP * (self.dims.hidden * F32_BYTES + I32_BYTES)
+        self.dims.k1_rows
+            * (K_TOP * (self.dims.hidden * F32_BYTES + I32_BYTES)
+                + 2 * self.dims.shared_intermediate * F32_BYTES)
     }
     /// Upper bound of the padded grouped rows of the window (`G`).
     pub fn grouped_rows_bound(&self) -> usize {
@@ -349,8 +356,9 @@ impl PromptRouteLayout {
 // ───────────────────────────── prepared tile call ─────────────────────────────
 
 /// One tile of the window: the incumbent's sealed grouped-prefill call for those rows,
-/// exactly as the incumbent builds it (rows, `route_rows`, recipe, shared bindings, scratch).
-/// S1 runs its prepare half and its shared down, never its routed tail.
+/// exactly as the incumbent builds it (rows, `route_rows`, recipe, shared bindings, scratch),
+/// or, for a one-row tile whose `route_rows` is 1 (the incumbent seals a DECODE call there),
+/// that decode call.  S1 runs its prepare half and its shared down, never its routed tail.
 pub struct PreparedChunkCall<'a> {
     call: &'a SealedMoeCall<'a>,
     rows: usize,
@@ -358,12 +366,66 @@ pub struct PreparedChunkCall<'a> {
     row0: usize,
     position: usize,
     k2: bool,
+    decode: bool,
     use_path2: bool,
     hidden: usize,
     n_exp: usize,
     mi: usize,
     down_m: usize,
     shared_intermediate: usize,
+}
+
+/// Pre-mutation admission of a one-row sealed DECODE call as a K1 tile of the window: the
+/// plain sealed expert-slab decode over a uniform MQ4 layer (GPU top-k with the fused
+/// router/shared gate-side, the K1 lane-union GEMV, the canonical top-10 combine, then the
+/// shared down after it), no EP, CPU split/splice, ninepath, deferred combine, fused
+/// down-last combine or routed-out partial.
+fn decode_admission(
+    gpu: &Gpu,
+    params: &crate::families::moe::MoeParams<'_>,
+) -> Result<(), DispatchError> {
+    use rdna_compute::slab_moe::SlabBuckets;
+    let refuse = |why: &str| {
+        Err(bail(format!(
+            "{why}; the one-row decode tile stays on the incumbent route"
+        )))
+    };
+    if !params
+        .route_policy
+        .is_some_and(|policy| policy.capability.is_slab())
+    {
+        return refuse("not the sealed expert-slab route");
+    }
+    if !super::slab_route::arch_supported(&gpu.arch) {
+        return refuse("the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only");
+    }
+    if params.batch_size != 1
+        || params.k != K_TOP
+        || params.hidden % 8 != 0
+        || params.routed_down_m != params.hidden
+        || params.routed_down_k != params.mi
+        || (gpu.arch == "gfx1100" && params.routed_down_k != 640)
+        || params.routed_down_m % 64 != 0
+        || params.routed_down_k % 128 != 0
+    {
+        return refuse("the one-row geometry is not the sealed slab geometry");
+    }
+    if !params.recipe.bf16_round_trip() || !params.recipe.shared_after_combine() {
+        return refuse("the recipe is not the BF16-row combine with the shared down after it");
+    }
+    if params.shared.is_none() || params.skip_shared || params.routed_out.is_some() {
+        return refuse("the call carries no plain shared expert");
+    }
+    let layer = super::slab_route::layer(
+        &gpu.arch,
+        params.route_policy.as_ref(),
+        &params.dtypes,
+        params.expert_dtype_tags,
+    )?;
+    match layer.buckets {
+        SlabBuckets::Uniform(bucket) if bucket != 0 => Ok(()),
+        _ => refuse("the layer is not uniform MQ4"),
+    }
 }
 
 impl<'a> PreparedChunkCall<'a> {
@@ -376,9 +438,52 @@ impl<'a> PreparedChunkCall<'a> {
         row0: usize,
         position: usize,
     ) -> Result<Self, DispatchError> {
+        if let Some(params) = call.decode_params() {
+            // `seal_moe_for_layer` seals a decode call when `route_rows == 1`.
+            decode_admission(gpu, params)?;
+            let selection = match call.kernel_selection() {
+                super::moe_program::MoeKernelSelection::Decode(selection) => selection,
+                super::moe_program::MoeKernelSelection::Prefill(_) => {
+                    return Err(bail("the call carries a prefill selection"))
+                }
+            };
+            if selection.cpu_split
+                || selection.cpu_deferred_experts
+                || selection.down_last_combine
+                || selection.ninepath_d3
+                || selection.ninepath_d4
+                || !selection.resolution.use_gpu_topk
+                || !selection
+                    .route
+                    .is_some_and(crate::families::moe::MoeRouteCapability::is_sealed_grouped)
+                || params.defer_routed_combine
+                || params.ep_row_gather.is_some()
+                || params.ep_mode != crate::families::moe::MoeEpMode::None
+            {
+                return Err(bail(
+                    "the one-row decode call is not a plain sealed grouped decode",
+                ));
+            }
+            let shared_intermediate = params.shared.as_ref().map_or(0, |s| s.intermediate);
+            return Ok(Self {
+                call,
+                rows: 1,
+                route_rows: gpu.route_rows(1),
+                row0,
+                position,
+                k2: false,
+                decode: true,
+                use_path2: false,
+                hidden: params.hidden,
+                n_exp: params.n_exp,
+                mi: params.mi,
+                down_m: params.routed_down_m,
+                shared_intermediate,
+            });
+        }
         let params = call
             .prefill_params()
-            .ok_or_else(|| bail("the call carries no prefill operands"))?;
+            .ok_or_else(|| bail("the call carries no operands"))?;
         let k2 = super::qt44_qt53_prefill::slowlink_admission(gpu, params)?;
         let selection = match call.kernel_selection() {
             super::moe_program::MoeKernelSelection::Prefill(selection) => selection,
@@ -400,6 +505,7 @@ impl<'a> PreparedChunkCall<'a> {
             row0,
             position,
             k2,
+            decode: false,
             use_path2,
             hidden: params.gate_up_k,
             n_exp: params.n_exp,
@@ -425,20 +531,35 @@ impl<'a> PreparedChunkCall<'a> {
     pub fn is_k2(&self) -> bool {
         self.k2
     }
+    /// Whether the tile is the incumbent's one-row DECODE call (a K1 tile whose prepare,
+    /// routed K1 and shared down are the decode stages).
+    pub fn is_decode(&self) -> bool {
+        self.decode
+    }
 
+    /// The prefill operands of a prefill tile.
     fn params(&self) -> &MoePrefillParams<'_> {
         self.call
             .prefill_params()
-            .expect("admitted at construction")
+            .expect("a prefill tile (admitted at construction)")
     }
 
-    /// The numerical/shape signature every tile of one window must share: hidden width,
-    /// expert count, expert intermediate width, routed down width, shared intermediate width
-    /// (0 = none) and whether the call sealed the grouped (path-2) lowering.  A window's tiles
-    /// may differ ONLY in rows, `route_rows`, position and K1-vs-K2 ([`Self::is_k2`]): a K1
-    /// short-tail tile beside K2 tiles is legal, any other difference in these six values is
-    /// refused by [`prepare_routes`] before it launches anything.  The selector compares every
-    /// distinct tile's signature before the first mutation to bypass instead.
+    /// The decode operands of a one-row decode tile.
+    fn decode_params(&self) -> &crate::families::moe::MoeParams<'_> {
+        self.call
+            .decode_params()
+            .expect("a decode tile (admitted at construction)")
+    }
+
+    /// The numerical/shape signature of a tile: hidden width, expert count, expert
+    /// intermediate width, routed down width, shared intermediate width (0 = none) and
+    /// whether the call sealed the grouped (path-2) lowering.  The FIRST FIVE must be equal
+    /// across every tile of a window.  The sixth is the K2 arm: it must be equal across the
+    /// K2 tiles only, so a K1 short-tail tile (a prefill K1 call or a one-row decode call,
+    /// each with its own original path) may differ from it.  Tiles may also differ in rows,
+    /// `route_rows` and position.  Any other difference is refused by [`prepare_routes`]
+    /// before it launches anything; the selector compares every distinct tile with
+    /// [`window_arms_compatible`] before the first mutation to bypass instead.
     pub fn arm_signature(&self) -> [usize; 6] {
         [
             self.hidden,
@@ -449,10 +570,21 @@ impl<'a> PreparedChunkCall<'a> {
             usize::from(self.use_path2),
         ]
     }
+}
 
-    fn signature(&self) -> [usize; 6] {
-        self.arm_signature()
-    }
+/// Whether the tiles of a window (in order, each `(signature, is_k2)`) are compatible: every
+/// tile has the first tile's geometry (the first five signature values) and every K2 tile
+/// the first K2 tile's arm (the sixth).  K1 tiles, prefill tails and one-row decode calls,
+/// keep their own original path.  This is exactly what [`prepare_routes`] enforces tile by
+/// tile; the selector runs it before the first mutation to bypass instead.
+pub fn window_arms_compatible(tiles: &[([usize; 6], bool)]) -> bool {
+    let Some((first, _)) = tiles.first() else {
+        return true;
+    };
+    let k2_arm = tiles.iter().find(|t| t.1).map(|t| t.0[5]);
+    tiles
+        .iter()
+        .all(|(sig, k2)| sig[..5] == first[..5] && (!*k2 || Some(sig[5]) == k2_arm))
 }
 
 // ───────────────────────────── storage ─────────────────────────────
@@ -462,6 +594,8 @@ struct TileRec {
     row0: usize,
     rows: usize,
     k1: bool,
+    /// A one-row decode tile (its K1 stack is the decode stages).
+    decode: bool,
     /// First K1 row of this tile in the K1 y0 / masked-id scratch.
     k1_row0: usize,
 }
@@ -474,7 +608,11 @@ pub struct PromptRouteStorage {
     combined: GpuTensor,
     filled: usize,
     k1_used: usize,
-    signature: Option<[usize; 6]>,
+    /// The first tile's signature and K2-ness: the geometry reference for every tile and
+    /// the K2 arm reference for the K2 tiles.
+    first_arm: Option<([usize; 6], bool)>,
+    /// The K2 arm (`use_path2`) of the first K2 tile.
+    k2_arm: Option<usize>,
     tiles: Vec<TileRec>,
     window_xq: Option<Int4MmqPrepared>,
 }
@@ -517,7 +655,8 @@ impl PromptRouteStorage {
             combined,
             filled: 0,
             k1_used: 0,
-            signature: None,
+            first_arm: None,
+            k2_arm: None,
             tiles: Vec::new(),
             window_xq: None,
         })
@@ -534,7 +673,8 @@ impl PromptRouteStorage {
     pub fn reset_for_layer(&mut self) {
         self.filled = 0;
         self.k1_used = 0;
-        self.signature = None;
+        self.first_arm = None;
+        self.k2_arm = None;
         self.tiles.clear();
         self.window_xq = None;
     }
@@ -584,8 +724,31 @@ impl PromptRouteStorage {
 
 // ───────────────────────────── prepare ─────────────────────────────
 
+/// The decode selection of a one-row decode tile.
+fn decode_selection<'c>(call: &'c PreparedChunkCall<'_>) -> &'c super::moe_program::MoeDecodeSelection {
+    match call.call.kernel_selection() {
+        super::moe_program::MoeKernelSelection::Decode(selection) => selection,
+        super::moe_program::MoeKernelSelection::Prefill(_) => {
+            unreachable!("a decode tile was admitted with a decode selection")
+        }
+    }
+}
+
+/// The activation tensor the decode K1 gate/up reads: the rotated local copy when the
+/// resolution rotates, else the normalized input.
+fn decode_activation_input<'p>(
+    params: &'p crate::families::moe::MoeParams<'_>,
+    selection: &super::moe_program::MoeDecodeSelection,
+) -> &'p GpuTensor {
+    if selection.resolution.needs_x_rot_local {
+        params.x_rot_local
+    } else {
+        params.x_norm
+    }
+}
+
 /// Run the tile's prepare stages and append its saved state to `dst` (tiles ascend and are
-/// contiguous; every tile of a window shares one signature).
+/// contiguous; every tile of a window shares the geometry, and every K2 tile its K2 arm).
 pub fn prepare_routes(
     gpu: &mut Gpu,
     call: &PreparedChunkCall<'_>,
@@ -612,17 +775,21 @@ pub fn prepare_routes(
             "the tile's geometry differs from the window's route storage",
         ));
     }
-    match dst.signature {
-        Some(sig) if sig != call.signature() => {
-            return Err(bail("a tile's numerical arm differs from the window's"))
+    let sig = call.arm_signature();
+    if let Some((first, _)) = dst.first_arm {
+        if first[..5] != sig[..5] {
+            return Err(bail("a tile's geometry differs from the window's"));
         }
-        _ => {}
+    }
+    if let (true, Some(arm)) = (call.k2, dst.k2_arm) {
+        if arm != sig[5] {
+            return Err(bail("a K2 tile's numerical arm differs from the window's K2 arm"));
+        }
     }
     let k1 = !call.k2;
     if k1 && dst.k1_used + call.rows > d.k1_rows {
         return Err(bail("the K1 short-tail cohort exceeds its reserved rows"));
     }
-    let params = *call.params();
     let slots = call.rows * K_TOP;
     // The incumbent's own prepare stages, for this tile's own call.
     execute_sealed_prepare(gpu, call.call)?;
@@ -630,60 +797,113 @@ pub fn prepare_routes(
     let copy = |gpu: &Gpu, dst_off: usize, src: &GpuTensor, bytes: usize| {
         hip(gpu.memcpy_dtod_at_ordered_async(&dst.region.buf, dst_off, &src.buf, 0, bytes))
     };
-    copy(
-        gpu,
-        layout.x_norm + call.row0 * d.hidden * F32_BYTES,
-        params.x_norm_batch,
-        call.rows * d.hidden * F32_BYTES,
-    )?;
-    copy(
-        gpu,
-        layout.topk_ids + call.row0 * K_TOP * I32_BYTES,
-        params.topk_indices,
-        slots * I32_BYTES,
-    )?;
-    copy(
-        gpu,
-        layout.topk_weights + call.row0 * K_TOP * F32_BYTES,
-        params.topk_weights,
-        slots * F32_BYTES,
-    )?;
     let route_ids = dst.ids_view(layout.route_ids, call.row0, call.rows);
-    if k1 {
-        // The K1 cohort stays out of the K2 grouping: unrouted ids for the scatter/combine.
-        hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
-    } else {
+    if call.decode {
+        let params = *call.decode_params();
+        let selection = decode_selection(call);
+        let shared = params
+            .shared
+            .as_ref()
+            .ok_or_else(|| bail("the decode tile carries no shared expert"))?;
+        let input = decode_activation_input(&params, selection);
         copy(
             gpu,
-            layout.route_ids + call.row0 * K_TOP * I32_BYTES,
+            layout.x_norm + call.row0 * d.hidden * F32_BYTES,
+            input,
+            d.hidden * F32_BYTES,
+        )?;
+        copy(
+            gpu,
+            layout.topk_ids + call.row0 * K_TOP * I32_BYTES,
             params.topk_indices,
             slots * I32_BYTES,
         )?;
-    }
-    if let Some(shared) = params.prelude.shared.as_ref() {
         copy(
             gpu,
-            layout.shared_hidden + call.row0 * d.shared_intermediate * F32_BYTES,
-            shared.rotated,
-            call.rows * d.shared_intermediate * F32_BYTES,
+            layout.topk_weights + call.row0 * K_TOP * F32_BYTES,
+            params.topk_weights,
+            slots * F32_BYTES,
+        )?;
+        // The pre-activation shared gate/up and selector the decode route stage left: the
+        // shared activation is fused into the routed activation, so it is recomputed from
+        // them when the shared down runs.
+        let shared_row = layout.k1_shared + dst.k1_used * 2 * d.shared_intermediate * F32_BYTES;
+        copy(gpu, shared_row, shared.gate_out, d.shared_intermediate * F32_BYTES)?;
+        copy(
+            gpu,
+            shared_row + d.shared_intermediate * F32_BYTES,
+            shared.up_out,
+            d.shared_intermediate * F32_BYTES,
         )?;
         copy(
             gpu,
             layout.shared_scalar + call.row0 * F32_BYTES,
             shared.scalar,
-            call.rows * F32_BYTES,
+            F32_BYTES,
         )?;
+        hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
+    } else {
+        let params = *call.params();
+        copy(
+            gpu,
+            layout.x_norm + call.row0 * d.hidden * F32_BYTES,
+            params.x_norm_batch,
+            call.rows * d.hidden * F32_BYTES,
+        )?;
+        copy(
+            gpu,
+            layout.topk_ids + call.row0 * K_TOP * I32_BYTES,
+            params.topk_indices,
+            slots * I32_BYTES,
+        )?;
+        copy(
+            gpu,
+            layout.topk_weights + call.row0 * K_TOP * F32_BYTES,
+            params.topk_weights,
+            slots * F32_BYTES,
+        )?;
+        if k1 {
+            // The K1 cohort stays out of the K2 grouping: unrouted ids for the scatter/combine.
+            hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
+        } else {
+            copy(
+                gpu,
+                layout.route_ids + call.row0 * K_TOP * I32_BYTES,
+                params.topk_indices,
+                slots * I32_BYTES,
+            )?;
+        }
+        if let Some(shared) = params.prelude.shared.as_ref() {
+            copy(
+                gpu,
+                layout.shared_hidden + call.row0 * d.shared_intermediate * F32_BYTES,
+                shared.rotated,
+                call.rows * d.shared_intermediate * F32_BYTES,
+            )?;
+            copy(
+                gpu,
+                layout.shared_scalar + call.row0 * F32_BYTES,
+                shared.scalar,
+                call.rows * F32_BYTES,
+            )?;
+        }
     }
     dst.tiles.push(TileRec {
         row0: call.row0,
         rows: call.rows,
         k1,
+        decode: call.decode,
         k1_row0: dst.k1_used,
     });
     if k1 {
         dst.k1_used += call.rows;
     }
-    dst.signature = Some(call.signature());
+    if dst.first_arm.is_none() {
+        dst.first_arm = Some((sig, call.k2));
+    }
+    if call.k2 && dst.k2_arm.is_none() {
+        dst.k2_arm = Some(sig[5]);
+    }
     dst.filled += call.rows;
     Ok(())
 }
@@ -1078,19 +1298,36 @@ impl RoutedPanelView<'_> {
     }
 }
 
-/// The BF16 panel scratches and the tile call the K1 cohort borrows its scratch from.
+/// A one-row decode tile registered with the scratch: the decode operands and selection its
+/// K1 stack and shared down run with.
+struct DecodeTile<'a> {
+    row0: usize,
+    params: crate::families::moe::MoeParams<'a>,
+    resolution: crate::families::moe::MoeResolution,
+    route: Option<crate::families::moe::MoeRouteCapability>,
+    /// The activation tensor the decode K1 gate/up reads (restored before every launch).
+    input: &'a GpuTensor,
+}
+
+/// The BF16 panel scratches and the tile calls the K1 cohort borrows its scratch from.
 pub struct PanelScratch<'a> {
     params: MoePrefillParams<'a>,
+    decode: Vec<DecodeTile<'a>>,
     limits: PanelLimits,
 }
 
 impl<'a> PanelScratch<'a> {
-    /// Borrow the y scratches of `call` (the model's global grouped scratch: any tile's call
-    /// of the layer names the same tensors).
+    /// Borrow the y scratches of `call` (the model's global grouped scratch: any PREFILL
+    /// tile's call of the layer names the same tensors).
     pub fn new(
         call: &'a PreparedChunkCall<'a>,
         limits: PanelLimits,
     ) -> Result<Self, DispatchError> {
+        if call.decode {
+            return Err(bail(
+                "the panel scratch is borrowed from a prefill tile's call, not a decode call",
+            ));
+        }
         let params = *call.params();
         let mi_bytes = mul(mul(limits.max_grouped_rows, params.mi)?, BF16_BYTES)?;
         let down_bytes = mul(mul(limits.max_grouped_rows, params.down_m)?, BF16_BYTES)?;
@@ -1104,7 +1341,33 @@ impl<'a> PanelScratch<'a> {
                 limits.max_grouped_rows
             )));
         }
-        Ok(Self { params, limits })
+        Ok(Self {
+            params,
+            decode: Vec::new(),
+            limits,
+        })
+    }
+
+    /// Register a one-row decode tile's call: its K1 stack runs with these operands against
+    /// every binding.  Call once per decode tile of the layer, before the first panel.
+    pub fn add_decode_tile(&mut self, call: &'a PreparedChunkCall<'a>) -> Result<(), DispatchError> {
+        if !call.decode {
+            return Err(bail("only a one-row decode tile registers decode operands"));
+        }
+        if self.decode.iter().any(|t| t.row0 == call.row0) {
+            return Err(bail("the decode tile is already registered"));
+        }
+        let params = *call.decode_params();
+        let selection = decode_selection(call);
+        let input = decode_activation_input(call.decode_params(), selection);
+        self.decode.push(DecodeTile {
+            row0: call.row0,
+            params,
+            resolution: selection.resolution,
+            route: selection.route,
+            input,
+        });
+        Ok(())
     }
 
     /// Bytes of both panel scratches at the hard bound.
@@ -1263,7 +1526,7 @@ pub fn execute_panel(
         range.own_hi,
     ))?;
     if range.k1 {
-        run_k1_cohort(gpu, &params, routes, &weights, range, hook)?;
+        run_k1_cohort(gpu, &params, &scratch.decode, routes, &weights, range, hook)?;
     }
     combine.panels_done += 1;
     combine.next_row_base = range.row_base + range.rows;
@@ -1275,6 +1538,7 @@ pub fn execute_panel(
 fn run_k1_cohort(
     gpu: &mut Gpu,
     params: &MoePrefillParams<'_>,
+    decode_tiles: &[DecodeTile<'_>],
     routes: &PromptRouteStorage,
     weights: &ExpertPanelBinding<'_>,
     range: &PanelRange,
@@ -1284,6 +1548,54 @@ fn run_k1_cohort(
     let d = layout.dims;
     for tile in routes.tiles.iter().filter(|t| t.k1) {
         let slots = tile.rows * K_TOP;
+        let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
+        let masked = routes.view(
+            layout.k1_ids + tile.k1_row0 * K_TOP * I32_BYTES,
+            slots * I32_BYTES,
+            DType::Raw,
+        );
+        let y0 = routes.f32_rows(layout.k1_y0, tile.k1_row0 * K_TOP, slots, d.hidden);
+        if tile.decode {
+            // The one-row decode tile: the incumbent's decode K1 stack (gate/up GEMV,
+            // activation with the down rotation, down GEMV) over the ids masked to this
+            // binding and the binding's tables, writing its slots' unweighted rows into the
+            // tile's persistent `[10, hidden]` rows.  The shared expert is not part of it
+            // (`skip_shared`): its fused activation runs once, in `finish_shared`.
+            let dt = decode_tiles
+                .iter()
+                .find(|t| t.row0 == tile.row0)
+                .ok_or_else(|| bail("a one-row decode tile was not registered with the scratch"))?;
+            scoped(gpu, hook, tile.row0, |gpu| {
+                hip(gpu.memcpy_dtod_at_ordered_async(
+                    &dt.input.buf,
+                    0,
+                    &routes.region.buf,
+                    layout.x_norm + tile.row0 * d.hidden * F32_BYTES,
+                    d.hidden * F32_BYTES,
+                ))?;
+                hip(gpu.slowlink_mask_ids(&ids, &masked, slots, range.bind_lo, range.bind_hi))?;
+                let mut view = dt.params.with_topk_indices(&masked);
+                view.expert_gate_up_ptrs = weights.gate_up_table;
+                view.expert_down_ptrs = weights.down_table;
+                view.skip_shared = true;
+                view.down_expanded = &y0;
+                super::decode_gate_up_stage(gpu, &view, dt.resolution, dt.input, false, dt.route)?;
+                super::decode_activation_stage(gpu, &view, dt.resolution, dt.route, None)?;
+                super::decode_down_stage(
+                    gpu,
+                    &view,
+                    dt.resolution,
+                    view.x_residual,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    dt.route,
+                )
+            })?;
+            continue;
+        }
         let active = slots * d.mi * F32_BYTES;
         if params.gate_batch.buf.size() < active
             || params.up_batch.buf.size() < active
@@ -1292,13 +1604,6 @@ fn run_k1_cohort(
         {
             return Err(bail("the model's scratch cannot hold a K1 short-tail tile"));
         }
-        let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
-        let masked = routes.view(
-            layout.k1_ids + tile.k1_row0 * K_TOP * I32_BYTES,
-            slots * I32_BYTES,
-            DType::Raw,
-        );
-        let y0 = routes.f32_rows(layout.k1_y0, tile.k1_row0 * K_TOP, slots, d.hidden);
         let mut view = *params;
         view.batch_size = tile.rows;
         // Under the tile's own scope (its route rows, few-row limit and arm flags): restore
@@ -1381,10 +1686,67 @@ pub fn finish_shared(
         .iter()
         .find(|t| t.row0 == call.row0 && t.rows == call.rows)
         .ok_or_else(|| bail("the tile was not prepared in this window"))?;
-    let params = call.params();
     let target = routes
         .combined
         .sub_offset(rec.row0 * d.hidden, rec.rows * d.hidden);
+    if call.decode {
+        // The one-row decode tile: its shared activation rides in the routed activation
+        // launch (and applies the selector sigmoid in place), so restore the pre-activation
+        // shared gate/up and selector and run that fused launch, then the shared down.  The
+        // routed half of the launch reads stale scratch and its output is dead: the routed
+        // K1 stack finished before.
+        let params = *call.decode_params();
+        let selection = decode_selection(call);
+        let shared = params
+            .shared
+            .as_ref()
+            .ok_or_else(|| bail("the decode tile carries no shared expert"))?;
+        let smi = d.shared_intermediate;
+        let saved = layout.k1_shared + rec.k1_row0 * 2 * smi * F32_BYTES;
+        return scoped(gpu, hook, rec.row0, |gpu| {
+            hip(gpu.memcpy_dtod_at_ordered_async(
+                &shared.gate_out.buf,
+                0,
+                &routes.region.buf,
+                saved,
+                smi * F32_BYTES,
+            ))?;
+            hip(gpu.memcpy_dtod_at_ordered_async(
+                &shared.up_out.buf,
+                0,
+                &routes.region.buf,
+                saved + smi * F32_BYTES,
+                smi * F32_BYTES,
+            ))?;
+            hip(gpu.memcpy_dtod_at_ordered_async(
+                &shared.scalar.buf,
+                0,
+                &routes.region.buf,
+                layout.shared_scalar + rec.row0 * F32_BYTES,
+                F32_BYTES,
+            ))?;
+            let gate = super::slice_moe_f32_view(shared.gate_out, 0, smi);
+            let up = super::slice_moe_f32_view(shared.up_out, 0, smi);
+            super::decode_activation_stage(
+                gpu,
+                &params,
+                selection.resolution,
+                selection.route,
+                Some((&gate, &up)),
+            )?;
+            super::decode_shared_down_stage(
+                call.call.dispatch_ctx(),
+                gpu,
+                &params,
+                &gate,
+                &up,
+                &target,
+                selection.router_shared_fuse,
+                selection.route,
+            )
+        });
+    }
+    let params = call.params();
     scoped(gpu, hook, rec.row0, |gpu| {
         if let Some(shared) = params.prelude.shared.as_ref() {
             hip(gpu.memcpy_dtod_at_ordered_async(
@@ -1676,6 +2038,7 @@ pub mod selftest {
                 row0,
                 rows,
                 k1: tile.k1,
+                decode: false,
                 k1_row0: k1_used,
             });
             if tile.k1 {
@@ -1685,7 +2048,8 @@ pub mod selftest {
         }
         routes.filled = row0;
         routes.k1_used = k1_used;
-        routes.signature = Some(call.signature());
+        routes.first_arm = Some((call.arm_signature(), call.k2));
+        routes.k2_arm = call.k2.then(|| call.arm_signature()[5]);
         if row0 != d.rows {
             return Err(bail("the synthetic tiles do not fill the window"));
         }
@@ -2507,20 +2871,66 @@ mod slowlink_panel_tests {
     }
 
     #[test]
+    fn slowlink_panel_k1_shared_region_carries_the_decode_tile_preactivation_gate_up() {
+        // 48 K1 rows * (gate + up) * I640 * 4 B = 245,760 B, charged inside total_bytes.
+        let mut d = dims(16_384);
+        d.k1_rows = 48;
+        let with = PromptRouteLayout::new(&d).unwrap();
+        d.k1_rows = 0;
+        let without = PromptRouteLayout::new(&d).unwrap();
+        assert_eq!(
+            with.k1_bytes(),
+            48 * (K_TOP * (2560 * 4 + 4) + 2 * 640 * 4),
+            "the K1 account names y0, masked ids and the shared pre-activation rows"
+        );
+        assert_eq!(without.k1_bytes(), 0);
+        assert!(with.total_bytes() >= without.total_bytes() + with.k1_bytes());
+        // A layer with no shared expert saves no shared rows.
+        let mut d = dims(1536);
+        d.shared_intermediate = 0;
+        d.k1_rows = 8;
+        assert_eq!(PromptRouteLayout::new(&d).unwrap().k1_bytes(), 8 * K_TOP * (2560 * 4 + 4));
+    }
+
+    #[test]
+    fn slowlink_panel_arm_signatures_enforce_geometry_and_the_k2_arm_only_between_k2_tiles() {
+        // (signature, is_k2) with signature = [hidden, n_exp, mi, down_m, shared_I, use_path2].
+        let k2 = ([2560, 512, 640, 2560, 640, 1], true);
+        // A K1 prefill tail and a one-row decode tile, each on its own original path.
+        let k1_tail = ([2560, 512, 640, 2560, 640, 0], false);
+        let decode = ([2560, 512, 640, 2560, 640, 0], false);
+        assert!(window_arms_compatible(&[k2, k2, k1_tail]));
+        assert!(window_arms_compatible(&[k2, k2, decode]));
+        assert!(window_arms_compatible(&[k1_tail, k2, k2, decode]), "a window may open with K1");
+        assert!(window_arms_compatible(&[decode, k1_tail]), "a K1-only window");
+        // Two K2 tiles on different K2 arms never share a window, even when a K1 tile opens it.
+        let other_arm = ([2560, 512, 640, 2560, 640, 0], true);
+        assert!(!window_arms_compatible(&[k2, other_arm]));
+        assert!(!window_arms_compatible(&[decode, k2, other_arm]));
+        // Any geometry difference refuses, K1 or not.
+        for field in 0..5 {
+            let mut bad = k1_tail;
+            bad.0[field] += 1;
+            assert!(!window_arms_compatible(&[k2, bad]), "field {field}");
+            assert!(!window_arms_compatible(&[bad, k2]), "field {field}");
+        }
+    }
+
+    #[test]
     fn slowlink_panel_charged_bytes_are_region_a4_and_full_window_scatter_scratch() {
         // The real MQ4 layer identity: H2560, mi 640, E512, shared I640, a 16384-row window
         // with up to 48 K1 rows.
         let mut d = dims(16_384);
         d.k1_rows = 48;
         let l = PromptRouteLayout::new(&d).unwrap();
-        assert_eq!(l.total_bytes(), 385_825_024);
+        assert_eq!(l.total_bytes(), 386_070_784);
         assert_eq!(l.a4_sidecar_bytes(), 82_575_360);
         assert_eq!(l.group_scatter_bytes(), 3_278_848);
         assert_eq!(
             l.group_scatter_bytes(),
             rdna_compute::scratch::qwen4_moe_group_layout(163_840, 512).bytes
         );
-        assert_eq!(l.charged_bytes(), 471_679_232);
+        assert_eq!(l.charged_bytes(), 471_924_992);
         // The 1536-row tile's scratch is a strict subset of the full-window size.
         let tile = PromptRouteLayout::new(&dims(1536)).unwrap();
         assert_eq!(tile.group_scatter_bytes(), 309_248);
