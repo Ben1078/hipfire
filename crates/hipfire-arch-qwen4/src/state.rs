@@ -3548,6 +3548,64 @@ impl Qwen4State {
         }
     }
 
+    /// The `(full, raw, pooled, selected, position)` lengths QSA slot `slot`
+    /// currently holds: the private per-layer cursor of a layer-major prompt
+    /// window (the layer's own tile wrote them), read for a cut stage.
+    pub(crate) fn qsa_cursor(&self, slot: usize) -> Option<(usize, usize, usize, usize, usize)> {
+        self.qsa
+            .get(slot)
+            .map(|q| (q.full_len, q.raw_len, q.pooled_len, q.selected_len, q.position))
+    }
+
+    /// Whether every QSA layer's private cursor reached the end of a
+    /// `rows`-row prompt window that began at the live global position, the
+    /// state the single global commit of [`Self::commit_prompt_window`]
+    /// publishes. Host only; nothing is mutated.
+    pub(crate) fn validate_prompt_window(&self, rows: usize) -> Result<(), StateError> {
+        let end = self
+            .position
+            .checked_add(rows)
+            .filter(|&end| end <= self.max_seq_len)
+            .ok_or(StateError::DimensionOverflow)?;
+        for layer in &self.qsa {
+            for (what, actual) in [
+                ("QSA full_len at prompt commit", layer.full_len),
+                ("QSA raw_len at prompt commit", layer.raw_len),
+                ("QSA position at prompt commit", layer.position),
+            ] {
+                if actual != end {
+                    return Err(StateError::Length { what, expected: end, actual });
+                }
+            }
+            if layer.pooled_len != end / self.qsa_compress {
+                return Err(StateError::Length {
+                    what: "QSA pooled_len at prompt commit",
+                    expected: end / self.qsa_compress,
+                    actual: layer.pooled_len,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The one global commit of a layer-major prompt window: the layers'
+    /// private QSA cursors already hold the window end, so only the PLE token
+    /// history, the global position and the row-capture slot move. The derived
+    /// F16 / pooled mirrors are clamped to the committed marks exactly as the
+    /// chunk-major commit does.
+    pub(crate) fn commit_prompt_window(&mut self, tokens: &[u32]) -> Result<(), StateError> {
+        self.validate_prompt_window(tokens.len())?;
+        for layer in &self.qsa {
+            layer.clamp_f16_valid();
+        }
+        for &token in tokens {
+            self.ple_history.push(token);
+        }
+        self.commit_row_capture(tokens.len());
+        self.position += tokens.len();
+        Ok(())
+    }
+
     /// Roll an armed `rows`-row verify forward back to its first `keep` rows,
     /// keeping the snapshot ticket active (the caller commits or restores
     /// it). The GDN recurrent state re-runs the kept rows' recurrence from

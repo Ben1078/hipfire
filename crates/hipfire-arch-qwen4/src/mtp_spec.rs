@@ -7848,6 +7848,101 @@ impl Qwen4MtpDrafter {
         let skip_intermediate_pick = mtp_skip_intermediate_pick_enabled();
         let chunk_rows = self.prefill_rows.max(1);
         let mut pos = start_pos;
+        // The whole remaining prompt goes through the slow-link selector
+        // BEFORE the per-chunk loop splits it: a qualified request runs its
+        // target layer-major (one expert sweep per window) and this head
+        // consumes the bounded per-tile hidden rows the final layer emits, in
+        // order: token `p` pairs with the target hidden of `p - 1` (`pending`
+        // for a tile's first row, prompt position 0 with its own), a due
+        // session cut is published once its tile is appended, and the head and
+        // `pending` are part of the transaction. The selector declining
+        // (before any mutation) leaves the incumbent loop below untouched.
+        if !ops.is_mesh()
+            && start_pos < prompt_tokens.len()
+            && Self::bundle(target)?.slowlink_capture_eligible().is_ok()
+        {
+            Self::bundle(target)?
+                .slowlink_save_pending(ops.gpu()?, pending)
+                .map_err(|error| error.to_string())?;
+            let aborted = std::cell::Cell::new(false);
+            let mut sink = |gpu: &mut Gpu,
+                            bundle: &mut Qwen4Bundle,
+                            tile: crate::slowlink_prefill::PromptTile<'_>|
+             -> Result<(), String> {
+                if abort() {
+                    aborted.set(true);
+                    return Err("Qwen4 native MTP prefill aborted".to_string());
+                }
+                let end = tile
+                    .start
+                    .checked_add(tile.rows)
+                    .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+                let chunk = prompt_tokens
+                    .get(tile.start..end)
+                    .ok_or_else(|| "Qwen4 slow-link tile is outside the prompt".to_string())?;
+                let flow = {
+                    let mut tile_ops = Qwen4Ops::Single(&mut *gpu);
+                    // The wide rows of this tile are `spec_hidden` rows
+                    // `0..rows`; the abort poll is the sink's own (a reset
+                    // inside an open transaction would orphan its tickets).
+                    mtp_append_prefill_chunk(
+                        bundle,
+                        &mut tile_ops,
+                        chunk,
+                        tile.start,
+                        0,
+                        pending,
+                        batched_scratch.as_deref_mut(),
+                        false,
+                        &|| false,
+                    )?
+                };
+                if flow.is_break() {
+                    return Err("Qwen4 native MTP tile append stopped".to_string());
+                }
+                if tile.last {
+                    // The window end: the snapshot keeps `pending` (the target
+                    // hidden of `end - 1`); the transaction's commit publishes it.
+                    if bundle.session_next_boundary() == Some(end) {
+                        bundle
+                            .session_save_boundary_hidden(gpu, pending)
+                            .map_err(|error| error.to_string())?;
+                    }
+                } else if bundle.slowlink_cut_due(end) {
+                    bundle
+                        .slowlink_publish_cut_mtp(gpu, pending)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            };
+            let outcome = Self::bundle(target)?.slowlink_try_capture(
+                ops.gpu()?,
+                &prompt_tokens[start_pos..],
+                &mut sink,
+            );
+            match outcome {
+                Ok(Some(seed)) => {
+                    first_token = Some(seed);
+                    pos = prompt_tokens.len();
+                }
+                // Declined before any mutation: the incumbent loop runs.
+                Ok(None) => {}
+                Err(error) => {
+                    if aborted.get() {
+                        Self::bundle(target)?.ops_reset(ops)?;
+                        return Ok(PrefillOutcome::Aborted);
+                    }
+                    // The transaction restored target and head to the entry
+                    // state; put the entry `pending` hidden back with them.
+                    let message = error.to_string();
+                    let restored = Self::bundle(target)?.slowlink_restore_pending(ops.gpu()?, pending);
+                    return Err(match restored {
+                        Ok(()) => message,
+                        Err(restore) => format!("{message}; pending hidden restore failed: {restore}"),
+                    });
+                }
+            }
+        }
         while pos < prompt_tokens.len() {
             if abort() {
                 Self::bundle(target)?.ops_reset(ops)?;
