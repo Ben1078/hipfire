@@ -209,7 +209,7 @@ impl PromptRouteLayout {
             return Err(bail(format!("unsupported route storage dimensions {d:?}")));
         }
         // The single count readback packs the K2 padded count (< 2^20) and the K1 slot count
-        // (< 2^10) of an expert into one word.
+        // (< 2^11, bits 20..30) of an expert into one non-negative i32 word.
         if d.rows * K_TOP + (MOE_GROUPED_BLOCK_M - 1) >= 1 << COUNT_BITS
             || d.k1_rows * K_TOP >= 1 << (31 - COUNT_BITS)
         {
@@ -3574,11 +3574,16 @@ mod slowlink_panel_tests {
         d.k1_rows = 48;
         assert!(PromptRouteLayout::new(&d).is_ok());
         assert!(PromptRouteLayout::new(&dims(104_858)).is_err());
-        // K1 slot counts per expert stay below 2^10: at most 102 K1 rows.
+        // K1 slot counts per expert fill the 11 bits above the K2 field (bits 20..30, the sign
+        // bit stays clear so the packed i32 word is never negative): below 2^11 = 2048 slots,
+        // so at most 204 K1 rows.
         let mut d = dims(16_384);
-        d.k1_rows = 102;
+        d.k1_rows = 204;
         assert!(PromptRouteLayout::new(&d).is_ok());
-        d.k1_rows = 103;
+        d.k1_rows = 205;
         assert!(PromptRouteLayout::new(&d).is_err());
+        // The worst packed word (K1 field full, K2 field full) is still a positive i32.
+        let worst = (2047i64 << COUNT_BITS) | ((1i64 << COUNT_BITS) - 1);
+        assert!(worst <= i64::from(i32::MAX));
     }
 }
