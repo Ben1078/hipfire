@@ -20,6 +20,7 @@
 //!                     --rows 1,2,...,32 --out OUT.json
 //!                     [--iters 5] [--n-ctx 8192] [--block greedy|prompt]
 //!                     [--accepts ends|all|none] [--arms base,wide16,wide32] [--trace]
+//!                     [--hot-budget-mib N] [--hotset SIDECAR]
 //!
 //! `--rows` is a comma list; `a-b` ranges are accepted (`1-32`).
 //! `--prompt-files` runs every prompt in one model load (`--prompt-file` is the
@@ -43,6 +44,12 @@
 //! Every record carries the execution mode (`replay.is_recording()`,
 //! `graphs.capture_mode`) read just before its windows.
 //!
+//! A fixed `--hot-budget-mib` uses the same frozen expert-tier partition with
+//! `HIPFIRE_OFFLOAD_EXEC=cpu` (requires D2 armed) or `pcie` (requires D2 unarmed).
+//! Both receipts expose its actual `partition_digest`; `split_digest` remains
+//! the real D2 identity, never a substitute PCIe partition identity. Missing or
+//! invalid hotsets, zero/overflowing budgets and passback fail the pinned load.
+//!
 //! Rewind: AR passes and the timed arms rewind with the model-owned snapshot
 //! ticket (`Qwen4Bundle::snapshot` / `restore`; a verify is rolled back with its
 //! own ticket). Accept arms end in a committed state with no ticket, so those
@@ -56,6 +63,7 @@
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::wide_verify_oracle as oracle;
+use hipfire_config::memory::OffloadExec;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::llama::argmax;
@@ -69,6 +77,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -211,6 +220,10 @@ fn parse_args() -> Result<Args, String> {
         println!("{USAGE}");
         std::process::exit(0);
     }
+    parse_args_from(&argv)
+}
+
+fn parse_args_from(argv: &[String]) -> Result<Args, String> {
     let mut model = None;
     let mut prompt_files: Option<Vec<PathBuf>> = None;
     let mut rows = None;
@@ -322,6 +335,124 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+/// Admission is separate from GPU setup so CPU-only tests cover both controls.
+fn admit_pinned_control(
+    exec: OffloadExec,
+    uma: bool,
+    cpu_experts_enabled: bool,
+) -> Result<(), String> {
+    if uma {
+        return Err("fixed hotset requires a discrete GPU".into());
+    }
+    match exec {
+        OffloadExec::Pcie => Ok(()),
+        OffloadExec::Cpu if cpu_experts_enabled => Ok(()),
+        OffloadExec::Cpu => Err("fixed CPU hotset requires CPU experts enabled".into()),
+        OffloadExec::Passback => {
+            Err("fixed hotset requires HIPFIRE_OFFLOAD_EXEC=cpu or pcie (not passback)".into())
+        }
+    }
+}
+
+fn admit_pinned_split(
+    exec: OffloadExec,
+    has_split_layers: bool,
+    has_split_digest: bool,
+) -> Result<(), String> {
+    match exec {
+        OffloadExec::Cpu if has_split_layers && has_split_digest => Ok(()),
+        OffloadExec::Cpu => Err("requested D2 hotset split did not arm".into()),
+        OffloadExec::Pcie if !has_split_layers && !has_split_digest => Ok(()),
+        OffloadExec::Pcie => Err("pinned PCIe control unexpectedly armed a D2 split".into()),
+        OffloadExec::Passback => Err("passback is not a pinned control".into()),
+    }
+}
+
+#[cfg(test)]
+mod pinned_control_tests {
+    use super::*;
+
+    fn cli(extra: &[&str]) -> Result<Args, String> {
+        let argv: Vec<String> = [
+            "--model", "model.hfq", "--prompt-file", "prompt.txt",
+            "--rows", "1,2,4,8", "--out", "receipt.json",
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect();
+        parse_args_from(&argv)
+    }
+
+    #[test]
+    fn pinned_cli_keeps_budget_requirements_fail_closed() {
+        assert!(cli(&[]).unwrap().hot_budget_mib.is_none());
+        assert!(cli(&["--hotset", "bound.expert-hotset"]).is_err());
+        for budget in ["0", "-1", "bad", "17592186044416", "18446744073709551616"] {
+            assert!(cli(&["--hot-budget-mib", budget]).is_err(), "{budget}");
+        }
+        assert!(cli(&["--hot-budget-mib"]).is_err());
+        let args = cli(&[
+            "--hot-budget-mib", "4096", "--hotset", "bound.expert-hotset",
+        ]).unwrap();
+        assert_eq!(args.hot_budget_mib, Some(4096));
+        assert_eq!(args.hotset.as_deref(), Some(Path::new("bound.expert-hotset")));
+    }
+
+    #[test]
+    fn pinned_controls_use_the_config_parser_and_require_real_split_status() {
+        use hipfire_config::memory::parse_offload_exec;
+
+        let pcie = parse_offload_exec(Some(" PCIE "));
+        let cpu = parse_offload_exec(Some(" CPU "));
+        assert_eq!(pcie, OffloadExec::Pcie);
+        assert_eq!(cpu, OffloadExec::Cpu);
+        assert!(admit_pinned_control(pcie, false, false).is_ok());
+        assert!(admit_pinned_control(cpu, false, true).is_ok());
+        assert!(admit_pinned_control(cpu, false, false).is_err());
+        for exec in [pcie, cpu] {
+            assert!(admit_pinned_control(exec, true, true).is_err());
+            for layers in [false, true] {
+                for digest in [false, true] {
+                    let expected = match exec {
+                        OffloadExec::Cpu => layers && digest,
+                        OffloadExec::Pcie => !layers && !digest,
+                        OffloadExec::Passback => unreachable!(),
+                    };
+                    assert_eq!(admit_pinned_split(exec, layers, digest).is_ok(), expected);
+                }
+            }
+        }
+        let passback = parse_offload_exec(Some("passback"));
+        assert!(admit_pinned_control(passback, false, true).is_err());
+        assert!(admit_pinned_split(passback, false, false).is_err());
+    }
+
+    #[test]
+    fn pinned_hotset_preflight_rejects_disabled_empty_and_missing_paths() {
+        use hipfire_arch_qwen4::expert_hotset as hotsets;
+
+        let env = hotsets::HotsetEnv {
+            gpu_arch: "gfx1201",
+            unified_memory: false,
+            expert_parallel: false,
+            explicit_vram_layers: false,
+            source: hotsets::HotsetSource::Aggregate,
+        };
+        let missing = std::env::temp_dir()
+            .join(format!("qwen4-wide-verify-{}", std::process::id()))
+            .join("missing.expert-hotset");
+        for policy in [
+            hotsets::HotsetPolicy::Off,
+            hotsets::HotsetPolicy::Explicit(PathBuf::new()),
+            hotsets::HotsetPolicy::Explicit(missing),
+        ] {
+            assert!(hotsets::preflight(&policy, Path::new("model.hfq"), &env).is_err());
+        }
+        assert!(hotsets::require_experts(0).is_err());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Product loader (qwen4_kld `Model::load`, minus the PLE hot store)
 // ---------------------------------------------------------------------------
@@ -335,6 +466,9 @@ struct LoadInfo {
     model_bytes: u64,
     uma: bool,
     expert_vram_layers: Option<usize>,
+    offload_exec: OffloadExec,
+    partition_digest: Option<String>,
+    split_armed: bool,
 }
 
 struct Model {
@@ -433,16 +567,16 @@ impl Model {
             &receipt.manifest,
         )
         .map_err(es)?;
+        let offload_exec = hipfire_config::memory::offload_exec();
         // Use the same bound sidecar, slab plan and tier owners as cpu_split_parity.
         // The fixed budget freezes one partition for all AR/verify/commit passes.
         let tier_lease = if let Some(mib) = hot_budget_mib {
             use hipfire_arch_qwen4::expert_hotset as hotsets;
-            if gpu.is_uma()
-                || !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
-                || hipfire_dispatch::cpu_exec::passback_enabled()
-            {
-                return Err("D2 hotset requires a discrete GPU and HIPFIRE_OFFLOAD_EXEC=cpu (not passback)".into());
-            }
+            admit_pinned_control(
+                offload_exec,
+                gpu.is_uma(),
+                hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled(),
+            )?;
             if hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()?.is_some() {
                 return Err("fixed hotset conflicts with HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS".into());
             }
@@ -501,6 +635,15 @@ impl Model {
         } else {
             None
         };
+        // The lease retains the actual frozen plan's logical digest in either
+        // execution mode; PCIe has no D2 split digest to use as its identity.
+        let partition_digest = tier_lease.as_ref().map(|lease| {
+            let mut hex = String::with_capacity(64);
+            for byte in lease.logical_digest() {
+                write!(&mut hex, "{byte:02x}").expect("write digest to String");
+            }
+            hex
+        });
         let uma = gpu.is_uma();
         if uma {
             hfq.drop_mmap();
@@ -600,8 +743,15 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, n_ctx, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
-        if hot_budget_mib.is_some() && (bundle.split_layers().is_empty() || bundle.split_digest().is_none()) {
-            return Err("requested D2 hotset split did not arm".into());
+        let has_split_layers = !bundle.split_layers().is_empty();
+        let has_split_digest = bundle.split_digest().is_some();
+        let split_armed = has_split_layers && has_split_digest;
+        if hot_budget_mib.is_some() {
+            admit_pinned_split(offload_exec, has_split_layers, has_split_digest)?;
+        }
+        eprintln!("qwen4_wide_verify: offload_exec={offload_exec} split_armed={split_armed}");
+        if let Some(digest) = &partition_digest {
+            eprintln!("qwen4_wide_verify: partition_digest={digest}");
         }
         eprintln!("qwen4_wide_verify: split_digest {:?}", bundle.split_digest());
         eprintln!(
@@ -620,6 +770,9 @@ impl Model {
             model_bytes,
             uma,
             expert_vram_layers,
+            offload_exec,
+            partition_digest,
+            split_armed,
         };
         Ok(Self {
             gpu,
@@ -752,6 +905,11 @@ struct Rig {
     iters: usize,
 }
 
+fn begin_arm_rewind_checks(checked: &mut BTreeSet<&'static str>) {
+    // AR was checked before the arm loop; verify rewind is specific to each arm.
+    checked.retain(|kind| *kind == "ar_ticket");
+}
+
 impl Rig {
     fn sync(&mut self) -> Result<(), String> {
         self.m.gpu.hip.device_synchronize().map_err(es)
@@ -786,7 +944,7 @@ impl Rig {
     /// and return the verify rows the arch now resolves to.
     fn begin_arm(&mut self, arm: &Arm) -> usize {
         rdna_compute::prefill_invariant::set_qwen4_wide_verify_rows_override(arm.rows);
-        self.rewind_checked.clear();
+        begin_arm_rewind_checks(&mut self.rewind_checked);
         rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&self.m.gpu.arch)
     }
 
@@ -1369,6 +1527,9 @@ fn run() -> Result<bool, String> {
         "expert_vram_layers": rig.m.info.expert_vram_layers,
         "hot_budget_mib": args.hot_budget_mib,
         "hotset": args.hotset.as_ref().map(|p| p.display().to_string()),
+        "offload_exec": rig.m.info.offload_exec.to_string(),
+        "partition_digest": rig.m.info.partition_digest,
+        "split_armed": rig.m.info.split_armed,
         "split_digest": rig.m.bundle.split_digest(),
         "model_path": model_path,
         "model_bytes": rig.m.info.model_bytes,
@@ -1605,5 +1766,20 @@ fn main() {
             eprintln!("qwen4_wide_verify: {error}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arm_rewind_checks_preserve_only_completed_reference_checks() {
+        let mut checked = BTreeSet::from(["ar_ticket", "verify_ticket"]);
+        begin_arm_rewind_checks(&mut checked);
+        assert_eq!(checked, BTreeSet::from(["ar_ticket"]));
+        let mut unchecked = BTreeSet::from(["verify_ticket"]);
+        begin_arm_rewind_checks(&mut unchecked);
+        assert!(unchecked.is_empty(), "never invent an AR rewind check");
     }
 }
