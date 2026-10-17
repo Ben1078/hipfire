@@ -2320,21 +2320,19 @@ fn load_qwen4_rank_scoped(
                 let (gate_up_layer_bytes, down_layer_bytes) =
                     residency::routed_layer_payload_split(&manifest.weights, &bytes_of)
                         .map_err(s1::SlowlinkDecline::Geometry)?;
-                let census_context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
-                    backend,
-                    ctx.max_seq,
-                    ctx.max_seq,
-                    vmm_granularity,
-                );
-                let fixed_state_bytes = residency::state_census(
+                // One session fixed-state snapshot (no context rows): the exact
+                // bytes each new boundary snapshot copies, charged once.
+                let fixed_state_bytes = hipfire_arch_qwen4::bundle::session_snapshot_bytes(
                     &config,
                     state_format,
-                    &census_context,
-                    s1::S1_TILE_ROWS,
-                    scratch_mode,
+                    placement_native_mtp,
+                    0,
                 )
-                .map_err(s1::SlowlinkDecline::Geometry)?
-                .state;
+                .ok_or_else(|| {
+                    s1::SlowlinkDecline::Geometry(
+                        "session fixed snapshot bytes overflow".to_string(),
+                    )
+                })?;
                 Ok(s1::AdmissionInputs {
                     geometry,
                     free,
@@ -7733,9 +7731,10 @@ mod qwen4_slowlink_tests {
         let arena =
             s1::PromptArenaLayout::new(&geometry, s1::S1_WINDOW_ROWS, s1::S1_TILE_ROWS).unwrap();
         pages.total_bytes().unwrap()
-            + s1::panel_scratch_bytes(&geometry).unwrap()
+            + s1::route_storage_bytes(&geometry, s1::S1_WINDOW_ROWS).unwrap()
+            + s1::a4_sidecar_bytes(&geometry, s1::S1_WINDOW_ROWS).unwrap()
             + arena.total_bytes
-            + (1 + s1::S1_MAX_BOUNDARY_SNAPSHOTS as u64) * FIXED_STATE
+            + s1::S1_MAX_BOUNDARY_SNAPSHOTS as u64 * FIXED_STATE
     }
 
     /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.
