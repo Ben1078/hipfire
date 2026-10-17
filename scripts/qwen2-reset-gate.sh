@@ -49,8 +49,10 @@ in_file="$(mktemp)"; out_file="$(mktemp)"
     printf '{"type":"load","model":"%s","params":{"max_seq":%d}}\n' "$MODEL" "$MAX_SEQ"
     pj="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$PROMPT")"
     for i in $(seq 1 "$CYCLES"); do
-        printf '{"type":"reset"}\n'
-        printf '{"type":"generate","id":"r%d","prompt":%s,"temperature":0.0,"max_tokens":%d}\n' "$i" "$pj" "$MAX_TOKENS"
+        # attempt_id is mandatory and nonzero on reset/generate (daemon
+        # require_wire_attempt_id); use a distinct id per message.
+        printf '{"type":"reset","attempt_id":%d}\n' "$((2 * i - 1))"
+        printf '{"type":"generate","id":"r%d","attempt_id":%d,"prompt":%s,"temperature":0.0,"max_tokens":%d}\n' "$i" "$((2 * i))" "$pj" "$MAX_TOKENS"
     done
     printf '{"type":"unload"}\n'
 } > "$in_file"
