@@ -44,6 +44,7 @@
 use super::*;
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
 use std::any::Any;
+use std::collections::HashMap;
 
 type R<T> = Result<T, Qwen4GpuForwardError>;
 
@@ -2105,6 +2106,385 @@ impl ExpertPanelRing {
     }
 }
 
+// ── diagnostic: payload / table identity self-test ───────────────────
+
+/// What a downloaded reader image was compared against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImageCheck {
+    pub(crate) payload_bytes: u64,
+    pub(crate) table_entries: u64,
+    pub(crate) pad_bytes: u64,
+}
+
+/// Check a page image read back from the device against the pinned host
+/// sources: `image` is the page payload `[0, used + ARENA_TAIL_PAD_BYTES)`;
+/// every group expert's gate/up and down bytes (located through its table
+/// entry, rebased onto `page_base`) must equal the source extent byte for
+/// byte, the tail pad must be zero, group entries must point inside the
+/// payload and every other table entry must be zero.
+fn verify_page_image(
+    image: &[u8],
+    used: usize,
+    page_base: usize,
+    experts: &[usize],
+    sources: &LayerExpertSources,
+    gate_up_table: &[u64],
+    down_table: &[u64],
+) -> R<ImageCheck> {
+    let layer = sources.layer();
+    let fail = |what: String| invalid(format!("panel image layer {layer}: {what}"));
+    let need = used
+        .checked_add(ARENA_TAIL_PAD_BYTES)
+        .ok_or_else(|| fail("payload length overflows".into()))?;
+    if image.len() < need {
+        return Err(fail(format!("image of {} bytes is shorter than {need}", image.len())));
+    }
+    if gate_up_table.len() != sources.num_experts() || down_table.len() != sources.num_experts() {
+        return Err(fail(format!(
+            "tables of {}/{} entries, expected {}",
+            gate_up_table.len(),
+            down_table.len(),
+            sources.num_experts()
+        )));
+    }
+    let mut check = ImageCheck::default();
+    if let Some(at) = image[used..need].iter().position(|&b| b != 0) {
+        return Err(fail(format!("tail pad byte {at} is nonzero")));
+    }
+    check.pad_bytes = ARENA_TAIL_PAD_BYTES as u64;
+    let mut in_group = vec![false; sources.num_experts()];
+    for &id in experts {
+        *in_group
+            .get_mut(id)
+            .ok_or_else(|| fail(format!("group expert {id} is outside the table")))? = true;
+    }
+    for (name, table) in [("gate_up", gate_up_table), ("down", down_table)] {
+        for (id, &entry) in table.iter().enumerate() {
+            if !in_group[id] && entry != 0 {
+                return Err(fail(format!("{name} table entry {id} is nonzero outside the group")));
+            }
+            check.table_entries += 1;
+        }
+    }
+    for &id in experts {
+        let expert = sources
+            .expert(id)
+            .ok_or_else(|| fail(format!("expert {id} is not held")))?;
+        for (name, table, extent) in [
+            ("gate_up", gate_up_table, expert.gate_up),
+            ("down", down_table, expert.down),
+        ] {
+            let offset = usize::try_from(table[id])
+                .ok()
+                .and_then(|entry| entry.checked_sub(page_base))
+                .ok_or_else(|| {
+                    fail(format!("expert {id} {name} entry {:#x} is below the page", table[id]))
+                })?;
+            let end = offset
+                .checked_add(extent.len)
+                .filter(|end| *end <= used)
+                .ok_or_else(|| {
+                    fail(format!(
+                        "expert {id} {name} entry names [{offset}, +{}) outside the {used}-byte payload",
+                        extent.len
+                    ))
+                })?;
+            // SAFETY: the extent was bounds-checked against the pinned host
+            // range of `sources`, which its owner keeps alive and unmodified.
+            let source = unsafe { std::slice::from_raw_parts(extent.addr as *const u8, extent.len) };
+            if let Some(at) = source.iter().zip(&image[offset..end]).position(|(a, b)| a != b) {
+                return Err(fail(format!(
+                    "expert {id} {name} byte {at} differs from the pinned source"
+                )));
+            }
+            check.payload_bytes += extent.len as u64;
+        }
+    }
+    Ok(check)
+}
+
+/// What [`primitive_selftest`] proved on the device.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrimitiveSelftestReport {
+    pub(crate) layers: usize,
+    pub(crate) groups_checked: u64,
+    /// Expert gate/up + down bytes compared against the pinned sources.
+    pub(crate) payload_bytes_compared: u64,
+    pub(crate) table_entries_checked: u64,
+    pub(crate) pad_bytes_checked: u64,
+    /// Page refilled at the same address while the previous epoch's (delayed)
+    /// reader was still queued, and that reader's bytes still matched.
+    pub(crate) delayed_reader_reuses: u64,
+    pub(crate) stale_ticket_rejections: u64,
+    pub(crate) distinct_addresses: usize,
+    /// Addresses that held at least two distinct epochs, each verified.
+    pub(crate) repeated_address_epochs: u64,
+    pub(crate) min_epochs_per_address: u64,
+    pub(crate) max_epochs_per_address: u64,
+    pub(crate) submitted_payload_bytes: u64,
+}
+
+fn selftest_epoch_summary(seen: &HashMap<usize, Vec<u64>>) -> PrimitiveSelftestReport {
+    PrimitiveSelftestReport {
+        distinct_addresses: seen.len(),
+        repeated_address_epochs: seen.values().filter(|e| e.len() >= 2).count() as u64,
+        min_epochs_per_address: seen.values().map(|e| e.len() as u64).min().unwrap_or(0),
+        max_epochs_per_address: seen.values().map(|e| e.len() as u64).max().unwrap_or(0),
+        ..PrimitiveSelftestReport::default()
+    }
+}
+
+const SELFTEST_DELAY_BYTES: usize = 64 << 20;
+
+struct PendingReader {
+    layer_index: usize,
+    experts: SmallVec<[usize; MAX_GROUP_EXPERTS]>,
+    used: usize,
+    base: usize,
+}
+
+/// Real-device diagnostic of the transport primitives, driven through the
+/// SAME `prime / enter_layer / require / acquire / retire / pump` path the
+/// layer-major prefill uses, on the first `layers` host layers of `schedule`
+/// (their real [`LayerExpertSources`]).
+///
+/// For every group the compute stream first runs a long delay, then a D2D
+/// reader copies the page payload, tail pad and both pointer tables into a
+/// scratch buffer; the page is retired and the schedule pumped, which refills
+/// the freed page at the same address while that reader is still queued. Only
+/// then are the streams synchronized, the scratch downloaded and compared
+/// byte for byte with the pinned host sources ([`verify_page_image`]). A
+/// transport that let the refill start before the reader finished, or whose
+/// tables/pad/payload were not ready at acquire, fails here. The fixture must
+/// hold at least two full pool sweeps (`2 * pages` groups) so every address
+/// is reused; otherwise this is an error, not a pass.
+///
+/// Ends with the ring drained; the schedule must be `prime`d again before
+/// real use. Diagnostic only: allocates one page-sized scratch and two
+/// delay buffers for its duration.
+pub(crate) fn primitive_selftest(
+    gpu: &mut Gpu,
+    ring: &mut ExpertPanelRing,
+    schedule: &mut PanelSchedule,
+    layers: usize,
+    delay_repeats: usize,
+) -> R<PrimitiveSelftestReport> {
+    let spec = *ring.spec();
+    let reserve = spec
+        .reserve()
+        .ok_or_else(|| invalid("panel selftest: pool byte size overflows"))?;
+    if layers == 0 || layers > schedule.layers.len() {
+        return Err(invalid(format!(
+            "panel selftest: {layers} layers requested of {}",
+            schedule.layers.len()
+        )));
+    }
+    let groups: usize = schedule.layers[..layers].iter().map(|l| l.groups.len()).sum();
+    if groups < 2 * reserve.pages {
+        return Err(invalid(format!(
+            "panel selftest: {groups} groups cannot reuse each of {} pages twice; need at least {} (use more layers)",
+            reserve.pages,
+            2 * reserve.pages
+        )));
+    }
+    let table_bytes = spec.num_experts * std::mem::size_of::<u64>();
+    let scratch_bytes = reserve.page_bytes + 2 * table_bytes;
+    let scratch = gpu.alloc_tensor(&[scratch_bytes], DType::Raw)?;
+    let mut delay = Vec::with_capacity(2);
+    for _ in 0..2 {
+        match gpu.alloc_tensor(&[SELFTEST_DELAY_BYTES], DType::Raw) {
+            Ok(buffer) => delay.push(buffer),
+            Err(error) => {
+                let _ = gpu.free_tensor(scratch);
+                for buffer in delay {
+                    let _ = gpu.free_tensor(buffer);
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    let result = run_selftest(
+        gpu,
+        ring,
+        schedule,
+        layers,
+        delay_repeats,
+        &scratch,
+        &delay,
+        table_bytes,
+        reserve.page_bytes,
+    );
+    // Streams must be idle before the scratch/delay buffers are freed.
+    let drained = ring.drain(&*gpu);
+    let mut freed: R<()> = Ok(());
+    for tensor in std::iter::once(scratch).chain(delay) {
+        if let Err(error) = gpu.free_tensor(tensor) {
+            freed = freed.and(Err(error.into()));
+        }
+    }
+    let report = result?;
+    drained?;
+    freed?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selftest(
+    gpu: &Gpu,
+    ring: &mut ExpertPanelRing,
+    schedule: &mut PanelSchedule,
+    layers: usize,
+    delay_repeats: usize,
+    scratch: &GpuTensor,
+    delay: &[GpuTensor],
+    table_bytes: usize,
+    page_bytes: usize,
+) -> R<PrimitiveSelftestReport> {
+    let mut report = PrimitiveSelftestReport {
+        layers,
+        ..PrimitiveSelftestReport::default()
+    };
+    let mut seen: HashMap<usize, Vec<u64>> = HashMap::new();
+    let mut image = vec![0u8; page_bytes + 2 * table_bytes];
+    let mut pending: Option<PendingReader> = None;
+
+    // Verify the reader issued for the previous group: sync, download, compare.
+    let verify = |ring: &mut ExpertPanelRing,
+                  schedule: &PanelSchedule,
+                  image: &mut Vec<u8>,
+                  report: &mut PrimitiveSelftestReport,
+                  reader: PendingReader|
+     -> R<()> {
+        ring.core.backend.drain(gpu)?;
+        gpu.hip.memcpy_dtoh(image.as_mut_slice(), &scratch.buf)?;
+        let decode = |bytes: &[u8]| -> Vec<u64> {
+            bytes
+                .chunks_exact(std::mem::size_of::<u64>())
+                .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("8-byte chunk")))
+                .collect()
+        };
+        let gate_up = decode(&image[page_bytes..page_bytes + table_bytes]);
+        let down = decode(&image[page_bytes + table_bytes..page_bytes + 2 * table_bytes]);
+        let sources = &schedule.layers[reader.layer_index].sources;
+        let check = verify_page_image(
+            &image[..page_bytes],
+            reader.used,
+            reader.base,
+            &reader.experts,
+            sources,
+            &gate_up,
+            &down,
+        )?;
+        report.groups_checked += 1;
+        report.payload_bytes_compared += check.payload_bytes;
+        report.table_entries_checked += check.table_entries;
+        report.pad_bytes_checked += check.pad_bytes;
+        Ok(())
+    };
+
+    ring.prime(gpu, schedule)?;
+    for layer_index in 0..layers {
+        let layer = schedule.layers[layer_index].sources.layer();
+        ring.enter_layer(gpu, schedule, layer)?;
+        let group_count = schedule.layers[layer_index].groups.len();
+        for group in 0..group_count {
+            let ticket = ring.require(gpu, schedule, layer, group as u32)?;
+            if let Some(reader) = pending.take() {
+                verify(ring, schedule, &mut image, &mut report, reader)?;
+            }
+            let reader = {
+                let lease = ring.acquire(gpu, ticket)?;
+                let parts = lease.parts();
+                let base = parts.payload.buf.as_ptr() as usize;
+                seen.entry(base).or_default().push(parts.epoch);
+                let compute = compute_stream(gpu)?;
+                for _ in 0..delay_repeats {
+                    gpu.hip.memcpy_dtod_async_at(
+                        &delay[1].buf,
+                        0,
+                        &delay[0].buf,
+                        0,
+                        SELFTEST_DELAY_BYTES,
+                        compute,
+                    )?;
+                    gpu.hip.memcpy_dtod_async_at(
+                        &delay[0].buf,
+                        0,
+                        &delay[1].buf,
+                        0,
+                        SELFTEST_DELAY_BYTES,
+                        compute,
+                    )?;
+                }
+                let image_bytes = parts.payload_used + ARENA_TAIL_PAD_BYTES;
+                gpu.hip.memcpy_dtod_async_at(
+                    &scratch.buf,
+                    0,
+                    &parts.payload.buf,
+                    0,
+                    image_bytes,
+                    compute,
+                )?;
+                gpu.hip.memcpy_dtod_async_at(
+                    &scratch.buf,
+                    page_bytes,
+                    &parts.gate_up_table.buf,
+                    0,
+                    table_bytes,
+                    compute,
+                )?;
+                gpu.hip.memcpy_dtod_async_at(
+                    &scratch.buf,
+                    page_bytes + table_bytes,
+                    &parts.down_table.buf,
+                    0,
+                    table_bytes,
+                    compute,
+                )?;
+                PendingReader {
+                    layer_index,
+                    experts: SmallVec::from_slice(parts.experts),
+                    used: parts.payload_used,
+                    base,
+                }
+            };
+            ring.retire(gpu, ticket)?;
+            if ring.acquire(gpu, ticket).is_ok() {
+                return Err(invalid(format!(
+                    "panel selftest: retired ticket (slot {}, epoch {}) was acquired again",
+                    ticket.slot, ticket.epoch
+                )));
+            }
+            if ring.core.is_quarantined() {
+                return Err(invalid("panel selftest: a refused stale ticket quarantined the ring"));
+            }
+            report.stale_ticket_rejections += 1;
+            // Refill the freed page while the delayed reader is still queued.
+            ring.pump(gpu, schedule)?;
+            let page = &ring.core.pages[ticket.slot];
+            if page.epoch != ticket.epoch && page.state != PageState::Free {
+                report.delayed_reader_reuses += 1;
+            }
+            pending = Some(reader);
+        }
+    }
+    if let Some(reader) = pending.take() {
+        verify(ring, schedule, &mut image, &mut report, reader)?;
+    }
+    let epochs = selftest_epoch_summary(&seen);
+    report.distinct_addresses = epochs.distinct_addresses;
+    report.repeated_address_epochs = epochs.repeated_address_epochs;
+    report.min_epochs_per_address = epochs.min_epochs_per_address;
+    report.max_epochs_per_address = epochs.max_epochs_per_address;
+    report.submitted_payload_bytes = ring.stats().submitted_payload_bytes;
+    if report.delayed_reader_reuses == 0 {
+        return Err(invalid(
+            "panel selftest: no page was refilled while a delayed reader was queued; the delayed-reader case was not exercised",
+        ));
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod slowlink_ring {
     use super::*;
@@ -2782,6 +3162,153 @@ mod slowlink_ring {
         assert_eq!(ring.backend.ops.len(), ops);
         assert!(!ring.is_quarantined());
         assert_eq!(ring.free.len(), 1, "the page stayed free");
+    }
+
+    /// A real host arena the sources point into (test memory, not a mock of
+    /// the verifier): the verifier compares against these actual bytes.
+    struct Arena {
+        bytes: Vec<u8>,
+    }
+
+    impl Arena {
+        fn new() -> Self {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let bytes = (0..EXPERTS * (GU + DN) + 4096)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 33) as u8 | 1
+                })
+                .collect();
+            Self { bytes }
+        }
+        fn sources(&self, layer: usize) -> LayerExpertSources {
+            let base = self.bytes.as_ptr() as usize;
+            let experts = (0..EXPERTS)
+                .map(|id| {
+                    let at = base + id * (GU + DN);
+                    Some(ExpertSource {
+                        codec: PanelCodec(1),
+                        gate_up: ExpertExtent { addr: at, len: GU },
+                        down: ExpertExtent { addr: at + GU, len: DN },
+                    })
+                })
+                .collect();
+            // SAFETY: `self.bytes` outlives the sources in every test below.
+            unsafe {
+                LayerExpertSources::new(layer, base, EXPERTS * (GU + DN), experts, Arc::new(0u8))
+            }
+            .unwrap()
+        }
+    }
+
+    /// The page image the copy stream would produce, plus its tables.
+    fn page_image(
+        s: &LayerExpertSources,
+        experts: &[usize],
+        base: usize,
+    ) -> (Vec<u8>, usize, Vec<u64>, Vec<u64>) {
+        let layout = plan_group_layout(experts, s).unwrap();
+        let mut image = vec![0u8; layout.used + ARENA_TAIL_PAD_BYTES];
+        for run in &layout.runs {
+            // SAFETY: the run lies inside the arena the sources were built on.
+            let src = unsafe { std::slice::from_raw_parts(run.src as *const u8, run.len) };
+            image[run.dst..run.dst + run.len].copy_from_slice(src);
+        }
+        let (mut gu, mut dn) = (vec![0u64; EXPERTS], vec![0u64; EXPERTS]);
+        fill_tables(&layout, experts, base, &mut gu, &mut dn).unwrap();
+        (image, layout.used, gu, dn)
+    }
+
+    #[test]
+    fn slowlink_ring_image_verifier_accepts_the_real_copy_and_counts_what_it_compared() {
+        let arena = Arena::new();
+        let s = arena.sources(4);
+        let experts = [3usize, 4, 9, 40];
+        let base = 0x2_0000_0000usize;
+        let (image, used, gu, dn) = page_image(&s, &experts, base);
+        let check = verify_page_image(&image, used, base, &experts, &s, &gu, &dn).unwrap();
+        assert_eq!(check.payload_bytes, (4 * (GU + DN)) as u64);
+        assert_eq!(check.table_entries, 2 * EXPERTS as u64);
+        assert_eq!(check.pad_bytes, ARENA_TAIL_PAD_BYTES as u64);
+    }
+
+    #[test]
+    fn slowlink_ring_image_verifier_rejects_every_kind_of_corruption() {
+        let arena = Arena::new();
+        let s = arena.sources(4);
+        let experts = [3usize, 4, 9];
+        let base = 0x2_0000_0000usize;
+        let (image, used, gu, dn) = page_image(&s, &experts, base);
+        let ok = |image: &[u8], gu: &[u64], dn: &[u64]| {
+            verify_page_image(image, used, base, &experts, &s, gu, dn)
+        };
+        assert!(ok(&image, &gu, &dn).is_ok());
+        // A refilled page: any payload byte differing from the pinned source.
+        let at3 = (gu[3] as usize) - base;
+        let at9 = (dn[9] as usize) - base;
+        for at in [at3, at3 + GU - 1, (dn[3] as usize) - base, at9 + DN - 1] {
+            let mut bad = image.clone();
+            bad[at] ^= 0x55;
+            assert!(ok(&bad, &gu, &dn).is_err(), "payload byte {at}");
+        }
+        // A nonzero tail pad byte.
+        let mut bad = image.clone();
+        bad[used] = 1;
+        assert!(ok(&bad, &gu, &dn).is_err());
+        let mut bad = image.clone();
+        bad[used + ARENA_TAIL_PAD_BYTES - 1] = 1;
+        assert!(ok(&bad, &gu, &dn).is_err());
+        // A short image cannot hide missing bytes.
+        assert!(ok(&image[..used], &gu, &dn).is_err());
+        // A stale table entry (previous epoch's address), a pointer outside
+        // the payload, a missing group entry and a stray non-group entry.
+        let mut bad = gu.clone();
+        bad[4] += 8;
+        assert!(ok(&image, &bad, &dn).is_err());
+        let mut bad = dn.clone();
+        bad[9] = (base + used) as u64;
+        assert!(ok(&image, &gu, &bad).is_err());
+        let mut bad = gu.clone();
+        bad[3] = 0;
+        assert!(ok(&image, &bad, &dn).is_err());
+        let mut bad = dn.clone();
+        bad[10] = base as u64;
+        assert!(ok(&image, &gu, &bad).is_err());
+        // Tables of the wrong length.
+        assert!(ok(&image, &gu[..EXPERTS - 1], &dn).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_image_verifier_distinguishes_same_address_different_epochs() {
+        // The same page address holds group A, then group B: B's image verified
+        // against A's expectations (a reader that ran after the refill) fails.
+        let arena = Arena::new();
+        let s = arena.sources(0);
+        let base = 0x2_0000_0000usize;
+        let a = [0usize, 1, 2, 3];
+        let b = [4usize, 5, 6, 7];
+        let (img_a, used_a, gu_a, dn_a) = page_image(&s, &a, base);
+        let (img_b, used_b, gu_b, dn_b) = page_image(&s, &b, base);
+        assert_eq!(used_a, used_b);
+        verify_page_image(&img_a, used_a, base, &a, &s, &gu_a, &dn_a).unwrap();
+        verify_page_image(&img_b, used_b, base, &b, &s, &gu_b, &dn_b).unwrap();
+        assert!(verify_page_image(&img_b, used_a, base, &a, &s, &gu_a, &dn_a).is_err());
+        assert!(verify_page_image(&img_a, used_a, base, &a, &s, &gu_b, &dn_b).is_err());
+    }
+
+    #[test]
+    fn slowlink_ring_selftest_report_counts_repeated_address_epochs() {
+        let mut seen: HashMap<usize, Vec<u64>> = HashMap::new();
+        for (address, epoch) in [(1usize, 1u64), (2, 2), (1, 3), (1, 5), (2, 6), (3, 7)] {
+            seen.entry(address).or_default().push(epoch);
+        }
+        let report = selftest_epoch_summary(&seen);
+        assert_eq!(report.distinct_addresses, 3);
+        assert_eq!(report.repeated_address_epochs, 2);
+        assert_eq!((report.min_epochs_per_address, report.max_epochs_per_address), (1, 3));
+        let empty = selftest_epoch_summary(&HashMap::new());
+        assert_eq!(empty.distinct_addresses, 0);
+        assert_eq!(empty.min_epochs_per_address, 0);
     }
 
     #[test]
