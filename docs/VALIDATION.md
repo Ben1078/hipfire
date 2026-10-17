@@ -343,6 +343,49 @@ Use only when the claim class below names them. They are not universal.
 | Path-specific parity / state oracle | Arch-owned example or test named by the change (when one exists) | Hidden-state, logit, KV/conv, or graph parity. If none exists for the surface → **blocked**. |
 | RADV/ACO MQ4 pilot | [`pm_aco_oracle`](../crates/rdna-compute/examples/pm_aco_oracle.rs), with the pinned offline producer under `tools/aco-export/` | Frozen artifact/config/entry-ABI identity; original Vulkan vs PM/HIP vs hipcc whole-buffer and guard equality, negative controls, eager and hipGraph replay. Native-writer relift and raw typed round-trip checks precede GPU execution. Separate matched-data timing is diagnostic only and requires a passing parity report; no product-route admission is implied. |
 
+### S1 slow-link layer-major prefill (claim-scoped)
+
+Scope: Flash-Next MQ4 packed on an exact gfx1100 behind a measured narrow
+(<16 GB/s) discrete host link, `HIPFIRE_QWEN4_SLOWLINK_PREFILL`
+(`developer.qwen4_slowlink_prefill`), **default OFF**. Nothing here is a claim
+about any other arch, codec or link: fast links, unified memory and an
+unmeasured link never select the route, and a fast-link GPU result is never
+inferred from the XTX. H0's one-layer synthetic transfer evidence (copy-bound
+at ~99.9% of 7.09 GB/s) is a ceiling, and its 1,400+ tok/s pp16384 figure is a
+projection; only the fresh full-path receipts below can support a delivered
+number. 1,400 tok/s at pp16384 is the delivery target, 2,000 a measured
+stretch; never infer either from raw bandwidth.
+
+Harness (CPU-testable parts run in `no-gpu` CI; GPU parts only inside a hipx
+fabric hold):
+
+| Piece | What it proves |
+|---|---|
+| [`qwen4_slowlink_gate`](../crates/hipfire-arch-qwen4/examples/qwen4_slowlink_gate.rs) `--model ABS --fixture ABS.json --output ABS.json --mode primitives\|state\|product\|perf --route incumbent\|layer-major --manifest ABS.json` | `primitives`: production panel transport/dispatch/ordered combine on real host-expert sources (payload and table identity, repeated epochs at the same addresses, delayed readers, within-expert panels with canaries, exact canonical combine). `state`: per-prompt route receipts (>=10 resident layers, <=38 host layers, tile <=1,536 rows, no retained 8,192-row/full-prompt scratch, ring+lookahead reserve charged, one submitted payload sweep per window, exactly one window at 16,384 rows), same-route repeat digests of every fixed state and the final logits, launch-cut and resume chronology, session restore and divergent continuation at the fixture's boundaries, the four named failure injections (restore or contain, then a clean re-run), bounded head-row scoring (never N x vocab), and eager vs retained-body replay decode after the prefill. `product`: greedy ids plus decoded text per prompt (a human reads the text; the attractor heuristic is not a quality gate). `perf`: untimed warmup, pp512/pp8192/pp16384 timing and decode, with spans, the barrier cost and the cross-layer overlap evidence. `--route` is a force inside the one production selector and safety predicate, not another implementation. A required check that did not execute makes the run `incomplete`; only `pass` exits 0. The manifest pins source base/tip, binary SHA-256, model identity, PLE source/format/sidecars, kernel code-object hashes, host/device/link and the memory ledger; the binary hash and model size are re-observed and a mismatch fails before GPU work. |
+| [`qwen4_greedy_ids`](../crates/hipfire-arch-qwen4/examples/qwen4_greedy_ids.rs) `--receipt` | Exact full-`token_ids`/finish_reason/prompt-count equality between the beta autoregressive arm and the candidate over byte-identical id fixtures (512, 1536, 1537, 8192, 16384 rows plus a `resume_at` irregular resumed prefix). The ids file is unchanged by the receipt flag; the receipts name the route each record took. |
+| [`qwen4_kld`](../crates/hipfire-arch-qwen4/examples/qwen4_kld.rs) `s11ref --decode` then `pair` | The full 24-sequence, 6,120-row code24 decode corpus against the existing fp8 `code24` reference (`code24.fp8.s11ref`, md5 `56d93a4931631e306244e95ea64aecfc`; `code24.corpus.json`, md5 `6145e25c0858e31e08527c1e5278c074`; never regenerated). `pair` aggregates KL per corpus sequence, then the paired candidate-minus-beta 95% t interval; pass when `lo <= 0`, else `hi <= +0.010`. A partition, a partial corpus or a different reference/corpus/config is refused. The decode scorer prefills the unscored prefix and records whether each prefix took S1 (`slowlink_prefix_routes`); it does not by itself prove 16K prompt scoring, and the cold-prefill all-row scorer (N x vocab logits) never exercises S1. |
+| [`qwen4_parity --mode slowlink-state`](../crates/hipfire-arch-qwen4/examples/qwen4_parity.rs) | Raw-byte SHA-256 digests of GDN/QSA/PLE state and a final-logit summary over repeated whole-prompt prefills; same-route determinism, one route per setting. |
+| [`slowlink_prefill_hw`](../crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs), the S1 test in [`session_cache_hw`](../crates/hipfire-arch-qwen4/tests/session_cache_hw.rs) | Focused hardware tests (primitives on the admitted profile, repeated epochs, injected failures, decode-after-prefill replay, session restore through the layer-major route). The un-ignored receipt/hold-guard tests are GPU-free. |
+
+Because S1's 1,536-row mixer tile differs from the incumbent's 8,192-row
+manifest, a layer-major result is never labelled bitwise-identical to the
+incumbent: exact greedy ids and the paired KLD verdict are the cross-route
+gates, and identical digests are required only between repeats of one route.
+A receipt without a cross-layer event intersection (copy of layer L+1
+overlapping compute of layer L) cannot support an overlap claim. Decode after
+the S1 prefill is proved on Qwen4's retained-body replay (the only decode body
+replay Qwen4 production has); an XTX `qwen4_g2_replay_gate` SKIP is not that
+proof.
+
+CPU commands (sequential, `ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1`):
+`cargo test -p hipfire-arch-qwen4 --features lab,reference-parity --example qwen4_slowlink_gate -- slowlink_receipt --test-threads=1`,
+`cargo test -p hipfire-arch-qwen4 --features lab --example qwen4_greedy_ids -- --test-threads=1`,
+`cargo test -p hipfire-arch-qwen4 --features lab --example qwen4_kld -- --test-threads=1` and
+`python3 scripts/check-env-docs.py`. At most three XTX holds are budgeted
+(schedule correctness, matched full-path A/B with the baseline code24 row,
+candidate code24 and regression closure); any missing cell is `incomplete`,
+not a pass, and a failed promotion leaves the route default OFF.
+
 ### Flash-Next product-default receipts (perf claims)
 
 A Flash-Next (`qwen3.8:flash-next`) perf claim MUST state the startup
