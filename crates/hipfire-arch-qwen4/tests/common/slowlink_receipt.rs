@@ -34,12 +34,14 @@ pub const TARGET_ROWS: u64 = 16_384;
 
 pub const FAILURE_POINTS: [&str; 4] = ["before_dma", "during_panel", "after_layer", "before_commit"];
 pub const REQUIRED_PROMPT_ROWS: [usize; 5] = [512, 1536, 1537, 8192, 16384];
-pub const PRIMITIVE_CASES: [&str; 5] = [
+pub const PRIMITIVE_CASES: [&str; 7] = [
     "payload_table_identity",
     "repeated_epoch_same_address",
     "delayed_reader_reuse",
     "within_expert_panel_canary",
     "canonical_combine_exact",
+    "k1_tail_cohort",
+    "zero_row_panel",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,6 +499,8 @@ pub struct Fixture {
     pub head_rows: usize,
     /// Session-cache budget of the `state` mode's bundle (bytes).
     pub session_cache_bytes: u64,
+    /// Timed prefills per prompt in `perf` mode (default 1).
+    pub perf_repeats: usize,
     pub prompts: Vec<FixturePrompt>,
     pub continuation_ids: Vec<u32>,
     pub failure_injections: Vec<String>,
@@ -554,6 +558,13 @@ impl Fixture {
             .get("session_cache_bytes")
             .map_or(Some(2u64 << 30), Value::as_u64)
             .ok_or("fixture session_cache_bytes is not an unsigned integer")?;
+        // In-process timed prefill repetitions of `perf` mode. The delivery
+        // observations are fresh processes, so the default is one.
+        let perf_repeats = value
+            .get("perf_repeats")
+            .map_or(Some(1u64), Value::as_u64)
+            .filter(|&n| n >= 1)
+            .ok_or("fixture perf_repeats is not a positive integer")? as usize;
         let expert_vram_layers = match value.get("expert_vram_layers") {
             None | Some(Value::Null) => None,
             Some(v) => Some(
@@ -656,6 +667,7 @@ impl Fixture {
             repeats,
             head_rows,
             session_cache_bytes,
+            perf_repeats,
             prompts,
             continuation_ids,
             failure_injections,
