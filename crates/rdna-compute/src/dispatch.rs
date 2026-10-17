@@ -5581,13 +5581,6 @@ impl Gpu {
         self.host_mapped.len()
     }
 
-    /// Host-mapped allocations whose last-holder ownership was shared with an S1 lease and
-    /// that this `Gpu` still records (zero outside S1).
-    pub fn leased_host_count(&self) -> usize {
-        // bind_thread: skip — pure length read, touches no device state.
-        self.host_leases.len()
-    }
-
     /// Share the physical ownership of a host-mapped OWNER tensor (the tensor returned by
     /// the host-mapped allocation, not a view of it) with the caller: the returned lease keeps
     /// the `hipHostMalloc` allocation alive until it and every clone are dropped, even after
@@ -8505,6 +8498,7 @@ impl<O> HostLeaseTable<O> {
         Self { map: HashMap::new() }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }

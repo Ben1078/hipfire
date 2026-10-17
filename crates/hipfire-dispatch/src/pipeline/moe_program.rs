@@ -2203,8 +2203,14 @@ pub(super) const PREPARE_STAGES: [MoeStage; 6] = [
 /// window) through the shared Step interpreter.  Refuses, before any launch,
 /// every call whose lowering is not exactly the plain grouped tail followed by a
 /// shared down after the combine.
-pub(super) fn execute_prepare(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), DispatchError> {
+pub(super) fn execute_prepare(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+) -> Result<(), DispatchError> {
     let state = MoeStepState::new(call);
+    if call.protocol() == MoeProtocol::IndexedDecode {
+        return execute_prepare_decode(gpu, call, &state);
+    }
     let (params, selection) = state.prefill_parts()?;
     if !selection
         .route
@@ -2222,11 +2228,58 @@ pub(super) fn execute_prepare(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result
     }
     let mut steps: SmallVec<[Step<'_>; INLINE_STEP_CAPACITY]> = SmallVec::new();
     for stage in PREPARE_STAGES {
-        append_step(
-            &mut steps,
-            Step::MoeStage(SealedMoeOp::new(&state), stage),
-        )?;
+        append_step(&mut steps, Step::MoeStage(SealedMoeOp::new(&state), stage))?;
     }
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+}
+
+/// The decode (one-row, `route_rows == 1`) twin of [`execute_prepare`]: the incumbent's
+/// own decode prelude up to and including the route (normalize, the optional input basis,
+/// the fused router/shared gate-side stage, the GPU top-k), and nothing of its routed tail
+/// or shared down.  The routed tail of a one-row tile is the K1 cohort of `slowlink_prefill`.
+fn execute_prepare_decode<'a>(
+    gpu: &mut Gpu,
+    call: &'a SealedMoeCall<'a>,
+    state: &'a MoeStepState<'a>,
+) -> Result<(), DispatchError> {
+    let (params, selection) = state.decode_parts()?;
+    let adopted = matches!(
+        call.router_input(),
+        MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK
+    );
+    if !selection
+        .route
+        .is_some_and(MoeRouteCapability::is_sealed_grouped)
+        || !matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
+        || !params.recipe.shared_after_combine()
+        || !selection.resolution.use_gpu_topk
+        || adopted
+        || selection.cpu_split
+        || selection.cpu_deferred_experts
+        || selection.down_last_combine
+        || selection.ninepath_d3
+        || selection.ninepath_d4
+        || params.ep_row_gather.is_some()
+        || params.ep_mode != crate::families::moe::MoeEpMode::None
+        || params.routed_out.is_some()
+        || params.defer_routed_combine
+        || params.skip_shared
+        || params.shared.is_none()
+        || params.batch_size != 1
+        || params.k != 10
+    {
+        return Err(DispatchError::Hip(
+            "slowlink prepare: the one-row call is not a plain sealed grouped decode with the shared down after the combine".into(),
+        ));
+    }
+    let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
+    let mut steps: SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]> = SmallVec::new();
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+    if selection.resolution.needs_x_rot_local {
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+    }
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateSide))?;
+    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
 }
 
