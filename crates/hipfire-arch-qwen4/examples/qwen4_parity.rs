@@ -4121,6 +4121,11 @@ enum ParityMode {
         fixture: PathBuf,
         output: PathBuf,
     },
+    SlowlinkState {
+        model: PathBuf,
+        fixture: PathBuf,
+        output: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<ParityMode, String> {
@@ -4186,8 +4191,26 @@ fn parse_args() -> Result<ParityMode, String> {
         (Some("cache-quality"), _, _, _) => fail(
             "--mode cache-quality needs --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON (and no --fixtures)",
         ),
+        (Some("slowlink-state"), None, Some(model), Some(fixture)) => {
+            for (flag, path) in [("--model", &model), ("--tokens", &fixture), ("--out", &output)] {
+                if !path.is_absolute() {
+                    return fail(format!(
+                        "--mode slowlink-state needs absolute paths: {flag} {} is relative",
+                        path.display()
+                    ));
+                }
+            }
+            Ok(ParityMode::SlowlinkState {
+                model,
+                fixture,
+                output,
+            })
+        }
+        (Some("slowlink-state"), _, _, _) => fail(
+            "--mode slowlink-state needs --model ABS --tokens ABS_PROMPT_JSON --out ABS_REPORT_JSON (and no --fixtures)",
+        ),
         (Some(other), _, _, _) => fail(format!(
-            "unsupported --mode {other:?}; only --mode state, --mode profile and --mode cache-quality are available"
+            "unsupported --mode {other:?}; only --mode state, --mode profile, --mode cache-quality and --mode slowlink-state are available"
         )),
         _ => fail(
             "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, --mode state --model FILE --tokens CORPUS, --mode profile --model FILE --tokens CORPUS, or --mode cache-quality --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON",
@@ -4325,6 +4348,11 @@ fn run() -> Result<(), String> {
             println!("qwen4 bounded profile written: {}", output.display());
             Ok(())
         }
+        ParityMode::SlowlinkState {
+            model,
+            fixture,
+            output,
+        } => run_slowlink_state(&model, &fixture, &output),
         ParityMode::CacheQuality {
             model,
             fixture,
@@ -4333,6 +4361,118 @@ fn run() -> Result<(), String> {
             hipfire_arch_qwen4::cache_quality::run_prefix_cache_quality(&model, &fixture, &output)?;
             println!("qwen4 cache quality PASS: {}", output.display());
             Ok(())
+        }
+    }
+}
+
+/// The `--mode slowlink-state` prompt file: `{"prompt_ids": [..], "max_seq":
+/// N, "repeats": R (default 3), "expert_vram_layers": N (optional)}`. The
+/// ids are used verbatim; `max_seq` must hold the whole prompt.
+#[derive(Debug, PartialEq, Eq)]
+struct SlowlinkStateFixture {
+    prompt_ids: Vec<u32>,
+    max_seq: usize,
+    repeats: usize,
+    expert_vram_layers: Option<usize>,
+}
+
+fn parse_slowlink_state_fixture(value: &Value) -> Result<SlowlinkStateFixture, String> {
+    let prompt_ids: Vec<u32> = serde_json::from_value(
+        value
+            .get("prompt_ids")
+            .cloned()
+            .ok_or("slowlink-state fixture has no prompt_ids")?,
+    )
+    .map_err(|error| format!("invalid prompt_ids: {error}"))?;
+    if prompt_ids.is_empty() {
+        return Err("slowlink-state prompt_ids is empty".to_string());
+    }
+    let unsigned = |key: &str| -> Result<Option<usize>, String> {
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .map(|n| Some(n as usize))
+                .ok_or_else(|| format!("slowlink-state {key} is not an unsigned integer")),
+        }
+    };
+    let max_seq = unsigned("max_seq")?.ok_or("slowlink-state fixture has no max_seq")?;
+    if max_seq <= prompt_ids.len() {
+        return Err(format!(
+            "slowlink-state max_seq {max_seq} does not hold {} prompt ids and a trailer",
+            prompt_ids.len()
+        ));
+    }
+    let repeats = unsigned("repeats")?.unwrap_or(3);
+    if repeats < 2 {
+        return Err("slowlink-state repeats must be at least 2 (determinism needs a repeat)".to_string());
+    }
+    Ok(SlowlinkStateFixture {
+        prompt_ids,
+        max_seq,
+        repeats,
+        expert_vram_layers: unsigned("expert_vram_layers")?,
+    })
+}
+
+fn run_slowlink_state(model: &Path, fixture: &Path, output: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(fixture)
+        .map_err(|error| format!("read {}: {error}", fixture.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("parse {}: {error}", fixture.display()))?;
+    let fixture = parse_slowlink_state_fixture(&value)?;
+    let report = hipfire_arch_qwen4::state_parity::run_slowlink_prefill_state(
+        model,
+        &fixture.prompt_ids,
+        fixture.expert_vram_layers,
+        fixture.max_seq,
+        fixture.repeats,
+    )?;
+    fs::write(
+        output,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write {}: {error}", output.display()))?;
+    if report["status"] == "pass" {
+        println!("qwen4 slowlink state PASS: {}", output.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "slowlink state repeats differ (same-route determinism); report: {}",
+            output.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod slowlink_state_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn slowlink_state_fixture_requires_ids_context_and_a_repeat() {
+        let ok = parse_slowlink_state_fixture(&json!({
+            "prompt_ids": [1, 2, 3], "max_seq": 16, "expert_vram_layers": 10
+        }))
+        .unwrap();
+        assert_eq!(
+            ok,
+            SlowlinkStateFixture {
+                prompt_ids: vec![1, 2, 3],
+                max_seq: 16,
+                repeats: 3,
+                expert_vram_layers: Some(10)
+            }
+        );
+        for bad in [
+            json!({"max_seq": 16}),
+            json!({"prompt_ids": [], "max_seq": 16}),
+            json!({"prompt_ids": [1, 2, 3]}),
+            json!({"prompt_ids": [1, 2, 3], "max_seq": 3}),
+            json!({"prompt_ids": [1, 2, 3], "max_seq": 16, "repeats": 1}),
+            json!({"prompt_ids": [1, -2], "max_seq": 16}),
+            json!({"prompt_ids": [1, 2], "max_seq": "x"}),
+        ] {
+            assert!(parse_slowlink_state_fixture(&bad).is_err(), "{bad}");
         }
     }
 }

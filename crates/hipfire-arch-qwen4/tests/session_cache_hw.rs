@@ -1306,3 +1306,74 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
     );
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
+
+#[cfg(feature = "reference-parity")]
+#[path = "common/slowlink_receipt.rs"]
+mod slowlink_receipt;
+
+/// S1 slow-link layer-major prefill: the session-cache chain and branch of
+/// `restored_prefill_matches_cold_on_flash_next`, with the routed experts of
+/// layers past `HIPFIRE_SESSION_CACHE_EXPERT_VRAM_LAYERS` (default 10)
+/// host-mapped and the route forced through the production switch
+/// (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`). Every cold and restored prefill must
+/// carry a valid S1 route receipt (a call of at most one tile may be an
+/// explicit named bypass), A is restored through its three-link chain and B
+/// through the shared root (a divergent continuation), and each restored
+/// state, final logits and greedy ids must equal the same-route cold prefill
+/// byte for byte. Needs `--features reference-parity`.
+#[cfg(feature = "reference-parity")]
+#[test]
+#[ignore = "needs a HIP GPU, a narrow-link host, HIPFIRE_SESSION_CACHE_MODEL and --features reference-parity"]
+fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
+    use hipfire_arch_qwen4::state_parity::{slowlink_load_bundle, SlowlinkLoaded};
+    use slowlink_receipt::{validate, validate_forced_short, Expect, Limits, MAX_TILE_ROWS};
+
+    require_fabric_hold();
+    match std::env::var("HIPFIRE_QWEN4_SLOWLINK_PREFILL") {
+        Ok(v) => assert_eq!(v, "1", "the layer-major restore test forces the route on"),
+        Err(_) => std::env::set_var("HIPFIRE_QWEN4_SLOWLINK_PREFILL", "1"),
+    }
+    let model = std::env::var_os(MODEL_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
+    let layers = std::env::var("HIPFIRE_SESSION_CACHE_EXPERT_VRAM_LAYERS")
+        .ok()
+        .map_or(10, |v| v.parse::<usize>().expect("expert vram layers"));
+    let mut gpu = Gpu::init().expect("GPU");
+    let SlowlinkLoaded { mut bundle, vocab, .. } =
+        slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, Some(layers), Some(u64::MAX >> 1))
+            .expect("slowlink load");
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let a = prompt(0xa, 3 * chunk + 300);
+    let mut b = a[..chunk].to_vec();
+    b.extend(prompt(0xb, chunk + 200));
+    println!("S1 layer-major restore: chunk={chunk} expert vram layers={layers}");
+
+    let check_route = |bundle: &Qwen4Bundle, rows: usize, what: &str| {
+        let receipt = bundle.slowlink_receipt();
+        let limits = Limits::default();
+        let problems = if rows as u64 > MAX_TILE_ROWS {
+            validate(receipt.as_ref(), Expect::LayerMajor, &limits)
+        } else {
+            validate_forced_short(receipt.as_ref(), &limits)
+        };
+        assert!(problems.is_empty(), "{what}: route receipt problems {problems:?}\n{receipt:?}");
+    };
+
+    let cold_a = run(&mut bundle, &mut gpu, &logits, &a, 0);
+    check_route(&bundle, a.len(), "cold A");
+    let cold_b = run(&mut bundle, &mut gpu, &logits, &b, 0);
+    check_route(&bundle, b.len(), "cold B");
+    for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
+        let reused = bundle.session_plan(tokens, SessionRoute::Ar);
+        assert_eq!(reused, links * chunk, "plan must offer {name}'s {links}-chunk snapshot");
+        let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
+        check_route(&bundle, tokens.len() - reused, &format!("restored {name}"));
+        assert_same_state(&format!("S1 AR {name}"), &cold.0, &digests);
+        assert!(warm_logits == cold.1, "S1 AR {name}: restored final logits differ from cold");
+        assert_eq!(warm_ids, cold.2, "S1 AR {name}");
+    }
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}

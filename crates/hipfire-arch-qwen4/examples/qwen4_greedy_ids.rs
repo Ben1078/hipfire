@@ -19,6 +19,16 @@
 //!   qwen4_greedy_ids --model MODEL.hfq --input PROMPTS.jsonl --output IDS.jsonl \
 //!                    --max-new-tokens N [--max-seq 8192] [--thinking on|off]
 //!
+//! S1 slow-link validation: `--receipt RECEIPTS.jsonl` writes one line per
+//! record, `{"id": .., "slowlink": [<route receipt per prefill call>]}`, from
+//! `Qwen4Bundle::slowlink_receipt`; the ids file is unchanged, so an
+//! incumbent arm and a layer-major arm (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=0|1`)
+//! still compare byte for byte, and the receipts prove which route each ran.
+//! A requested receipt that is missing fails the run. An id record may carry
+//! `"resume_at": N` (0 < N < len): the first N ids are prefilled, then the
+//! rest as a second consecutive call entering at position N (the irregular
+//! resumed-prefix fixture).
+//!
 //! `--input` (alias `--prompts`) / `--output` default to stdin / stdout (`-`
 //! selects them too).
 //!
@@ -78,7 +88,7 @@ use std::borrow::Cow;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: qwen4_greedy_ids --model MODEL.hfq --max-new-tokens N [--input|--prompts PROMPTS.jsonl|-] [--output IDS.jsonl|-] [--max-seq 8192] [--thinking on|off]\ninput line: {\"id\": ..., \"messages\": [{\"role\": \"user\", \"content\": \"...\"}], \"tools\": [..]?, \"category\": ..?} | {\"id\": ..., \"prompt_ids\": [..]}\noutput line: {\"id\": ..., \"token_ids\": [..], \"finish_reason\": \"stop\"|\"length\", \"prompt_tokens\": N}";
+const USAGE: &str = "usage: qwen4_greedy_ids --model MODEL.hfq --max-new-tokens N [--input|--prompts PROMPTS.jsonl|-] [--output IDS.jsonl|-] [--max-seq 8192] [--thinking on|off] [--receipt RECEIPTS.jsonl]\ninput line: {\"id\": ..., \"messages\": [{\"role\": \"user\", \"content\": \"...\"}], \"tools\": [..]?, \"category\": ..?} | {\"id\": ..., \"prompt_ids\": [..], \"resume_at\": N?}\noutput line: {\"id\": ..., \"token_ids\": [..], \"finish_reason\": \"stop\"|\"length\", \"prompt_tokens\": N}";
 
 const DEFAULT_MAX_SEQ: usize = 8192;
 
@@ -97,6 +107,9 @@ struct Args {
     max_new_tokens: usize,
     max_seq: usize,
     thinking: bool,
+    /// Optional JSONL of each record's S1 route receipt (`--receipt`). The
+    /// ids file is unchanged, so two arms still compare byte for byte.
+    receipt: Option<PathBuf>,
 }
 
 fn parse_stream(value: String) -> Stream {
@@ -112,6 +125,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
     let (mut model, mut max_new_tokens) = (None, None);
     let (mut input, mut output) = (Stream::Std, Stream::Std);
     let (mut max_seq, mut thinking) = (DEFAULT_MAX_SEQ, false);
+    let mut receipt = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -137,6 +151,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
                     other => return Err(format!("--thinking: {other:?} is not on or off")),
                 }
             }
+            "--receipt" => receipt = Some(PathBuf::from(value()?)),
             _ => return Err(format!("unknown argument {flag}")),
         }
     }
@@ -155,6 +170,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
         max_new_tokens,
         max_seq,
         thinking,
+        receipt,
     })
 }
 
@@ -169,6 +185,9 @@ enum Prompt {
 struct Record {
     id: Value,
     prompt: Prompt,
+    /// `prompt_ids` only: prefill the first `resume_at` ids, then the rest as
+    /// a second consecutive call (a resumed prefix).
+    resume_at: Option<usize>,
 }
 
 /// Content normalization applied to every message (`parse_generate_messages`).
@@ -187,6 +206,7 @@ fn parse_record(line: &str, line_no: usize, normalize: Normalizer) -> Result<Rec
     let tools = object.remove("tools");
     // A caller-side label.
     object.remove("category");
+    let resume_at = object.remove("resume_at");
     if let Some(key) = object.keys().next() {
         return Err(at(format!("unknown key {key:?}")));
     }
@@ -230,7 +250,30 @@ fn parse_record(line: &str, line_no: usize, normalize: Normalizer) -> Result<Rec
             Prompt::Ids(ids)
         }
     };
-    Ok(Record { id, prompt })
+    let resume_at = match resume_at {
+        None => None,
+        Some(value) => {
+            let Prompt::Ids(ids) = &prompt else {
+                return Err(at("\"resume_at\" needs \"prompt_ids\"".into()));
+            };
+            let row = value
+                .as_u64()
+                .map(|n| n as usize)
+                .ok_or_else(|| at("\"resume_at\" is not an unsigned integer".into()))?;
+            if row == 0 || row >= ids.len() {
+                return Err(at(format!(
+                    "\"resume_at\" {row} is not interior to {} prompt_ids",
+                    ids.len()
+                )));
+            }
+            Some(row)
+        }
+    };
+    Ok(Record {
+        id,
+        prompt,
+        resume_at,
+    })
 }
 
 fn read_records(input: &Stream) -> Result<Vec<Record>, String> {
@@ -271,6 +314,23 @@ fn output_line(id: &Value, token_ids: &[u32], finish_reason: &str, prompt_tokens
         "prompt_tokens": prompt_tokens,
     })
     .to_string()
+}
+
+/// One receipt line: the record id and the route receipt of each prefill
+/// call. A missing receipt (no verdict from the selector) is an error.
+fn receipt_line(id: &Value, route: &[Option<Value>]) -> Result<String, String> {
+    if route.is_empty() {
+        return Err("no slowlink receipt: the prefill made no call".into());
+    }
+    let mut receipts = Vec::with_capacity(route.len());
+    for (call, receipt) in route.iter().enumerate() {
+        receipts.push(
+            receipt
+                .clone()
+                .ok_or_else(|| format!("no slowlink receipt for prefill call {call}"))?,
+        );
+    }
+    Ok(serde_json::json!({"id": id, "slowlink": receipts}).to_string())
 }
 
 struct Model {
@@ -492,14 +552,20 @@ impl Model {
     }
 
     /// Greedy ids for `prompt` from a fresh state, why they ended (the first
-    /// terminator, included, "stop"; or `max_new` tokens, "length") and the
+    /// terminator, included, "stop"; or `max_new` tokens, "length"), the
     /// prefill wall seconds (`prefill_final` through the prompt-logits
-    /// download, which synchronizes the device).
+    /// download, which synchronizes the device) and the S1 route receipt of
+    /// each prefill call (one for a whole prompt, two for a `resume_at`
+    /// prompt). `resume_at = Some(n)` prefills the first `n` ids and then
+    /// the rest as two consecutive `forward_chunk_final` calls (a resumed
+    /// prefix: the second call enters at position `n`).
+    #[allow(clippy::type_complexity)]
     fn generate(
         &mut self,
         prompt: &[u32],
+        resume_at: Option<usize>,
         max_new: usize,
-    ) -> Result<(Vec<u32>, &'static str, f64), String> {
+    ) -> Result<(Vec<u32>, &'static str, f64, Vec<Option<Value>>), String> {
         if prompt.is_empty() {
             return Err("prompt rendered to zero tokens".into());
         }
@@ -514,11 +580,34 @@ impl Model {
                 self.max_seq
             ));
         }
-        // `reused = 0` with no session cache attached resets every owner.
         let prefill_started = std::time::Instant::now();
-        self.bundle
-            .prefill_final(&mut self.gpu, prompt, 0, &self.prompt_logits)
-            .map_err(|e| format!("prefill: {e}"))?;
+        let mut route = Vec::new();
+        match resume_at {
+            None => {
+                // `reused = 0` with no session cache attached resets every owner.
+                self.bundle
+                    .prefill_final(&mut self.gpu, prompt, 0, &self.prompt_logits)
+                    .map_err(|e| format!("prefill: {e}"))?;
+                route.push(self.bundle.slowlink_receipt());
+            }
+            Some(at) => {
+                if at == 0 || at >= prompt.len() {
+                    return Err(format!(
+                        "resume_at {at} is not interior to {} prompt ids",
+                        prompt.len()
+                    ));
+                }
+                self.bundle
+                    .reset(&mut self.gpu)
+                    .map_err(|e| format!("reset: {e}"))?;
+                for part in [&prompt[..at], &prompt[at..]] {
+                    self.bundle
+                        .forward_chunk_final(&mut self.gpu, part, &self.prompt_logits, None)
+                        .map_err(|e| format!("resumed prefill: {e}"))?;
+                    route.push(self.bundle.slowlink_receipt());
+                }
+            }
+        }
         let row = self
             .gpu
             .download_f32(&self.prompt_logits)
@@ -538,10 +627,10 @@ impl Model {
                 .map_err(|e| format!("decode: {e}"))?;
             ids.push(token);
             if token == self.eos_token || self.tokenizer.is_terminator(token) {
-                return Ok((ids, "stop", prefill_s));
+                return Ok((ids, "stop", prefill_s, route));
             }
         }
-        Ok((ids, "length", prefill_s))
+        Ok((ids, "length", prefill_s, route))
     }
 }
 
@@ -562,6 +651,13 @@ fn run() -> Result<(), String> {
         )),
     };
     let mut model = Model::load(&args.model, args.max_seq)?;
+    let mut receipts: Option<Box<dyn Write>> = match &args.receipt {
+        Some(path) => Some(Box::new(std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .map_err(|e| format!("create {}: {e}", path.display()))?,
+        ))),
+        None => None,
+    };
     let started = std::time::Instant::now();
     let total = records.len();
     for (i, record) in records.iter().enumerate() {
@@ -569,12 +665,21 @@ fn run() -> Result<(), String> {
         let prompt = model
             .prompt_ids(&record.prompt, args.thinking)
             .map_err(|e| format!("record {label}: {e}"))?;
-        let (ids, finish, prefill_s) = model
-            .generate(&prompt, args.max_new_tokens)
+        let (ids, finish, prefill_s, route) = model
+            .generate(&prompt, record.resume_at, args.max_new_tokens)
             .map_err(|e| format!("record {label}: {e}"))?;
         writeln!(out, "{}", output_line(&record.id, &ids, finish, prompt.len()))
             .and_then(|()| out.flush())
             .map_err(|e| format!("write output: {e}"))?;
+        if let Some(sink) = receipts.as_mut() {
+            // A requested receipt that is missing is a failed run: the arms
+            // are compared by their ids, and the route each took is proof.
+            let line =
+                receipt_line(&record.id, &route).map_err(|e| format!("record {label}: {e}"))?;
+            writeln!(sink, "{line}")
+                .and_then(|()| sink.flush())
+                .map_err(|e| format!("write receipt: {e}"))?;
+        }
         eprintln!(
             "qwen4_greedy_ids: {}/{total} id {label}: prompt {} tokens, generated {}  {:.0}s  prefill {:.3}s",
             i + 1,
@@ -631,10 +736,48 @@ mod tests {
                 max_new_tokens: 64,
                 max_seq: DEFAULT_MAX_SEQ,
                 thinking: false,
+                receipt: None,
             }
         );
         assert!(parse_args(argv("--max-new-tokens 4")).is_err());
         assert!(parse_args(argv("--model m.hfq")).is_err());
+    }
+
+    #[test]
+    fn args_receipt_is_an_optional_output_path() {
+        let a = parse_args(argv(
+            "--model m.hfq --max-new-tokens 8 --receipt /tmp/slowlink-receipts.jsonl",
+        ))
+        .unwrap();
+        assert_eq!(a.receipt, Some("/tmp/slowlink-receipts.jsonl".into()));
+        assert!(parse_args(argv("--model m.hfq --max-new-tokens 8 --receipt")).is_err());
+    }
+
+    #[test]
+    fn record_resume_at_splits_an_id_prompt_at_an_interior_row() {
+        let r = record(r#"{"id": "r", "prompt_ids": [1, 2, 3, 4, 5], "resume_at": 3}"#).unwrap();
+        assert_eq!(r.resume_at, Some(3));
+        assert_eq!(record(r#"{"id": "r", "prompt_ids": [1, 2]}"#).unwrap().resume_at, None);
+        for bad in [
+            r#"{"id": 1, "prompt_ids": [1, 2, 3], "resume_at": 0}"#,
+            r#"{"id": 1, "prompt_ids": [1, 2, 3], "resume_at": 3}"#,
+            r#"{"id": 1, "prompt_ids": [1, 2, 3], "resume_at": -1}"#,
+            r#"{"id": 1, "prompt_ids": [1, 2, 3], "resume_at": "x"}"#,
+            r#"{"id": 1, "messages": [{"role":"user","content":"x"}], "resume_at": 1}"#,
+        ] {
+            assert!(record(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn receipt_line_fails_closed_without_a_route_receipt() {
+        let id = serde_json::json!("a");
+        let receipt = serde_json::json!({"route": "layer-major"});
+        let line: Value =
+            serde_json::from_str(&receipt_line(&id, &[Some(receipt.clone())]).unwrap()).unwrap();
+        assert_eq!(line, serde_json::json!({"id": "a", "slowlink": [receipt]}));
+        assert!(receipt_line(&id, &[None]).unwrap_err().contains("no slowlink receipt"));
+        assert!(receipt_line(&id, &[]).is_err());
     }
 
     #[test]

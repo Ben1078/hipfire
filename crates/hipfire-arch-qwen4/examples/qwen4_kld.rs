@@ -29,6 +29,18 @@
 //!                    [--sequence-range START:END]
 //!   qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json \
 //!                    [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2]
+//!   qwen4_kld pair --base BASE.npy --cand CAND.npy --corpus CORPUS.json --output OUT.json
+//! `pair` (S1 slow-link gate, CPU-only) reads two full-gate `s11ref --decode`
+//! outputs (each with its OUT.npy.json receipt) over the same reference and
+//! corpus: per-corpus-sequence mean KL first, then the paired
+//! candidate-minus-base 95% t interval; pass when `lo <= 0`, else
+//! `hi <= +0.010`. Every row and sequence is required; a partition, a partial
+//! corpus or a different reference/corpus/config is refused, and OUT.json is
+//! written either way. The decode `s11ref` receipt also records
+//! `slowlink_prefix_routes`: the S1 route receipt of every unscored prefix
+//! (`forward_chunk_final`), so a run states which prefixes took layer-major.
+//! The cold-prefill route scores all-row logits (N x vocab) and never
+//! exercises S1.
 //! `--product-prompt` uses the product's cold, single-user answer-mode prompt
 //! renderer (no system, tools or history). Speed receipts retain prompt ids,
 //! full generated ids (including warmup), and the product's terminator ids.
@@ -91,6 +103,10 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+// Shared S1 receipt/KLD validation (GPU-free): the paired verdict below.
+#[path = "../tests/common/slowlink_receipt.rs"]
+mod slowlink_receipt;
 
 /// Open the PLE hot-row store from `<model>.plehot` and the
 /// `<rows source>.plehotrows` pack (`plan.source_path` is the model file or
@@ -1377,6 +1393,7 @@ fn score_s11ref(
     };
     let started = Instant::now();
     let selected = &corpus.sequences[seqs.clone()];
+    let mut prefix_routes: Vec<serde_json::Value> = Vec::new();
     for s in selected {
         if decode {
             m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
@@ -1386,6 +1403,12 @@ fn score_s11ref(
                 m.bundle
                     .forward_chunk_final(&mut m.gpu, &s.tokens[..from], &row, None)
                     .map_err(|e| e.to_string())?;
+                // Whether this unscored prefix ran the S1 layer-major route.
+                prefix_routes.push(serde_json::json!({
+                    "id": s.id,
+                    "prefix_rows": from,
+                    "slowlink": m.bundle.slowlink_receipt(),
+                }));
             }
             let to = s.score_positions.last().map_or(from, |p| p + 1);
             let mut positions = s.score_positions.iter().copied().peekable();
@@ -1470,7 +1493,8 @@ fn score_s11ref(
             "rows": kls.len(), "n_ctx": n_ctx,
             "sequences": selected.len(),
             "forward_tokens": forward_tokens,
-            "route": route
+            "route": route,
+            "slowlink_prefix_routes": prefix_routes
         })
     } else {
         serde_json::json!({
@@ -1485,7 +1509,8 @@ fn score_s11ref(
             "rows": kls.len(), "n_ctx": n_ctx,
             "sequences": total_sequences,
             "forward_tokens": forward_tokens,
-            "route": route
+            "route": route,
+            "slowlink_prefix_routes": prefix_routes
         })
     };
     std::fs::write(
@@ -1649,6 +1674,140 @@ fn speed(
     Ok(())
 }
 
+/// Little-endian f64 rows of a 1-D `.npy` as `write_kl_npy` writes them.
+fn read_kl_npy(path: &Path) -> Result<Vec<f64>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" || bytes[6] != 1 {
+        return Err(format!("{}: not a version-1 .npy", path.display()));
+    }
+    let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let header = bytes
+        .get(10..10 + header_len)
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .ok_or_else(|| format!("{}: truncated .npy header", path.display()))?;
+    if !header.contains("'<f8'") || !header.contains("'fortran_order': False") {
+        return Err(format!("{}: not a C-order little-endian f8 array", path.display()));
+    }
+    let data = &bytes[10 + header_len..];
+    if data.len() % 8 != 0 {
+        return Err(format!("{}: payload is not a whole number of f64 rows", path.display()));
+    }
+    Ok(data
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+        .collect())
+}
+
+/// `pair`: the S1 paired candidate-minus-beta KLD verdict over two full-gate
+/// s11ref decode runs on the same reference and corpus. Per-sequence mean KL
+/// first (the corpus sequence is the unit, never the token), then the paired
+/// 95% t interval of candidate minus base; pass when `lo <= 0`, else
+/// `hi <= +0.010`. Every row and every corpus sequence is required: a partial
+/// corpus, a partition receipt, a different reference/corpus/config or a
+/// corpus whose SHA differs from the receipts is refused. The report is
+/// written even for a failing or refused verdict (`pass` false, `problems`).
+fn pair(base: &Path, cand: &Path, corpus_path: &Path, output: &Path) -> Result<(), String> {
+    let receipt_of = |npy: &Path| -> Result<serde_json::Value, String> {
+        let path = format!("{}.json", npy.display());
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+    };
+    let (rb, rc) = (receipt_of(base)?, receipt_of(cand)?);
+    let corpus_bytes = std::fs::read(corpus_path).map_err(|e| e.to_string())?;
+    let corpus_sha = format!("{:x}", Sha256::digest(&corpus_bytes));
+    let mut problems: Vec<String> = Vec::new();
+    for (arm, receipt) in [("base", &rb), ("cand", &rc)] {
+        for p in slowlink_receipt::kld_receipt_problems(receipt) {
+            problems.push(format!("{arm}: {p}"));
+        }
+        if receipt["corpus_sha256"].as_str() != Some(corpus_sha.as_str()) {
+            problems.push(format!("{arm}: receipt corpus_sha256 differs from the supplied corpus"));
+        }
+    }
+    problems.extend(slowlink_receipt::kld_receipts_comparable(&rb, &rc));
+    let write = |report: serde_json::Value| -> Result<(), String> {
+        std::fs::write(
+            output,
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())? + "\n",
+        )
+        .map_err(|e| format!("write {}: {e}", output.display()))
+    };
+    let fail = |problems: Vec<String>| -> Result<(), String> {
+        write(serde_json::json!({
+            "schema": "hipfire.qwen4.slowlink_kld_pair.v1", "pass": false, "problems": problems,
+            "base_receipt": rb, "cand_receipt": rc,
+        }))?;
+        Err(format!("qwen4_kld pair refused: {}", problems.join("; ")))
+    };
+    if !problems.is_empty() {
+        return fail(problems);
+    }
+    let corpus: S11Corpus = serde_json::from_slice(&corpus_bytes).map_err(|e| e.to_string())?;
+    let counts: Vec<usize> = corpus.sequences.iter().map(|s| s.score_positions.len()).collect();
+    let (base_rows, cand_rows) = (read_kl_npy(base)?, read_kl_npy(cand)?);
+    let reduce = |rows: &[f64]| slowlink_receipt::sequence_means(rows, &counts);
+    let (bm, cm) = match (reduce(&base_rows), reduce(&cand_rows)) {
+        (Ok(b), Ok(c)) => (b, c),
+        (b, c) => {
+            let mut p = Vec::new();
+            p.extend(b.err());
+            p.extend(c.err());
+            return fail(p);
+        }
+    };
+    if base_rows.len() as u64 != slowlink_receipt::KLD_ROWS || cand_rows.len() != base_rows.len() {
+        return fail(vec![format!(
+            "row vectors are {} and {} rows, {} required",
+            base_rows.len(),
+            cand_rows.len(),
+            slowlink_receipt::KLD_ROWS
+        )]);
+    }
+    if bm.len() as u64 != slowlink_receipt::KLD_SEQUENCES {
+        return fail(vec![format!(
+            "the corpus has {} sequences, {} required",
+            bm.len(),
+            slowlink_receipt::KLD_SEQUENCES
+        )]);
+    }
+    let ci = match slowlink_receipt::paired_ci(&bm, &cm) {
+        Ok(ci) => ci,
+        Err(e) => return fail(vec![e]),
+    };
+    let pass = slowlink_receipt::paired_verdict(&ci);
+    write(serde_json::json!({
+        "schema": "hipfire.qwen4.slowlink_kld_pair.v1",
+        "pass": pass, "problems": Vec::<String>::new(),
+        "rule": "per-sequence means, paired candidate-minus-base 95% t interval; pass lo<=0, else hi<=0.010",
+        "sequences": ci.n, "rows": base_rows.len(),
+        "mean_diff": ci.mean, "se": ci.se, "lo": ci.lo, "hi": ci.hi, "hi_limit": slowlink_receipt::KLD_HI_LIMIT,
+        "base_mean": bm.iter().sum::<f64>() / bm.len() as f64,
+        "cand_mean": cm.iter().sum::<f64>() / cm.len() as f64,
+        "corpus_sha256": corpus_sha,
+        "base_receipt": rb, "cand_receipt": rc,
+        "slowlink_prefix_routes": {
+            "base": rb.get("slowlink_prefix_routes").cloned().unwrap_or(serde_json::Value::Null),
+            "cand": rc.get("slowlink_prefix_routes").cloned().unwrap_or(serde_json::Value::Null),
+        },
+    }))?;
+    eprintln!(
+        "qwen4_kld pair: mean diff {:+.6}, 95% CI [{:+.6}, {:+.6}] over {} sequences -> {}",
+        ci.mean,
+        ci.lo,
+        ci.hi,
+        ci.n,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    if pass {
+        Ok(())
+    } else {
+        Err(format!(
+            "paired KLD verdict failed: lo {:+.6} > 0 and hi {:+.6} > {}",
+            ci.lo, ci.hi, slowlink_receipt::KLD_HI_LIMIT
+        ))
+    }
+}
+
 fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mode = args.next().ok_or(USAGE)?;
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
@@ -1658,6 +1817,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut pin = HotsetPin::default();
     let mut smoke_seqs: Option<usize> = None;
     let mut sequence_range: Option<std::ops::Range<usize>> = None;
+    let (mut pair_base, mut pair_cand): (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let mut prompt_file: Option<PathBuf> = None;
     let mut product_prompt = false;
     let (mut decode_tokens, mut speed_warmup, mut reps, mut max_prompt) =
@@ -1691,6 +1851,8 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             }
             "--smoke-seqs" => smoke_seqs = Some(number(value()?)?),
             "--sequence-range" => sequence_range = Some(parse_sequence_range(&value()?)?),
+            "--base" => pair_base = Some(PathBuf::from(value()?)),
+            "--cand" => pair_cand = Some(PathBuf::from(value()?)),
             "--prompt-file" => prompt_file = Some(PathBuf::from(value()?)),
             "--product-prompt" => product_prompt = true,
             "--decode-tokens" => decode_tokens = number(value()?)?,
@@ -1777,6 +1939,14 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 product_prompt,
                 &pin,
             )
+        }
+        ("pair", None, None, None, Some(output)) => {
+            // CPU-only: the paired candidate-minus-beta verdict over two
+            // full-gate s11ref decode receipts.
+            let (Some(base), Some(cand), Some(corpus)) = (pair_base, pair_cand, corpus) else {
+                return Err("pair requires --base BASE.npy --cand CAND.npy --corpus CORPUS.json --output OUT.json".into());
+            };
+            pair(&base, &cand, &corpus, &output)
         }
         ("ple-derive", Some(model), None, None, None) => {
             // CPU-only: writes `<model>.ple-q4` (row order) from the embedded
@@ -2228,6 +2398,111 @@ kl = [kld_from_block(r['ids'][i],r['logprobs'][i],r['residual'][i],candidate) fo
             "import numpy as np,sys; a=np.load(sys.argv[1]); assert a.dtype==np.float64 and a.shape==(3,); np.testing.assert_array_equal(a,[.1,.2,.3])"])
             .arg(dir.join("rows.npy")).status().unwrap();
         assert!(status.success());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod slowlink_pair_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "qwen4-kld-pair-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// A 24-sequence, 6120-row corpus (255 scored rows each) and the S11
+    /// receipt of one arm over it.
+    fn arm(dir: &Path, name: &str, corpus_sha: &str, rows: &[f64], sequences: usize) -> PathBuf {
+        let npy = dir.join(format!("{name}.npy"));
+        write_kl_npy(&npy, rows).unwrap();
+        let receipt = serde_json::json!({
+            "schema": "hipfire.qwen4.s11ref_klrows.v1", "direction": "KL(ref || hipfire)",
+            "estimator": "e", "model_sha256": "1".repeat(64), "ref_sha256": "2".repeat(64),
+            "corpus_sha256": corpus_sha, "binary_sha256": "4".repeat(64),
+            "output_sha256": "5".repeat(64), "rows": rows.len(), "n_ctx": 512,
+            "sequences": sequences, "forward_tokens": 1, "route": "decode",
+        });
+        std::fs::write(format!("{}.json", npy.display()), receipt.to_string()).unwrap();
+        npy
+    }
+
+    fn corpus(dir: &Path, sequences: usize, rows_each: usize) -> (PathBuf, String) {
+        let seqs: Vec<serde_json::Value> = (0..sequences)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("s{i}"), "tokens": vec![1u32; rows_each + 2],
+                    "score_positions": (1..=rows_each).collect::<Vec<usize>>(),
+                    "reset": true, "stratum": "x", "role_mask": null,
+                })
+            })
+            .collect();
+        let bytes = serde_json::json!({"schema": "hipfire.qwen4.kl_corpus.v1", "sequences": seqs})
+            .to_string()
+            .into_bytes();
+        let path = dir.join("corpus.json");
+        std::fs::write(&path, &bytes).unwrap();
+        (path, format!("{:x}", Sha256::digest(&bytes)))
+    }
+
+    #[test]
+    fn slowlink_pair_npy_roundtrips_what_the_scorer_writes() {
+        let dir = temp_dir("npy");
+        let rows = [0.25, -1.5, 3.0e-9];
+        write_kl_npy(&dir.join("r.npy"), &rows).unwrap();
+        assert_eq!(read_kl_npy(&dir.join("r.npy")).unwrap(), rows);
+        std::fs::write(dir.join("bad.npy"), b"not numpy").unwrap();
+        assert!(read_kl_npy(&dir.join("bad.npy")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn slowlink_pair_verdict_uses_per_sequence_means_over_the_full_corpus() {
+        let dir = temp_dir("full");
+        let (corpus_path, sha) = corpus(&dir, 24, 255);
+        let base: Vec<f64> = (0..6120).map(|i| 0.05 + 0.0001 * ((i / 255) % 5) as f64).collect();
+        let cand: Vec<f64> = base.iter().enumerate().map(|(i, v)| v + 0.0001 * ((i / 255) % 3) as f64).collect();
+        let (b, c) = (arm(&dir, "base", &sha, &base, 24), arm(&dir, "cand", &sha, &cand, 24));
+        let out = dir.join("pair.json");
+        pair(&b, &c, &corpus_path, &out).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(report["schema"], "hipfire.qwen4.slowlink_kld_pair.v1");
+        assert_eq!(report["pass"], true);
+        assert_eq!(report["sequences"], 24);
+        assert_eq!(report["rows"], 6120);
+        // A clearly worse candidate fails the verdict and the command.
+        let worse: Vec<f64> = base.iter().enumerate().map(|(i, v)| v + 0.05 + 0.0001 * ((i / 255) % 3) as f64).collect();
+        let w = arm(&dir, "worse", &sha, &worse, 24);
+        assert!(pair(&b, &w, &corpus_path, &out).is_err());
+        let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(report["pass"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn slowlink_pair_refuses_a_partial_corpus_and_a_mismatched_reference() {
+        let dir = temp_dir("partial");
+        let (corpus_path, sha) = corpus(&dir, 10, 255);
+        let rows: Vec<f64> = vec![0.05; 2550];
+        let (b, c) = (arm(&dir, "base", &sha, &rows, 10), arm(&dir, "cand", &sha, &rows, 10));
+        let out = dir.join("pair.json");
+        let error = pair(&b, &c, &corpus_path, &out).unwrap_err();
+        assert!(error.contains("partial corpus"), "{error}");
+        assert!(!std::fs::read_to_string(&out).unwrap().contains("\"pass\": true"));
+        // Full row count but another corpus SHA than the receipts name.
+        let (full_corpus, full_sha) = corpus(&dir, 24, 255);
+        let rows: Vec<f64> = vec![0.05; 6120];
+        let (b, c) = (arm(&dir, "b2", "9".repeat(64).as_str(), &rows, 24), arm(&dir, "c2", &full_sha, &rows, 24));
+        let error = pair(&b, &c, &full_corpus, &out).unwrap_err();
+        assert!(error.contains("corpus_sha256") || error.contains("not the same"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
