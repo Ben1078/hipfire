@@ -103,7 +103,12 @@ impl PanelLimits {
     /// rows `[rows, down_m]`.
     pub fn scratch_bytes(&self, mi: usize, down_m: usize) -> Result<usize, DispatchError> {
         self.validate()?;
-        mul(self.max_grouped_rows, add(mi, down_m)?.checked_mul(BF16_BYTES).ok_or_else(|| bail("extent overflows"))?)
+        mul(
+            self.max_grouped_rows,
+            add(mi, down_m)?
+                .checked_mul(BF16_BYTES)
+                .ok_or_else(|| bail("extent overflows"))?,
+        )
     }
 }
 
@@ -282,6 +287,21 @@ impl PromptRouteLayout {
         gate_up + down
     }
 
+    /// Bytes of the grouped-scatter Gpu scratch at FULL window size: exactly what
+    /// `qwen4_moe_group_layout(rows * 10, n_exp)` reserves (rank, per-chunk partial counts and
+    /// chunk prefixes).  Gpu scratch, grow-only, NOT part of [`Self::total_bytes`]; the
+    /// 1536-row tile's own scatter scratch may already be reserved (this is the full size, not
+    /// the net growth).
+    pub fn group_scatter_bytes(&self) -> usize {
+        rdna_compute::scratch::qwen4_moe_group_layout(self.dims.rows * K_TOP, self.dims.n_exp).bytes
+    }
+
+    /// Everything the window charges: the route region, the A4 sidecars and the grouped-scatter
+    /// scratch.
+    pub fn charged_bytes(&self) -> usize {
+        self.total_bytes() + self.a4_sidecar_bytes() + self.group_scatter_bytes()
+    }
+
     /// Saved prepared input, F32 `[rows, hidden]`.
     pub fn x_norm_bytes(&self) -> usize {
         self.dims.rows * self.dims.hidden * F32_BYTES
@@ -367,7 +387,9 @@ impl<'a> PreparedChunkCall<'a> {
             }
         };
         if selection.cpu_split || selection.cpu_deferred_experts {
-            return Err(bail("a CPU-split or CPU-deferred call is not a layer-major tile"));
+            return Err(bail(
+                "a CPU-split or CPU-deferred call is not a layer-major tile",
+            ));
         }
         let use_path2 = selection.uses_grouped_rows();
         let shared_intermediate = params.prelude.shared.as_ref().map_or(0, |s| s.intermediate);
@@ -466,14 +488,21 @@ impl PromptRouteStorage {
 
     /// Carve the storage from a region the caller owns (at least `layout.total_bytes()`
     /// bytes, 256-aligned base); the storage never frees it.
-    pub fn from_region(region: &GpuTensor, layout: &PromptRouteLayout) -> Result<Self, DispatchError> {
+    pub fn from_region(
+        region: &GpuTensor,
+        layout: &PromptRouteLayout,
+    ) -> Result<Self, DispatchError> {
         if region.buf.size() < layout.total_bytes() || region.buf.as_ptr() as usize % ALIGN != 0 {
             return Err(bail("the route region is too small or unaligned"));
         }
         Self::over(region.shallow_clone(), false, layout)
     }
 
-    fn over(region: GpuTensor, owned: bool, layout: &PromptRouteLayout) -> Result<Self, DispatchError> {
+    fn over(
+        region: GpuTensor,
+        owned: bool,
+        layout: &PromptRouteLayout,
+    ) -> Result<Self, DispatchError> {
         let combined = GpuTensor {
             buf: region
                 .buf
@@ -538,10 +567,18 @@ impl PromptRouteStorage {
     }
 
     fn ids_view(&self, offset: usize, row0: usize, rows: usize) -> GpuTensor {
-        self.view(offset + row0 * K_TOP * I32_BYTES, rows * K_TOP * I32_BYTES, DType::Raw)
+        self.view(
+            offset + row0 * K_TOP * I32_BYTES,
+            rows * K_TOP * I32_BYTES,
+            DType::Raw,
+        )
     }
     fn f32_rows(&self, offset: usize, row0: usize, rows: usize, width: usize) -> GpuTensor {
-        self.view(offset + row0 * width * F32_BYTES, rows * width * F32_BYTES, DType::F32)
+        self.view(
+            offset + row0 * width * F32_BYTES,
+            rows * width * F32_BYTES,
+            DType::F32,
+        )
     }
 }
 
@@ -571,7 +608,9 @@ pub fn prepare_routes(
         || call.down_m != d.hidden
         || call.shared_intermediate != d.shared_intermediate
     {
-        return Err(bail("the tile's geometry differs from the window's route storage"));
+        return Err(bail(
+            "the tile's geometry differs from the window's route storage",
+        ));
     }
     match dst.signature {
         Some(sig) if sig != call.signature() => {
@@ -706,7 +745,9 @@ impl LayerRoutePlan {
         let mut counts_padded = Vec::with_capacity(counts.len());
         for &count in counts {
             if count < 0 || count as usize % MOE_GROUPED_BLOCK_M != 0 {
-                return Err(bail(format!("the stable grouping produced a count of {count}")));
+                return Err(bail(format!(
+                    "the stable grouping produced a count of {count}"
+                )));
             }
             counts_padded.push(count as u32);
             let last = *offsets.last().unwrap();
@@ -767,7 +808,10 @@ impl LayerRoutePlan {
             prev_hi = hi;
         }
         // Every routed expert must lie in some binding, or its rows would be dropped.
-        for e in self.experts_with_rows().chain(self.k1_experts.iter().copied()) {
+        for e in self
+            .experts_with_rows()
+            .chain(self.k1_experts.iter().copied())
+        {
             if !binding_ranges.iter().any(|&(lo, hi)| e >= lo && e < hi) {
                 return Err(bail(format!("routed expert {e} is in no binding")));
             }
@@ -848,7 +892,11 @@ impl LayerRoutePlan {
     }
 
     /// The panel's view of the window's route state.
-    pub fn view<'a>(&'a self, routes: &'a PromptRouteStorage, panel: &'a PanelRange) -> RoutedPanelView<'a> {
+    pub fn view<'a>(
+        &'a self,
+        routes: &'a PromptRouteStorage,
+        panel: &'a PanelRange,
+    ) -> RoutedPanelView<'a> {
         RoutedPanelView { routes, panel }
     }
 }
@@ -881,7 +929,9 @@ pub fn finish_route_plan(
     let offsets = routes.view(layout.offsets, (d.n_exp + 1) * I32_BYTES, DType::Raw);
     // The window's activations quantize once per layer (row-wise, so independent of the tile
     // that produced a row).
-    routes.window_xq = Some(hip(gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows))?);
+    routes.window_xq = Some(hip(
+        gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows)
+    )?);
     hip(gpu.moe_scatter_stable_top10_slab(
         &route_ids,
         &counts,
@@ -979,7 +1029,9 @@ impl<'a> ExpertPanelBinding<'a> {
             _ => return Err(bail("an empty expert binding")),
         };
         if experts.windows(2).any(|w| w[1] != w[0] + 1) {
-            return Err(bail("a binding must be an ascending contiguous run of expert ids"));
+            return Err(bail(
+                "a binding must be an ascending contiguous run of expert ids",
+            ));
         }
         Ok(Self {
             layer,
@@ -1035,11 +1087,16 @@ pub struct PanelScratch<'a> {
 impl<'a> PanelScratch<'a> {
     /// Borrow the y scratches of `call` (the model's global grouped scratch: any tile's call
     /// of the layer names the same tensors).
-    pub fn new(call: &'a PreparedChunkCall<'a>, limits: PanelLimits) -> Result<Self, DispatchError> {
+    pub fn new(
+        call: &'a PreparedChunkCall<'a>,
+        limits: PanelLimits,
+    ) -> Result<Self, DispatchError> {
         let params = *call.params();
         let mi_bytes = mul(mul(limits.max_grouped_rows, params.mi)?, BF16_BYTES)?;
         let down_bytes = mul(mul(limits.max_grouped_rows, params.down_m)?, BF16_BYTES)?;
-        if params.y_gate_up_grouped.buf.size() < mi_bytes || params.y_down_grouped.buf.size() < down_bytes {
+        if params.y_gate_up_grouped.buf.size() < mi_bytes
+            || params.y_down_grouped.buf.size() < down_bytes
+        {
             return Err(bail(format!(
                 "panel scratch holds {} + {} bytes, a {}-row panel needs {mi_bytes} + {down_bytes}",
                 params.y_gate_up_grouped.buf.size(),
@@ -1116,7 +1173,10 @@ pub fn execute_panel(
     let (routes, range) = (panel.routes, panel.panel);
     let layout = &routes.layout;
     let d = layout.dims;
-    if combine.combined || range.index != combine.panels_done || range.index >= combine.expected_panels {
+    if combine.combined
+        || range.index != combine.panels_done
+        || range.index >= combine.expected_panels
+    {
         return Err(bail("panels must execute once each in schedule order"));
     }
     if range.rows > scratch.limits.max_grouped_rows {
@@ -1275,7 +1335,9 @@ pub fn finish_combine(
     hook: &mut dyn TileScopeHook,
 ) -> Result<(), DispatchError> {
     if combine.combined || combine.panels_done != combine.expected_panels {
-        return Err(bail("the ordered combine is incomplete or already finished"));
+        return Err(bail(
+            "the ordered combine is incomplete or already finished",
+        ));
     }
     let layout = &routes.layout;
     let d = layout.dims;
@@ -1394,7 +1456,11 @@ pub mod selftest {
 
     impl PrimitiveReport {
         fn new(name: &'static str) -> Self {
-            Self { name, ok: true, checks: Vec::new() }
+            Self {
+                name,
+                ok: true,
+                checks: Vec::new(),
+            }
         }
 
         fn check(&mut self, name: &str, ok: bool, detail: impl Into<String>) {
@@ -1445,7 +1511,10 @@ pub mod selftest {
     }
 
     fn diffs(a: &[f32], b: &[f32]) -> usize {
-        a.iter().zip(b).filter(|(x, y)| !model::same(**x, **y)).count()
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| !model::same(**x, **y))
+            .count()
     }
 
     /// The shipped canonical combine kernels (`moe_combine_order_top10` +
@@ -1515,7 +1584,9 @@ pub mod selftest {
     ) -> SynthTile {
         SynthTile {
             k1,
-            ids: (0..rows * K_TOP).map(|s| id_of(s / K_TOP, s % K_TOP)).collect(),
+            ids: (0..rows * K_TOP)
+                .map(|s| id_of(s / K_TOP, s % K_TOP))
+                .collect(),
             weights: (0..rows * K_TOP).map(|_| rng.unit()).collect(),
             x: (0..rows * hidden).map(|_| rng.unit()).collect(),
         }
@@ -1572,20 +1643,41 @@ pub mod selftest {
         let (mut row0, mut k1_used) = (0usize, 0usize);
         for tile in tiles {
             let rows = tile.rows();
-            if tile.x.len() != rows * d.hidden || tile.weights.len() != rows * K_TOP || row0 + rows > d.rows {
+            if tile.x.len() != rows * d.hidden
+                || tile.weights.len() != rows * K_TOP
+                || row0 + rows > d.rows
+            {
                 return Err(bail("a synthetic tile does not fit the window"));
             }
-            let mut put = |view: GpuTensor, bytes: &[u8]| hip(gpu.hip.memcpy_htod(&view.buf, bytes));
-            put(routes.f32_rows(layout.x_norm, row0, rows, d.hidden), &f32_bytes(&tile.x))?;
-            put(routes.ids_view(layout.topk_ids, row0, rows), &i32_bytes(&tile.ids))?;
-            put(routes.f32_rows(layout.topk_weights, row0, rows, K_TOP), &f32_bytes(&tile.weights))?;
+            let mut put =
+                |view: GpuTensor, bytes: &[u8]| hip(gpu.hip.memcpy_htod(&view.buf, bytes));
+            put(
+                routes.f32_rows(layout.x_norm, row0, rows, d.hidden),
+                &f32_bytes(&tile.x),
+            )?;
+            put(
+                routes.ids_view(layout.topk_ids, row0, rows),
+                &i32_bytes(&tile.ids),
+            )?;
+            put(
+                routes.f32_rows(layout.topk_weights, row0, rows, K_TOP),
+                &f32_bytes(&tile.weights),
+            )?;
             let route_ids = if tile.k1 {
                 vec![-1i32; rows * K_TOP]
             } else {
                 tile.ids.clone()
             };
-            put(routes.ids_view(layout.route_ids, row0, rows), &i32_bytes(&route_ids))?;
-            routes.tiles.push(TileRec { row0, rows, k1: tile.k1, k1_row0: k1_used });
+            put(
+                routes.ids_view(layout.route_ids, row0, rows),
+                &i32_bytes(&route_ids),
+            )?;
+            routes.tiles.push(TileRec {
+                row0,
+                rows,
+                k1: tile.k1,
+                k1_row0: k1_used,
+            });
             if tile.k1 {
                 k1_used += rows;
             }
@@ -1598,17 +1690,26 @@ pub mod selftest {
             return Err(bail("the synthetic tiles do not fill the window"));
         }
         let plan = finish_route_plan(gpu, routes, limits)?;
-        let ranges: Vec<(usize, usize)> = bindings.iter().map(|b| (b.expert_lo, b.expert_hi)).collect();
+        let ranges: Vec<(usize, usize)> = bindings
+            .iter()
+            .map(|b| (b.expert_lo, b.expert_hi))
+            .collect();
         let panels = plan.schedule(&ranges, limits)?;
         let mut scratch = PanelScratch::new(call, limits)?;
-        let (y_gu, y_dn) = (scratch.params.y_gate_up_grouped, scratch.params.y_down_grouped);
+        let (y_gu, y_dn) = (
+            scratch.params.y_gate_up_grouped,
+            scratch.params.y_down_grouped,
+        );
         let mut down = vec![0u16; plan.total_rows * d.hidden];
         let (mut canary_checks, mut canary_violations) = (0usize, 0usize);
         {
             let shared: &PromptRouteStorage = routes;
             let mut cursor = OrderedCombineCursor::start(gpu, shared, &panels)?;
             for panel in &panels {
-                let (gu_used, dn_used) = (panel.rows * d.mi * BF16_BYTES, panel.rows * d.hidden * BF16_BYTES);
+                let (gu_used, dn_used) = (
+                    panel.rows * d.mi * BF16_BYTES,
+                    panel.rows * d.hidden * BF16_BYTES,
+                );
                 let guards: Vec<GpuTensor> = if canaries && panel.rows > 0 {
                     [guard_view(y_gu, gu_used), guard_view(y_dn, dn_used)]
                         .into_iter()
@@ -1642,7 +1743,8 @@ pub mod selftest {
                     };
                     let bytes = hip(gpu.download_raw_bytes(&rows_view))?;
                     for (i, pair) in bytes.chunks_exact(2).enumerate() {
-                        down[panel.row_base * d.hidden + i] = u16::from_le_bytes([pair[0], pair[1]]);
+                        down[panel.row_base * d.hidden + i] =
+                            u16::from_le_bytes([pair[0], pair[1]]);
                     }
                 }
             }
@@ -1702,7 +1804,12 @@ pub mod selftest {
     }
 
     /// The CPU canonical combine over the window's actual K2 grouped down rows.
-    fn cpu_canonical(window: &Window, call: &PreparedChunkCall<'_>, ids: &[i32], weights: &[f32]) -> Vec<f32> {
+    fn cpu_canonical(
+        window: &Window,
+        call: &PreparedChunkCall<'_>,
+        ids: &[i32],
+        weights: &[f32],
+    ) -> Vec<f32> {
         let tokens = ids.len() / K_TOP;
         let case = model::Case {
             tokens,
@@ -1843,7 +1950,9 @@ pub mod selftest {
             return Err(bail("empty diagnostic geometry"));
         }
         let active = g.binding_experts.min(g.n_exp);
-        let upper = |slots: usize| (slots + MOE_GROUPED_BLOCK_M.saturating_sub(1) * active.min(slots)) / 16 * 16;
+        let upper = |slots: usize| {
+            (slots + MOE_GROUPED_BLOCK_M.saturating_sub(1) * active.min(slots)) / 16 * 16
+        };
         let mut out = DiagBytes::default();
         match case {
             DiagCase::CanonicalCombine => {
@@ -1856,10 +1965,19 @@ pub mod selftest {
                     ("order_scratch", t * K_TOP * 8),
                 ];
                 out.host_parts = vec![
-                    ("case_rows_map_ids_weights", rows * h * BF16_BYTES + 3 * t * K_TOP * I32_BYTES),
+                    (
+                        "case_rows_map_ids_weights",
+                        rows * h * BF16_BYTES + 3 * t * K_TOP * I32_BYTES,
+                    ),
                     ("case_init_and_cpu_canonical", 2 * t * h * F32_BYTES),
-                    ("upload_byte_copies", rows * h * BF16_BYTES + 2 * t * K_TOP * I32_BYTES),
-                    ("monolithic_reversed_and_panelled_results", 3 * t * h * F32_BYTES),
+                    (
+                        "upload_byte_copies",
+                        rows * h * BF16_BYTES + 2 * t * K_TOP * I32_BYTES,
+                    ),
+                    (
+                        "monolithic_reversed_and_panelled_results",
+                        3 * t * h * F32_BYTES,
+                    ),
                     ("init_bytes", t * h * F32_BYTES),
                 ];
             }
@@ -1877,7 +1995,10 @@ pub mod selftest {
                 host.push(("ids_weights_clones", 2 * rows * K_TOP * I32_BYTES));
                 host.push(("cpu_canonical_want", rows * g.hidden * F32_BYTES));
                 let cpu_phase = cpu_canonical_bytes(g, rows, grouped) - rows * g.hidden * F32_BYTES;
-                host.push(("max(cpu_model_case_clones, monolithic_host_transients)", cpu_phase.max(mono_host)));
+                host.push((
+                    "max(cpu_model_case_clones, monolithic_host_transients)",
+                    cpu_phase.max(mono_host),
+                ));
                 out.device_parts = dev;
                 out.host_parts = host;
             }
@@ -1892,7 +2013,10 @@ pub mod selftest {
                     "k1_reference_y0_and_accumulator",
                     k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
                 ));
-                host.push(("cpu_model_case_clones_and_output", cpu_canonical_bytes(g, rows, grouped)));
+                host.push((
+                    "cpu_model_case_clones_and_output",
+                    cpu_canonical_bytes(g, rows, grouped),
+                ));
                 host.push(("k1_reference_readback", k1 * g.hidden * F32_BYTES));
                 out.device_parts = dev;
                 out.host_parts = host;
@@ -1915,7 +2039,11 @@ pub mod selftest {
                 } else {
                     out.device_parts = dev_b;
                 }
-                out.host_parts = if sum_parts(&host_a) >= sum_parts(&host_b) { host_a } else { host_b };
+                out.host_parts = if sum_parts(&host_a) >= sum_parts(&host_b) {
+                    host_a
+                } else {
+                    host_b
+                };
             }
         }
         out.device_peak = sum_parts(&out.device_parts);
@@ -1926,14 +2054,24 @@ pub mod selftest {
     /// `canonical_combine_exact`: the production panel/pad combine kernels over the
     /// adversarial fixture and many partitions (within-expert splits included) equal the CPU
     /// canonical model and the monolithic GPU combine; reversed panel order differs.
-    pub fn canonical_combine_exact(gpu: &mut Gpu, seed: u64) -> Result<PrimitiveReport, DispatchError> {
+    pub fn canonical_combine_exact(
+        gpu: &mut Gpu,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
         let mut rep = PrimitiveReport::new("canonical_combine_exact");
         let r = hip(model::canonical_combine_exact(gpu, seed))?;
-        rep.check("panels_equal_cpu_canonical", r.mismatches_vs_cpu == 0, r.to_json());
+        rep.check(
+            "panels_equal_cpu_canonical",
+            r.mismatches_vs_cpu == 0,
+            r.to_json(),
+        );
         rep.check(
             "panels_equal_monolithic_gpu",
             r.mismatches_vs_monolithic_gpu == 0,
-            format!("{} mismatches over {} partitions", r.mismatches_vs_monolithic_gpu, r.partitions),
+            format!(
+                "{} mismatches over {} partitions",
+                r.mismatches_vs_monolithic_gpu, r.partitions
+            ),
         );
         rep.check(
             "reversed_order_negative_control_differs",
@@ -1975,7 +2113,10 @@ pub mod selftest {
         rep.check(
             "hot_expert_exceeds_one_panel",
             hot_rows > limits.max_grouped_rows,
-            format!("hot expert {lo}: {hot_rows} rows, bound {}", limits.max_grouped_rows),
+            format!(
+                "hot expert {lo}: {hot_rows} rows, bound {}",
+                limits.max_grouped_rows
+            ),
         );
         let hot_panels = window
             .panels
@@ -1996,12 +2137,19 @@ pub mod selftest {
         rep.check(
             "panels_cover_every_grouped_row_once",
             window.panels.iter().map(|p| p.rows).sum::<usize>() == window.plan.total_rows,
-            format!("{} rows over {} panels", window.plan.total_rows, window.panels.len()),
+            format!(
+                "{} rows over {} panels",
+                window.plan.total_rows,
+                window.panels.len()
+            ),
         );
         rep.check(
             "scratch_guard_canaries_intact",
             window.canary_checks > 0 && window.canary_violations == 0,
-            format!("{} guard bytes checked, {} overwritten", window.canary_checks, window.canary_violations),
+            format!(
+                "{} guard bytes checked, {} overwritten",
+                window.canary_checks, window.canary_violations
+            ),
         );
         let want = cpu_canonical(&window, call, &ids, &weights);
         rep.check(
@@ -2045,12 +2193,20 @@ pub mod selftest {
     ) -> Result<(), DispatchError> {
         let (lo, hi) = (binding.expert_lo, binding.expert_hi);
         if hi - lo < 2 || hi > call.n_exp {
-            return Err(bail("the K1 scenario needs a binding of at least two experts"));
+            return Err(bail(
+                "the K1 scenario needs a binding of at least two experts",
+            ));
         }
         let mid = lo + (hi - lo) / 2;
         let halves = [
-            ExpertPanelBinding { expert_hi: mid, ..binding },
-            ExpertPanelBinding { expert_lo: mid, ..binding },
+            ExpertPanelBinding {
+                expert_hi: mid,
+                ..binding
+            },
+            ExpertPanelBinding {
+                expert_lo: mid,
+                ..binding
+            },
         ];
         let width = hi - lo;
         let k1_rows = 3usize.min(gpu.few_row_limit());
@@ -2061,18 +2217,26 @@ pub mod selftest {
                 (lo + (tok * 11 + r * 5) % width) as i32
             }));
         }
-        let k1_tile = synth_tile(&mut rng, k1_rows, call.hidden, true, |tok, r| match (tok, r) {
-            (0, 0) => lo as i32,
-            (0, 1) => (hi - 1) as i32,
-            (t, 9) if t + 1 == k1_rows => -1,
-            _ => (lo + (tok * 5 + r * 3) % width) as i32,
+        let k1_tile = synth_tile(&mut rng, k1_rows, call.hidden, true, |tok, r| {
+            match (tok, r) {
+                (0, 0) => lo as i32,
+                (0, 1) => (hi - 1) as i32,
+                (t, 9) if t + 1 == k1_rows => -1,
+                _ => (lo + (tok * 5 + r * 3) % width) as i32,
+            }
         });
         let k1_ids = k1_tile.ids.clone();
         tiles.push(k1_tile);
         let k2_rows: usize = if with_k2 { tiles[0].rows() } else { 0 };
         let all_ids: Vec<i32> = tiles
             .iter()
-            .flat_map(|t| if t.k1 { vec![-1; t.ids.len()] } else { t.ids.clone() })
+            .flat_map(|t| {
+                if t.k1 {
+                    vec![-1; t.ids.len()]
+                } else {
+                    t.ids.clone()
+                }
+            })
             .collect();
         let all_weights: Vec<f32> = tiles.iter().flat_map(|t| t.weights.clone()).collect();
         let window = run_window(gpu, call, &halves, limits, &tiles, true)?;
@@ -2100,7 +2264,11 @@ pub mod selftest {
                 window.plan.total_rows == 0
                     && window.panels.len() == 2
                     && window.panels.iter().all(|p| p.rows == 0 && p.k1),
-                format!("{} rows, {} panels", window.plan.total_rows, window.panels.len()),
+                format!(
+                    "{} rows, {} panels",
+                    window.plan.total_rows,
+                    window.panels.len()
+                ),
             );
         } else {
             let want = cpu_canonical(&window, call, &all_ids, &all_weights);
@@ -2108,12 +2276,18 @@ pub mod selftest {
             rep.check(
                 "k2_rows_equal_cpu_canonical_beside_the_cohort",
                 diffs(&window.acc[..n], &want[..n]) == 0,
-                format!("{} mismatching elements", diffs(&window.acc[..n], &want[..n])),
+                format!(
+                    "{} mismatching elements",
+                    diffs(&window.acc[..n], &want[..n])
+                ),
             );
             rep.check(
                 "scratch_guard_canaries_intact",
                 window.canary_violations == 0,
-                format!("{} of {} guard bytes overwritten", window.canary_violations, window.canary_checks),
+                format!(
+                    "{} of {} guard bytes overwritten",
+                    window.canary_violations, window.canary_checks
+                ),
             );
         }
         // The incumbent's own K1 path over the whole binding, from the same saved input.
@@ -2135,8 +2309,12 @@ pub mod selftest {
             layout.x_norm + tile.row0 * d.hidden * F32_BYTES,
             tile.rows * d.hidden * F32_BYTES,
         ))?;
-        let ids = window.routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
-        let weights = window.routes.f32_rows(layout.topk_weights, tile.row0, tile.rows, K_TOP);
+        let ids = window
+            .routes
+            .ids_view(layout.topk_ids, tile.row0, tile.rows);
+        let weights = window
+            .routes
+            .f32_rows(layout.topk_weights, tile.row0, tile.rows, K_TOP);
         let y0 = hip(gpu.alloc_tensor(&[tile.rows * K_TOP * d.hidden], DType::F32))?;
         let reference = hip(gpu.zeros(&[tile.rows * d.hidden], DType::F32))?;
         let run = (|| -> Result<Vec<f32>, DispatchError> {
@@ -2161,7 +2339,11 @@ pub mod selftest {
         rep.check(
             "k1_rows_equal_the_incumbent_k1_path",
             diffs(got, &reference) == 0,
-            format!("{} mismatching elements over {} rows", diffs(got, &reference), tile.rows),
+            format!(
+                "{} mismatching elements over {} rows",
+                diffs(got, &reference),
+                tile.rows
+            ),
         );
         window.routes.release(gpu);
         Ok(())
@@ -2200,13 +2382,21 @@ pub mod selftest {
             "empty_window_is_one_zero_row_panel_owning_every_expert",
             window.plan.total_rows == 0
                 && window.panels.len() == 1
-                && only.is_some_and(|p| p.rows == 0 && !p.k1 && p.own_lo == 0 && p.own_hi == call.n_exp),
-            format!("{} rows, panels {:?}", window.plan.total_rows, window.panels),
+                && only.is_some_and(|p| {
+                    p.rows == 0 && !p.k1 && p.own_lo == 0 && p.own_hi == call.n_exp
+                }),
+            format!(
+                "{} rows, panels {:?}",
+                window.plan.total_rows, window.panels
+            ),
         );
         rep.check(
             "empty_window_accumulator_is_all_positive_zero",
             window.acc.iter().all(|v| v.to_bits() == 0),
-            format!("{} non-+0 elements", window.acc.iter().filter(|v| v.to_bits() != 0).count()),
+            format!(
+                "{} non-+0 elements",
+                window.acc.iter().filter(|v| v.to_bits() != 0).count()
+            ),
         );
         window.routes.release(gpu);
         k1_scenario(gpu, call, binding, limits, seed ^ 0x5a5a, false, &mut rep)?;
@@ -2261,7 +2451,10 @@ mod slowlink_panel_tests {
                 count[id as usize] += 1;
             }
         }
-        let counts_padded: Vec<i32> = count.iter().map(|&c| (c.div_ceil(16) * 16) as i32).collect();
+        let counts_padded: Vec<i32> = count
+            .iter()
+            .map(|&c| (c.div_ceil(16) * 16) as i32)
+            .collect();
         let mut start = vec![0usize; N_EXP + 1];
         for e in 0..N_EXP {
             start[e + 1] = start[e] + counts_padded[e] as usize;
@@ -2278,7 +2471,12 @@ mod slowlink_panel_tests {
                 sorted[row] = slot as i32;
             }
         }
-        Grouping { counts_padded, start, inverse, sorted }
+        Grouping {
+            counts_padded,
+            start,
+            inverse,
+            sorted,
+        }
     }
 
     fn plan(ids: &[i32], k1: Vec<usize>) -> (Grouping, LayerRoutePlan) {
@@ -2306,6 +2504,27 @@ mod slowlink_panel_tests {
             }
         }
         ids
+    }
+
+    #[test]
+    fn slowlink_panel_charged_bytes_are_region_a4_and_full_window_scatter_scratch() {
+        // The real MQ4 layer identity: H2560, mi 640, E512, shared I640, a 16384-row window
+        // with up to 48 K1 rows.
+        let mut d = dims(16_384);
+        d.k1_rows = 48;
+        let l = PromptRouteLayout::new(&d).unwrap();
+        assert_eq!(l.total_bytes(), 385_825_024);
+        assert_eq!(l.a4_sidecar_bytes(), 82_575_360);
+        assert_eq!(l.group_scatter_bytes(), 3_278_848);
+        assert_eq!(
+            l.group_scatter_bytes(),
+            rdna_compute::scratch::qwen4_moe_group_layout(163_840, 512).bytes
+        );
+        assert_eq!(l.charged_bytes(), 471_679_232);
+        // The 1536-row tile's scratch is a strict subset of the full-window size.
+        let tile = PromptRouteLayout::new(&dims(1536)).unwrap();
+        assert_eq!(tile.group_scatter_bytes(), 309_248);
+        assert!(tile.group_scatter_bytes() < l.group_scatter_bytes());
     }
 
     #[test]
@@ -2392,7 +2611,10 @@ mod slowlink_panel_tests {
             let (g, p) = plan(&ids, Vec::new());
             for width in [32usize, 64, 512] {
                 for max_rows in [16usize, 48, 256, 2048] {
-                    let limits = PanelLimits { experts_per_slot: width, max_grouped_rows: max_rows };
+                    let limits = PanelLimits {
+                        experts_per_slot: width,
+                        max_grouped_rows: max_rows,
+                    };
                     let bindings = runs(width);
                     let panels = p.schedule(&bindings, limits).unwrap();
                     assert!(!panels.is_empty());
@@ -2405,7 +2627,10 @@ mod slowlink_panel_tests {
                         let (lo, hi) = bindings[panel.binding];
                         assert_eq!((panel.bind_lo, panel.bind_hi), (lo, hi));
                         if panel.rows > 0 {
-                            assert!(panel.row_base >= p.offsets[lo] && panel.row_base + panel.rows <= p.offsets[hi]);
+                            assert!(
+                                panel.row_base >= p.offsets[lo]
+                                    && panel.row_base + panel.rows <= p.offsets[hi]
+                            );
                             assert!(panel.expert_lo >= lo && panel.expert_hi <= hi);
                             assert!(panel.expert_lo < panel.expert_hi);
                             for r in panel.row_base..panel.row_base + panel.rows {
@@ -2442,7 +2667,9 @@ mod slowlink_panel_tests {
         let panels = p.schedule(&runs(32), PanelLimits::S1).unwrap();
         assert_eq!(panels.len(), 3);
         assert_eq!(panels.iter().map(|x| x.rows).sum::<usize>(), 5008);
-        assert!(panels.iter().all(|x| x.rows <= 2048 && x.expert_lo == 7 && x.expert_hi == 8));
+        assert!(panels
+            .iter()
+            .all(|x| x.rows <= 2048 && x.expert_lo == 7 && x.expert_hi == 8));
         // The split expert's invalid-row slots are owned by exactly its first panel.
         assert_eq!((panels[0].own_lo, panels[0].own_hi), (0, 8));
         assert_eq!((panels[1].own_lo, panels[1].own_hi), (8, 8));
@@ -2457,7 +2684,10 @@ mod slowlink_panel_tests {
         let panels = p.schedule(&runs(32), PanelLimits::S1).unwrap();
         assert_eq!(panels.len(), 1);
         let only = panels[0];
-        assert_eq!((only.rows, only.own_lo, only.own_hi, only.k1), (0, 0, N_EXP, false));
+        assert_eq!(
+            (only.rows, only.own_lo, only.own_hi, only.k1),
+            (0, 0, N_EXP, false)
+        );
         // Sparse: experts 3 and 500 only: two panels in two bindings, the middle ones skipped.
         let mut ids = vec![3i32; 10];
         ids.extend(vec![500i32; 10]);
@@ -2474,7 +2704,10 @@ mod slowlink_panel_tests {
         assert!(p.schedule(&[(10, 20), (15, 30)], PanelLimits::S1).is_err());
         assert!(p.schedule(&[(20, 10)], PanelLimits::S1).is_err());
         assert!(p.schedule(&[(0, N_EXP + 1)], PanelLimits::S1).is_err());
-        let bad = PanelLimits { experts_per_slot: 32, max_grouped_rows: 100 };
+        let bad = PanelLimits {
+            experts_per_slot: 32,
+            max_grouped_rows: 100,
+        };
         assert!(p.schedule(&runs(32), bad).is_err());
     }
 
@@ -2511,7 +2744,13 @@ mod slowlink_panel_tests {
             let (g, p) = plan(&ids, Vec::new());
             for (width, max_rows) in [(32usize, 2048usize), (32, 64), (64, 16), (512, 512)] {
                 let panels = p
-                    .schedule(&runs(width), PanelLimits { experts_per_slot: width, max_grouped_rows: max_rows })
+                    .schedule(
+                        &runs(width),
+                        PanelLimits {
+                            experts_per_slot: width,
+                            max_grouped_rows: max_rows,
+                        },
+                    )
                     .unwrap();
                 for (slot, &id) in ids.iter().enumerate() {
                     let valid = (0..N_EXP as i32).contains(&id);
@@ -2569,7 +2808,16 @@ mod slowlink_panel_tests {
                 let owners = panels
                     .iter()
                     .filter(|q| {
-                        slowlink_panel_owns(bad_id, bad_row, N_EXP, plan.total_rows, q.row_base, q.rows, q.own_lo, q.own_hi)
+                        slowlink_panel_owns(
+                            bad_id,
+                            bad_row,
+                            N_EXP,
+                            plan.total_rows,
+                            q.row_base,
+                            q.rows,
+                            q.own_lo,
+                            q.own_hi,
+                        )
                     })
                     .count();
                 assert_eq!(owners, 1, "id {bad_id} row {bad_row}");
@@ -2581,24 +2829,51 @@ mod slowlink_panel_tests {
     fn slowlink_panel_limits_bound_the_scratch() {
         let l = PanelLimits::S1;
         assert_eq!(l.scratch_bytes(640, 2560).unwrap(), 2048 * (640 + 2560) * 2);
-        assert!(PanelLimits { experts_per_slot: 0, max_grouped_rows: 16 }.validate().is_err());
-        assert!(PanelLimits { experts_per_slot: 32, max_grouped_rows: 0 }.validate().is_err());
-        assert!(PanelLimits { experts_per_slot: 32, max_grouped_rows: 17 }.validate().is_err());
-        assert!(PanelLimits { experts_per_slot: 32, max_grouped_rows: usize::MAX & !15 }
-            .scratch_bytes(640, 2560)
-            .is_err());
+        assert!(PanelLimits {
+            experts_per_slot: 0,
+            max_grouped_rows: 16
+        }
+        .validate()
+        .is_err());
+        assert!(PanelLimits {
+            experts_per_slot: 32,
+            max_grouped_rows: 0
+        }
+        .validate()
+        .is_err());
+        assert!(PanelLimits {
+            experts_per_slot: 32,
+            max_grouped_rows: 17
+        }
+        .validate()
+        .is_err());
+        assert!(PanelLimits {
+            experts_per_slot: 32,
+            max_grouped_rows: usize::MAX & !15
+        }
+        .scratch_bytes(640, 2560)
+        .is_err());
     }
 
     #[test]
     fn slowlink_panel_packed_counts_carry_k2_padding_and_k1_touch_in_one_word() {
         // Device words: K2 padded count in the low 20 bits, K1 slot count above.
-        let packed = [0, 32, (3 << COUNT_BITS) | 48, 1 << COUNT_BITS, 16, (480 << COUNT_BITS) | ((1 << COUNT_BITS) - 16)];
+        let packed = [
+            0,
+            32,
+            (3 << COUNT_BITS) | 48,
+            1 << COUNT_BITS,
+            16,
+            (480 << COUNT_BITS) | ((1 << COUNT_BITS) - 16),
+        ];
         let (counts, k1) = unpack_counts(&packed).unwrap();
         assert_eq!(counts, vec![0, 32, 48, 0, 16, (1 << COUNT_BITS) - 16]);
         assert_eq!(k1, vec![2, 3, 5]);
         assert!(unpack_counts(&[-1]).is_err());
         // The unpacked counts are exactly what the plan consumes.
-        let plan = LayerRoutePlan::from_counts(&counts[..5], k1[..2].to_vec(), BarrierCost::default()).unwrap();
+        let plan =
+            LayerRoutePlan::from_counts(&counts[..5], k1[..2].to_vec(), BarrierCost::default())
+                .unwrap();
         assert_eq!(plan.total_rows, 96);
         assert_eq!(plan.k1_experts, vec![2, 3]);
     }
