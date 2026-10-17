@@ -1988,7 +1988,9 @@ pub fn source_forward_scratch_mode(
         crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }
     );
     let symmetric = ple_bf16 && !slab && routed_headers_symmetric(hfq, manifest)?;
-    Ok(qwen4_forward_scratch_mode(gpu, config, symmetric, slab, ple_bf16))
+    Ok(qwen4_forward_scratch_mode(
+        gpu, config, symmetric, slab, ple_bf16,
+    ))
 }
 
 /// The geometry facts of a PLE table header that admission checks against the

@@ -478,7 +478,11 @@ impl Carrier for Qwen2Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("qwen2", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "qwen2",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_qwen2::load_qwen2_bundle(src, ctx)?;
@@ -1258,7 +1262,13 @@ fn qwen4_placement_inputs(
     scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
     ranks: usize,
 ) -> Result<
-    (u64, u64, hipfire_arch_qwen4::expert_residency::AutoReserve, Option<u64>, Option<u64>),
+    (
+        u64,
+        u64,
+        hipfire_arch_qwen4::expert_residency::AutoReserve,
+        Option<u64>,
+        Option<u64>,
+    ),
     String,
 > {
     use hipfire_arch_qwen4::expert_residency as residency;
@@ -1278,12 +1288,8 @@ fn qwen4_placement_inputs(
     // admitted context mapped (a VMM arena maps ahead to `max_seq`, rounded
     // to the driver granularity), not the legacy-forced layout the historical
     // formula charges on a discrete card.
-    let census_context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
-        backend,
-        max_seq,
-        max_seq,
-        vmm_granularity,
-    );
+    let census_context =
+        hipfire_arch_qwen4::Qwen4ContextCommit::new(backend, max_seq, max_seq, vmm_granularity);
     // Every placement host-maps at least the MTP layer's routed experts, so
     // the head is still attached after it only where the host-mapped policy
     // keeps it (exact gfx1201, or an explicit `--spec mtp`); only then does
@@ -1320,22 +1326,23 @@ fn qwen4_placement_inputs(
     // context is (none when the route is off: the reserve is then unchanged).
     // Bytes already committed by an earlier load in this process are out of
     // `free` and only growth past them is charged.
-    let gather_for = |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
-        rdna_compute::tensor_ops::qsa_gather_workspace_needed(
-            gpu,
-            qsa_format,
-            state_format.qsa_f16_arena,
-        )
-        .then(|| {
-            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-                config.num_key_value_heads,
-                context.tokens,
+    let gather_for =
+        |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+            rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+                gpu,
+                qsa_format,
+                state_format.qsa_f16_arena,
             )
-            .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
-            .ok_or("qwen4: QSA gather scratch size overflows".to_string())
-        })
-        .transpose()
-    };
+            .then(|| {
+                rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                    config.num_key_value_heads,
+                    context.tokens,
+                )
+                .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
+                .ok_or("qwen4: QSA gather scratch size overflows".to_string())
+            })
+            .transpose()
+        };
     let mtp_bytes = mtp_for(&context)?;
     let gather_bytes = gather_for(&context)?;
     // The measured HIP runtime overhead (exact gfx1201, discrete,
@@ -1481,7 +1488,11 @@ pub fn qwen4_ep_alias_free(devices: &[i32], free: &[u64]) -> Vec<u64> {
         .iter()
         .zip(free)
         .map(|(device, &bytes)| {
-            let aliased = devices.iter().filter(|other| *other == device).count().max(1);
+            let aliased = devices
+                .iter()
+                .filter(|other| *other == device)
+                .count()
+                .max(1);
             bytes / aliased as u64
         })
         .collect()
@@ -2036,12 +2047,15 @@ fn load_qwen4_rank_scoped(
         expert_parallel: ep.is_some() || expert_vram_layers.is_some(),
         explicit_vram_layers: explicit.is_some(),
         source: match &manifest.identity.recipe {
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } =>
-                hotsets::HotsetSource::Aggregate,
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } =>
-                hotsets::HotsetSource::SlabArena,
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 =>
-                hotsets::HotsetSource::StockFp8,
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
+                hotsets::HotsetSource::Aggregate
+            }
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => {
+                hotsets::HotsetSource::SlabArena
+            }
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => {
+                hotsets::HotsetSource::StockFp8
+            }
             _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
         },
     };
@@ -2251,7 +2265,9 @@ fn load_qwen4_rank_scoped(
             // Fully resident has no host layer, so no stage buffers; the
             // safety margin is charged exactly as `auto` charges it.
             let charges = placement_charges(layer_experts, false)?;
-            let reserve = charges.reserve(base_reserve).map_err(|error| format!("qwen4: {error}"))?;
+            let reserve = charges
+                .reserve(base_reserve)
+                .map_err(|error| format!("qwen4: {error}"))?;
             let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
             unset_note = format!(
                     " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve (base {}; plus {}) {} {} MiB free VRAM)",
@@ -2302,24 +2318,24 @@ fn load_qwen4_rank_scoped(
             ));
     }
     if hotset_plan.is_none() {
-    eprintln!(
-        "  qwen4 expert placement: {}{unset_note}",
-        match (explicit, placement) {
-            _ if expert_vram_layers.is_some() => format!(
-                "agreed split {} of {moe_layers} MoE layers resident",
-                expert_vram_layers.unwrap_or(0)
-            ),
-            (Some(residency::ExpertVramLayers::Layers(layers)), _) =>
-                format!("{}={layers}", residency::EXPERT_VRAM_LAYERS_ENV),
-            (Some(residency::ExpertVramLayers::Auto), _) =>
-                format!("{}=auto", residency::EXPERT_VRAM_LAYERS_ENV),
-            (None, None) => format!(
-                "{} unset, fully resident",
-                residency::EXPERT_VRAM_LAYERS_ENV
-            ),
-            (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
-        }
-    );
+        eprintln!(
+            "  qwen4 expert placement: {}{unset_note}",
+            match (explicit, placement) {
+                _ if expert_vram_layers.is_some() => format!(
+                    "agreed split {} of {moe_layers} MoE layers resident",
+                    expert_vram_layers.unwrap_or(0)
+                ),
+                (Some(residency::ExpertVramLayers::Layers(layers)), _) =>
+                    format!("{}={layers}", residency::EXPERT_VRAM_LAYERS_ENV),
+                (Some(residency::ExpertVramLayers::Auto), _) =>
+                    format!("{}=auto", residency::EXPERT_VRAM_LAYERS_ENV),
+                (None, None) => format!(
+                    "{} unset, fully resident",
+                    residency::EXPERT_VRAM_LAYERS_ENV
+                ),
+                (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
+            }
+        );
     }
     // Host memory is kept out of reclaim only by a process started for a
     // Qwen4 model (`prepare_host_memory_for`) or with the placement set;
@@ -2440,20 +2456,20 @@ fn load_qwen4_rank_scoped(
                     host_bytes,
                     &format!("on {}", ctx.gpu.arch),
                 )
-                );
+            );
         }
     }
     if let Some((plan, _)) = &hotset_plan {
         // Trunk payloads are tier-owned; the unchanged MTP entries still use
         // their ordinary host-mapped WeightEntries.
-        let mtp_tensors = residency::place_routed_experts(
-            &mut manifest.weights, config.num_hidden_layers,
-        );
-        manifest = manifest.with_expert_tiers().map_err(|error| error.to_string())?;
-        let expected: std::collections::BTreeSet<_> = manifest
-            .resident_keys()
-            .collect();
-        placements.retain(|placement| expected.contains(&(placement.name.as_str(), placement.layer)));
+        let mtp_tensors =
+            residency::place_routed_experts(&mut manifest.weights, config.num_hidden_layers);
+        manifest = manifest
+            .with_expert_tiers()
+            .map_err(|error| error.to_string())?;
+        let expected: std::collections::BTreeSet<_> = manifest.resident_keys().collect();
+        placements
+            .retain(|placement| expected.contains(&(placement.name.as_str(), placement.layer)));
         // Host/GTT checks already passed while the original manifest was
         // intact, so none of these optional-sidecar decisions can fail here.
         let host_bytes = hotset_host_bytes;
@@ -2461,13 +2477,21 @@ fn load_qwen4_rank_scoped(
         let host_projections = host_experts * 2 + mtp_tensors;
         if native_mtp
             && !crate::admission::qwen4_mtp_with_host_mapped_experts(
-                ctx.spec, &ctx.gpu.arch, host_projections,
+                ctx.spec,
+                &ctx.gpu.arch,
+                host_projections,
             )
         {
             native_mtp = false;
-            eprintln!("{}", hipfire_config::mtp_host_spill_decline_line(
-                "qwen4 native", host_projections, host_bytes, &format!("on {}", ctx.gpu.arch),
-            ));
+            eprintln!(
+                "{}",
+                hipfire_config::mtp_host_spill_decline_line(
+                    "qwen4 native",
+                    host_projections,
+                    host_bytes,
+                    &format!("on {}", ctx.gpu.arch),
+                )
+            );
         }
     }
     // Expert parallelism: this rank's fit line, at the split it applied.
@@ -2528,7 +2552,9 @@ fn load_qwen4_rank_scoped(
                 .map(|per_rank| {
                     per_rank[ep.map_or(0, |placement| placement.rank)]
                         + hotset_plan.as_ref().map_or(0, |(plan, _)| {
-                            plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
+                            plan.owner_bytes(
+                                hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped,
+                            )
                         })
                 })
                 .unwrap_or(0)
@@ -2543,7 +2569,10 @@ fn load_qwen4_rank_scoped(
     #[cfg(not(unix))]
     let (ple_table_worker, ple_load_fill) = {
         if rank_table.is_some() {
-            return Err("qwen4: rank-ordered PLE table workers are unsupported on Windows; run on Linux".into());
+            return Err(
+                "qwen4: rank-ordered PLE table workers are unsupported on Windows; run on Linux"
+                    .into(),
+            );
         }
         (None::<hipfire_arch_qwen4::bundle::PleHotWorker>, 0u64)
     };
@@ -4426,7 +4455,11 @@ impl Carrier for LlamaCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("llama", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "llama",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -4765,7 +4798,11 @@ impl Carrier for DotsOcrCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("dots_ocr", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "dots_ocr",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -4886,7 +4923,11 @@ impl Carrier for Deepseek4Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("deepseek4", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "deepseek4",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5102,7 +5143,11 @@ impl Carrier for MinimaxCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("minimax", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "minimax",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         // Per-source diagnostic stays at the call site, before resolve_source_meta.
         dir_diag(&src);
@@ -5214,7 +5259,11 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("lfm2moe", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "lfm2moe",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5415,7 +5464,11 @@ impl Carrier for Cohere2MoeCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("cohere2moe", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "cohere2moe",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5524,7 +5577,11 @@ impl Carrier for MapleCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("maple", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "maple",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5690,7 +5747,11 @@ impl Carrier for Gemma4Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("gemma4", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "gemma4",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         if ctx.draft_path.is_some() {
             return Err("params.draft (a Qwen3.5 DFlash draft) is not supported for Gemma 4 (arch_id=13). For Gemma 4 speculative decoding, pass the Gemma 4 EAGLE drafter (arch 22) as params.drafter instead.".to_string());
@@ -5925,7 +5986,11 @@ impl Carrier for MuseGlimmerCarrier {
             );
         }
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("muse_glimmer", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "muse_glimmer",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         if ctx.gemma4_drafter_path.is_some() {
             return Err(
@@ -6363,7 +6428,11 @@ impl Carrier for Qwen35EmbedCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(crate::pp_unsupported_message("qwen35-embed", matches!(src, ModelSource::Dir(_)), ctx.pp));
+            return Err(crate::pp_unsupported_message(
+                "qwen35-embed",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -6404,7 +6473,6 @@ impl Carrier for Qwen35EmbedCarrier {
             .map_err(|e| format!("EmbedSlotEngine spawn: {e}"))?;
         Ok(Box::new(engine))
     }
-
 }
 
 #[cfg(test)]
@@ -6643,8 +6711,14 @@ mod qwen4_admission_tests {
             vec![24 * gib, 20 * gib, 16 * gib]
         );
         // One physical device under 3 and 6 ranks.
-        assert_eq!(qwen4_ep_alias_free(&[0, 0, 0], &[24 * gib; 3]), vec![8 * gib; 3]);
-        assert_eq!(qwen4_ep_alias_free(&[0; 6], &[24 * gib; 6]), vec![4 * gib; 6]);
+        assert_eq!(
+            qwen4_ep_alias_free(&[0, 0, 0], &[24 * gib; 3]),
+            vec![8 * gib; 3]
+        );
+        assert_eq!(
+            qwen4_ep_alias_free(&[0; 6], &[24 * gib; 6]),
+            vec![4 * gib; 6]
+        );
         // Four physical devices under 6 ranks: devices 0 and 1 carry two ranks.
         let devices = qwen4_ep_rank_devices(6, 4, true).unwrap();
         let free = [24 * gib, 20 * gib, 16 * gib, 12 * gib, 24 * gib, 20 * gib];
@@ -6654,7 +6728,10 @@ mod qwen4_admission_tests {
         );
         // Four physical devices under 8 ranks: every device carries two.
         let devices = qwen4_ep_rank_devices(8, 4, true).unwrap();
-        assert_eq!(qwen4_ep_alias_free(&devices, &[24 * gib; 8]), vec![12 * gib; 8]);
+        assert_eq!(
+            qwen4_ep_alias_free(&devices, &[24 * gib; 8]),
+            vec![12 * gib; 8]
+        );
         assert_eq!(qwen4_ep_emulation_map(&[0, 1, 0]), "0->0, 1->1, 2->0");
     }
 }
@@ -6726,7 +6803,10 @@ mod qwen4_ple_load_fill_tests {
             ple_prewarm_budget_for(Auto, Some(112 * GIB)),
             (15 * GIB, false)
         );
-        assert_eq!(ple_prewarm_budget_for(Bytes(2 * GIB), None), (2 * GIB, false));
+        assert_eq!(
+            ple_prewarm_budget_for(Bytes(2 * GIB), None),
+            (2 * GIB, false)
+        );
         assert_eq!(ple_prewarm_budget_for(Bytes(0), Some(112 * GIB)), (0, true));
         assert_eq!(ple_prewarm_budget_for(Auto, None), (0, false));
     }

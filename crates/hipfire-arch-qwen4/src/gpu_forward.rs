@@ -5961,7 +5961,11 @@ impl Qwen4GpuForward {
             // sized for: all expert-slab layers (K1 lane-union GEMVs inside
             // the 512-row F32 fallback, K2 grouped GEMMs writing the BF16
             // grouped rows) or all symmetric-IU4 layers.
-            let slab_layers = moe.iter().flatten().filter(|layer| layer.slab.is_some()).count();
+            let slab_layers = moe
+                .iter()
+                .flatten()
+                .filter(|layer| layer.slab.is_some())
+                .count();
             let all_slab = moe_count != 0 && slab_layers == moe_count;
             if compact && slab_layers != 0 && !all_slab {
                 return Err(invalid(
@@ -10593,15 +10597,27 @@ mod tests {
         };
         assert_eq!(slab.mode(), Mode::FnSymGfx1201);
         assert_eq!(
-            CompactScratchTerms { knob: Some(true), ..slab }.mode(),
+            CompactScratchTerms {
+                knob: Some(true),
+                ..slab
+            }
+            .mode(),
             Mode::FnSymGfx1201
         );
         assert_eq!(
-            CompactScratchTerms { sym_iu4_requested: true, ..slab }.mode(),
+            CompactScratchTerms {
+                sym_iu4_requested: true,
+                ..slab
+            }
+            .mode(),
             Mode::FnSymGfx1201
         );
         assert_eq!(
-            CompactScratchTerms { knob: Some(false), ..slab }.mode(),
+            CompactScratchTerms {
+                knob: Some(false),
+                ..slab
+            }
+            .mode(),
             Mode::Full
         );
         // The symmetric IU4 route stays opt-in: it needs `1` plus the IU4
@@ -10619,25 +10635,57 @@ mod tests {
         assert_eq!(sym.mode(), Mode::FnSymGfx1201);
         let sym_off = [
             CompactScratchTerms { knob: None, ..sym },
-            CompactScratchTerms { knob: Some(false), ..sym },
-            CompactScratchTerms { sym_iu4_requested: false, ..sym },
-            CompactScratchTerms { source_symmetric: false, ..sym },
+            CompactScratchTerms {
+                knob: Some(false),
+                ..sym
+            },
+            CompactScratchTerms {
+                sym_iu4_requested: false,
+                ..sym
+            },
+            CompactScratchTerms {
+                source_symmetric: false,
+                ..sym
+            },
         ];
         for terms in sym_off {
             assert_eq!(terms.mode(), Mode::Full, "{terms:?}");
         }
         // Neither route: a packed (non-slab, non-symmetric) artifact.
         assert_eq!(
-            CompactScratchTerms { source_symmetric: false, ..sym }.mode(),
+            CompactScratchTerms {
+                source_symmetric: false,
+                ..sym
+            }
+            .mode(),
             Mode::Full
         );
         // Device, PLE and profile terms gate both routes whatever the knob.
-        for base in [slab, CompactScratchTerms { knob: Some(true), ..slab }, sym] {
+        for base in [
+            slab,
+            CompactScratchTerms {
+                knob: Some(true),
+                ..slab
+            },
+            sym,
+        ] {
             let off = [
-                CompactScratchTerms { exact_gfx1201: false, ..base },
-                CompactScratchTerms { grouped_gemm: false, ..base },
-                CompactScratchTerms { ple_key_value_bf16: false, ..base },
-                CompactScratchTerms { flash_next_profile: false, ..base },
+                CompactScratchTerms {
+                    exact_gfx1201: false,
+                    ..base
+                },
+                CompactScratchTerms {
+                    grouped_gemm: false,
+                    ..base
+                },
+                CompactScratchTerms {
+                    ple_key_value_bf16: false,
+                    ..base
+                },
+                CompactScratchTerms {
+                    flash_next_profile: false,
+                    ..base
+                },
             ];
             for terms in off {
                 assert_eq!(terms.mode(), Mode::Full, "{terms:?}");

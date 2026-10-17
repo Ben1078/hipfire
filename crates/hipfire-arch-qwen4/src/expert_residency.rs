@@ -142,7 +142,12 @@ pub fn refuse_host_expert_request(
 
 /// Whether every routed expert (`expert_bytes`), the non-expert weights and
 /// `reserve` ([`auto_vram_reserve`]) fit in `free_vram`.
-pub fn fits_fully_resident(free_vram: u64, non_expert_bytes: u64, expert_bytes: u64, reserve: u64) -> bool {
+pub fn fits_fully_resident(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    expert_bytes: u64,
+    reserve: u64,
+) -> bool {
     non_expert_bytes
         .checked_add(expert_bytes)
         .and_then(|bytes| bytes.checked_add(reserve))
@@ -162,7 +167,9 @@ pub fn fits_fully_resident(free_vram: u64, non_expert_bytes: u64, expert_bytes: 
 pub fn keeps_host_memory_out_of_reclaim(arch_id: u32, device_archs: &[&str]) -> bool {
     arch_id == crate::ARCH_ID
         && !device_archs.is_empty()
-        && device_archs.iter().all(|arch| hipfire_config::is_discrete_memory_arch(arch))
+        && device_archs
+            .iter()
+            .all(|arch| hipfire_config::is_discrete_memory_arch(arch))
 }
 
 /// Bytes of every routed expert payload (trunk and MTP layers).
@@ -220,7 +227,9 @@ fn parse_expert_vram_layers(value: &str) -> Result<ExpertVramLayers, String> {
     value
         .parse::<usize>()
         .map(ExpertVramLayers::Layers)
-        .map_err(|_| format!("{EXPERT_VRAM_LAYERS_ENV}={value:?} is neither `auto` nor a layer count"))
+        .map_err(|_| {
+            format!("{EXPERT_VRAM_LAYERS_ENV}={value:?} is neither `auto` nor a layer count")
+        })
 }
 
 fn is_routed_expert(name: &str) -> bool {
@@ -257,7 +266,8 @@ pub fn resident_split_ranks(
         if entry.residency.is_external() || matches!(entry.policy, ShardPolicy::Tied { .. }) {
             continue;
         }
-        let bytes = bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
         if !is_routed_expert(&entry.name) {
             non_expert += bytes;
         } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
@@ -320,25 +330,36 @@ pub fn auto_vram_reserve(
     };
     let committed = trunk(context.committed_layer_bytes(config, qsa_format))
         .ok_or_else(|| overflow(context.max_seq))?;
-    let measured_context = trunk(config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, qsa_format))
-        .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
+    let measured_context =
+        trunk(config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, qsa_format))
+            .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
     // The derived arenas' (BF-1 F16 K/V, pooled BF16 mirror) extra storage
     // must fit through the admitted context, including on UMA VMM loads that
     // otherwise charge only the first mapped chunk. Do not subtract it with
     // the historical (arena-off) measured layout.
     let arena = if qsa_layout.f16_arena || qsa_layout.pooled_bf16 {
-        let capacity = crate::Qwen4ContextCommit { tokens: context.max_seq, ..*context };
-        let plain = capacity.committed_layer_bytes(config, qsa_format)
+        let capacity = crate::Qwen4ContextCommit {
+            tokens: context.max_seq,
+            ..*context
+        };
+        let plain = capacity
+            .committed_layer_bytes(config, qsa_format)
             .ok_or_else(|| overflow(context.max_seq))?;
-        let with = capacity.committed_layer_bytes(config, qsa_layout)
+        let with = capacity
+            .committed_layer_bytes(config, qsa_layout)
             .ok_or_else(|| overflow(context.max_seq))?;
-        trunk(Some(with.checked_sub(plain).ok_or_else(|| overflow(context.max_seq))?))
-            .ok_or_else(|| overflow(context.max_seq))?
+        trunk(Some(
+            with.checked_sub(plain)
+                .ok_or_else(|| overflow(context.max_seq))?,
+        ))
+        .ok_or_else(|| overflow(context.max_seq))?
     } else {
         0
     };
-    let context = committed.saturating_sub(measured_context)
-        .checked_add(arena).ok_or_else(|| overflow(context.max_seq))?;
+    let context = committed
+        .saturating_sub(measured_context)
+        .checked_add(arena)
+        .ok_or_else(|| overflow(context.max_seq))?;
     let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
     let measured = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
         config,
@@ -351,8 +372,8 @@ pub fn auto_vram_reserve(
         scratch.checked_add(spec as u64)
     })
     .ok_or_else(overflow)?;
-    let forward =
-        crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode).ok_or_else(overflow)?;
+    let forward = crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
+        .ok_or_else(overflow)?;
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(forward))
@@ -469,7 +490,11 @@ pub fn state_census(
         .ok_or_else(|| overflow("state without its QSA context"))?;
     let forward = crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
         .ok_or_else(|| overflow("forward resources"))?;
-    Ok(StateCensus { qsa_context, state, forward })
+    Ok(StateCensus {
+        qsa_context,
+        state,
+        forward,
+    })
 }
 
 /// The forward scratch one pipeline-parallel rank allocates, split by who
@@ -1250,7 +1275,8 @@ const F16_SHADOW_LAYER_SUFFIXES: [&str; 8] = [
 ];
 
 /// The final hyper-connection's down mix, shadowed like the per-layer ones.
-const F16_SHADOW_ROOT: &str = "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight";
+const F16_SHADOW_ROOT: &str =
+    "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight";
 
 /// Device bytes of the lazy F16 weight shadows the long-prefill routes can
 /// create for the trunk: for every resident, non-tied BF16 rank-2 entry of
@@ -1341,7 +1367,11 @@ pub struct AutoReserve {
 impl AutoReserve {
     pub fn new(historical: Option<u64>, census: ReserveCensus) -> Result<Self, String> {
         let census_total = census.total()?;
-        Ok(Self { historical, census, census_total })
+        Ok(Self {
+            historical,
+            census,
+            census_total,
+        })
     }
 
     /// The bytes `auto` reserves: `max(historical, census)`, or the census
@@ -1416,7 +1446,10 @@ pub fn auto_placement_layers(
 ) -> Result<usize, String> {
     const MIB: u64 = 1 << 20;
     let reserve = charges.reserve(base_reserve)?;
-    if non_expert_bytes.checked_add(reserve).is_none_or(|need| free_vram < need) {
+    if non_expert_bytes
+        .checked_add(reserve)
+        .is_none_or(|need| free_vram < need)
+    {
         return Err(format!(
             "{} MiB of free VRAM cannot hold the {} MiB of non-expert weights plus the {} MiB reserve ({} MiB base + {}) even with every routed expert in host RAM; free VRAM on this GPU",
             free_vram / MIB,
@@ -1426,7 +1459,13 @@ pub fn auto_placement_layers(
             charges.describe()
         ));
     }
-    Ok(auto_vram_layers(free_vram, non_expert_bytes, layer_expert_bytes, num_layers, reserve))
+    Ok(auto_vram_layers(
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes,
+        num_layers,
+        reserve,
+    ))
 }
 
 /// Device bytes an expert-tier lease's frozen tables take beyond the payload:
@@ -1469,7 +1508,10 @@ pub fn expert_hotset_budget(
 /// Whether a load on `arch` builds the long-prefill expert stage (the same
 /// switch `Qwen4ExpertStage::new` reads), so its buffers need a budget.
 pub fn expert_stage_enabled(arch: &str) -> bool {
-    hipfire_config::developer_bool(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV, arch == "gfx1201")
+    hipfire_config::developer_bool(
+        crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
+        arch == "gfx1201",
+    )
 }
 
 /// Device bytes the tier long-prefill staging allocates for `plan`: one VRAM
@@ -1490,7 +1532,10 @@ pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -
             .sum();
         largest[layer % 2] = largest[layer % 2].max(host);
     }
-    largest.iter().map(|bytes| bytes + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64).sum()
+    largest
+        .iter()
+        .map(|bytes| bytes + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64)
+        .sum()
 }
 
 /// Whether a whole-layer (slab arena) load allocates the two dedicated
@@ -1537,7 +1582,10 @@ impl PlacementCharges {
         } else {
             0
         };
-        Ok(Self { margin: EXPERT_HOTSET_VRAM_MARGIN_BYTES, stage })
+        Ok(Self {
+            margin: EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+            stage,
+        })
     }
 
     /// `base` ([`auto_vram_reserve`]) plus both charges.
@@ -1567,8 +1615,8 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
         if entry.residency != WeightResidency::Resident || !is_routed_expert(&entry.name) {
             continue;
         }
-        let trunk_resident = !entry.name.starts_with("mtp.")
-            && entry.layer.is_some_and(|layer| layer < vram_layers);
+        let trunk_resident =
+            !entry.name.starts_with("mtp.") && entry.layer.is_some_and(|layer| layer < vram_layers);
         if !trunk_resident {
             entry.residency = WeightResidency::HostMapped;
             moved += 1;
@@ -1698,7 +1746,9 @@ fn rank_share(entry: &WeightEntry, bytes: u64, rank: usize, ranks: usize) -> Res
         return Ok(bytes / ranks);
     }
     if rank >= ranks {
-        return Err(format!("expert-parallel rank {rank} is outside {ranks} ranks"));
+        return Err(format!(
+            "expert-parallel rank {rank} is outside {ranks} ranks"
+        ));
     }
     let experts = entry.logical_shape.first().copied().unwrap_or(0);
     if experts < ranks {
@@ -1949,7 +1999,10 @@ pub fn gtt_budget() -> Option<GttBudget> {
         return None;
     }
     let limit_bytes = read_sysfs_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
-    Some(GttBudget { limit_bytes, used_bytes: amdgpu_gtt_used_bytes()? })
+    Some(GttBudget {
+        limit_bytes,
+        used_bytes: amdgpu_gtt_used_bytes()?,
+    })
 }
 
 /// Refuse before any allocation when GTT-backed host-mapped experts would not
@@ -1957,7 +2010,11 @@ pub fn gtt_budget() -> Option<GttBudget> {
 /// Past it `hipHostMalloc` fails, after the load has uploaded the VRAM
 /// weights. `None` (userptr, or no TTM limit in sysfs) skips the check.
 pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), String> {
-    let Some(GttBudget { limit_bytes, used_bytes }) = budget else {
+    let Some(GttBudget {
+        limit_bytes,
+        used_bytes,
+    }) = budget
+    else {
         return Ok(());
     };
     let free = limit_bytes.saturating_sub(used_bytes);
@@ -1985,12 +2042,16 @@ mod tests {
     use crate::gpu_forward::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
     use hipfire_runtime::weight_manifest::ShardPolicy;
     use rdna_compute::tensor_ops::QsaKvFormat::{self, F32};
-    use rdna_compute::DType;
     use rdna_compute::uma_memory::ttm_pool_estimate_from;
+    use rdna_compute::DType;
 
     fn entry(name: &str, layer: usize) -> WeightEntry {
-        let mut entry =
-            WeightEntry::model(name, vec![4, 4, 256], DType::MQ4G256V2, ShardPolicy::Replicate);
+        let mut entry = WeightEntry::model(
+            name,
+            vec![4, 4, 256],
+            DType::MQ4G256V2,
+            ShardPolicy::Replicate,
+        );
         entry.layer = Some(layer);
         entry
     }
@@ -2017,15 +2078,24 @@ mod tests {
             arena_entry(3, 200),
             entry("model.language_model.layers.0.self_attn.q_proj.weight", 0),
         ];
-        assert!(weights[..4].iter().all(|entry| is_routed_expert(&entry.name)));
-        let (non_expert, layer_experts) =
-            resident_split(&weights, |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2))
-                .expect("split");
-        assert_eq!(layer_experts, 700 * 2, "the charge is the max arena, never layer 0's");
+        assert!(weights[..4]
+            .iter()
+            .all(|entry| is_routed_expert(&entry.name)));
+        let (non_expert, layer_experts) = resident_split(&weights, |entry| {
+            Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)
+        })
+        .expect("split");
+        assert_eq!(
+            layer_experts,
+            700 * 2,
+            "the charge is the max arena, never layer 0's"
+        );
         assert_eq!(non_expert, 4 * 4 * 256 * 2);
         // Admission totals every arena's physical bytes.
         assert_eq!(
-            routed_expert_bytes(&weights, |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)),
+            routed_expert_bytes(&weights, |entry| Some(
+                entry.logical_shape.iter().product::<usize>() as u64 * 2
+            )),
             Ok((100 + 300 + 700 + 200) * 2)
         );
         // Per-rank shares of a max arena split the same way.
@@ -2049,7 +2119,10 @@ mod tests {
         let mut weights = vec![
             entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
             entry("model.language_model.layers.1.mlp.experts.down_proj", 1),
-            entry("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", 1),
+            entry(
+                "model.language_model.layers.1.mlp.shared_expert.down_proj.weight",
+                1,
+            ),
             entry("model.language_model.layers.2.mlp.experts.gate_up_proj", 2),
             entry("mtp.layers.0.mlp.experts.down_proj", 0),
         ];
@@ -2073,7 +2146,10 @@ mod tests {
         let mut weights = vec![
             entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
             entry("model.language_model.layers.2.mlp.experts.down_proj", 2),
-            entry("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", 1),
+            entry(
+                "model.language_model.layers.1.mlp.shared_expert.down_proj.weight",
+                1,
+            ),
             entry("mtp.layers.0.mlp.experts.gate_up_proj", 0),
             entry("mtp.layers.0.mlp.experts.down_proj", 0),
             entry("model.language_model.embed_tokens.weight", 0),
@@ -2087,16 +2163,31 @@ mod tests {
             let mut placed = weights.clone();
             place_routed_experts(&mut placed, vram_layers);
             placed.retain(|entry| {
-                !(is_routed_expert(&entry.name) && !entry.name.starts_with("mtp.") && entry.layer.is_some())
+                !(is_routed_expert(&entry.name)
+                    && !entry.name.starts_with("mtp.")
+                    && entry.layer.is_some())
             });
-            assert_eq!(got, host_mapped_bytes(&placed, bytes_of).unwrap(), "vram_layers={vram_layers}");
+            assert_eq!(
+                got,
+                host_mapped_bytes(&placed, bytes_of).unwrap(),
+                "vram_layers={vram_layers}"
+            );
         }
         // MTP experts and the preexisting host entry only; the input never mutates.
-        let expected = (weights[3].name.len() + weights[4].name.len() + weights[5].name.len()) as u64
-            * 1000
-            + 3 * HOST_MAPPED_PAD_BYTES;
-        assert_eq!(hotset_host_mapped_bytes(&weights, bytes_of, 3), Ok(expected));
-        assert_eq!(before, weights.iter().map(|entry| entry.residency).collect::<Vec<_>>());
+        let expected =
+            (weights[3].name.len() + weights[4].name.len() + weights[5].name.len()) as u64 * 1000
+                + 3 * HOST_MAPPED_PAD_BYTES;
+        assert_eq!(
+            hotset_host_mapped_bytes(&weights, bytes_of, 3),
+            Ok(expected)
+        );
+        assert_eq!(
+            before,
+            weights
+                .iter()
+                .map(|entry| entry.residency)
+                .collect::<Vec<_>>()
+        );
         assert!(hotset_host_mapped_bytes(&weights, |_| None, 3).is_err());
         assert!(hotset_host_mapped_bytes(&weights, |_| Some(u64::MAX), 3).is_err());
     }
@@ -2114,7 +2205,10 @@ mod tests {
         let exact =
             non_expert + reserve + EXPERT_TIER_TABLE_BYTES + EXPERT_HOTSET_VRAM_MARGIN_BYTES;
         assert_eq!(expert_hotset_budget(exact, non_expert, reserve).unwrap(), 0);
-        assert_eq!(expert_hotset_budget(exact + 1, non_expert, reserve).unwrap(), 1);
+        assert_eq!(
+            expert_hotset_budget(exact + 1, non_expert, reserve).unwrap(),
+            1
+        );
         assert!(expert_hotset_budget(exact - 1, non_expert, reserve).is_err());
         assert!(expert_hotset_budget(0, 1, 0).is_err());
         assert!(expert_hotset_budget(u64::MAX, u64::MAX, u64::MAX).is_err());
@@ -2148,12 +2242,14 @@ mod tests {
     fn f16_arena_reserve_covers_full_capacity_even_with_vmm() {
         let config = crate::config::compact_test_config();
         let layout = rdna_compute::tensor_ops::QsaStateLayout {
-            f16_arena: true, ..rdna_compute::tensor_ops::QsaStateLayout::F32
+            f16_arena: true,
+            ..rdna_compute::tensor_ops::QsaStateLayout::F32
         };
         for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
             let context = crate::Qwen4ContextCommit::new(backend, 262145, 8192, 2 << 20);
             let plain = auto_vram_reserve(&config, &context, 8192, Full, F32, None, None).unwrap();
-            let with = auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
+            let with =
+                auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
             let extra = if backend == crate::Qwen4KvBackend::Vmm {
                 2 * (262148usize * 1024).div_ceil(2 << 20) * (2 << 20) * config.n_full_layers()
             } else {
@@ -2170,14 +2266,16 @@ mod tests {
         };
         let config = crate::config::compact_test_config();
         let layout = rdna_compute::tensor_ops::QsaStateLayout {
-            pooled_bf16: true, ..rdna_compute::tensor_ops::QsaStateLayout::F32
+            pooled_bf16: true,
+            ..rdna_compute::tensor_ops::QsaStateLayout::F32
         };
         let blocks = 262145usize.div_ceil(4);
         let block_bytes = layout.pooled_bf16_bytes_per_block(128);
         for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
             let context = crate::Qwen4ContextCommit::new(backend, 262145, 8192, 2 << 20);
             let plain = auto_vram_reserve(&config, &context, 8192, Full, F32, None, None).unwrap();
-            let with = auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
+            let with =
+                auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
             let per_layer = if backend == crate::Qwen4KvBackend::Vmm {
                 KvChunkPlan::new(
                     block_bytes,
@@ -2279,12 +2377,27 @@ mod tests {
             &[320, 10240],
         )];
         for i in 0..48 {
-            weights.push(bf16(&layer(i, "attn_hyper_connection.input_mix_weight_down.weight"), &[320, 10240]));
-            weights.push(bf16(&layer(i, "mlp_hyper_connection.input_mix_weight_down.weight"), &[320, 10240]));
+            weights.push(bf16(
+                &layer(i, "attn_hyper_connection.input_mix_weight_down.weight"),
+                &[320, 10240],
+            ));
+            weights.push(bf16(
+                &layer(i, "mlp_hyper_connection.input_mix_weight_down.weight"),
+                &[320, 10240],
+            ));
             weights.push(bf16(&layer(i, "mlp.gate.weight"), &[512, 2560]));
-            weights.push(bf16(&layer(i, "mlp.shared_expert.gate_proj.weight"), &[640, 2560]));
-            weights.push(bf16(&layer(i, "mlp.shared_expert.up_proj.weight"), &[640, 2560]));
-            weights.push(bf16(&layer(i, "mlp.shared_expert.down_proj.weight"), &[2560, 640]));
+            weights.push(bf16(
+                &layer(i, "mlp.shared_expert.gate_proj.weight"),
+                &[640, 2560],
+            ));
+            weights.push(bf16(
+                &layer(i, "mlp.shared_expert.up_proj.weight"),
+                &[640, 2560],
+            ));
+            weights.push(bf16(
+                &layer(i, "mlp.shared_expert.down_proj.weight"),
+                &[2560, 640],
+            ));
         }
         weights.push(bf16(&layer(2, "ple.key_proj.weight"), &[6400, 2560]));
         weights.push(bf16(&layer(2, "ple.value_proj.weight"), &[6400, 2560]));
@@ -2344,7 +2457,13 @@ mod tests {
     /// The full-context census at the default 4096-row chunk, `Full` forward,
     /// no runtime term: what the census was before the runtime overhead.
     fn real_census(config: &Qwen4Config, max_seq: usize) -> ReserveCensus {
-        census_at(config, max_seq, crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"), Full, 0)
+        census_at(
+            config,
+            max_seq,
+            crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"),
+            Full,
+            0,
+        )
     }
 
     /// Placement of the reproduction card with the real census: the layers
@@ -2381,7 +2500,10 @@ mod tests {
         assert_eq!(census.f16_shadows, 1_298_923_520);
         // The 4096-row pool workspace with every short tail (slab union plan
         // sized for 32 lanes: 7688 B).
-        assert_eq!(census.workspace.iter().map(|term| term.1).sum::<u64>(), 153_261_832);
+        assert_eq!(
+            census.workspace.iter().map(|term| term.1).sum::<u64>(),
+            153_261_832
+        );
         // The split selector's constant score + filter extent.
         assert_eq!(census.qsa_selector, 83_894_272);
         assert!(census.gather > 0 && census.forward > 0 && census.state > 0);
@@ -2414,11 +2536,24 @@ mod tests {
         assert!(free - non_expert - (placed as u64 + 1) * layer < charged);
         // Every census term is itemised in the log text.
         let text = reserve.describe();
-        for name in ["QSA context", "state", "forward", "F16 weight shadows", "QSA selector", "native MTP", "QSA gather", "fp16_x", "ksplit_det", "gdn_pair_counters"] {
+        for name in [
+            "QSA context",
+            "state",
+            "forward",
+            "F16 weight shadows",
+            "QSA selector",
+            "native MTP",
+            "QSA gather",
+            "fp16_x",
+            "ksplit_det",
+            "gdn_pair_counters",
+        ] {
             assert!(text.contains(name), "{name}: {text}");
         }
         assert!(charges.describe().contains("512 MiB safety margin"));
-        assert!(charges.describe().contains("2120 MiB long-prefill stage buffers"));
+        assert!(charges
+            .describe()
+            .contains("2120 MiB long-prefill stage buffers"));
     }
 
     #[test]
@@ -2436,7 +2571,8 @@ mod tests {
         assert_eq!(census.qsa_context, 336 << 20);
         // The actual full map exceeds what the first prefill chunk maps: the
         // growth the historical floor charges as zero.
-        let first = crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, 17_408, 1536, 2 << 20);
+        let first =
+            crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, 17_408, 1536, 2 << 20);
         let first = state_census(&config, target_state_format(), &first, 4096, Full).unwrap();
         assert!(census.qsa_context > first.qsa_context);
         let (unfixed, floor_charged, placed, reserve, _) =
@@ -2463,14 +2599,19 @@ mod tests {
 
     #[test]
     fn a_retired_floor_makes_the_census_the_reserve_and_says_so() {
-        let census = ReserveCensus { runtime: 1344 << 20, ..census_with(1 << 30, 1 << 30, 1 << 30, 0, 0) };
+        let census = ReserveCensus {
+            runtime: 1344 << 20,
+            ..census_with(1 << 30, 1 << 30, 1 << 30, 0, 0)
+        };
         let retired = AutoReserve::new(None, census).unwrap();
         assert_eq!(retired.bytes(), retired.census_total);
         assert_eq!(retired.winner(), "census (historical floor retired)");
         let text = retired.describe();
         assert!(text.contains("HIP runtime 1344 MiB"), "{text}");
         assert!(
-            text.contains("(historical floor retired: the census carries the measured HIP runtime overhead)"),
+            text.contains(
+                "(historical floor retired: the census carries the measured HIP runtime overhead)"
+            ),
             "{text}"
         );
         // Even a census below what a floor would have been is not raised.
@@ -2504,14 +2645,29 @@ mod tests {
         )
         .unwrap() as u64;
         let historical = auto_vram_reserve(
-            &config, &context, chunk, Full, format.layout(), None, Some(gather),
+            &config,
+            &context,
+            chunk,
+            Full,
+            format.layout(),
+            None,
+            Some(gather),
         )
         .unwrap();
-        let today = AutoReserve::new(Some(historical), census_at(&config, max_seq, chunk, Full, 0))
-            .unwrap();
+        let today = AutoReserve::new(
+            Some(historical),
+            census_at(&config, max_seq, chunk, Full, 0),
+        )
+        .unwrap();
         let new = AutoReserve::new(
             None,
-            census_at(&config, max_seq, chunk, FnSymGfx1201, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES),
+            census_at(
+                &config,
+                max_seq,
+                chunk,
+                FnSymGfx1201,
+                QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+            ),
         )
         .unwrap();
         let layers = |reserve: &AutoReserve| {
@@ -2537,7 +2693,11 @@ mod tests {
         let charges = PlacementCharges::new(1060 << 20, false).unwrap();
         let fits = |chunk: usize| {
             let census = census_at(
-                &config, 32768, chunk, FnSymGfx1201, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+                &config,
+                32768,
+                chunk,
+                FnSymGfx1201,
+                QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
             );
             let reserve = AutoReserve::new(None, census).unwrap();
             fits_fully_resident(
@@ -2555,14 +2715,22 @@ mod tests {
     fn the_compact_1024_census_covers_the_measured_peak_beyond_weights() {
         let config = crate::config::compact_test_config();
         let census = census_at(
-            &config, 32768, 1024, FnSymGfx1201, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+            &config,
+            32768,
+            1024,
+            FnSymGfx1201,
+            QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
         );
         // 4,141 MiB: the measured peak beyond the weights at this config.
         assert!(census.total().unwrap() >= 4141 << 20);
         assert_eq!(census.total().unwrap() >> 20, 4237);
         // For the record: the `Full` 8192-row chunk at 32K with the runtime.
         let full = census_at(
-            &config, 32768, 8192, Full, QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
+            &config,
+            32768,
+            8192,
+            Full,
+            QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
         );
         assert_eq!(full.total().unwrap() >> 20, 12302);
     }
@@ -2588,18 +2756,37 @@ mod tests {
         // pages (`for_expert_reserve(use_ranges = true)`), the census the
         // whole admitted context.
         let first = crate::Qwen4ContextCommit::for_expert_reserve(
-            crate::Qwen4KvBackend::Vmm, true, max_seq, chunk, granularity,
+            crate::Qwen4KvBackend::Vmm,
+            true,
+            max_seq,
+            chunk,
+            granularity,
         );
-        let full =
-            crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
-        assert!(full.committed_layer_bytes(&config, format.layout())
-            > first.committed_layer_bytes(&config, format.layout()));
+        let full = crate::Qwen4ContextCommit::new(
+            crate::Qwen4KvBackend::Vmm,
+            max_seq,
+            max_seq,
+            granularity,
+        );
+        assert!(
+            full.committed_layer_bytes(&config, format.layout())
+                > first.committed_layer_bytes(&config, format.layout())
+        );
         let gather = |tokens: usize| {
-            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(config.num_key_value_heads, tokens)
-                .unwrap() as u64
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                config.num_key_value_heads,
+                tokens,
+            )
+            .unwrap() as u64
         };
         let historical = auto_vram_reserve(
-            &config, &first, chunk, Full, format.layout(), None, Some(gather(first.tokens)),
+            &config,
+            &first,
+            chunk,
+            Full,
+            format.layout(),
+            None,
+            Some(gather(first.tokens)),
         )
         .unwrap();
         // The logged reserve of the shipped runs.
@@ -2632,13 +2819,25 @@ mod tests {
         // Both Halo artifacts fit fully resident under whichever formula wins
         // (exact non-expert bytes 5,364,055,296 = 5,115.6 MiB).
         assert_eq!(reserve.census_total >> 20, 9854, "{}", reserve.describe());
-        for (free, routed) in [(118_441u64 << 20, 62_475u64 << 20), (118_415 << 20, 51_375 << 20)] {
-            assert!(fits_fully_resident(free, 5_364_055_296, routed, reserve.bytes()), "{}", reserve.describe());
+        for (free, routed) in [
+            (118_441u64 << 20, 62_475u64 << 20),
+            (118_415 << 20, 51_375 << 20),
+        ] {
+            assert!(
+                fits_fully_resident(free, 5_364_055_296, routed, reserve.bytes()),
+                "{}",
+                reserve.describe()
+            );
         }
         // The census decision: the historical floor wins on this admission
         // (no flip), so unified-memory behaviour is unchanged. A failure here
         // is the flip: unified memory must then admit on `historical`.
-        assert_eq!(reserve.winner(), "historical floor", "{}", reserve.describe());
+        assert_eq!(
+            reserve.winner(),
+            "historical floor",
+            "{}",
+            reserve.describe()
+        );
     }
 
     #[test]
@@ -2658,10 +2857,22 @@ mod tests {
         assert_eq!(reserve.bytes(), total);
         assert_eq!(reserve.winner(), "census");
         let text = reserve.describe();
-        for name in ["QSA context", "state", "forward", "F16 weight shadows", "workspace", "QSA selector", "native MTP", "QSA gather"] {
+        for name in [
+            "QSA context",
+            "state",
+            "forward",
+            "F16 weight shadows",
+            "workspace",
+            "QSA selector",
+            "native MTP",
+            "QSA gather",
+        ] {
             assert!(text.contains(name), "{name}: {text}");
         }
-        assert!(text.contains("census wins") && text.contains("7927 MiB historical floor"), "{text}");
+        assert!(
+            text.contains("census wins") && text.contains("7927 MiB historical floor"),
+            "{text}"
+        );
         // The census, not the floor, sizes the placement.
         let by_floor = auto_vram_layers(free, non_expert, layer, 49, historical);
         let by_census = auto_vram_layers(free, non_expert, layer, 49, reserve.bytes());
@@ -2685,7 +2896,9 @@ mod tests {
                 // Whole admitted context mapped, as the actual backend maps it.
                 let full = crate::Qwen4ContextCommit::new(backend, max_seq, max_seq, granularity);
                 let census = state_census(&config, format, &full, 4096, Full).unwrap();
-                let context = full.committed_layer_bytes(&config, format.layout()).unwrap()
+                let context = full
+                    .committed_layer_bytes(&config, format.layout())
+                    .unwrap()
                     * config.n_full_layers();
                 assert_eq!(census.qsa_context, context as u64, "{backend:?} {format:?}");
                 // The rest of the state plus the context is exactly the state.
@@ -2718,9 +2931,18 @@ mod tests {
         let layer = |i: usize, suffix: &str| format!("model.language_model.layers.{i}.{suffix}");
         let mut weights = vec![
             // Shadowed: full F16 matrices, 2 bytes per element.
-            bf16("model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", &[4, 8]),
-            bf16(&layer(0, "attn_hyper_connection.input_mix_weight_down.weight"), &[2, 2]),
-            bf16(&layer(1, "mlp_hyper_connection.input_mix_weight_down.weight"), &[2, 2]),
+            bf16(
+                "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+                &[4, 8],
+            ),
+            bf16(
+                &layer(0, "attn_hyper_connection.input_mix_weight_down.weight"),
+                &[2, 2],
+            ),
+            bf16(
+                &layer(1, "mlp_hyper_connection.input_mix_weight_down.weight"),
+                &[2, 2],
+            ),
             bf16(&layer(0, "mlp.gate.weight"), &[3, 5]),
             bf16(&layer(0, "mlp.shared_expert.gate_proj.weight"), &[3, 5]),
             bf16(&layer(0, "mlp.shared_expert.up_proj.weight"), &[3, 5]),
@@ -2728,7 +2950,10 @@ mod tests {
             bf16(&layer(0, "ple.key_proj.weight"), &[1, 7]),
             bf16(&layer(0, "ple.value_proj.weight"), &[1, 7]),
             // Direct BF16 readers and other tensors: no shadow.
-            bf16(&layer(0, "attn_hyper_connection.input_mix_weight_up.weight"), &[2, 2]),
+            bf16(
+                &layer(0, "attn_hyper_connection.input_mix_weight_up.weight"),
+                &[2, 2],
+            ),
             bf16(&layer(0, "mlp.shared_expert_gate.weight"), &[1, 9]),
             bf16(&layer(0, "input_layernorm.weight"), &[1, 9]),
             // Past the trunk, wrong rank or wrong dtype: no shadow.
@@ -2769,7 +2994,13 @@ mod tests {
         assert!(!dedicated_slab_stage(true, true, true));
         let (free, non_expert, layer, base) = EVIDENCE;
         let off = PlacementCharges::new(layer, false).unwrap();
-        assert_eq!(off, PlacementCharges { margin: 512 << 20, stage: 0 });
+        assert_eq!(
+            off,
+            PlacementCharges {
+                margin: 512 << 20,
+                stage: 0
+            }
+        );
         assert_eq!(off.reserve(base).unwrap(), base + (512 << 20));
         // No stage: only the margin costs layers
         // ((32550 - 5115 - 7927 - 512) / 1060 = 17.9).
@@ -2784,7 +3015,12 @@ mod tests {
         let experts = 20 * layer;
         let need = non_expert + experts + base;
         assert!(fits_fully_resident(need, non_expert, experts, base));
-        assert!(!fits_fully_resident(need, non_expert, experts, off.reserve(base).unwrap()));
+        assert!(!fits_fully_resident(
+            need,
+            non_expert,
+            experts,
+            off.reserve(base).unwrap()
+        ));
     }
 
     #[test]
@@ -2793,16 +3029,28 @@ mod tests {
         let charges = PlacementCharges::new(layer, true).unwrap();
         let need = non_expert + charges.reserve(base).unwrap();
         // Exactly the weights and the charged reserve: zero resident layers.
-        assert_eq!(auto_placement_layers(need, non_expert, layer, 49, base, &charges), Ok(0));
+        assert_eq!(
+            auto_placement_layers(need, non_expert, layer, 49, base, &charges),
+            Ok(0)
+        );
         let error =
             auto_placement_layers(need - 1, non_expert, layer, 49, base, &charges).unwrap_err();
-        assert!(error.contains("cannot hold") && error.contains("every routed expert in host RAM"), "{error}");
+        assert!(
+            error.contains("cannot hold") && error.contains("every routed expert in host RAM"),
+            "{error}"
+        );
         assert!(error.contains("512 MiB safety margin"), "{error}");
-        assert!(error.contains("2120 MiB long-prefill stage buffers"), "{error}");
+        assert!(
+            error.contains("2120 MiB long-prefill stage buffers"),
+            "{error}"
+        );
         // Without the stage the same card still loads: the 2120 MiB + 8191 B
         // the stage took now holds two whole layers.
         let off = PlacementCharges::new(layer, false).unwrap();
-        assert_eq!(auto_placement_layers(need - 1, non_expert, layer, 49, base, &off), Ok(2));
+        assert_eq!(
+            auto_placement_layers(need - 1, non_expert, layer, 49, base, &off),
+            Ok(2)
+        );
     }
 
     #[test]
@@ -2838,7 +3086,11 @@ mod tests {
         for rows in [AUTO_VRAM_RESERVE_CHUNK, 2048, 4096] {
             let delta = forward(rows, Full) - forward(rows, FnSymGfx1201);
             assert!(delta > 0, "{rows} rows");
-            assert_eq!(reserve(rows, Full) - reserve(rows, FnSymGfx1201), delta, "{rows} rows");
+            assert_eq!(
+                reserve(rows, Full) - reserve(rows, FnSymGfx1201),
+                delta,
+                "{rows} rows"
+            );
         }
         // A compact 8192-row chunk costs no more than today's 4096-row chunk,
         // so `auto` keeps at least the layers it keeps today.
@@ -2853,9 +3105,16 @@ mod tests {
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
-        let base =
-            auto_vram_reserve(&config, &measured, AUTO_VRAM_RESERVE_CHUNK, Full, F32, None, None)
-                .unwrap();
+        let base = auto_vram_reserve(
+            &config,
+            &measured,
+            AUTO_VRAM_RESERVE_CHUNK,
+            Full,
+            F32,
+            None,
+            None,
+        )
+        .unwrap();
         let native = |context: &crate::Qwen4ContextCommit, max_k, row_capture| {
             crate::mtp_spec::native_mtp_device_bytes(
                 &config,
@@ -2915,8 +3174,8 @@ mod tests {
         let verify = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row;
         assert!(verify > scratch);
         let capture4 =
-            crate::state::Qwen4State::row_capture_bytes(&config, crate::GdnStateFormat::Q8, 4).unwrap()
-                as u64;
+            crate::state::Qwen4State::row_capture_bytes(&config, crate::GdnStateFormat::Q8, 4)
+                .unwrap() as u64;
         assert_eq!(mtp, resident + verify + capture4);
         assert_eq!(native(&measured, 3, None), resident + verify);
         assert_eq!(native(&measured, 10, None), resident + verify);
@@ -2925,7 +3184,10 @@ mod tests {
             let capture =
                 crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;
             let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row + capture;
-            assert_eq!(native(&measured, 10, Some(gdn)), resident + scratch.max(request));
+            assert_eq!(
+                native(&measured, 10, Some(gdn)),
+                resident + scratch.max(request)
+            );
             // The gfx1151 batched prompt fill adds its row scratch (sub-chunks
             // of at most MTP_FILL_ROWS rows) and one chunk of prompt token ids
             // to the request.
@@ -3077,7 +3339,8 @@ mod tests {
             for format in [QsaKvFormat::Fp8, F32] {
                 // Discrete: a VMM backend's reserve and placement are legacy
                 // storage's at this `max_seq`.
-                let discrete = Commit::for_expert_reserve(Backend::Vmm, false, max_seq, chunk, granularity);
+                let discrete =
+                    Commit::for_expert_reserve(Backend::Vmm, false, max_seq, chunk, granularity);
                 assert_eq!(discrete, legacy);
                 assert_eq!(placement(&discrete, format), placement(&legacy, format));
                 assert_eq!(
@@ -3087,7 +3350,8 @@ mod tests {
                 // Unified memory is unchanged: VMM charges the first chunk's
                 // pages, legacy all of `max_seq`.
                 let vmm = Commit::new(Backend::Vmm, max_seq, chunk, granularity);
-                let uma_vmm = Commit::for_expert_reserve(Backend::Vmm, true, max_seq, chunk, granularity);
+                let uma_vmm =
+                    Commit::for_expert_reserve(Backend::Vmm, true, max_seq, chunk, granularity);
                 assert_eq!(uma_vmm, vmm);
                 assert_eq!(placement(&uma_vmm, format), placement(&vmm, format));
                 assert!(placement(&uma_vmm, format).0 < placement(&legacy, format).0);
@@ -3097,7 +3361,15 @@ mod tests {
                     legacy
                 );
             }
-            assert!(mtp(&Commit::for_expert_reserve(Backend::Vmm, true, max_seq, chunk, granularity)) < mtp(&legacy));
+            assert!(
+                mtp(&Commit::for_expert_reserve(
+                    Backend::Vmm,
+                    true,
+                    max_seq,
+                    chunk,
+                    granularity
+                )) < mtp(&legacy)
+            );
         }
     }
 
@@ -3118,8 +3390,14 @@ mod tests {
     #[test]
     fn stage_mirrors_charge_every_rank_on_the_shared_host() {
         let full = 512 * (1_740_800 + 870_400);
-        assert_eq!(expert_stage_mirror_bytes(full, 1).unwrap(), 2 * full as u64 + 4 * HOST_MAPPED_PAD_BYTES);
-        assert_eq!(expert_stage_mirror_bytes(full / 2, 2).unwrap(), 2 * full as u64 + 8 * HOST_MAPPED_PAD_BYTES);
+        assert_eq!(
+            expert_stage_mirror_bytes(full, 1).unwrap(),
+            2 * full as u64 + 4 * HOST_MAPPED_PAD_BYTES
+        );
+        assert_eq!(
+            expert_stage_mirror_bytes(full / 2, 2).unwrap(),
+            2 * full as u64 + 8 * HOST_MAPPED_PAD_BYTES
+        );
         assert!(expert_stage_mirror_bytes(full, 0).is_err());
         assert!(expert_stage_mirror_bytes(usize::MAX, 2).is_err());
     }
@@ -3136,7 +3414,12 @@ mod tests {
         assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES), 0).is_ok());
         assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES - 1), 0).is_err());
         // So does the GTT cap: one rank's quarter fits where the four-rank total does not.
-        let budget = |limit_bytes| Some(GttBudget { limit_bytes, used_bytes: 0 });
+        let budget = |limit_bytes| {
+            Some(GttBudget {
+                limit_bytes,
+                used_bytes: 0,
+            })
+        };
         assert!(check_gtt_cap(charge, budget(charge)).is_ok());
         assert!(check_gtt_cap(charge, budget(charge - 1)).is_err());
         assert!(check_gtt_cap(charge / 4, budget(charge - 1)).is_ok());
@@ -3144,7 +3427,10 @@ mod tests {
 
     /// `/proc/meminfo` text from `(field, MiB)` pairs.
     fn meminfo(fields: &[(&str, u64)]) -> String {
-        fields.iter().map(|(key, mib)| format!("{key}:{:>16} kB\n", mib << 10)).collect()
+        fields
+            .iter()
+            .map(|(key, mib)| format!("{key}:{:>16} kB\n", mib << 10))
+            .collect()
     }
 
     /// The measured 5-card gfx1201 host (MemTotal 128865156 kB, pool cap
@@ -3194,13 +3480,22 @@ mod tests {
         // This host: pages_limit 16108144 (61.4 GiB); N=12 host-maps 46.1 GiB.
         let limit_bytes = 16_108_144 * TTM_PAGE_BYTES;
         let host = 46u64 << 30;
-        let fresh = GttBudget { limit_bytes, used_bytes: 16 << 20 };
+        let fresh = GttBudget {
+            limit_bytes,
+            used_bytes: 16 << 20,
+        };
         assert!(check_gtt_cap(host, Some(fresh)).is_ok());
         assert!(check_gtt_cap(limit_bytes - fresh.used_bytes, Some(fresh)).is_ok());
         let error = check_gtt_cap(limit_bytes - fresh.used_bytes + 1, Some(fresh)).unwrap_err();
-        assert!(error.contains("pages_limit") && error.contains("16108144 pages"), "{error}");
+        assert!(
+            error.contains("pages_limit") && error.contains("16108144 pages"),
+            "{error}"
+        );
         // A second load beside one already holding 46 GiB of GTT is refused.
-        let beside = GttBudget { limit_bytes, used_bytes: 46 << 30 };
+        let beside = GttBudget {
+            limit_bytes,
+            used_bytes: 46 << 30,
+        };
         assert!(check_gtt_cap(host, Some(beside)).is_err());
         // Userptr host memory, or no TTM limit in sysfs, is not GTT-capped.
         assert!(check_gtt_cap(u64::MAX, None).is_ok());
@@ -3208,8 +3503,14 @@ mod tests {
 
     #[test]
     fn parse_accepts_auto_and_counts_only() {
-        assert_eq!(parse_expert_vram_layers(" auto "), Ok(ExpertVramLayers::Auto));
-        assert_eq!(parse_expert_vram_layers("16"), Ok(ExpertVramLayers::Layers(16)));
+        assert_eq!(
+            parse_expert_vram_layers(" auto "),
+            Ok(ExpertVramLayers::Auto)
+        );
+        assert_eq!(
+            parse_expert_vram_layers("16"),
+            Ok(ExpertVramLayers::Layers(16))
+        );
         assert!(parse_expert_vram_layers("16GB").is_err());
     }
 
@@ -3224,27 +3525,50 @@ mod tests {
         assert!(!fits_fully_resident(10 * GIB, 2 * GIB, 7 * GIB, GIB + 1));
         assert!(!fits_fully_resident(u64::MAX, 1, u64::MAX, 0));
         assert_eq!(resolve_expert_vram_layers(None, || Ok(true)), Ok(None));
-        assert_eq!(resolve_expert_vram_layers(None, || Ok(false)), Ok(Some(ExpertVramLayers::Auto)));
+        assert_eq!(
+            resolve_expert_vram_layers(None, || Ok(false)),
+            Ok(Some(ExpertVramLayers::Auto))
+        );
         assert!(resolve_expert_vram_layers(None, || Err("vram".into())).is_err());
         // Explicit values never consult the fit.
-        for policy in [ExpertVramLayers::Layers(12), ExpertVramLayers::Layers(99), ExpertVramLayers::Auto] {
-            let resolved = resolve_expert_vram_layers(Some(policy), || panic!("explicit consulted the fit"));
+        for policy in [
+            ExpertVramLayers::Layers(12),
+            ExpertVramLayers::Layers(99),
+            ExpertVramLayers::Auto,
+        ] {
+            let resolved =
+                resolve_expert_vram_layers(Some(policy), || panic!("explicit consulted the fit"));
             assert_eq!(resolved, Ok(Some(policy)));
         }
     }
 
     #[test]
     fn only_qwen4_on_discrete_gpus_keeps_host_memory_out_of_reclaim() {
-        assert!(keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1201"]));
-        assert!(keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1100", "gfx942"]));
+        assert!(keeps_host_memory_out_of_reclaim(
+            crate::ARCH_ID,
+            &["gfx1201"]
+        ));
+        assert!(keeps_host_memory_out_of_reclaim(
+            crate::ARCH_ID,
+            &["gfx1100", "gfx942"]
+        ));
         // Another model on the same card (arch 5: the Qwen3.5-family trunk).
         assert!(!keeps_host_memory_out_of_reclaim(5, &["gfx1201"]));
         // Unified memory, alone or beside a discrete card ROCr also exposes.
-        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1151"]));
-        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx1100", "gfx1151"]));
+        assert!(!keeps_host_memory_out_of_reclaim(
+            crate::ARCH_ID,
+            &["gfx1151"]
+        ));
+        assert!(!keeps_host_memory_out_of_reclaim(
+            crate::ARCH_ID,
+            &["gfx1100", "gfx1151"]
+        ));
         // No card known, or one whose memory kind is not known.
         assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &[]));
-        assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx90a"]));
+        assert!(!keeps_host_memory_out_of_reclaim(
+            crate::ARCH_ID,
+            &["gfx90a"]
+        ));
     }
 
     /// Total payload bytes of a manifest entry at 2 bytes per element.
@@ -3408,12 +3732,15 @@ mod tests {
         );
         let pad = routed as u64 * HOST_MAPPED_PAD_BYTES;
         for ranks in [2usize, 3, 4, 5, 6, 8] {
-            let charges =
-                host_mapped_bytes_ranks(&manifest.weights, element_bytes, ranks).unwrap();
+            let charges = host_mapped_bytes_ranks(&manifest.weights, element_bytes, ranks).unwrap();
             assert_eq!(charges.len(), ranks);
             for (rank, &charge) in charges.iter().enumerate() {
                 let local = Qwen4EpPlacement { rank, ranks }.local_count(512) as u64;
-                assert_eq!(charge, (single - pad) / 512 * local + pad, "ranks={ranks} rank={rank}");
+                assert_eq!(
+                    charge,
+                    (single - pad) / 512 * local + pad,
+                    "ranks={ranks} rank={rank}"
+                );
             }
             // The host charge equals the full payload: nothing lost or doubled.
             assert_eq!(
@@ -3439,7 +3766,13 @@ mod tests {
         let per_expert = 1_336_934_400u64 / 512;
         let split = |ranks: usize| {
             let max = Qwen4EpPlacement { rank: 0, ranks }.max_local_count(512) as u64;
-            ep_vram_layers(&config, &[free; 8][..ranks], non_expert, per_expert * max, reserve)
+            ep_vram_layers(
+                &config,
+                &[free; 8][..ranks],
+                non_expert,
+                per_expert * max,
+                reserve,
+            )
         };
         assert_eq!(split(2), 19);
         assert_eq!(split(4), 39);
@@ -3479,10 +3812,22 @@ mod tests {
         );
         let lines: Vec<_> = report.lines().collect();
         assert_eq!(lines.len(), 5, "{report}");
-        assert!(lines[0].contains("4 ranks") && lines[0].contains("32768") && lines[0].contains("1536"));
+        assert!(
+            lines[0].contains("4 ranks") && lines[0].contains("32768") && lines[0].contains("1536")
+        );
         for (rank, line) in lines[1..].iter().enumerate() {
-            assert!(line.starts_with(&format!("qwen4 EP rank {rank}/4:")), "{line}");
-            for part in ["free", "trunk", "experts", "resident expert layers", "reserve", "headroom"] {
+            assert!(
+                line.starts_with(&format!("qwen4 EP rank {rank}/4:")),
+                "{line}"
+            );
+            for part in [
+                "free",
+                "trunk",
+                "experts",
+                "resident expert layers",
+                "reserve",
+                "headroom",
+            ] {
                 assert!(line.contains(part), "{part} missing from {line}");
             }
             // 49 MoE layers incl. the MTP head.
@@ -3490,12 +3835,24 @@ mod tests {
         }
         // EP4 at 28..30 GiB free keeps all 49 MoE layers (the MTP layer too) resident.
         assert!(lines[0].contains("VRAM split 49 of 49"), "{}", lines[0]);
-        assert!(lines[1].contains("resident expert layers 49 of 49 (0 host-mapped"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("resident expert layers 49 of 49 (0 host-mapped"),
+            "{}",
+            lines[1]
+        );
         // Headroom: 30 GiB - 5.99 GB trunk - 49 x 0.334 GB - 6.5 GiB reserve > 0 on rank 0.
         assert!(lines[1].contains("headroom +"), "{}", lines[1]);
         // A rank with too little VRAM for the reserve reports negative headroom.
-        let tight =
-            ep_fit_rank_line(&config, 1, 2, 8 << 30, 5_990_000_000, 668_450_000, 6_656u64 << 20, 0);
+        let tight = ep_fit_rank_line(
+            &config,
+            1,
+            2,
+            8 << 30,
+            5_990_000_000,
+            668_450_000,
+            6_656u64 << 20,
+            0,
+        );
         assert!(tight.contains("headroom -"), "{tight}");
         assert!(tight.contains("resident expert layers 0 of 49"), "{tight}");
     }
@@ -3512,18 +3869,39 @@ mod tests {
         assert_eq!(rank(64 << 30), 49, "everything fits");
         assert_eq!(rank(1 << 30), 0, "reserve alone does not fit");
         let free = [30u64 << 30, 24 << 30, 30 << 30, 29 << 30];
-        assert_eq!(ep_vram_layers(&config, &free, non_expert, layer, reserve), tight);
-        assert_eq!(ep_vram_layers(&config, &free[..1], non_expert, layer, reserve), roomy);
+        assert_eq!(
+            ep_vram_layers(&config, &free, non_expert, layer, reserve),
+            tight
+        );
+        assert_eq!(
+            ep_vram_layers(&config, &free[..1], non_expert, layer, reserve),
+            roomy
+        );
         assert_eq!(ep_vram_layers(&config, &[], non_expert, layer, reserve), 0);
         // The report applies the minimum to every rank.
         let report = ep_fit_report(&config, 4, &free, non_expert, layer, reserve, 32768, 1536);
         let lines: Vec<_> = report.lines().collect();
-        assert!(lines[0].contains(&format!("VRAM split {tight} of 49")), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("VRAM split {tight} of 49")),
+            "{}",
+            lines[0]
+        );
         for line in &lines[1..] {
-            assert!(line.contains(&format!("resident expert layers {tight} of 49")), "{line}");
+            assert!(
+                line.contains(&format!("resident expert layers {tight} of 49")),
+                "{line}"
+            );
         }
-        assert!(lines[2].contains(&format!("this rank alone fits {tight}")), "{}", lines[2]);
-        assert!(lines[1].contains(&format!("this rank alone fits {roomy}")), "{}", lines[1]);
+        assert!(
+            lines[2].contains(&format!("this rank alone fits {tight}")),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[1].contains(&format!("this rank alone fits {roomy}")),
+            "{}",
+            lines[1]
+        );
     }
 
     fn band_scopes(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
