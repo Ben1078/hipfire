@@ -689,9 +689,10 @@ pub struct SlowlinkCensus {
     pub a4_sidecars: u64,
     /// The architecture-owned HC-stream arena ([`PromptArenaLayout`]).
     pub arena: u64,
-    /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary copies of the session fixed
-    /// state, charged once each. The entry snapshot is the incumbent's own
-    /// snapshot arena, already in the base reserve, and is never charged again.
+    /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary stages of the target's session
+    /// fixed parts, charged once each, plus the native-MTP entry `pending`
+    /// hidden copy. The entry snapshot is the incumbent's own snapshot arena,
+    /// already in the base reserve, and is never charged again.
     pub boundary_state: u64,
 }
 
@@ -744,10 +745,13 @@ pub struct AdmissionInputs {
     pub base_reserve: u64,
     /// The incumbent 1,536-row placement's layers, for the log only.
     pub baseline_layers: usize,
-    /// Bytes of one session fixed-state snapshot (GDN recurrent and conv, QSA
-    /// selections, PLE conv, hyper feedback; no context rows):
-    /// [`crate::bundle::session_snapshot_bytes`] at `p = 0`.
+    /// Bytes of ONE boundary stage: the target's session fixed parts (GDN
+    /// recurrent and conv, QSA selections, PLE conv, hyper feedback; no context
+    /// rows, no MTP head), [`crate::bundle::session_snapshot_bytes`] at `p = 0`
+    /// with `native_mtp = false`.
     pub fixed_state_bytes: u64,
+    /// Entry `pending` hidden copy of a native-MTP request (0 for AR).
+    pub pending_save_bytes: u64,
     pub window_rows: usize,
     pub link_gbps: f64,
 }
@@ -852,7 +856,8 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
                 S1_MAX_BOUNDARY_SNAPSHOTS as u64,
                 inputs.fixed_state_bytes,
                 "boundary state",
-            )?,
+            )
+            .and_then(|stages| checked_add(stages, inputs.pending_save_bytes, "boundary state"))?,
         })
     })()
     .map_err(SlowlinkDecline::Geometry)?;
@@ -955,15 +960,33 @@ pub fn load_admission_inputs(
     let (gate_up_layer_bytes, down_layer_bytes) =
         residency::routed_layer_payload_split(facts.weights, facts.bytes_of)
             .map_err(SlowlinkDecline::Geometry)?;
-    // One session fixed-state snapshot (no context rows): the exact bytes each
-    // new boundary snapshot copies, charged once.
-    let fixed_state_bytes = crate::bundle::session_snapshot_bytes(
-        facts.config,
-        facts.state_format,
-        facts.native_mtp,
-        0,
-    )
-    .ok_or_else(|| SlowlinkDecline::Geometry("session fixed snapshot bytes overflow".into()))?;
+    // One boundary stage = the TARGET's session fixed parts only (the head's
+    // rows are not staged), each part aligned to the cache's 256-byte packing:
+    // `session_snapshot_bytes` at `p = 0` without the native MTP head. Each
+    // new boundary stage is charged once.
+    let fixed_state_bytes =
+        crate::bundle::session_snapshot_bytes(facts.config, facts.state_format, false, 0)
+            .ok_or_else(|| {
+                SlowlinkDecline::Geometry("session fixed snapshot bytes overflow".into())
+            })?;
+    // A native-MTP request also saves the entry `pending` hidden (one F32 wide
+    // row, `hc_count * hidden * 4`) for rollback: a NEW buffer beyond the
+    // existing pending owner (`Qwen4Bundle::slowlink_save_pending`).
+    let pending_save_bytes = if facts.native_mtp {
+        checked_mul(
+            checked_mul(
+                facts.config.hc_count as u64,
+                facts.config.hidden_size as u64,
+                "pending hidden",
+            )
+            .map_err(SlowlinkDecline::Geometry)?,
+            4,
+            "pending hidden",
+        )
+        .map_err(SlowlinkDecline::Geometry)?
+    } else {
+        0
+    };
     Ok(AdmissionInputs {
         geometry,
         free: facts.free,
@@ -975,6 +998,7 @@ pub fn load_admission_inputs(
         base_reserve: facts.tile_reserve,
         baseline_layers,
         fixed_state_bytes,
+        pending_save_bytes,
         window_rows: facts.window_rows,
         link_gbps,
     })
@@ -1289,6 +1313,7 @@ mod tests {
             base_reserve: 5261 * MIB,
             baseline_layers: 10,
             fixed_state_bytes: 64 * MIB,
+            pending_save_bytes: 4 * 2560 * 4,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
         }
@@ -1308,6 +1333,7 @@ mod tests {
             + a4_sidecar_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + arena.total_bytes
             + S1_MAX_BOUNDARY_SNAPSHOTS as u64 * inputs.fixed_state_bytes
+            + inputs.pending_save_bytes
     }
 
     /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.

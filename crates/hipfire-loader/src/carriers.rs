@@ -7489,6 +7489,8 @@ mod qwen4_slowlink_tests {
     const NON_EXPERT: u64 = 5_364_000_000;
     const BASE_RESERVE: u64 = 5261 * MIB;
     const FIXED_STATE: u64 = 64 * MIB;
+    // One F32 wide row (`hc_count * hidden * 4`): the native-MTP entry pending copy.
+    const PENDING_SAVE: u64 = 4 * 2560 * 4;
     const MARGIN: u64 = 512 * MIB;
 
     fn shape(arch: &str) -> s1::LoadShape<'_> {
@@ -7531,6 +7533,7 @@ mod qwen4_slowlink_tests {
             + s1::a4_sidecar_bytes(&geometry, s1::S1_WINDOW_ROWS).unwrap()
             + arena.total_bytes
             + s1::S1_MAX_BOUNDARY_SNAPSHOTS as u64 * FIXED_STATE
+            + PENDING_SAVE
     }
 
     /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.
@@ -7550,6 +7553,7 @@ mod qwen4_slowlink_tests {
             base_reserve: BASE_RESERVE,
             baseline_layers: 10,
             fixed_state_bytes: FIXED_STATE,
+            pending_save_bytes: PENDING_SAVE,
             window_rows: s1::S1_WINDOW_ROWS,
             link_gbps,
         }
