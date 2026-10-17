@@ -2501,8 +2501,14 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         )
     };
     // The bottom-up census at the full admitted context.
-    let state = state_census(config, state_format, &census_context, chunk_rows, scratch_mode)
-        .map_err(|error| format!("qwen4: {error}"))?;
+    let state = state_census(
+        config,
+        state_format,
+        &census_context,
+        chunk_rows,
+        scratch_mode,
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     // Lazy F16 weight shadows of the BF16 owners the long-prefill F16 WMMA
     // arms read (exact gfx1201): the cold bound from the manifest, not the
     // warm cache.
@@ -2573,7 +2579,8 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         gather: gather_for(&census_context)?.unwrap_or(0),
         runtime: runtime.unwrap_or(0),
     };
-    let reserve = AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
+    let reserve =
+        AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
     Ok(PlacementInputs {
         non_expert,
         layer_experts,
@@ -5515,16 +5522,8 @@ mod tests {
     fn xtx_reserve(chunk: usize) -> AutoReserve {
         let config = crate::config::compact_test_config();
         let context = crate::Qwen4ContextCommit::legacy(XTX_MAX_SEQ);
-        let historical = auto_vram_reserve(
-            &config,
-            &context,
-            chunk,
-            Full,
-            QsaKvFormat::Q8,
-            None,
-            None,
-        )
-        .unwrap();
+        let historical =
+            auto_vram_reserve(&config, &context, chunk, Full, QsaKvFormat::Q8, None, None).unwrap();
         // The census terms the receipts print (QSA context 132 MiB, state
         // 65 MiB, forward at this chunk); it stays below the floor at every
         // rung, as in both receipts, so the historical floor sets the reserve.
@@ -5588,14 +5587,13 @@ mod tests {
     ) -> XtxDryrun {
         let mut weights = xtx_manifest();
         let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
-        assert_eq!((non_expert, layer), (XTX_NON_EXPERT, XTX_GATE_UP + XTX_DOWN));
-        // Placement: the requested chunk, the placement stage switch.
-        let placement_rows = crate::gpu_forward::prefill_chunk_requested_from(
-            arch,
-            chunk_env,
-            XTX_MAX_SEQ,
-            || link,
+        assert_eq!(
+            (non_expert, layer),
+            (XTX_NON_EXPERT, XTX_GATE_UP + XTX_DOWN)
         );
+        // Placement: the requested chunk, the placement stage switch.
+        let placement_rows =
+            crate::gpu_forward::prefill_chunk_requested_from(arch, chunk_env, XTX_MAX_SEQ, || link);
         let charges = PlacementCharges::new(
             layer,
             dedicated_slab_stage(expert_stage_placement_switch(arch, stage_env), slab, false),

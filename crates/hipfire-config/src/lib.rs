@@ -6650,12 +6650,7 @@ mod tests {
         );
         assert!(is_developer_key(KEY));
         assert!(is_typed_bool_developer_key(KEY));
-        for (raw, want) in [
-            ("1", true),
-            ("true", true),
-            ("0", false),
-            ("False", false),
-        ] {
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("False", false)] {
             let mut layer = ConfigLayer::default();
             layer.set_cli(KEY, raw).unwrap();
             assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
