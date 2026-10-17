@@ -1973,7 +1973,17 @@ fn load_qwen4_rank_scoped(
     // `max_seq`), never their virtual extent; a discrete card charges legacy
     // storage of `max_seq` whatever the backend, so VMM growth stays inside
     // the reserve and placement matches legacy.
-    let auto_inputs_at = |chunk_rows: usize| -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
+    let auto_inputs_at = |chunk_rows: usize| -> Result<
+        (
+            u64,
+            u64,
+            u64,
+            residency::AutoReserve,
+            Option<u64>,
+            Option<u64>,
+        ),
+        String,
+    > {
         let (free, _) = ctx
             .gpu
             .device_mem_info()
@@ -7562,6 +7572,7 @@ mod qwen4_slowlink_tests {
             baseline_layers: 10,
             fixed_state_bytes: FIXED_STATE,
             pending_save_bytes: PENDING_SAVE,
+            checkpoint_stride_rows: 8192,
             window_rows: s1::S1_WINDOW_ROWS,
             link_gbps,
         }
@@ -7656,7 +7667,10 @@ mod qwen4_slowlink_tests {
         );
         assert_eq!(builds, 1);
         let error = outcome.unwrap_err();
-        assert!(error.contains("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1"), "{error}");
+        assert!(
+            error.contains("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1"),
+            "{error}"
+        );
         assert!(error.contains("keeps 9 of the required 10"), "{error}");
         assert!(error.contains(&(LAYER - 1).to_string()), "{error}");
     }
