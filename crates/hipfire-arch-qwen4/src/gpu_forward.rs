@@ -1310,6 +1310,157 @@ impl Qwen4SlabLayer {
     }
 }
 
+impl Qwen4MoeLayerRuntime {
+    /// The layer's routed experts live in pinned host memory (every expert of
+    /// the layer: S1 places whole layers).
+    pub(crate) fn s1_host_mapped(&self) -> bool {
+        self.host_mapped
+    }
+
+    /// Whether this layer is the qualified S1 shape: uniform MQ4 experts with
+    /// no CPU splice or tier split, no stock FP8, no expert-keep pruning mask
+    /// and no non-MQ4 slab codec. `Err` names the first reason; the S1
+    /// selector turns it into a pre-mutation incumbent verdict.
+    pub(crate) fn s1_layer_check(&self) -> Result<(), &'static str> {
+        if self.fp8 {
+            return Err("stock FP8 experts");
+        }
+        if self.cpu_deferred_experts
+            || self.cpu_expert_owners.is_some()
+            || self.cpu_tier_owners.is_some()
+            || self.cpu_split.is_some()
+        {
+            return Err("CPU expert splice");
+        }
+        if self.tier.is_some() {
+            return Err("expert tiers");
+        }
+        if !self.experts_all_gate_up_mq4 {
+            return Err("experts are not uniform MQ4");
+        }
+        if self.expert_keep_mask.is_some() {
+            return Err("expert-keep pruning mask");
+        }
+        if let Some(slab) = self.slab.as_ref() {
+            if slab.codecs.iter().any(|codec| *codec != crate::expert_arena::CODEC_MQ4) {
+                return Err("mixed-codec slab layer");
+            }
+        }
+        if self.expert_gate_up_entries.len() != self.experts.len()
+            || self.expert_down_entries.len() != self.experts.len()
+        {
+            return Err("expert table entries differ from the expert views");
+        }
+        Ok(())
+    }
+
+    /// The layer's device pointer tables (global expert id indexed u64, gate/up
+    /// then down): the binding of an S1 resident layer.
+    pub(crate) fn s1_tables(&self) -> (&GpuTensor, &GpuTensor) {
+        (&self.expert_gate_up_ptrs, &self.expert_down_ptrs)
+    }
+
+    /// Experts one table holds (the model's expert count).
+    pub(crate) fn s1_num_experts(&self) -> usize {
+        self.experts.len()
+    }
+
+    /// Per-expert payload bytes `(gate/up, down)` of expert `id`, `None` for an
+    /// expert the layer does not hold.
+    pub(crate) fn s1_expert_bytes(&self, id: usize) -> Option<(usize, usize)> {
+        let expert = self.experts.get(id)?;
+        if expert.gate_up.tensor.buf.size() == 0 || expert.down.tensor.buf.size() == 0 {
+            return None;
+        }
+        Some((
+            checked_bytes(expert.gate_up.m, expert.gate_up.row_stride)?,
+            checked_bytes(expert.down.m, expert.down.row_stride)?,
+        ))
+    }
+
+    /// The transport sources of this host layer's experts: pinned CPU
+    /// addresses of the immutable weight payload, translated from the device
+    /// alias addresses of the layer's pointer entries. A slab arena layer has
+    /// one host range; the aggregate packed layer has one per projection.
+    pub(crate) fn s1_host_sources(
+        &self,
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        layer: usize,
+    ) -> Result<panel_stage::LayerExpertSources, Qwen4GpuForwardError> {
+        use panel_stage::{AliasExpert, LayerExpertSources, PanelCodec};
+        self.s1_layer_check().map_err(|why| {
+            invalid(format!("slow-link layer {layer} is not S1 qualified: {why}"))
+        })?;
+        if !self.host_mapped {
+            return Err(invalid(format!(
+                "slow-link layer {layer} has no host-mapped experts to stream"
+            )));
+        }
+        let mut aliases: Vec<Option<AliasExpert>> = Vec::with_capacity(self.experts.len());
+        for id in 0..self.experts.len() {
+            aliases.push(self.s1_expert_bytes(id).map(|(gate_up_len, down_len)| AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: self.expert_gate_up_entries[id],
+                gate_up_len,
+                down_addr: self.expert_down_entries[id],
+                down_len,
+            }));
+        }
+        let weights = bundle
+            .weights
+            .layer(layer)
+            .ok_or_else(|| invalid(format!("slow-link layer {layer} is not owned")))?
+            .ffn
+            .moe()
+            .ok_or_else(|| invalid(format!("slow-link layer {layer} has no MoE weights")))?;
+        let host_range = |tensor: &GpuTensor| -> Result<(usize, usize, usize), Qwen4GpuForwardError> {
+            let host = gpu.host_bytes(tensor).ok_or_else(|| {
+                invalid(format!(
+                    "slow-link layer {layer}: a host expert owner has no pinned host bytes"
+                ))
+            })?;
+            Ok((host.as_ptr() as usize, tensor.buf.as_ptr() as usize, host.len()))
+        };
+        // The pinned weight allocation outlives the forward (the bundle frees
+        // the forward, which drains the ring, before the weights), so the
+        // unit owner only marks provenance.
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        // SAFETY: each range is the pinned host allocation of the layer's own
+        // resident weight tensor, immutable and alive until `Qwen4Bundle::free_gpu`
+        // (after this forward and its ring are freed); every extent is bounds
+        // checked against its range by the constructor.
+        match (self.slab.as_ref(), weights.expert_arena.as_ref()) {
+            (Some(slab), Some(arena_ref)) => {
+                let tensor = bundle.weights.resident(arena_ref)?;
+                let (cpu_base, _, host_len) = host_range(tensor)?;
+                if host_len < slab.arena_bytes {
+                    return Err(invalid(format!(
+                        "slow-link layer {layer}: host slab arena is shorter than its plan"
+                    )));
+                }
+                unsafe {
+                    LayerExpertSources::from_alias(
+                        layer,
+                        cpu_base,
+                        slab.arena_base,
+                        slab.arena_bytes,
+                        &aliases,
+                        owner,
+                    )
+                }
+            }
+            _ => {
+                let gate_up = host_range(bundle.weights.resident(&weights.experts_gate_up)?)?;
+                let down = host_range(bundle.weights.resident(&weights.experts_down)?)?;
+                unsafe {
+                    LayerExpertSources::from_alias_split(layer, gate_up, down, &aliases, owner)
+                }
+            }
+        }
+    }
+}
+
 /// Host bytes of a mixed slab layer's tag tensor from its real per-expert
 /// codecs. The K1 union planner reads the leading `[512]` u8 table as
 /// bucket membership only (bucket 0 = cold, 1 = MQ4: byte `1` selects the
@@ -3725,6 +3876,9 @@ pub(crate) struct Qwen4ExpertStage {
 }
 
 mod slab_stage;
+/// S1 slow-link layer-major prefill transport: the bounded expert page ring
+/// and the layer-ahead weight schedule ([`crate::slowlink_prefill`]).
+pub(crate) mod panel_stage;
 
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
@@ -5827,6 +5981,76 @@ pub(crate) struct TileScopes {
     ragged: bool,
 }
 
+/// How a prefill chunk's staged PLE rows reach the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PleUploadMode {
+    /// After a device-token readback the host already synchronized past the
+    /// previous upload.
+    Unfenced,
+    /// Fenced asynchronous upload: the staging bytes stay unwritable until the
+    /// copy ran, the host never waits on the device queue.
+    Async,
+    /// Blocking upload (capture aware).
+    Blocking,
+}
+
+/// Wait for a fetched PLE row lease, stage it in `host`, upload it to
+/// `staged` and widen it into `ple_rows` (F16 when `rows_f16`). The one body
+/// of the PLE row staging: the chunk-major forward and every S1 layer-major
+/// tile run it, so the rows reaching the PLE step are produced identically.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_ple_rows(
+    gpu: &mut Gpu,
+    host: &mut PleHostStage,
+    ple: &mut RowFetch<'_>,
+    staged: &GpuTensor,
+    ple_rows: &GpuTensor,
+    rows_f16: bool,
+    rows: usize,
+    head_count: usize,
+    row_width: usize,
+    mode: PleUploadMode,
+) -> Result<(), Qwen4GpuForwardError> {
+    let wait_started = qwen4_profile_start();
+    let lease_result = ple.wait();
+    qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
+    let lease = lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+    let upload_len = lease
+        .as_bytes()
+        .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
+        .len();
+    // Retire any earlier asynchronous upload still reading the staging bytes
+    // before the host copy overwrites them.
+    let stage_started = qwen4_profile_start();
+    let stage_result = match host.stage_buffer(gpu, upload_len) {
+        Ok(buffer) => lease
+            .stage_into(buffer)
+            .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string())),
+        Err(error) => Err(error.into()),
+    };
+    qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
+    stage_result?;
+    let upload_started = qwen4_profile_start();
+    let upload_result = match mode {
+        PleUploadMode::Unfenced => host.upload_unfenced(gpu, &staged.buf, upload_len),
+        PleUploadMode::Async => host.upload_async(gpu, &staged.buf, upload_len),
+        PleUploadMode::Blocking => host.upload_blocking(gpu, &staged.buf, upload_len),
+    };
+    qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
+    upload_result?;
+    lease
+        .validate_after_upload()
+        .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
+    let apply_started = qwen4_profile_start();
+    if rows_f16 {
+        gpu.grouped_gather_convert_bf16_f16(staged, ple_rows, rows, head_count, row_width)?;
+    } else {
+        gpu.grouped_gather_convert_bf16(staged, ple_rows, rows, head_count, row_width)?;
+    }
+    qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
+    Ok(())
+}
+
 /// Typed per-layer step construction shared by the chunk-major forward
 /// (`forward_chunk_scoped`) and the S1 layer-major prompt schedule
 /// (`crate::slowlink_prefill`). Every lowering of a layer's HC read / mixer /
@@ -6135,6 +6359,37 @@ impl<'a> LayerPhaseEnv<'a> {
         Ok(())
     }
 
+    /// Seal the layer's MoE call for this program's rows and routing rows
+    /// exactly as the incumbent does ([`crate::program::seal_moe_for_layer`]);
+    /// `scratch` is the program's layer scratch view.
+    pub(crate) fn seal_moe(
+        &self,
+        ctx: &'a DispatchCtx,
+        moe: Qwen4MoeBinding<'a>,
+        scratch: &'a Qwen4LayerScratch<'a>,
+    ) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
+        crate::program::seal_moe_for_layer(ctx, self.dims, moe, scratch, self.rows, self.route_n)
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))
+    }
+
+    /// The MoE FFN steps of a layer: the routed accumulator clear and the
+    /// sealed call (its output is `scratch.ffn_output`).
+    pub(crate) fn moe_steps(
+        &self,
+        steps: &mut Vec<Step<'a>>,
+        ctx: &'a DispatchCtx,
+        moe: Qwen4MoeBinding<'a>,
+        scratch: &'a Qwen4LayerScratch<'a>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let sealed = self.seal_moe(ctx, moe, scratch)?;
+        steps.push(Step::Clear(ClearOp {
+            tensor: &self.scratch.ffn_output,
+            elements: self.rows * self.bundle.config.hidden_size,
+        }));
+        steps.push(Step::Moe(sealed));
+        Ok(())
+    }
+
     /// The dense FFN step (a non-MoE layer): reads `scratch.hc_mixed`, writes
     /// `scratch.ffn_output`.
     pub(crate) fn dense_step(&self, dense: &Qwen4DenseBinding<'a>) -> Step<'a> {
@@ -6276,6 +6531,10 @@ pub struct Qwen4GpuForward {
     mesh_tokens: PleHostStage,
     /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
     mesh_trunk_ops: std::ops::Range<u32>,
+    /// S1 slow-link layer-major prefill state: the admitted profile and, once
+    /// the first S1 prompt ran, its page ring and prompt storage
+    /// ([`crate::slowlink_prefill`]). Empty on every other load.
+    pub(crate) slowlink: crate::slowlink_prefill::SlowlinkSlot,
     #[cfg(target_os = "linux")]
     npu_trunk: Option<npu_forward::NpuForward>,
 }
@@ -7332,6 +7591,7 @@ impl Qwen4GpuForward {
             mesh_route_rows: None,
             mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
             mesh_trunk_ops,
+            slowlink: Default::default(),
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
@@ -7837,6 +8097,76 @@ impl Qwen4GpuForward {
             .extend_from_slice(&tokens[..tokens.len().min(self.scratch.max_chunk)]);
     }
 
+    /// Hand the forward the S1 slow-link profile the load admitted
+    /// (`Qwen4Bundle::attach_slowlink_profile`, before attach). The profile is
+    /// immutable for the forward's life; nothing is allocated here.
+    pub(crate) fn set_slowlink_profile(&mut self, profile: crate::slowlink_admission::SlowlinkProfile) {
+        self.slowlink.profile = Some(profile);
+    }
+
+    /// The admitted S1 profile, `None` on every load that did not take S1.
+    pub(crate) fn slowlink_profile(&self) -> Option<&crate::slowlink_admission::SlowlinkProfile> {
+        self.slowlink.profile.as_ref()
+    }
+
+    /// The layers this forward runs (the whole trunk for a single-band forward).
+    pub(crate) fn band_layers(&self) -> std::ops::Range<usize> {
+        self.scope.band.clone()
+    }
+
+    /// Why this forward refuses an S1 prompt: a mode whose state or weights S1
+    /// does not own. Host only, no mutation.
+    pub(crate) fn slowlink_forward_blocker(&self, config: &Qwen4Config) -> Option<&'static str> {
+        if self.ep.is_some() {
+            Some("expert parallelism")
+        } else if self.has_cpu_deferred_experts() || self.cpu_split_layers > 0 {
+            Some("CPU expert splice")
+        } else if self.qsa_tap.is_some() {
+            Some("the QSA parity tap")
+        } else if self.route_trace.is_some() {
+            Some("the routing trace")
+        } else if self.cut_layers.is_some() {
+            Some(CUT_LAYERS_ENV)
+        } else if self.lane_scope {
+            Some("lane scope")
+        } else if self.mesh_route_rows.is_some() {
+            Some("a mesh forward")
+        } else if self.npu_trunk_loaded() {
+            Some("the NPU trunk")
+        } else if self.scope != Qwen4BandScope::single(config) {
+            Some("a pipeline band")
+        } else {
+            None
+        }
+    }
+
+    /// First effects of an S1 prompt, before it touches any state: restore a
+    /// donor a failed staged forward left overwritten (resident layers run
+    /// here), retire the early token-id copy (`token_ids` is rewritten per
+    /// tile) and drop the stale retained PLE ticket and lookahead (S1 fetches
+    /// every tile's rows itself, from its private history cursor). Returns the
+    /// retained ticket for the first tile to adopt.
+    pub(crate) fn slowlink_begin(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<Option<RowTicket>, Qwen4GpuForwardError> {
+        if let Some(stage) = self.expert_stage.as_ref() {
+            stage.restore_blocking(gpu)?;
+        }
+        if let Some(readback) = self.token_readback.as_mut() {
+            readback.complete(&gpu.hip)?;
+        }
+        self.ple_lookahead.clear();
+        self.uploaded_id_rows = 0;
+        Ok(self.ple_ahead.take())
+    }
+
+    /// A device-side effect of S1 rewrote `token_ids`: no claim on the ids an
+    /// earlier forward uploaded.
+    pub(crate) fn slowlink_note_ids_rewritten(&mut self) {
+        self.uploaded_id_rows = 0;
+    }
+
     /// Teardown only: free the forward right before the bundle weights it
     /// ran on (`Qwen4Bundle::free_gpu`). After a failed staged forward
     /// whose recovery also failed, two resident expert layers may still hold
@@ -7857,6 +8187,7 @@ impl Qwen4GpuForward {
             decode_q8,
             route_trace,
             trunk_zba,
+            slowlink,
             #[cfg(target_os = "linux")]
             npu_trunk,
             ..
@@ -7867,6 +8198,11 @@ impl Qwen4GpuForward {
         // the weights (`Qwen4Bundle::free_gpu`), so nothing reads it again.
         if expert_stage.is_some() || ep.is_some() || cpu_split_layers > 0 {
             gpu.hip.device_synchronize()?;
+        }
+        // The S1 expert page ring and prompt storage drain their own streams
+        // before freeing; a failed teardown is reported, never silenced.
+        if let Err(error) = slowlink.free_gpu(gpu) {
+            eprintln!("  qwen4 slow-link prefill teardown: {error}");
         }
         // The PLE staging bytes may still be read by an enqueued upload:
         // retire it before the device buffers and the host bytes go.
@@ -9383,24 +9719,14 @@ impl Qwen4GpuForward {
 
             match &description.ffn {
                 Qwen4FfnBinding::Moe(moe) => {
-                    let sealed = crate::program::seal_moe_for_layer(
+                    layer_env.moe_steps(
+                        &mut steps,
                         &ctx,
-                        dims,
                         *moe,
                         ep_scratches.as_ref().map_or(&scratch_desc, |parity| {
                             &parity[qwen4_ep_buffer_index(layer_index, config.num_hidden_layers)]
                         }),
-                        n,
-                        route_n,
-                    )
-                    .map_err(|error| {
-                        Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}"))
-                    })?;
-                    steps.push(Step::Clear(ClearOp {
-                        tensor: &self.scratch.ffn_output,
-                        elements: n * config.hidden_size,
-                    }));
-                    steps.push(Step::Moe(sealed));
+                    )?;
                 }
                 Qwen4FfnBinding::Dense(dense) => {
                     steps.push(layer_env.dense_step(dense));
@@ -9671,36 +9997,14 @@ impl Qwen4GpuForward {
                 let Some(ple) = ple.as_mut() else {
                     return Ok(());
                 };
-
-                let wait_started = qwen4_profile_start();
-                let lease_result = ple.wait();
-                qwen4_profile_record(Qwen4ProfilePhase::PleWait, wait_started);
-                let lease =
-                    lease_result.map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                let upload_len = lease
-                    .as_bytes()
-                    .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
-                    .len();
-                // Retire any earlier asynchronous upload still reading the
-                // staging bytes before the host copy overwrites them.
-                let stage_started = qwen4_profile_start();
-                let stage_result = match ple_host.stage_buffer(gpu, upload_len) {
-                    Ok(buffer) => lease
-                        .stage_into(buffer)
-                        .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string())),
-                    Err(error) => Err(error.into()),
-                };
-                qwen4_profile_record(Qwen4ProfilePhase::PleStage, stage_started);
-                stage_result?;
-                let upload_started = qwen4_profile_start();
                 // After a device-token readback the host has synchronized past
                 // the previous forward's upload, so the staging buffer is free.
-                let upload_result = if device_token.is_some() {
-                    ple_host.upload_unfenced(gpu, &staged.buf, upload_len)
+                let mode = if device_token.is_some() {
+                    PleUploadMode::Unfenced
                 } else if mesh_run && !gpu.graphs.capture_mode {
                     // Mesh: never block the host on the device queue; the fence
                     // keeps the staging bytes unwritable until the copy ran.
-                    ple_host.upload_async(gpu, &staged.buf, upload_len)
+                    PleUploadMode::Async
                 } else if ple_async_upload(
                     ple_host.enabled(),
                     false,
@@ -9710,35 +10014,22 @@ impl Qwen4GpuForward {
                     // Deferred past layer 0: do not make the host wait for the
                     // layers already enqueued. The fence keeps the staging
                     // bytes unwritable until the copy has run.
-                    ple_host.upload_async(gpu, &staged.buf, upload_len)
+                    PleUploadMode::Async
                 } else {
-                    ple_host.upload_blocking(gpu, &staged.buf, upload_len)
+                    PleUploadMode::Blocking
                 };
-                qwen4_profile_record(Qwen4ProfilePhase::PleUpload, upload_started);
-                upload_result?;
-                lease
-                    .validate_after_upload()
-                    .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-                let apply_started = qwen4_profile_start();
-                if ple_rows_f16 {
-                    gpu.grouped_gather_convert_bf16_f16(
-                        &staged,
-                        &ple_rows,
-                        n,
-                        ple_head_count,
-                        ple_row_width,
-                    )?;
-                } else {
-                    gpu.grouped_gather_convert_bf16(
-                        &staged,
-                        &ple_rows,
-                        n,
-                        ple_head_count,
-                        ple_row_width,
-                    )?;
-                }
-                qwen4_profile_record(Qwen4ProfilePhase::PleApply, apply_started);
-                Ok(())
+                stage_ple_rows(
+                    gpu,
+                    ple_host,
+                    ple,
+                    &staged,
+                    &ple_rows,
+                    ple_rows_f16,
+                    n,
+                    ple_head_count,
+                    ple_row_width,
+                    mode,
+                )
             };
             if ple_split.is_none() {
                 stage_ple(gpu)?;
