@@ -503,6 +503,8 @@ pub struct Fixture {
     pub session_cache_bytes: u64,
     /// Timed prefills per prompt in `perf` mode (default 1).
     pub perf_repeats: usize,
+    /// Row-prompt lengths `perf` mode times.
+    pub perf_rows: Vec<usize>,
     pub prompts: Vec<FixturePrompt>,
     pub continuation_ids: Vec<u32>,
     pub failure_injections: Vec<String>,
@@ -567,6 +569,18 @@ impl Fixture {
             .map_or(Some(1u64), Value::as_u64)
             .filter(|&n| n >= 1)
             .ok_or("fixture perf_repeats is not a positive integer")? as usize;
+        // Row prompts `perf` mode times (default pp512/pp8192/pp16384). The
+        // beta anchor fixture times only the 16384-row synthetic prompt.
+        let perf_rows = match value.get("perf_rows") {
+            None | Some(Value::Null) => vec![512, 8192, 16384],
+            Some(_) => {
+                let rows = usize_list(value.get("perf_rows"), "perf_rows")?;
+                if rows.is_empty() {
+                    return Err("fixture perf_rows is empty".into());
+                }
+                rows
+            }
+        };
         let mut prompts = Vec::new();
         for item in value
             .get("prompts")
@@ -674,6 +688,7 @@ impl Fixture {
             head_rows,
             session_cache_bytes,
             perf_repeats,
+            perf_rows,
             prompts,
             continuation_ids,
             failure_injections,
