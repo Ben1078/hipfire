@@ -336,3 +336,14 @@ extern "C" __global__ __launch_bounds__(64) void slowlink_combine_pad(
     *(float4*)a = make_float4(v[0], v[1], v[2], v[3]);
     *(float4*)(a + 4) = make_float4(v[4], v[5], v[6], v[7]);
 }
+
+// S1 K1-cohort support: the ids of a short-tail tile restricted to one expert binding
+// [lo, hi); every other id becomes -1 (the K1 kernels' no-load exit), so a K1 launch against
+// one staged binding computes exactly the slots whose expert that binding holds.
+extern "C" __global__ __launch_bounds__(256) void slowlink_mask_ids(
+    const int* __restrict__ ids, int* __restrict__ out, int n, int lo, int hi) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int v = ids[i];
+    out[i] = (v >= lo && v < hi) ? v : -1;
+}
