@@ -7522,17 +7522,12 @@ mod qwen4_slowlink_tests {
         }
     }
 
+    /// The S1 charge exactly as admission computes it ([`s1::census_of`], every
+    /// term: ring, lookahead, route storage, A4, group scatter, HC arena and
+    /// boundary state), never a second copy of the formula.
     fn census_total() -> u64 {
-        let geometry = geometry();
-        let pages = s1::PanelPageLayout::new(512, 512 * 1_740_800, 512 * 870_400).unwrap();
-        let arena =
-            s1::PromptArenaLayout::new(&geometry, s1::S1_WINDOW_ROWS, s1::S1_TILE_ROWS).unwrap();
-        pages.total_bytes().unwrap()
-            + s1::route_storage_bytes(&geometry, s1::S1_WINDOW_ROWS).unwrap()
-            + s1::a4_sidecar_bytes(&geometry, s1::S1_WINDOW_ROWS).unwrap()
-            + arena.total_bytes
-            + s1::S1_MAX_BOUNDARY_SNAPSHOTS as u64 * FIXED_STATE
-            + PENDING_SAVE
+        let (_, _, census) = s1::census_of(&inputs(0, 7.09)).unwrap();
+        census.total().unwrap()
     }
 
     /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.
