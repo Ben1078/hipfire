@@ -3364,7 +3364,30 @@ mod slowlink_prompt {
         let resumed = PleHistory::from_previous(151_643, [11, 22]);
         let from_resume = PleCursor::histories_for(resumed, &plan.tiles, &tokens);
         assert_eq!(from_resume[0], resumed);
-        assert_ne!(from_resume[1], histories[1]);
+        assert_ne!(from_resume[0], histories[0], "the entry history is the base");
+        // The history is the last TWO tokens: once a tile has consumed two rows
+        // the entry no longer matters, so a full-size tile's successors agree.
+        assert_eq!(
+            from_resume[1], histories[1],
+            "past two rows of tokens the entry history is forgotten"
+        );
+        // A one-row head tile leaves one entry token in its successor's history:
+        // that is where the entry must (and does) show, by the private cursor.
+        let short = plan(0, 16384, &[1]);
+        assert_eq!(short.tiles[0].rows, 1);
+        let short_tokens: Vec<u32> = (0..short.rows as u32).map(|t| t * 7 + 2).collect();
+        let from_entry = PleCursor::histories_for(entry, &short.tiles, &short_tokens);
+        let from_resumed = PleCursor::histories_for(resumed, &short.tiles, &short_tokens);
+        assert_ne!(from_entry[1], from_resumed[1]);
+        assert_eq!(
+            from_resumed[1].previous(),
+            [22, short_tokens[0]],
+            "one entry token plus the head tile's only token"
+        );
+        assert_eq!(
+            from_entry[1].previous(),
+            [entry.previous()[1], short_tokens[0]]
+        );
     }
 
     #[test]
