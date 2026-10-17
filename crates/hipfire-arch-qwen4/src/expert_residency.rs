@@ -1606,6 +1606,219 @@ impl PlacementCharges {
     }
 }
 
+/// The long-prefill stage a `whole-first` load runs with
+/// (`HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY`), the existing G2 stage unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeFirstStage {
+    /// No stage: switch off, no host layer, or fewer than two resident layers
+    /// to donate.
+    None,
+    /// Legacy aggregate (packed) layout: the stage borrows the last two
+    /// resident whole layers as its DMA buffers. Nothing is allocated; the
+    /// restore copies are pinned host RAM.
+    Borrowed {
+        donors: [usize; 2],
+        /// Resident device bytes the two donors lend (no incremental VRAM).
+        capacity: u64,
+        /// Pinned host bytes the donors are restored from.
+        restore_copies: u64,
+    },
+    /// Slab layout: two dedicated VRAM stage buffers, charged in
+    /// [`PlacementCharges::stage`].
+    Dedicated { buffer: u64, allocated: u64 },
+}
+
+impl WholeFirstStage {
+    /// Device bytes the stage allocates beyond the resident layers.
+    pub fn allocated_vram(&self) -> u64 {
+        match self {
+            Self::Dedicated { allocated, .. } => *allocated,
+            Self::None | Self::Borrowed { .. } => 0,
+        }
+    }
+
+    /// Resident device bytes the stage borrows from donor layers.
+    pub fn borrowed_vram(&self) -> u64 {
+        match self {
+            Self::Borrowed { capacity, .. } => *capacity,
+            Self::None | Self::Dedicated { .. } => 0,
+        }
+    }
+}
+
+/// The whole-layer placement `HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY=whole-first`
+/// keeps: exactly the `hotset=0` whole-layer plan (no tier plan, owners or
+/// sidecar), so the decode route is the whole-layer route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WholeFirstPlan {
+    /// Whole resident layers: trunk layers `0..whole_layers`.
+    pub whole_layers: usize,
+    /// MoE layers of the model (trunk plus MTP).
+    pub moe_layers: usize,
+    /// Hot experts kept off a host layer: always 0 (no tier lease).
+    pub hot_experts: usize,
+    /// Largest layer payload the plan was budgeted with.
+    pub layer_expert_bytes: u64,
+    pub stage: WholeFirstStage,
+}
+
+impl WholeFirstPlan {
+    /// The stage for `whole_layers` resident layers. `charges` are the
+    /// loader's [`PlacementCharges`] for the load (a slab stage is charged in
+    /// `charges.stage`); `borrowed_donors` is whether the stage is switched
+    /// on and borrows donor layers (legacy aggregate recipe, no expert
+    /// parallelism).
+    pub fn stage_for(
+        whole_layers: usize,
+        moe_layers: usize,
+        layer_expert_bytes: u64,
+        charges: &PlacementCharges,
+        borrowed_donors: bool,
+    ) -> WholeFirstStage {
+        if whole_layers >= moe_layers {
+            WholeFirstStage::None
+        } else if charges.stage > 0 {
+            WholeFirstStage::Dedicated {
+                buffer: charges.stage / 2,
+                allocated: charges.stage,
+            }
+        } else if borrowed_donors && whole_layers >= 2 {
+            let pair = layer_expert_bytes.saturating_mul(2);
+            WholeFirstStage::Borrowed {
+                donors: [whole_layers - 2, whole_layers - 1],
+                capacity: pair,
+                restore_copies: pair,
+            }
+        } else {
+            WholeFirstStage::None
+        }
+    }
+
+    /// The `auto` placement under `whole-first`: [`auto_placement_layers`]
+    /// with the same inputs the `hotset=0` path passes (so never fewer whole
+    /// layers), the stage that load runs with, and a check that the
+    /// resident layers, the charged reserve (dedicated stage included) and
+    /// the non-expert weights fit `free_vram`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn auto(
+        free_vram: u64,
+        non_expert_bytes: u64,
+        layer_expert_bytes: u64,
+        num_layers: usize,
+        moe_layers: usize,
+        base_reserve: u64,
+        charges: &PlacementCharges,
+        borrowed_donors: bool,
+    ) -> Result<Self, String> {
+        let whole_layers = auto_placement_layers(
+            free_vram,
+            non_expert_bytes,
+            layer_expert_bytes,
+            num_layers,
+            base_reserve,
+            charges,
+        )?;
+        charges
+            .reserve(base_reserve)
+            .ok()
+            .and_then(|reserve| reserve.checked_add(non_expert_bytes))
+            .and_then(|bytes| {
+                layer_expert_bytes
+                    .checked_mul(whole_layers as u64)
+                    .and_then(|layers| bytes.checked_add(layers))
+            })
+            .filter(|need| *need <= free_vram)
+            .ok_or_else(|| {
+                format!(
+                    "whole-first plan of {whole_layers} layers does not fit {} MiB free VRAM",
+                    free_vram >> 20
+                )
+            })?;
+        Ok(Self {
+            whole_layers,
+            moe_layers,
+            hot_experts: 0,
+            layer_expert_bytes,
+            stage: Self::stage_for(
+                whole_layers,
+                moe_layers,
+                layer_expert_bytes,
+                charges,
+                borrowed_donors,
+            ),
+        })
+    }
+
+    /// The fully resident load (every MoE layer whole, no host layer, no
+    /// stage).
+    pub fn fully_resident(moe_layers: usize, layer_expert_bytes: u64) -> Self {
+        Self {
+            whole_layers: moe_layers,
+            moe_layers,
+            hot_experts: 0,
+            layer_expert_bytes,
+            stage: WholeFirstStage::None,
+        }
+    }
+
+    /// The one log line (no newline, no prefix) of an opt-in load.
+    /// `resident_bytes` is the measured routed-expert bytes left
+    /// device-resident ([`resident_routed_expert_bytes`]). The layer range
+    /// is half open, as the placement log prints it.
+    pub fn describe(&self, resident_bytes: u64) -> String {
+        const MIB: u64 = 1 << 20;
+        let stage = match self.stage {
+            WholeFirstStage::None => "stage allocated 0 MiB, borrowed 0 MiB".to_string(),
+            WholeFirstStage::Borrowed {
+                donors,
+                capacity,
+                restore_copies,
+            } => format!(
+                "stage allocated 0 MiB, borrowed {} MiB from resident layers {} and {} ({} MiB pinned host restore copies)",
+                capacity / MIB,
+                donors[0],
+                donors[1],
+                restore_copies / MIB
+            ),
+            WholeFirstStage::Dedicated { buffer, allocated } => format!(
+                "stage allocated {} MiB (2 dedicated buffers of {} MiB, charged to the placement), borrowed 0 MiB",
+                allocated / MIB,
+                buffer / MIB
+            ),
+        };
+        format!(
+            "policy=whole-first, whole layers 0..{} ({} of {} MoE layers), hot experts {}, expert resident {} MiB, {stage}; hotset=0 whole-layer placement, sidecar not consulted",
+            self.whole_layers,
+            self.whole_layers,
+            self.moe_layers,
+            self.hot_experts,
+            resident_bytes / MIB
+        )
+    }
+}
+
+/// Routed-expert bytes of the entries left [`WeightResidency::Resident`]
+/// (after [`place_routed_experts`], what stays on the device).
+pub fn resident_routed_expert_bytes(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<u64, String> {
+    weights
+        .iter()
+        .filter(|entry| {
+            entry.residency == WeightResidency::Resident
+                && is_routed_expert(&entry.name)
+                && !matches!(entry.policy, ShardPolicy::Tied { .. })
+        })
+        .try_fold(0u64, |total, entry| {
+            let bytes =
+                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| "resident routed-expert byte census overflows".to_string())
+        })
+}
+
 /// Mark the routed-expert entries of trunk layers `>= vram_layers`, and of
 /// the MTP layer, [`WeightResidency::HostMapped`]. Returns the number of
 /// entries moved to host RAM.
@@ -3063,6 +3276,197 @@ mod tests {
         assert!(auto_placement_layers(u64::MAX, 0, 1 << 20, 49, u64::MAX, &charges).is_err());
         // A non-expert size that overflows the sum is a refusal, not a wrap.
         assert!(auto_placement_layers(u64::MAX, u64::MAX, 1 << 20, 49, 1, &charges).is_err());
+    }
+
+    const WF_LAYER: u64 = 1275 << 20;
+    const WF_NON_EXPERT: u64 = 6000 << 20;
+    const WF_BASE: u64 = 8000 << 20;
+
+    /// Free VRAM that places exactly 14 whole 1275 MiB layers after the
+    /// non-expert weights, the base reserve and the 512 MiB margin (the
+    /// receipt's 14-layer geometry; no stage charge).
+    fn wf_free_for_14() -> u64 {
+        WF_NON_EXPERT + WF_BASE + (512 << 20) + 14 * WF_LAYER + (100 << 20)
+    }
+
+    fn wf_auto(
+        free: u64,
+        charges: &PlacementCharges,
+        borrowed: bool,
+    ) -> Result<WholeFirstPlan, String> {
+        WholeFirstPlan::auto(
+            free,
+            WF_NON_EXPERT,
+            WF_LAYER,
+            48,
+            49,
+            WF_BASE,
+            charges,
+            borrowed,
+        )
+    }
+
+    #[test]
+    fn whole_first_never_places_fewer_layers_than_the_hotset0_baseline_and_fits() {
+        for dedicated in [false, true] {
+            let charges = PlacementCharges::new(WF_LAYER, dedicated).unwrap();
+            for borrowed in [false, true] {
+                for step in 0..=96u64 {
+                    let free = (14_000u64 + step * 250) << 20;
+                    let baseline =
+                        auto_placement_layers(free, WF_NON_EXPERT, WF_LAYER, 48, WF_BASE, &charges);
+                    let plan = wf_auto(free, &charges, borrowed);
+                    match (baseline, plan) {
+                        (Ok(layers), Ok(plan)) => {
+                            assert!(plan.whole_layers >= layers, "free {free}");
+                            assert_eq!(plan.hot_experts, 0);
+                            assert!(plan.whole_layers <= 48);
+                            // Resident layers + charged reserve (dedicated
+                            // stage included) + non-expert weights fit.
+                            let need = WF_NON_EXPERT
+                                + charges.reserve(WF_BASE).unwrap()
+                                + plan.whole_layers as u64 * WF_LAYER;
+                            assert!(need <= free, "free {free}: need {need}");
+                            // One more layer would not have fit.
+                            if plan.whole_layers < 48 {
+                                assert!(need + WF_LAYER > free);
+                            }
+                        }
+                        (Err(_), Err(_)) => {}
+                        (baseline, plan) => panic!("diverged: {baseline:?} vs {plan:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_first_receipt_geometry_is_14_layers_with_2550_mib_borrowed_and_nothing_allocated() {
+        let free = wf_free_for_14();
+        let off = PlacementCharges::new(WF_LAYER, false).unwrap();
+        let plan = wf_auto(free, &off, true).unwrap();
+        assert_eq!(plan.whole_layers, 14);
+        assert_eq!(
+            auto_placement_layers(free, WF_NON_EXPERT, WF_LAYER, 48, WF_BASE, &off),
+            Ok(14)
+        );
+        assert_eq!(
+            plan.stage,
+            WholeFirstStage::Borrowed {
+                donors: [12, 13],
+                capacity: 2550 << 20,
+                restore_copies: 2550 << 20,
+            }
+        );
+        assert_eq!(plan.stage.allocated_vram(), 0);
+        assert_eq!(plan.stage.borrowed_vram(), 2550 << 20);
+        let line = plan.describe(14 * WF_LAYER);
+        for part in [
+            "policy=whole-first",
+            "whole layers 0..14 (14 of 49 MoE layers)",
+            "hot experts 0",
+            "expert resident 17850 MiB",
+            "stage allocated 0 MiB, borrowed 2550 MiB from resident layers 12 and 13",
+            "2550 MiB pinned host restore copies",
+            "sidecar not consulted",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+
+    #[test]
+    fn whole_first_stage_accounting_dedicated_borrowed_and_disabled() {
+        let free = wf_free_for_14() + (4000 << 20);
+        // Stage switch off or not a donor layout: nothing allocated or borrowed.
+        let off = PlacementCharges::new(WF_LAYER, false).unwrap();
+        let disabled = wf_auto(free, &off, false).unwrap();
+        assert_eq!(disabled.stage, WholeFirstStage::None);
+        assert!(disabled
+            .describe(0)
+            .contains("stage allocated 0 MiB, borrowed 0 MiB"));
+        // Borrowed donors cost no VRAM: same layers as the disabled load.
+        let borrowed = wf_auto(free, &off, true).unwrap();
+        assert_eq!(borrowed.whole_layers, disabled.whole_layers);
+        assert_eq!(borrowed.stage.allocated_vram(), 0);
+        assert_eq!(borrowed.stage.borrowed_vram(), 2 * WF_LAYER);
+        // A slab load's dedicated stage is allocated and charged: fewer
+        // layers than the stage-free load, and the buffers are accounted.
+        let on = PlacementCharges::new(WF_LAYER, true).unwrap();
+        let dedicated = wf_auto(free, &on, false).unwrap();
+        assert!(dedicated.whole_layers < disabled.whole_layers);
+        let buffer = WF_LAYER + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64;
+        assert_eq!(
+            dedicated.stage,
+            WholeFirstStage::Dedicated {
+                buffer,
+                allocated: 2 * buffer
+            }
+        );
+        assert_eq!(dedicated.stage.allocated_vram(), on.stage);
+        assert_eq!(dedicated.stage.borrowed_vram(), 0);
+        let line = dedicated.describe(0);
+        assert!(
+            line.contains("borrowed 0 MiB") && line.contains("2 dedicated buffers of"),
+            "{line}"
+        );
+        // The dedicated stage wins over borrowing (slab recipes never borrow).
+        assert_eq!(wf_auto(free, &on, true).unwrap().stage, dedicated.stage);
+        // Fewer than two resident layers cannot lend donors.
+        assert_eq!(
+            WholeFirstPlan::stage_for(1, 49, WF_LAYER, &off, true),
+            WholeFirstStage::None
+        );
+        assert!(matches!(
+            WholeFirstPlan::stage_for(2, 49, WF_LAYER, &off, true),
+            WholeFirstStage::Borrowed { donors: [0, 1], .. }
+        ));
+        // No host layer, no stage, even with a charge.
+        assert_eq!(
+            WholeFirstPlan::stage_for(49, 49, WF_LAYER, &on, true),
+            WholeFirstStage::None
+        );
+        let resident = WholeFirstPlan::fully_resident(49, WF_LAYER);
+        assert_eq!((resident.whole_layers, resident.hot_experts), (49, 0));
+        assert_eq!(resident.stage, WholeFirstStage::None);
+        assert!(resident
+            .describe(0)
+            .contains("whole layers 0..49 (49 of 49"));
+    }
+
+    #[test]
+    fn whole_first_refuses_exactly_like_the_baseline_when_nothing_fits() {
+        let on = PlacementCharges::new(WF_LAYER, true).unwrap();
+        let need = WF_NON_EXPERT + on.reserve(WF_BASE).unwrap();
+        assert_eq!(wf_auto(need, &on, false).unwrap().whole_layers, 0);
+        let plan_error = wf_auto(need - 1, &on, false).unwrap_err();
+        let base_error =
+            auto_placement_layers(need - 1, WF_NON_EXPERT, WF_LAYER, 48, WF_BASE, &on).unwrap_err();
+        assert_eq!(plan_error, base_error);
+    }
+
+    #[test]
+    fn resident_routed_expert_bytes_counts_only_what_stays_on_device() {
+        let mut weights = vec![
+            entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("model.language_model.layers.0.mlp.experts.down_proj", 0),
+            entry("model.language_model.layers.1.mlp.experts.gate_up_proj", 1),
+            entry("model.language_model.layers.0.self_attn.q_proj.weight", 0),
+            entry("mtp.layers.0.mlp.experts.gate_up_proj", 0),
+        ];
+        let bytes_of =
+            |entry: &WeightEntry| Some(entry.logical_shape.iter().product::<usize>() as u64);
+        let each = 4 * 4 * 256;
+        assert_eq!(
+            resident_routed_expert_bytes(&weights, bytes_of),
+            Ok(4 * each)
+        );
+        place_routed_experts(&mut weights, 1);
+        // Trunk layer 0's two projections stay; layer 1 and the MTP layer move.
+        assert_eq!(
+            resident_routed_expert_bytes(&weights, bytes_of),
+            Ok(2 * each)
+        );
+        assert!(resident_routed_expert_bytes(&weights, |_| None).is_err());
     }
 
     #[test]

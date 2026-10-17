@@ -998,10 +998,7 @@ fn qwen4_native_mtp_speculator(
                 if ngram_on && copy_lane {
                     eprintln!(
                         "  qwen4 native MTP n-gram copy lane: on (take_cap={})",
-                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(
-                            &config,
-                            verify_rows,
-                        )
+                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(&config, verify_rows,)
                     );
                 }
                 Some(config)
@@ -1667,6 +1664,7 @@ fn load_qwen4_rank_scoped(
     let max_k = shared.max_k;
     let mut native_mtp = shared.native_mtp;
     let hotset_policy = hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env()?;
+    let placement_policy = hipfire_arch_qwen4::expert_hotset::PlacementPolicy::from_env()?;
     if let Some(placement) = ep {
         if placement.ranks < 2 || placement.rank >= placement.ranks {
             return Err(format!(
@@ -2077,14 +2075,27 @@ fn load_qwen4_rank_scoped(
             _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
         },
     };
-    let hotset_path = match hotsets::preflight(&hotset_policy, model_path, &hotset_env) {
-        Ok(path) => Some(path),
-        Err(skip) => {
-            let path = hotset_policy.sidecar_path(model_path);
-            if let Some(line) = skip.log_line(&path) {
-                eprintln!("{line}");
+    let whole_first = hotsets::decide_whole_first(placement_policy, &hotset_env, band.is_some());
+    if let hotsets::WholeFirstDecision::Ignored(reason) = whole_first {
+        eprintln!(
+            "{}policy=whole-first not applied ({reason}); placement unchanged",
+            hotsets::LOG_PREFIX
+        );
+    }
+    // `whole-first` keeps the `hotset=0` whole-layer placement: the sidecar
+    // is not consulted, so no tier plan, owner or route is ever built.
+    let hotset_path = if whole_first == hotsets::WholeFirstDecision::Active {
+        None
+    } else {
+        match hotsets::preflight(&hotset_policy, model_path, &hotset_env) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                let path = hotset_policy.sidecar_path(model_path);
+                if let Some(line) = skip.log_line(&path) {
+                    eprintln!("{line}");
+                }
+                None
             }
-            None
         }
     };
     // All optional-sidecar decisions finish against the original manifest:
@@ -2379,6 +2390,13 @@ fn load_qwen4_rank_scoped(
             Ok((free, non_expert, layer_experts, reserve, mtp, gather))
         })
         .transpose()?;
+    let mut whole_first_plan = None;
+    let borrowed_stage_donors = residency::expert_stage_enabled(&ctx.gpu.arch)
+        && matches!(
+            manifest.identity.recipe,
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
+        )
+        && ep.is_none();
     let mut applied_layers = moe_layers;
     if let Some(policy) = placement {
         if use_ranges {
@@ -2420,15 +2438,32 @@ fn load_qwen4_rank_scoped(
                 // still leave less than the reserve, and fail later at
                 // the first request (e.g. beside another process's
                 // model): refuse before allocating instead.
-                residency::auto_placement_layers(
-                    free,
-                    non_expert,
-                    layer_experts,
-                    config.num_hidden_layers,
-                    auto.bytes(),
-                    &charges,
-                )
-                .map_err(|error| format!("qwen4: {error}"))?
+                if whole_first == hotsets::WholeFirstDecision::Active {
+                    let plan = residency::WholeFirstPlan::auto(
+                        free,
+                        non_expert,
+                        layer_experts,
+                        config.num_hidden_layers,
+                        moe_layers,
+                        auto.bytes(),
+                        &charges,
+                        borrowed_stage_donors,
+                    )
+                    .map_err(|error| format!("qwen4: {error}"))?;
+                    let layers = plan.whole_layers;
+                    whole_first_plan = Some(plan);
+                    layers
+                } else {
+                    residency::auto_placement_layers(
+                        free,
+                        non_expert,
+                        layer_experts,
+                        config.num_hidden_layers,
+                        auto.bytes(),
+                        &charges,
+                    )
+                    .map_err(|error| format!("qwen4: {error}"))?
+                }
             }
         };
         let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
@@ -2465,6 +2500,11 @@ fn load_qwen4_rank_scoped(
                 gib(mem_available.unwrap_or(0)),
                 gib(ttm_pool)
             );
+        if let Some(plan) = &whole_first_plan {
+            let resident = residency::resident_routed_expert_bytes(&manifest.weights, bytes_of)
+                .map_err(|error| format!("qwen4: {error}"))?;
+            eprintln!("{}{}", hotsets::LOG_PREFIX, plan.describe(resident));
+        }
         if native_mtp
             && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
         {
@@ -2478,6 +2518,14 @@ fn load_qwen4_rank_scoped(
                     &format!("on {}", ctx.gpu.arch),
                 )
             );
+        }
+    }
+    if whole_first == hotsets::WholeFirstDecision::Active && placement.is_none() {
+        if let Some(inputs) = &measured {
+            let plan = residency::WholeFirstPlan::fully_resident(moe_layers, inputs.2);
+            let resident = residency::resident_routed_expert_bytes(&manifest.weights, bytes_of)
+                .map_err(|error| format!("qwen4: {error}"))?;
+            eprintln!("{}{}", hotsets::LOG_PREFIX, plan.describe(resident));
         }
     }
     if let Some((plan, _)) = &hotset_plan {

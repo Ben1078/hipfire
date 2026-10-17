@@ -127,6 +127,86 @@ impl HotsetPolicy {
     }
 }
 
+/// Selects what the hotset sidecar is allowed to cost. Unset or `ranked`:
+/// the ranked-prefix tier plan (the [`HotsetPolicy`] path). `whole-first`:
+/// gfx1201 keeps the `hotset=0` whole-layer placement and never builds the
+/// tier plan, so decode takes the whole-layer route. Developer variable,
+/// independent of [`HOTSET_ENV`] (which only names the sidecar).
+pub const PLACEMENT_POLICY_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY";
+
+/// `HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY`: how expert VRAM is spent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlacementPolicy {
+    /// Unset or `ranked`: the existing hotset behaviour.
+    #[default]
+    Ranked,
+    /// `whole-first`: whole layers only; no sidecar tier plan.
+    WholeFirst,
+}
+
+impl PlacementPolicy {
+    /// Parse the raw variable value (`None` = unset = [`Self::Ranked`]).
+    /// An empty or unknown value is an error.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("ranked") => Ok(Self::Ranked),
+            Some("whole-first") => Ok(Self::WholeFirst),
+            Some(value) => Err(format!(
+                "{PLACEMENT_POLICY_ENV}={value:?} is not `ranked` or `whole-first`; unset it for \
+                 the ranked default"
+            )),
+        }
+    }
+
+    /// The policy from the process configuration snapshot.
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(
+            hipfire_config::developer_var(PLACEMENT_POLICY_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+}
+
+/// Whether `whole-first` governs a load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeFirstDecision {
+    /// Not requested, or not gfx1201: the load is exactly the default path.
+    Inactive,
+    /// gfx1201 load that keeps the `hotset=0` whole-layer placement and does
+    /// not consult the sidecar.
+    Active,
+    /// Requested on gfx1201 but this load's placement is chosen elsewhere;
+    /// carries why. Placement is unchanged.
+    Ignored(&'static str),
+}
+
+/// The pure `whole-first` decision. Effect is strictly [`HOTSET_ARCH`]; on
+/// any other architecture the policy is inert and silent.
+pub fn decide_whole_first(
+    policy: PlacementPolicy,
+    env: &HotsetEnv<'_>,
+    pipeline_band: bool,
+) -> WholeFirstDecision {
+    if policy != PlacementPolicy::WholeFirst || env.gpu_arch != HOTSET_ARCH {
+        WholeFirstDecision::Inactive
+    } else if env.unified_memory {
+        WholeFirstDecision::Ignored("unified-memory/use_ranges loading does not use the hotset")
+    } else if env.expert_parallel {
+        WholeFirstDecision::Ignored(
+            "expert-parallel or an agreed expert split chooses expert placement itself",
+        )
+    } else if pipeline_band {
+        WholeFirstDecision::Ignored("a pipeline band keeps every routed expert resident")
+    } else if env.explicit_vram_layers {
+        WholeFirstDecision::Ignored(
+            "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS chooses expert placement itself",
+        )
+    } else {
+        WholeFirstDecision::Active
+    }
+}
+
 /// Routed-expert layout of the base artifact, as the loader classified it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HotsetSource {
@@ -148,9 +228,7 @@ impl fmt::Display for HotsetSource {
             Self::SlabArena => f.write_str(
                 "per-expert slab artifact (slab arena / K4 route), not aggregate MQ4-XTS",
             ),
-            Self::StockFp8 => {
-                f.write_str("stock-FP8 routed experts (qt55), not aggregate MQ4-XTS")
-            }
+            Self::StockFp8 => f.write_str("stock-FP8 routed experts (qt55), not aggregate MQ4-XTS"),
             Self::Nonaggregate(detail) => {
                 write!(f, "not an aggregate MQ4-XTS artifact: {detail}")
             }
@@ -432,7 +510,10 @@ impl HotsetSidecar {
             return Err(format!("kind {:?}, expected {SIDECAR_KIND:?}", raw.kind));
         }
         if raw.version != SIDECAR_VERSION {
-            return Err(format!("version {}, expected {SIDECAR_VERSION}", raw.version));
+            return Err(format!(
+                "version {}, expected {SIDECAR_VERSION}",
+                raw.version
+            ));
         }
         for (name, value) in [
             ("model_sha256", &raw.model_sha256),
@@ -456,7 +537,11 @@ impl HotsetSidecar {
         }
 
         check_dim("layers", raw.layers, layers)?;
-        check_dim("experts_per_layer", raw.experts_per_layer, experts_per_layer)?;
+        check_dim(
+            "experts_per_layer",
+            raw.experts_per_layer,
+            experts_per_layer,
+        )?;
         check_dim("top_k", raw.top_k, top_k)?;
         if raw.capture_tokens == 0 {
             return Err("capture_tokens is 0".to_owned());
@@ -481,9 +566,10 @@ impl HotsetSidecar {
         let mut seen = vec![false; total];
         let mut rank = Vec::with_capacity(raw.rank.len());
         for (position, &id) in raw.rank.iter().enumerate() {
-            let slot = usize::try_from(id).ok().filter(|&slot| slot < total).ok_or_else(|| {
-                format!("rank[{position}] = {id} is out of range 0..{total}")
-            })?;
+            let slot = usize::try_from(id)
+                .ok()
+                .filter(|&slot| slot < total)
+                .ok_or_else(|| format!("rank[{position}] = {id} is out of range 0..{total}"))?;
             if std::mem::replace(&mut seen[slot], true) {
                 return Err(format!("rank[{position}] = {id} is a duplicate"));
             }
@@ -662,11 +748,16 @@ fn short(hex: &str) -> &str {
 }
 
 fn check_sha256(name: &str, value: &str) -> Result<(), String> {
-    let full = value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let full = value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     if full {
         Ok(())
     } else {
-        Err(format!("{name} {value:?} is not a full lowercase 64-hex SHA-256"))
+        Err(format!(
+            "{name} {value:?} is not a full lowercase 64-hex SHA-256"
+        ))
     }
 }
 
@@ -742,7 +833,8 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hipfire-hotset-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-hotset-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -757,8 +849,114 @@ mod tests {
         }
     }
 
-    fn decide(policy: &HotsetPolicy, exists: bool, env: &HotsetEnv<'_>) -> Result<PathBuf, HotsetSkip> {
+    fn decide(
+        policy: &HotsetPolicy,
+        exists: bool,
+        env: &HotsetEnv<'_>,
+    ) -> Result<PathBuf, HotsetSkip> {
         decide_environment(policy, Path::new(MODEL), exists, env)
+    }
+
+    #[test]
+    fn placement_policy_unset_and_ranked_are_the_legacy_default() {
+        assert_eq!(PlacementPolicy::default(), PlacementPolicy::Ranked);
+        assert_eq!(PlacementPolicy::parse(None), Ok(PlacementPolicy::Ranked));
+        assert_eq!(
+            PlacementPolicy::parse(Some("ranked")),
+            Ok(PlacementPolicy::Ranked)
+        );
+        assert_eq!(
+            PlacementPolicy::parse(Some(" whole-first ")),
+            Ok(PlacementPolicy::WholeFirst)
+        );
+        assert_eq!(PLACEMENT_POLICY_ENV, "HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY");
+        assert_ne!(PLACEMENT_POLICY_ENV, HOTSET_ENV);
+        for bad in [
+            "",
+            "  ",
+            "whole",
+            "Whole-First",
+            "1",
+            "0",
+            "tiered",
+            "/tmp/h.json",
+        ] {
+            let error = PlacementPolicy::parse(Some(bad)).unwrap_err();
+            assert!(error.contains(PLACEMENT_POLICY_ENV), "{bad:?}: {error}");
+            assert!(error.contains("whole-first"), "{bad:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn whole_first_is_inert_unless_requested_on_gfx1201() {
+        let band = false;
+        // Unset/ranked: the default path on every arch, even a hotset sidecar.
+        assert_eq!(
+            decide_whole_first(PlacementPolicy::Ranked, &good_env(), band),
+            WholeFirstDecision::Inactive
+        );
+        for arch in ["gfx1100", "gfx1030", "gfx942", "gfx90a"] {
+            let env = HotsetEnv {
+                gpu_arch: arch,
+                ..good_env()
+            };
+            assert_eq!(
+                decide_whole_first(PlacementPolicy::WholeFirst, &env, band),
+                WholeFirstDecision::Inactive,
+                "{arch}"
+            );
+        }
+        assert_eq!(
+            decide_whole_first(PlacementPolicy::WholeFirst, &good_env(), band),
+            WholeFirstDecision::Active
+        );
+        // Non-aggregate layouts keep the same whole-layer placement.
+        for source in [HotsetSource::SlabArena, HotsetSource::StockFp8] {
+            let env = HotsetEnv {
+                source,
+                ..good_env()
+            };
+            assert_eq!(
+                decide_whole_first(PlacementPolicy::WholeFirst, &env, band),
+                WholeFirstDecision::Active
+            );
+        }
+    }
+
+    #[test]
+    fn whole_first_is_ignored_where_placement_is_chosen_elsewhere() {
+        let ignored = |env: &HotsetEnv<'_>, band: bool| {
+            matches!(
+                decide_whole_first(PlacementPolicy::WholeFirst, env, band),
+                WholeFirstDecision::Ignored(_)
+            )
+        };
+        let uma = HotsetEnv {
+            unified_memory: true,
+            ..good_env()
+        };
+        let ep = HotsetEnv {
+            expert_parallel: true,
+            ..good_env()
+        };
+        let explicit = HotsetEnv {
+            explicit_vram_layers: true,
+            ..good_env()
+        };
+        assert!(ignored(&uma, false));
+        assert!(ignored(&ep, false));
+        assert!(ignored(&explicit, false));
+        assert!(ignored(&good_env(), true));
+        // A non-gfx1201 card stays silent even when the layout would be ignored.
+        let other = HotsetEnv {
+            gpu_arch: "gfx1100",
+            unified_memory: true,
+            ..good_env()
+        };
+        assert_eq!(
+            decide_whole_first(PlacementPolicy::WholeFirst, &other, true),
+            WholeFirstDecision::Inactive
+        );
     }
 
     #[test]
@@ -918,7 +1116,10 @@ mod tests {
         let parsed = parse(&sidecar()).unwrap();
         let other = HotsetBase::new(BASE_SIZE + 1, [0xab; 32]);
         let err = parsed.check_base(&other).unwrap_err();
-        assert!(err.contains("125144775193") && err.contains("125144775192"), "{err}");
+        assert!(
+            err.contains("125144775193") && err.contains("125144775192"),
+            "{err}"
+        );
         let dir = temp_dir("size-mismatch");
         let path = dir.join("hotset.json");
         std::fs::write(&path, sidecar().to_string()).unwrap();
@@ -933,7 +1134,10 @@ mod tests {
         let parsed = parse(&sidecar()).unwrap();
         let other = HotsetBase::new(BASE_SIZE, [0xcd; 32]);
         let err = parsed.check_base(&other).unwrap_err();
-        assert!(err.contains("cdcdcdcdcdcd") && err.contains("abababababab"), "{err}");
+        assert!(
+            err.contains("cdcdcdcdcdcd") && err.contains("abababababab"),
+            "{err}"
+        );
         let dir = temp_dir("index-mismatch");
         let path = dir.join("hotset.json");
         std::fs::write(&path, sidecar().to_string()).unwrap();
@@ -956,7 +1160,9 @@ mod tests {
         let path = dir.join("no-base.json");
         std::fs::write(&path, value.to_string()).unwrap();
         match HotsetSidecar::load_bound(&path, LAYERS, EXPERTS, TOP_K, &base()) {
-            Err(HotsetSkip::InvalidSidecar(reason)) => assert!(reason.contains("base_size"), "{reason}"),
+            Err(HotsetSkip::InvalidSidecar(reason)) => {
+                assert!(reason.contains("base_size"), "{reason}")
+            }
             other => panic!("expected InvalidSidecar, got {other:?}"),
         }
     }
@@ -970,7 +1176,16 @@ mod tests {
             Ok(HotsetPolicy::Explicit(PathBuf::from("/tmp/hotset.json")))
         );
         // Empty, blank, relative and near-miss values are the only policy errors.
-        for bad in ["", "  ", "hotset.json", "./hotset.json", "1", " 0", "off", "auto"] {
+        for bad in [
+            "",
+            "  ",
+            "hotset.json",
+            "./hotset.json",
+            "1",
+            " 0",
+            "off",
+            "auto",
+        ] {
             let err = HotsetPolicy::parse(Some(bad)).unwrap_err();
             assert!(err.contains(HOTSET_ENV), "{bad:?}: {err}");
         }
@@ -1000,7 +1215,11 @@ mod tests {
             Ok(PathBuf::from("/m/q.mq4-xts.expert-hotset"))
         );
         assert_eq!(
-            decide(&HotsetPolicy::Explicit(PathBuf::from("/x/h.json")), true, &good_env()),
+            decide(
+                &HotsetPolicy::Explicit(PathBuf::from("/x/h.json")),
+                true,
+                &good_env()
+            ),
             Ok(PathBuf::from("/x/h.json"))
         );
     }
@@ -1059,7 +1278,10 @@ mod tests {
         }
         let mut env = good_env();
         env.explicit_vram_layers = true;
-        assert_eq!(decide(&policy, true, &env), Err(HotsetSkip::ExplicitVramLayers));
+        assert_eq!(
+            decide(&policy, true, &env),
+            Err(HotsetSkip::ExplicitVramLayers)
+        );
     }
 
     #[test]
@@ -1072,8 +1294,14 @@ mod tests {
             source: HotsetSource::StockFp8,
         };
         // `0` is reported whether or not a sidecar exists.
-        assert_eq!(decide(&HotsetPolicy::Off, false, &bad), Err(HotsetSkip::Disabled));
-        assert_eq!(decide(&HotsetPolicy::Off, true, &bad), Err(HotsetSkip::Disabled));
+        assert_eq!(
+            decide(&HotsetPolicy::Off, false, &bad),
+            Err(HotsetSkip::Disabled)
+        );
+        assert_eq!(
+            decide(&HotsetPolicy::Off, true, &bad),
+            Err(HotsetSkip::Disabled)
+        );
         assert_eq!(
             decide(&HotsetPolicy::Default, false, &bad),
             Err(HotsetSkip::Missing { explicit: false })
@@ -1084,9 +1312,15 @@ mod tests {
         );
         let mut env = bad.clone();
         env.gpu_arch = "gfx1201";
-        assert_eq!(decide(&HotsetPolicy::Default, true, &env), Err(HotsetSkip::UnifiedMemory));
+        assert_eq!(
+            decide(&HotsetPolicy::Default, true, &env),
+            Err(HotsetSkip::UnifiedMemory)
+        );
         env.unified_memory = false;
-        assert_eq!(decide(&HotsetPolicy::Default, true, &env), Err(HotsetSkip::ExpertParallel));
+        assert_eq!(
+            decide(&HotsetPolicy::Default, true, &env),
+            Err(HotsetSkip::ExpertParallel)
+        );
         env.expert_parallel = false;
         assert_eq!(
             decide(&HotsetPolicy::Default, true, &env),
@@ -1132,7 +1366,10 @@ mod tests {
     #[test]
     fn budget_and_plan_skips() {
         assert_eq!(require_budget(Ok(1 << 30)), Ok(1 << 30));
-        assert!(matches!(require_budget(Ok(0)), Err(HotsetSkip::NoBudget(_))));
+        assert!(matches!(
+            require_budget(Ok(0)),
+            Err(HotsetSkip::NoBudget(_))
+        ));
         assert_eq!(
             require_budget(Err("short of VRAM".to_owned())),
             Err(HotsetSkip::NoBudget("short of VRAM".to_owned()))
@@ -1152,12 +1389,16 @@ mod tests {
              (HIPFIRE_QWEN4_EXPERT_HOTSET=0); whole-layer placement"
         );
         assert_eq!(
-            HotsetSkip::Missing { explicit: true }.log_line(path).unwrap(),
+            HotsetSkip::Missing { explicit: true }
+                .log_line(path)
+                .unwrap(),
             "  qwen4 expert hot set: /m/q.mq4-xts.expert-hotset present, not applied \
              (sidecar not found); whole-layer placement"
         );
         assert_eq!(
-            HotsetSkip::NotGfx1201("gfx1100".to_owned()).log_line(path).unwrap(),
+            HotsetSkip::NotGfx1201("gfx1100".to_owned())
+                .log_line(path)
+                .unwrap(),
             "  qwen4 expert hot set: /m/q.mq4-xts.expert-hotset present, not applied (gpu is \
              gfx1100; the default hotset runs on gfx1201 only (gfx1100 needs an explicit \
              HIPFIRE_QWEN4_EXPERT_HOTSET path)); whole-layer placement"
