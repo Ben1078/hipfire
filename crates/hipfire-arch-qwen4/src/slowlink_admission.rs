@@ -31,7 +31,7 @@
 //!    16 GB/s. A fast link, unified memory and an unmeasured link never select
 //!    S1, whatever the selector says;
 //! 5. the joint placement ([`admit`]): the 1,536-row tile, the prompt arena,
-//!    the expert page store, the panel scratch and the boundary state are all
+//!    the expert page store, the route storage and A4 sidecars, the HC arena and the boundary state are all
 //!    charged together, and the placement that remains must still keep
 //!    [`S1_MIN_RESIDENT_LAYERS`] trunk layers resident. A shortfall is refused
 //!    with its exact byte deficit ([`Deficit`]); fewer residents are never
@@ -42,7 +42,6 @@
 //! load that fails any step is the incumbent byte for byte with a zero S1
 //! charge ([`crate::expert_residency::PlacementCharges::slowlink`] is `0`).
 
-use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
 use crate::host_link::{HostLink, NARROW_LINK_GBPS};
 use crate::Qwen4Config;
 use std::fmt;
@@ -85,8 +84,8 @@ pub const ACTIVE_PAGES: usize = 2;
 /// Grouped rows one expert panel computes at most (`PanelLimits`).
 pub const PANEL_MAX_GROUPED_ROWS: usize = 2048;
 
-/// Boundary snapshots of the fixed per-layer state one window may hold beside
-/// the entry snapshot. A request with more session cuts is a bypass.
+/// New boundary snapshots of the session fixed state one window may hold (the
+/// entry snapshot is the incumbent's own). A request with more session cuts is a bypass.
 pub const S1_MAX_BOUNDARY_SNAPSHOTS: usize = 4;
 
 /// Byte alignment of every arena span and page region.
@@ -359,10 +358,22 @@ impl ModelGeometry {
     }
 }
 
-/// One transport page: the payload, tail pads and rebased pointer tables of
-/// [`EXPERTS_PER_PAGE`] consecutive experts. Offsets are within the page; the
-/// transport allocates exactly [`Self::page_bytes`] per page and the census
-/// charges the same number.
+/// Copy/compute interval records the receipt timeline keeps per window
+/// (`PanelPoolSpec::timeline_records`): 48 trunk layers x 16 pages x 2
+/// (current and lookahead tags), with room. Host memory and pooled HIP events
+/// only; no device bytes.
+pub const S1_TIMELINE_RECORDS: usize = 2048;
+
+/// Whole-layer compute marks the receipt timeline keeps per window.
+pub const S1_TIMELINE_LAYERS: usize = 64;
+
+/// The transport page pool of the profile: the geometry that
+/// `gpu_forward::panel_stage::PanelPoolSpec` allocates, built here so the
+/// census and the pool are ONE reserve (`PanelPoolSpec::reserve` is the single
+/// authority for page, table and staging bytes). The pool's page payload is
+/// the per-page upper bound [`Self::payload_bytes`]: the pool is constructed from
+/// exactly this number, and attach refuses a source set whose real
+/// `required_payload_bytes` exceeds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PanelPageLayout {
     pub experts_per_page: usize,
@@ -372,19 +383,19 @@ pub struct PanelPageLayout {
     pub active_pages: usize,
     pub gate_up_expert_bytes: u64,
     pub down_expert_bytes: u64,
-    /// Aligned payload span of a full page, per projection.
-    pub gate_up_span: u64,
-    pub down_span: u64,
-    /// Zeroed tail pad after each projection ([`ARENA_TAIL_PAD_BYTES`]).
-    pub tail_pad: u64,
-    pub gate_up_offset: u64,
-    pub gate_up_pad_offset: u64,
-    pub down_offset: u64,
-    pub down_pad_offset: u64,
-    pub table_offset: u64,
-    /// Rebased gate/up pointer table, down pointer table and codec table.
-    pub table_bytes: u64,
+    /// Upper bound of one page's packed payload before the tail pad:
+    /// `experts_per_page * (gate_up + down)` plus the worst-case run slack
+    /// (`2 * experts_per_page` unmerged extents, each at most
+    /// `2 * 255` bytes of 256-byte alignment and source-address congruence).
+    pub payload_bytes: u64,
+    /// Bytes of one page (payload, tail pad, rounded to 256).
     pub page_bytes: u64,
+    /// Rebased gate/up and down pointer tables of one page (device).
+    pub table_bytes_per_page: u64,
+    /// Pinned host staging of every page's tables.
+    pub host_staging_bytes: u64,
+    pub timeline_records: usize,
+    pub timeline_layers: usize,
 }
 
 impl PanelPageLayout {
@@ -412,41 +423,57 @@ impl PanelPageLayout {
         }
         let gate_up_expert_bytes = gate_up_layer_bytes / experts;
         let down_expert_bytes = down_layer_bytes / experts;
-        let per_page = EXPERTS_PER_PAGE as u64;
-        let gate_up_span = align(checked_mul(per_page, gate_up_expert_bytes, "page gate/up span")?)?;
-        let down_span = align(checked_mul(per_page, down_expert_bytes, "page down span")?)?;
-        let tail_pad = ARENA_TAIL_PAD_BYTES as u64;
-        let pointer_table = align(checked_mul(per_page, 8, "page pointer table")?)?;
-        let codec_table = align(per_page)?;
-        let table_bytes = checked_add(
-            checked_mul(2, pointer_table, "page tables")?,
-            codec_table,
-            "page tables",
-        )?;
-        let gate_up_offset = 0;
-        let gate_up_pad_offset = gate_up_span;
-        let down_offset = checked_add(gate_up_pad_offset, tail_pad, "page layout")?;
-        let down_pad_offset = checked_add(down_offset, down_span, "page layout")?;
-        let table_offset = checked_add(down_pad_offset, tail_pad, "page layout")?;
-        let page_bytes = checked_add(table_offset, table_bytes, "page bytes")?;
+        let to_usize = |bytes: u64| {
+            usize::try_from(bytes).map_err(|_| "slow-link prefill expert bytes overflow".to_string())
+        };
+        let spec = crate::gpu_forward::panel_stage::PanelPoolSpec::uniform(
+            ACTIVE_PAGES,
+            num_experts.div_ceil(EXPERTS_PER_PAGE),
+            EXPERTS_PER_PAGE,
+            num_experts,
+            to_usize(gate_up_expert_bytes)?,
+            to_usize(down_expert_bytes)?,
+            S1_TIMELINE_RECORDS,
+            S1_TIMELINE_LAYERS,
+        )
+        .map_err(|error| format!("slow-link prefill page pool: {error:?}"))?;
+        let reserve = spec
+            .reserve()
+            .ok_or_else(|| "slow-link prefill page pool bytes overflow".to_string())?;
         Ok(Self {
             experts_per_page: EXPERTS_PER_PAGE,
             num_experts,
-            pages_per_layer: num_experts.div_ceil(EXPERTS_PER_PAGE),
+            pages_per_layer: spec.lookahead_pages,
             active_pages: ACTIVE_PAGES,
             gate_up_expert_bytes,
             down_expert_bytes,
-            gate_up_span,
-            down_span,
-            tail_pad,
-            gate_up_offset,
-            gate_up_pad_offset,
-            down_offset,
-            down_pad_offset,
-            table_offset,
-            table_bytes,
-            page_bytes,
+            payload_bytes: spec.payload_bytes as u64,
+            page_bytes: reserve.page_bytes as u64,
+            table_bytes_per_page: (reserve.tables / reserve.pages) as u64,
+            host_staging_bytes: reserve.staging as u64,
+            timeline_records: S1_TIMELINE_RECORDS,
+            timeline_layers: S1_TIMELINE_LAYERS,
         })
+    }
+
+    /// The pool the forward constructs (`PanelPool::new(gpu, layout.pool_spec()?)`):
+    /// the same `PanelPoolSpec::uniform` the census read.
+    pub(crate) fn pool_spec(
+        &self,
+    ) -> Result<crate::gpu_forward::panel_stage::PanelPoolSpec, String> {
+        crate::gpu_forward::panel_stage::PanelPoolSpec::uniform(
+            self.active_pages,
+            self.pages_per_layer,
+            self.experts_per_page,
+            self.num_experts,
+            usize::try_from(self.gate_up_expert_bytes)
+                .map_err(|_| "slow-link prefill expert bytes overflow".to_string())?,
+            usize::try_from(self.down_expert_bytes)
+                .map_err(|_| "slow-link prefill expert bytes overflow".to_string())?,
+            self.timeline_records,
+            self.timeline_layers,
+        )
+        .map_err(|error| format!("slow-link prefill page pool: {error:?}"))
     }
 
     /// Active plus lookahead pages: the whole admitted working set.
@@ -454,79 +481,64 @@ impl PanelPageLayout {
         self.active_pages + self.pages_per_layer
     }
 
+    /// Device bytes of one page with its pointer tables.
+    pub fn device_page_bytes(&self) -> Result<u64, String> {
+        checked_add(self.page_bytes, self.table_bytes_per_page, "device page bytes")
+    }
+
     /// Device bytes of the double-buffered active ring.
     pub fn ring_bytes(&self) -> Result<u64, String> {
-        checked_mul(self.active_pages as u64, self.page_bytes, "active ring bytes")
+        checked_mul(
+            self.active_pages as u64,
+            self.device_page_bytes()?,
+            "active ring bytes",
+        )
     }
 
     /// Device bytes of the one-layer-ahead lookahead store.
     pub fn lookahead_bytes(&self) -> Result<u64, String> {
         checked_mul(
             self.pages_per_layer as u64,
-            self.page_bytes,
+            self.device_page_bytes()?,
             "lookahead store bytes",
         )
     }
 
-    /// Ring plus lookahead.
+    /// Ring plus lookahead: `PanelPoolReserve::device_total`.
     pub fn total_bytes(&self) -> Result<u64, String> {
         checked_add(self.ring_bytes()?, self.lookahead_bytes()?, "page store bytes")
     }
+
+    /// Pooled HIP events the timeline keeps (host handles, no device bytes).
+    pub fn timeline_events(&self) -> usize {
+        4 * self.timeline_records + 2 * self.timeline_layers
+    }
 }
 
-/// The spans of the prompt arena, in layout order.
+/// The spans of the prompt arena, in layout order. The arena holds only what
+/// the architecture (not the dispatch crate) owns across a layer: the
+/// hyper-connection streams. The saved prepared input, top-k ids/weights,
+/// route maps and widened accumulator are the dispatch crate's
+/// `PromptRouteStorage` and are charged from its own layout
+/// ([`route_storage_bytes`]), never duplicated here. Per-tile HC read/write
+/// gates, normalised rows and the mixed row are tile-local scratch the 1,536-row
+/// forward already owns (`HyperWriteOp` recomputes its gates from the saved
+/// streams and the layer's combined output), so no gate is saved per window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArenaField {
     /// Four hyper-connection branch streams of every window row, reserved at
     /// F32 width (the widest tag a tile can exit with; the per-tile BF16/F32
     /// tags are host-side metadata).
     HcStreams,
-    /// The saved prepared MoE input of every row, F32.
-    PreparedInput,
-    /// Per-row saved gates: the hyper-connection gates and the shared-expert
-    /// scalar, F32.
-    Gates,
-    TopkIds,
-    TopkWeights,
-    SortedSlotIndex,
-    InversePerm,
-    ExpertCounts,
-    ExpertOffsets,
-    ExpertTileIds,
-    /// The widened (F32) accumulator of the BF16 combine, one hidden row per
-    /// window row. No `rows x top-k x hidden` output exists anywhere.
-    Accumulator,
 }
 
 /// Every [`ArenaField`], in layout order.
-pub const ARENA_FIELDS: [ArenaField; 11] = [
-    ArenaField::HcStreams,
-    ArenaField::PreparedInput,
-    ArenaField::Gates,
-    ArenaField::TopkIds,
-    ArenaField::TopkWeights,
-    ArenaField::SortedSlotIndex,
-    ArenaField::InversePerm,
-    ArenaField::ExpertCounts,
-    ArenaField::ExpertOffsets,
-    ArenaField::ExpertTileIds,
-    ArenaField::Accumulator,
-];
+pub const ARENA_FIELDS: [ArenaField; 1] = [ArenaField::HcStreams];
 
 impl ArenaField {
     pub fn name(self) -> &'static str {
         match self {
             Self::HcStreams => "HC streams",
-            Self::PreparedInput => "prepared input",
-            Self::Gates => "gates",
-            Self::TopkIds => "top-k ids",
-            Self::TopkWeights => "top-k weights",
-            Self::SortedSlotIndex => "sorted slot index",
-            Self::InversePerm => "inverse perm",
-            Self::ExpertCounts => "expert counts",
-            Self::ExpertOffsets => "expert offsets",
-            Self::ExpertTileIds => "expert tile ids",
-            Self::Accumulator => "accumulator",
         }
     }
 }
@@ -547,10 +559,10 @@ impl ArenaSpan {
     }
 }
 
-/// The prompt arena of one window: a single device allocation of
-/// [`Self::total_bytes`], sliced by [`Self::span`]. The census charges
-/// exactly this number and the allocator allocates exactly this number, from
-/// this one function.
+/// The architecture-owned prompt arena of one window: a single device
+/// allocation of [`Self::total_bytes`], sliced by [`Self::span`]. The census
+/// charges exactly this number and the allocator allocates exactly this number,
+/// from this one function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptArenaLayout {
     pub rows: usize,
@@ -566,33 +578,13 @@ impl PromptArenaLayout {
         if rows == 0 || tile_rows == 0 {
             return Err("slow-link prefill arena has no rows".to_string());
         }
-        let rows64 = rows as u64;
         let f32_bytes = 4u64;
-        let top_k = geometry.experts_per_token as u64;
-        let experts = geometry.num_experts as u64;
-        let slots = checked_mul(rows64, top_k, "arena slots")?;
-        let grouped = crate::program::grouped_m_total_bound(
-            usize::try_from(slots).map_err(|_| "slow-link prefill arena slots overflow")?,
-            geometry.num_experts,
-        )
-        .map_err(|error| error.to_string())? as u64;
-        let row_bytes = |width: u64| -> Result<u64, String> {
-            checked_mul(checked_mul(rows64, width, "arena row bytes")?, f32_bytes, "arena bytes")
-        };
-        let hidden = geometry.hidden as u64;
-        let sizes: [u64; ARENA_FIELDS.len()] = [
-            row_bytes(geometry.wide()?)?,
-            row_bytes(hidden)?,
-            row_bytes(geometry.hc_count as u64 + 1)?,
-            checked_mul(slots, 4, "top-k id bytes")?,
-            checked_mul(slots, f32_bytes, "top-k weight bytes")?,
-            checked_mul(grouped, 4, "sorted slot index bytes")?,
-            checked_mul(slots, 4, "inverse perm bytes")?,
-            checked_mul(experts, 4, "expert count bytes")?,
-            checked_mul(experts + 1, 4, "expert offset bytes")?,
-            checked_mul(grouped / 16, 4, "expert tile id bytes")?,
-            row_bytes(hidden)?,
-        ];
+        let hc_streams = checked_mul(
+            checked_mul(rows as u64, geometry.wide()?, "arena row bytes")?,
+            f32_bytes,
+            "arena bytes",
+        )?;
+        let sizes: [u64; ARENA_FIELDS.len()] = [hc_streams];
         let mut offset = 0u64;
         let mut spans = [ArenaSpan {
             field: ArenaField::HcStreams,
@@ -625,19 +617,43 @@ impl PromptArenaLayout {
     }
 }
 
-/// Device bytes of the panel scratch: [`PANEL_MAX_GROUPED_ROWS`] grouped rows
-/// of the gate/up output, the activation and the down output, all F32.
-pub fn panel_scratch_bytes(geometry: &ModelGeometry) -> Result<u64, String> {
-    let width = checked_add(
-        checked_mul(3, geometry.moe_intermediate as u64, "panel scratch width")?,
-        geometry.hidden as u64,
-        "panel scratch width",
-    )?;
-    checked_mul(
-        checked_mul(PANEL_MAX_GROUPED_ROWS as u64, width, "panel scratch")?,
-        4,
-        "panel scratch",
-    )
+fn route_dims(geometry: &ModelGeometry, rows: usize) -> hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteDims {
+    hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteDims {
+        rows,
+        hidden: geometry.hidden,
+        n_exp: geometry.num_experts,
+        mi: geometry.moe_intermediate,
+    }
+}
+
+/// Device bytes of the dispatch crate's `PromptRouteStorage` for a window of
+/// `rows` rows (saved prepared input, top-k ids and weights, route maps and the
+/// widened accumulator): exactly
+/// `PromptRouteLayout::total_bytes`, the one layout `PromptRouteStorage::alloc`
+/// allocates from.
+pub fn route_storage_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64, String> {
+    hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(&route_dims(
+        geometry, rows,
+    ))
+    .map_err(|error| error.to_string())
+    .and_then(|layout| {
+        u64::try_from(layout.total_bytes())
+            .map_err(|_| "slow-link prefill route storage overflows".to_string())
+    })
+}
+
+/// Device bytes of the two window-wide A4 activation sidecars
+/// (`int4_mmq_x_scratch`, `qwen4_moe_down_i4_scratch`) the single count barrier
+/// quantizes into, from the dispatch crate's own layout.
+pub fn a4_sidecar_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64, String> {
+    hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(&route_dims(
+        geometry, rows,
+    ))
+    .map_err(|error| error.to_string())
+    .and_then(|layout| {
+        u64::try_from(layout.a4_sidecar_bytes())
+            .map_err(|_| "slow-link prefill A4 sidecars overflow".to_string())
+    })
 }
 
 /// Everything the S1 profile costs beyond the incumbent's 1,536-row reserve,
@@ -649,21 +665,29 @@ pub struct SlowlinkCensus {
     pub ring: u64,
     /// The one-layer-ahead lookahead pages.
     pub lookahead: u64,
-    pub panel_scratch: u64,
+    /// The dispatch crate's `PromptRouteStorage`
+    /// ([`route_storage_bytes`]: saved prepared input, top-k, route maps,
+    /// widened accumulator).
+    pub route_storage: u64,
+    /// The window-wide A4 activation sidecars ([`a4_sidecar_bytes`]).
+    pub a4_sidecars: u64,
+    /// The architecture-owned HC-stream arena ([`PromptArenaLayout`]).
     pub arena: u64,
-    /// The entry snapshot plus [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary copies
-    /// of the fixed per-layer state.
+    /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary copies of the session fixed
+    /// state, charged once each. The entry snapshot is the incumbent's own
+    /// snapshot arena, already in the base reserve, and is never charged again.
     pub boundary_state: u64,
 }
 
 impl SlowlinkCensus {
     /// Every term, named, in log order.
-    pub fn terms(&self) -> [(&'static str, u64); 5] {
+    pub fn terms(&self) -> [(&'static str, u64); 6] {
         [
             ("expert ring", self.ring),
             ("expert lookahead", self.lookahead),
-            ("panel scratch", self.panel_scratch),
-            ("prompt arena", self.arena),
+            ("route storage", self.route_storage),
+            ("A4 sidecars", self.a4_sidecars),
+            ("HC arena", self.arena),
             ("boundary state", self.boundary_state),
         ]
     }
@@ -704,8 +728,9 @@ pub struct AdmissionInputs {
     pub base_reserve: u64,
     /// The incumbent 1,536-row placement's layers, for the log only.
     pub baseline_layers: usize,
-    /// Bytes of one copy of the fixed per-layer state
-    /// ([`crate::expert_residency::StateCensus::state`]).
+    /// Bytes of one session fixed-state snapshot (GDN recurrent and conv, QSA
+    /// selections, PLE conv, hyper feedback; no context rows):
+    /// [`crate::bundle::session_snapshot_bytes`] at `p = 0`.
     pub fixed_state_bytes: u64,
     pub window_rows: usize,
     pub link_gbps: f64,
@@ -742,11 +767,18 @@ impl SlowlinkProfile {
         rows.div_ceil(self.window_rows)
     }
 
+    /// Pinned host bytes the profile adds beside the host-mapped experts: the
+    /// page pool's table staging (`PanelPoolReserve::staging`). Timeline events
+    /// are pooled HIP handles ([`PanelPageLayout::timeline_events`]), no bytes.
+    pub fn host_pinned_bytes(&self) -> u64 {
+        self.pages.host_staging_bytes
+    }
+
     /// The placement log line.
     pub fn describe(&self) -> String {
         format!(
             "slow-link prefill (S1): {} MiB charged [{}], {}-row tile, {}-row window, \
-             {} resident layers (1536-row baseline {}), {}+{} expert pages of {} bytes, link {:.1} GB/s",
+             {} resident layers (1536-row baseline {}), {}+{} expert pages of {} bytes ({} KiB pinned host table staging), link {:.1} GB/s",
             self.census.total().unwrap_or(0) >> 20,
             self.census.describe(),
             self.tile_rows,
@@ -756,12 +788,13 @@ impl SlowlinkProfile {
             self.pages.active_pages,
             self.pages.pages_per_layer,
             self.pages.page_bytes,
+            self.host_pinned_bytes() >> 10,
             self.link_gbps,
         )
     }
 }
 
-/// The joint S1 placement: charge the tile, arena, page store, panel scratch
+/// The joint S1 placement: charge the tile, HC arena, route storage, A4 sidecars, page store
 /// and boundary state together, then count the layers that remain. Refuses,
 /// before anything is allocated, with the exact deficit when fewer than
 /// [`S1_MIN_RESIDENT_LAYERS`] stay resident.
@@ -780,10 +813,11 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
         Ok(SlowlinkCensus {
             ring: pages.ring_bytes()?,
             lookahead: pages.lookahead_bytes()?,
-            panel_scratch: panel_scratch_bytes(&inputs.geometry)?,
+            route_storage: route_storage_bytes(&inputs.geometry, window_rows)?,
+            a4_sidecars: a4_sidecar_bytes(&inputs.geometry, window_rows)?,
             arena: arena.total_bytes,
             boundary_state: checked_mul(
-                1 + S1_MAX_BOUNDARY_SNAPSHOTS as u64,
+                S1_MAX_BOUNDARY_SNAPSHOTS as u64,
                 inputs.fixed_state_bytes,
                 "boundary state",
             )?,
@@ -988,9 +1022,10 @@ mod tests {
         let arena = PromptArenaLayout::new(&inputs.geometry, inputs.window_rows, S1_TILE_ROWS)
             .unwrap();
         pages.total_bytes().unwrap()
-            + panel_scratch_bytes(&inputs.geometry).unwrap()
+            + route_storage_bytes(&inputs.geometry, inputs.window_rows).unwrap()
+            + a4_sidecar_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + arena.total_bytes
-            + (1 + S1_MAX_BOUNDARY_SNAPSHOTS as u64) * inputs.fixed_state_bytes
+            + S1_MAX_BOUNDARY_SNAPSHOTS as u64 * inputs.fixed_state_bytes
     }
 
     /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.
@@ -1152,30 +1187,44 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_page_layout_matches_the_planned_reserve() {
+    fn slowlink_admission_page_layout_is_the_pool_reserve() {
         let pages = PanelPageLayout::new(512, GATE_UP_LAYER, DOWN_LAYER).unwrap();
         assert_eq!(pages.experts_per_page, 32);
         assert_eq!(pages.pages_per_layer, 16);
         assert_eq!(pages.total_pages(), 18);
         assert_eq!(pages.gate_up_expert_bytes, 1_740_800);
         assert_eq!(pages.down_expert_bytes, 870_400);
-        assert_eq!(pages.gate_up_span, 32 * 1_740_800);
-        assert_eq!(pages.down_span, 32 * 870_400);
-        // Regions are ordered, disjoint and end exactly at the page.
-        assert_eq!(pages.gate_up_offset, 0);
-        assert_eq!(pages.gate_up_pad_offset, pages.gate_up_span);
-        assert_eq!(pages.down_offset, pages.gate_up_pad_offset + 4096);
-        assert_eq!(pages.down_pad_offset, pages.down_offset + pages.down_span);
-        assert_eq!(pages.table_offset, pages.down_pad_offset + 4096);
-        assert_eq!(pages.page_bytes, pages.table_offset + pages.table_bytes);
-        assert_eq!(pages.table_bytes, 256 + 256 + 256);
-        // Plan: ~0.156 GiB ring + ~1.245 GiB lookahead = ~1.401 GiB payload,
-        // plus pads and tables.
-        let payload = 18 * 32 * 2_611_200u64;
-        assert_eq!(payload, pages.total_bytes().unwrap() - 18 * (2 * 4096 + 768));
+        // Payload bound: 32 experts' extents plus worst-case unmerged-run slack.
+        let extents = 32 * 2_611_200u64;
+        assert_eq!(pages.payload_bytes, extents + 64 * 2 * 255);
+        let spec = pages.pool_spec().unwrap();
+        assert_eq!(spec.active_slots, 2);
+        assert_eq!(spec.lookahead_pages, 16);
+        assert_eq!(spec.experts_per_slot, 32);
+        assert_eq!(spec.num_experts, 512);
+        assert_eq!(spec.payload_bytes as u64, pages.payload_bytes);
+        let reserve = spec.reserve().unwrap();
+        // ONE tail pad per page (rounded to 256) and two u64 pointer tables of
+        // every expert per page, exactly the pool's own accounting.
+        assert_eq!(
+            pages.page_bytes,
+            (pages.payload_bytes + 4096).div_ceil(256) * 256
+        );
+        assert_eq!(pages.table_bytes_per_page, 2 * 512 * 8);
+        assert_eq!(reserve.page_bytes as u64, pages.page_bytes);
+        assert_eq!(reserve.payload as u64, 18 * pages.page_bytes);
+        assert_eq!(reserve.tables as u64, 18 * pages.table_bytes_per_page);
+        assert_eq!(reserve.staging as u64, pages.host_staging_bytes);
+        assert_eq!(pages.total_bytes().unwrap(), reserve.device_total as u64);
+        assert_eq!(pages.ring_bytes().unwrap(), 2 * pages.device_page_bytes().unwrap());
+        assert_eq!(
+            pages.lookahead_bytes().unwrap(),
+            16 * pages.device_page_bytes().unwrap()
+        );
+        // Plan: ~1.401 GiB of payload beside tables and pads.
+        let payload = 18 * extents;
         assert!(payload > 1_500_000_000 && payload < 1_510_000_000, "{payload}");
-        assert_eq!(pages.ring_bytes().unwrap(), 2 * pages.page_bytes);
-        assert_eq!(pages.lookahead_bytes().unwrap(), 16 * pages.page_bytes);
+        assert_eq!(pages.timeline_events(), 4 * 2048 + 2 * 64);
     }
 
     #[test]
@@ -1193,48 +1242,21 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_arena_spans_are_aligned_disjoint_and_exact() {
+    fn slowlink_admission_arena_is_the_hc_streams_only_and_exact() {
         let geometry = geometry();
         let arena = PromptArenaLayout::new(&geometry, S1_WINDOW_ROWS, S1_TILE_ROWS).unwrap();
         assert_eq!(arena.tiles, 11);
         assert_eq!(arena.rows, 16384);
         let wide = (geometry.hc_count * geometry.hidden) as u64;
         let rows = S1_WINDOW_ROWS as u64;
+        // Saved prepared input, route maps and accumulator belong to the
+        // dispatch crate's route storage, never duplicated in the arena.
+        assert_eq!(ARENA_FIELDS, [ArenaField::HcStreams]);
         assert_eq!(arena.span(ArenaField::HcStreams).bytes, rows * wide * 4);
-        assert_eq!(
-            arena.span(ArenaField::PreparedInput).bytes,
-            rows * geometry.hidden as u64 * 4
-        );
-        assert_eq!(
-            arena.span(ArenaField::Accumulator).bytes,
-            rows * geometry.hidden as u64 * 4
-        );
-        assert_eq!(
-            arena.span(ArenaField::Gates).bytes,
-            rows * (geometry.hc_count as u64 + 1) * 4
-        );
-        let slots = rows * geometry.experts_per_token as u64;
-        assert_eq!(arena.span(ArenaField::TopkIds).bytes, slots * 4);
-        assert_eq!(arena.span(ArenaField::TopkWeights).bytes, slots * 4);
-        assert_eq!(arena.span(ArenaField::InversePerm).bytes, slots * 4);
-        assert_eq!(
-            arena.span(ArenaField::ExpertCounts).bytes,
-            geometry.num_experts as u64 * 4
-        );
-        assert_eq!(
-            arena.span(ArenaField::ExpertOffsets).bytes,
-            (geometry.num_experts as u64 + 1) * 4
-        );
-        let mut previous_end = 0u64;
-        for (span, field) in arena.spans.iter().zip(ARENA_FIELDS) {
-            assert_eq!(span.field, field);
-            assert_eq!(span.offset % S1_ALIGN, 0, "{}", field.name());
-            assert!(span.offset >= previous_end, "{} overlaps", field.name());
-            previous_end = span.end();
-        }
-        assert!(previous_end <= arena.total_bytes);
+        assert_eq!(arena.span(ArenaField::HcStreams).offset, 0);
         assert_eq!(arena.total_bytes % S1_ALIGN, 0);
-        assert!(arena.total_bytes - previous_end < S1_ALIGN);
+        assert!(arena.total_bytes >= rows * wide * 4);
+        assert!(arena.total_bytes - arena.span(ArenaField::HcStreams).end() < S1_ALIGN);
         // One window row more or fewer changes the allocation and the census alike.
         let shorter = PromptArenaLayout::new(&geometry, S1_WINDOW_ROWS - 1, S1_TILE_ROWS).unwrap();
         assert!(shorter.total_bytes < arena.total_bytes);
@@ -1253,15 +1275,25 @@ mod tests {
             profile.census.ring + profile.census.lookahead,
             profile.pages.total_bytes().unwrap()
         );
+        // The pool's own reserve is the page store: one authority.
+        let reserve = profile.pages.pool_spec().unwrap().reserve().unwrap();
+        assert_eq!(profile.pages.total_bytes().unwrap(), reserve.device_total as u64);
+        assert_eq!(profile.pages.host_staging_bytes, reserve.staging as u64);
+        assert_eq!(reserve.pages, 18);
         assert_eq!(
-            profile.census.panel_scratch,
-            panel_scratch_bytes(&profile.geometry).unwrap()
+            profile.census.route_storage,
+            route_storage_bytes(&profile.geometry, profile.window_rows).unwrap()
         );
+        assert_eq!(
+            profile.census.a4_sidecars,
+            a4_sidecar_bytes(&profile.geometry, profile.window_rows).unwrap()
+        );
+        assert!(profile.census.a4_sidecars > 0 && profile.census.route_storage > 0);
         assert_eq!(profile.reserve_bytes().unwrap(), census_total(&inputs));
         assert_eq!(profile.tile_rows, 1536);
         assert!(profile.tile_rows <= 1536);
         assert_eq!(profile.window_rows, 16384);
-        assert_eq!(profile.census.terms().len(), 5);
+        assert_eq!(profile.census.terms().len(), 6);
         assert!(profile.describe().contains("10 resident layers"));
     }
 
