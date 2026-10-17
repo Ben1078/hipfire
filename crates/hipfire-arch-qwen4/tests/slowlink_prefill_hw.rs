@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! S1 slow-link layer-major prefill: focused hardware tests.
+//!
+//! The `#[ignore]`d tests need a HIP GPU, a discrete narrow-link card and the
+//! canonical MQ4 Flash-Next artifact named by `HIPFIRE_SLOWLINK_HW_MODEL`,
+//! with routed experts placed by a fixed layer count
+//! (`HIPFIRE_SLOWLINK_HW_VRAM_LAYERS`, default 10; the rest host-mapped).
+//! They force the route through the one production switch
+//! (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`, set before the first config read) and
+//! run only inside a fabric hold with `--test-threads=1`:
+//!
+//! ```text
+//! fabric-run.sh --class correct --card xtx --mem-gb <actual peak> \
+//!   --hostmem-gb <actual unreclaimable> --hostmem-lock --max-secs 600 -- \
+//!   slowlink_prefill_hw --ignored --test-threads=1 --exact <test>
+//! ```
+//!
+//! `HIPFIRE_SLOWLINK_HW_ROWS` (default 3400, two full tiles and a tail) sets
+//! the prompt length; the 16384-row one-window proof is the gate's `state`
+//! mode (`examples/qwen4_slowlink_gate.rs`). The un-ignored tests are
+//! GPU-free and prove the shared receipt validation rejects what the plan
+//! requires it to reject.
+
+use hipfire_arch_qwen4::state_parity::{
+    slowlink_load_bundle, slowlink_logit_rows_summary, slowlink_state_digest, SlowlinkLoaded,
+};
+use rdna_compute::{DType, Gpu, GpuTensor};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+
+#[path = "common/slowlink_receipt.rs"]
+mod slowlink_receipt;
+use slowlink_receipt::*;
+
+const MODEL_ENV: &str = "HIPFIRE_SLOWLINK_HW_MODEL";
+const LAYERS_ENV: &str = "HIPFIRE_SLOWLINK_HW_VRAM_LAYERS";
+const ROWS_ENV: &str = "HIPFIRE_SLOWLINK_HW_ROWS";
+const ROUTE_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_PREFILL";
+const MAX_SEQ: usize = 16640;
+const DECODE: usize = 16;
+
+fn prompt(seed: u64, len: usize) -> Vec<u32> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (1000 + (state >> 33) % 99_000) as u32
+        })
+        .collect()
+}
+
+/// Why a hardware test must not load the model here: outside a fabric hold
+/// (`FABRIC_JOB` names the live job) or without `--test-threads=1`.
+fn hold_refusal(fabric_job: &str, threads_one: bool) -> Option<String> {
+    if !threads_one {
+        return Some("each test loads Flash-Next: run with --test-threads=1".into());
+    }
+    if fabric_job.trim().is_empty() {
+        return Some("no fabric hold (FABRIC_JOB unset)".into());
+    }
+    None
+}
+
+fn require_hold() {
+    let args: Vec<String> = std::env::args().collect();
+    let threads_one = std::env::var("RUST_TEST_THREADS").is_ok_and(|v| v == "1")
+        || args.iter().any(|a| a == "--test-threads=1")
+        || args
+            .windows(2)
+            .any(|w| w[0] == "--test-threads" && w[1] == "1");
+    let job = std::env::var("FABRIC_JOB").unwrap_or_default();
+    if let Some(why) = hold_refusal(&job, threads_one) {
+        panic!("refusing to load Flash-Next: {why}");
+    }
+}
+
+struct Hw {
+    gpu: Gpu,
+    bundle: hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    logits: GpuTensor,
+    vocab: usize,
+    eos: u32,
+    rows: usize,
+}
+
+fn load() -> Hw {
+    require_hold();
+    // Before the first config read of this process.
+    match std::env::var(ROUTE_ENV) {
+        Ok(v) => assert_eq!(v, "1", "{ROUTE_ENV}={v} conflicts with the forced layer-major tests"),
+        Err(_) => std::env::set_var(ROUTE_ENV, "1"),
+    }
+    let model = std::env::var_os(MODEL_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{MODEL_ENV} must name the MQ4 Flash-Next artifact"));
+    let layers = std::env::var(LAYERS_ENV)
+        .ok()
+        .map_or(10, |v| v.parse::<usize>().expect("vram layers"));
+    let rows = std::env::var(ROWS_ENV)
+        .ok()
+        .map_or(3400, |v| v.parse::<usize>().expect("rows"));
+    assert!(rows > MAX_TILE_ROWS as usize, "the prompt must exceed one tile");
+    let mut gpu = Gpu::init().expect("GPU");
+    let SlowlinkLoaded { bundle, vocab, eos_token, .. } =
+        slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, Some(layers), None).expect("load");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    Hw { gpu, bundle, logits, vocab, eos: eos_token, rows }
+}
+
+impl Hw {
+    fn prefill(&mut self, ids: &[u32]) -> (Value, Value, Option<Value>) {
+        self.bundle.reset(&mut self.gpu).expect("reset");
+        self.bundle
+            .prefill_final(&mut self.gpu, ids, 0, &self.logits)
+            .expect("prefill");
+        let receipt = self.bundle.slowlink_receipt();
+        let state = slowlink_state_digest(&self.gpu, &self.bundle).expect("state digest");
+        let logits = slowlink_logit_rows_summary(&self.gpu, &self.logits, 1, self.vocab, 16)
+            .expect("logit summary");
+        (state, logits, receipt)
+    }
+
+    fn decode(&mut self, count: usize) -> Vec<u32> {
+        let row = self.gpu.download_f32(&self.logits).expect("download");
+        let mut pending = Some(hipfire_runtime::llama::argmax(&row));
+        let mut ids = Vec::new();
+        while ids.len() < count {
+            let token = self
+                .bundle
+                .forward_token_or_argmax(&mut self.gpu, pending.take(), &self.logits)
+                .expect("decode");
+            ids.push(token);
+            if token == self.eos {
+                break;
+            }
+        }
+        ids
+    }
+
+    fn finish(self) {
+        let Hw { mut gpu, bundle, logits, .. } = self;
+        gpu.free_tensor(logits).expect("free logits");
+        bundle.free_gpu(&mut gpu).expect("free bundle");
+    }
+}
+
+fn assert_valid(receipt: &Option<Value>, rows: usize) {
+    let limits = Limits {
+        require_single_window: rows as u64 == TARGET_ROWS,
+        ..Limits::default()
+    };
+    let bad = validate(receipt.as_ref(), Expect::LayerMajor, &limits);
+    assert!(bad.is_empty(), "receipt problems: {bad:?}\nreceipt: {receipt:?}");
+}
+
+/// The production panel transport, dispatch and ordered combine, on the
+/// admitted profile's real host-expert sources (never a CPU model).
+#[test]
+#[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
+fn slowlink_primitives_pass_on_the_admitted_profile() {
+    let mut hw = load();
+    let report = hw
+        .bundle
+        .slowlink_primitive_selftest(&mut hw.gpu, &PRIMITIVE_CASES)
+        .expect("self-test on the admitted S1 profile");
+    let cases = report["cases"].as_array().expect("cases");
+    for name in PRIMITIVE_CASES {
+        let case = cases
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("self-test did not run {name}"));
+        assert_eq!(case["status"], "pass", "{name}: {case}");
+        assert_eq!(case["mismatches"].as_u64(), Some(0), "{name}: {case}");
+    }
+    hw.finish();
+}
+
+/// Same-route determinism across repeated epochs at the same device
+/// addresses, and one submitted payload sweep per request each time (no
+/// refetch, no growth): the lookahead pages are reused with delayed readers.
+#[test]
+#[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
+fn slowlink_repeated_epochs_are_deterministic_with_one_sweep_each() {
+    let mut hw = load();
+    let ids = prompt(0x51, hw.rows);
+    let first = hw.prefill(&ids);
+    assert_valid(&first.2, hw.rows);
+    let submitted = u64_at(first.2.as_ref().unwrap(), "submitted_bytes");
+    for epoch in 1..4 {
+        let again = hw.prefill(&ids);
+        assert_valid(&again.2, hw.rows);
+        assert_eq!(again.0["combined"], first.0["combined"], "epoch {epoch}: state digest");
+        assert_eq!(again.1["combined"], first.1["combined"], "epoch {epoch}: final logits");
+        assert_eq!(
+            u64_at(again.2.as_ref().unwrap(), "submitted_bytes"),
+            submitted,
+            "epoch {epoch}: submitted bytes changed (refetch or leak)"
+        );
+    }
+    hw.finish();
+}
+
+/// Each named failure aborts the request, restores or contains the state,
+/// and a clean re-run reproduces the clean digests (no donor restore, no
+/// poisoned pages).
+#[test]
+#[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
+fn slowlink_injected_failures_abort_cleanly_and_rerun_matches() {
+    let mut hw = load();
+    let ids = prompt(0x52, hw.rows);
+    let clean = hw.prefill(&ids);
+    assert_valid(&clean.2, hw.rows);
+    for point in FAILURE_POINTS {
+        hw.bundle.reset(&mut hw.gpu).expect("reset");
+        hw.bundle.slowlink_inject_failure(Some(point)).expect("arm");
+        let failed = hw.bundle.prefill_final(&mut hw.gpu, &ids, 0, &hw.logits);
+        assert!(failed.is_err(), "{point}: the injected failure did not fail the request");
+        let consumed = hw
+            .bundle
+            .slowlink_receipt()
+            .and_then(|r| r.get("injection_consumed").and_then(Value::as_bool));
+        assert_eq!(consumed, Some(true), "{point}: injection not consumed");
+        hw.bundle.slowlink_inject_failure(None).expect("clear");
+        let again = hw.prefill(&ids);
+        assert_valid(&again.2, hw.rows);
+        assert_eq!(again.0["combined"], clean.0["combined"], "{point}: state after abort + rerun");
+        assert_eq!(again.1["combined"], clean.1["combined"], "{point}: logits after abort + rerun");
+    }
+    hw.finish();
+}
+
+/// Decode after the S1 prefill: the retained-body replay (the only decode
+/// body replay Qwen4 production has) must reproduce the eager ids, with every
+/// measured token replayed.
+#[test]
+#[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
+fn slowlink_decode_after_prefill_replays_the_eager_ids() {
+    let mut hw = load();
+    let ids = prompt(0x53, hw.rows);
+    hw.gpu.replay.configure_model_default(true);
+    hw.prefill(&ids);
+    let row = hw.gpu.download_f32(&hw.logits).expect("download");
+    let mut pending = Some(hipfire_runtime::llama::argmax(&row));
+    let mut replay_ids = Vec::new();
+    let mut warm = 0;
+    while hw.gpu.replay.state() != rdna_compute::replay::ReplayState::Ready && warm < 6 {
+        replay_ids.push(
+            hw.bundle
+                .forward_token_or_argmax(&mut hw.gpu, pending.take(), &hw.logits)
+                .expect("warm"),
+        );
+        warm += 1;
+    }
+    assert_eq!(hw.gpu.replay.state(), rdna_compute::replay::ReplayState::Ready, "retained body never became Ready");
+    hw.gpu.replay.begin_replay_observation_window();
+    for _ in 0..DECODE {
+        replay_ids.push(
+            hw.bundle
+                .forward_token_or_argmax(&mut hw.gpu, pending.take(), &hw.logits)
+                .expect("replay"),
+        );
+    }
+    let observed = hw.gpu.replay.replay_observation();
+    assert_eq!(observed.count, DECODE as u64, "not every measured token replayed");
+    assert!(!observed.failed);
+    hw.gpu.replay.configure_model_default(false);
+    hw.prefill(&ids);
+    let eager = hw.decode(replay_ids.len());
+    assert_eq!(eager, replay_ids, "retained replay differs from eager decode after S1 prefill");
+    hw.finish();
+}
+
+// ── GPU-free ───────────────────────────────────────────────────────────
+
+#[test]
+fn slowlink_hold_guard_refuses_loads_outside_a_hold() {
+    assert!(hold_refusal("", true).is_some());
+    assert!(hold_refusal("123:456:xtx", false).is_some());
+    assert!(hold_refusal("123:456:xtx", true).is_none());
+}
+
+#[test]
+fn slowlink_receipt_a_missing_receipt_or_route_never_validates() {
+    assert!(!validate(None, Expect::LayerMajor, &Limits::default()).is_empty());
+    let partial = json!({"schema": RECEIPT_SCHEMA, "windows": []});
+    assert!(!validate(Some(&partial), Expect::LayerMajor, &Limits::default()).is_empty());
+}
+
+#[test]
+fn slowlink_receipt_a_short_forced_bypass_must_name_its_reason() {
+    let incumbent = json!({
+        "schema": RECEIPT_SCHEMA, "route": "incumbent", "selected_by": "env1", "bypass_reason": null,
+        "entry_pos": 0, "prompt_rows": 512, "windows": [{"start": 0, "rows": 512}], "launch_cuts": [],
+        "tile_rows": 512, "retained_scratch_rows": 512, "sweeps": 0, "resident_layers": 10, "host_layers": 38,
+        "host_expert_bytes_total": 0, "submitted_bytes": 0, "useful_bytes": 0, "unused_prefetched_bytes": 0,
+        "reserve": {"tile": 0, "arena": 0, "ring": 0, "lookahead": 0, "tables": 0, "total": 0},
+        "spans_ms": {"wall": 1.0, "copy": 0.0, "compute": 1.0, "route_barrier": 0.0, "nonexpert": 1.0},
+        "overlap": {"cross_layer_intersections": 0, "cross_layer_overlap_ms": 0.0, "copy_idle_ms": 0.0,
+                    "page_full_stalls": 0, "copy_starved_stalls": 0},
+        "peak_vram_bytes": 1,
+    });
+    assert!(!validate_forced_short(Some(&incumbent), &Limits::default()).is_empty());
+    let mut named = incumbent;
+    named["bypass_reason"] = json!("request shorter than the S1 qualification");
+    assert!(validate_forced_short(Some(&named), &Limits::default()).is_empty());
+}

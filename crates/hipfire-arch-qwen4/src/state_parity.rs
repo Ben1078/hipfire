@@ -2800,6 +2800,7 @@ pub struct SlowlinkLoaded {
     /// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, else all resident) decided.
     pub expert_vram_layers: Option<usize>,
     pub ple_format: String,
+    pub tokenizer: hipfire_runtime::tokenizer::Tokenizer,
 }
 
 /// Load one real Qwen4 HFQM artifact the way `qwen4_greedy_ids` /
@@ -2814,6 +2815,7 @@ pub fn slowlink_load_bundle(
     path: &Path,
     max_seq: usize,
     expert_vram_layers: Option<usize>,
+    session_cache_budget: Option<u64>,
 ) -> Result<SlowlinkLoaded, String> {
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(path)
         .map_err(|error| format!("open HFQM {}: {error}", path.display()))?;
@@ -2843,6 +2845,19 @@ pub fn slowlink_load_bundle(
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, gpu);
     let npu_identity = crate::npu_trunk::model_index_identity(&hfq, &gpu.arch);
     let use_ranges = gpu.is_uma();
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|error| format!("tokenizer: {error}"))?;
+    // The session-cache domain binds the artifact, tokenizer and device; it
+    // is read from the HFQ file before the source takes ownership of it.
+    let cache_domain = session_cache_budget.map(|_| {
+        hipfire_runtime::serve_contract::CacheDomain::for_model(
+            &hfq,
+            &tokenizer,
+            None,
+            "qwen4",
+            gpu.device_id,
+        )
+    });
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let weights = match expert_vram_layers {
         Some(layers) => {
@@ -2901,6 +2916,13 @@ pub fn slowlink_load_bundle(
     bundle
         .attach_forward(gpu, max_seq, scratch_mode)
         .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+    if let Some(domain) = cache_domain {
+        let cache = hipfire_runtime::session_cache::SessionCache::new(
+            domain,
+            session_cache_budget.unwrap_or(0),
+        );
+        bundle.attach_session_cache(cache);
+    }
     Ok(SlowlinkLoaded {
         bundle,
         vocab,
@@ -2909,6 +2931,7 @@ pub fn slowlink_load_bundle(
         host_mapped_tensors,
         expert_vram_layers,
         ple_format: choice.format.name().to_string(),
+        tokenizer,
     })
 }
 
@@ -2938,7 +2961,7 @@ pub fn run_slowlink_prefill_state(
         ));
     }
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let loaded = slowlink_load_bundle(&mut gpu, model_path, max_seq, expert_vram_layers)?;
+    let loaded = slowlink_load_bundle(&mut gpu, model_path, max_seq, expert_vram_layers, None)?;
     let SlowlinkLoaded {
         mut bundle,
         vocab,
