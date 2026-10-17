@@ -1194,10 +1194,9 @@ impl Qwen4Bundle {
         )
     }
 
-    /// Rewind a finished verify without committing: restore the scratch's
-    /// target snapshot ticket (the state the verify started from) and consume
-    /// it, the first step of `commit_prefix`'s partial-accept path minus the
-    /// replay.
+    /// Rewind a finished local verify without committing: take its target
+    /// ticket out of scratch, reject a mesh ticket, then restore and consume
+    /// the local snapshot (also releasing its arena entry on copy failure).
     pub(crate) fn dev_rollback_verify(
         &mut self,
         gpu: &mut Gpu,
