@@ -2223,6 +2223,7 @@ pub mod selftest {
         WithinExpertCanary,
         K1TailCohort,
         ZeroRowPanel,
+        DecodeTailCohort,
     }
 
     /// Geometry of the call and binding the diagnostics run over.
@@ -2236,6 +2237,9 @@ pub mod selftest {
         pub binding_experts: usize,
         /// K1 tile rows (`3.min(few_row_limit)`; the diagnostics use at most 3).
         pub k1_rows: usize,
+        /// Intermediate width of the shared expert of the real decode call
+        /// (`DecodeTailCohort` only; the other diagnostics seed no shared expert).
+        pub shared_intermediate: usize,
     }
 
     /// Unique-owner peak bytes of one diagnostic EXTRA to the model's own tensors: the panel
@@ -2263,6 +2267,7 @@ pub mod selftest {
         limits: PanelLimits,
         rows: usize,
         k1_rows: usize,
+        shared: usize,
         grouped: usize,
         dev: &mut Vec<(&'static str, usize)>,
         host: &mut Vec<(&'static str, usize)>,
@@ -2272,7 +2277,7 @@ pub mod selftest {
             hidden: g.hidden,
             n_exp: g.n_exp,
             mi: g.mi,
-            shared_intermediate: 0,
+            shared_intermediate: shared,
             k1_rows,
         })?;
         let slots = rows * K_TOP;
@@ -2373,7 +2378,7 @@ pub mod selftest {
                 let grouped = upper(rows * K_TOP);
                 let mut dev = Vec::new();
                 let mut host = Vec::new();
-                window_bytes(g, limits, rows, 0, grouped, &mut dev, &mut host)?;
+                window_bytes(g, limits, rows, 0, 0, grouped, &mut dev, &mut host)?;
                 let (mono_dev, mono_host) = monolithic_bytes(g, rows, grouped);
                 // Device: the window stays alive while the monolithic reference runs.
                 dev.push(("monolithic_reference", mono_dev));
@@ -2395,7 +2400,7 @@ pub mod selftest {
                 let grouped = upper(64 * K_TOP);
                 let mut dev = Vec::new();
                 let mut host = Vec::new();
-                window_bytes(g, limits, rows, k1, grouped, &mut dev, &mut host)?;
+                window_bytes(g, limits, rows, k1, 0, grouped, &mut dev, &mut host)?;
                 dev.push((
                     "k1_reference_y0_and_accumulator",
                     k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
@@ -2413,9 +2418,9 @@ pub mod selftest {
                 // the larger of the two is the peak.
                 let k1 = g.k1_rows;
                 let (mut dev_a, mut host_a) = (Vec::new(), Vec::new());
-                window_bytes(g, limits, 40, 0, 0, &mut dev_a, &mut host_a)?;
+                window_bytes(g, limits, 40, 0, 0, 0, &mut dev_a, &mut host_a)?;
                 let (mut dev_b, mut host_b) = (Vec::new(), Vec::new());
-                window_bytes(g, limits, k1, k1, 0, &mut dev_b, &mut host_b)?;
+                window_bytes(g, limits, k1, k1, 0, 0, &mut dev_b, &mut host_b)?;
                 dev_b.push((
                     "k1_reference_y0_and_accumulator",
                     k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
@@ -2431,6 +2436,34 @@ pub mod selftest {
                 } else {
                     host_b
                 };
+            }
+            DiagCase::DecodeTailCohort => {
+                // A K2 anchor tile of 64 tokens plus the real one-row decode call, over a binding
+                // that may be ALL experts (the grouped padding then spreads over every expert).
+                let k1 = 1usize;
+                let rows = DECODE_TAIL_ANCHOR_ROWS + k1;
+                let grouped = upper(DECODE_TAIL_ANCHOR_ROWS * K_TOP);
+                let mut dev = Vec::new();
+                let mut host = Vec::new();
+                window_bytes(
+                    g,
+                    limits,
+                    rows,
+                    k1,
+                    g.shared_intermediate,
+                    grouped,
+                    &mut dev,
+                    &mut host,
+                )?;
+                dev.push(("decode_reference_target_f32", g.hidden * F32_BYTES));
+                host.push((
+                    "cpu_model_case_clones_and_output",
+                    cpu_canonical_bytes(g, rows, grouped),
+                ));
+                host.push(("decode_reference_readback", g.hidden * F32_BYTES));
+                host.push(("routed_ids_readback", K_TOP * I32_BYTES));
+                out.device_parts = dev;
+                out.host_parts = host;
             }
         }
         out.device_peak = sum_parts(&out.device_parts);
@@ -3108,6 +3141,34 @@ mod slowlink_panel_tests {
         d.shared_intermediate = 0;
         d.k1_rows = 8;
         assert_eq!(PromptRouteLayout::new(&d).unwrap().k1_bytes(), 8 * K_TOP * (2560 * 4 + 4));
+    }
+
+    #[test]
+    fn slowlink_panel_decode_tail_diag_ledger_is_pinned_and_within_the_canary_peak() {
+        use super::selftest::{diagnostic_bytes, DiagCase, DiagGeometry};
+        // The real MQ4 layer identity with the RESIDENT all-expert binding, a 64-token K2
+        // anchor plus one decode row, shared I640.
+        let g = DiagGeometry {
+            hidden: 2560,
+            n_exp: 512,
+            mi: 640,
+            binding_experts: 512,
+            k1_rows: 1,
+            shared_intermediate: 640,
+        };
+        let limits = PanelLimits::S1;
+        let decode = diagnostic_bytes(DiagCase::DecodeTailCohort, &g, limits).unwrap();
+        // Grouped padding spreads over every expert: 640 slots + 15 * 512 pad rows = 8,320.
+        assert_eq!(decode.device_peak, 2_012_120, "{:?}", decode.device_parts);
+        assert_eq!(decode.host_peak, 99_041_064, "{:?}", decode.host_parts);
+        let canary = diagnostic_bytes(
+            DiagCase::WithinExpertCanary,
+            &DiagGeometry { binding_experts: 32, shared_intermediate: 0, ..g },
+            limits,
+        )
+        .unwrap();
+        assert!(decode.device_peak <= canary.device_peak);
+        assert!(decode.host_peak <= canary.host_peak);
     }
 
     #[test]
