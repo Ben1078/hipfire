@@ -61,50 +61,198 @@ use rdna_compute::tensor_ops::{
     indexed_attention_select_batch_mirrored, IndexedAttentionAppendPrologue,
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppend,
     IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
-    IndexedAttentionIndexKeyAppendBatch, IndexedAttentionNormRope,
-    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
-    IndexedAttentionSelectBatch, QsaKvFormat, QsaPositionBinding,
+    IndexedAttentionIndexKeyAppendBatch, IndexedAttentionNormRope, IndexedAttentionNormRopeBatch,
+    IndexedAttentionPoolRope, IndexedAttentionReuseSelection, IndexedAttentionSelectBatch,
+    QsaKvFormat, QsaPositionBinding,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub const CASES: &[Q4Case] = &[
-    Q4Case { name: "qwen4_qsa_gfx942_gates_and_kv_format_refusal", timeout_s: 60, run: case_gates },
-    Q4Case { name: "qwen4_indexed_attention_norm_rope_f32_batched", timeout_s: 120, run: case_norm_rope_batched },
-    Q4Case { name: "qwen4_indexed_attention_norm_rope_f32_single", timeout_s: 60, run: case_norm_rope_single },
-    Q4Case { name: "qwen4_indexed_attention_cache_append_f32_batched", timeout_s: 60, run: case_cache_append_batched },
-    Q4Case { name: "qwen4_indexed_attention_cache_append_f32_single", timeout_s: 60, run: case_cache_append_single },
-    Q4Case { name: "qwen4_indexed_attention_index_key_append_bf16_batched", timeout_s: 60, run: case_index_key_append },
-    Q4Case { name: "qwen4_bf16_round_trip_f32_strided_qsa_index_k", timeout_s: 60, run: case_round_trip_strided },
-    Q4Case { name: "qwen4_copy_rows_strided_f32_qsa_raw_index_keys", timeout_s: 60, run: case_copy_rows_strided },
-    Q4Case { name: "qwen4_indexed_attention_decode_prologue_f32", timeout_s: 120, run: case_decode_prologue },
-    Q4Case { name: "qwen4_indexed_attention_pool_rope_f32", timeout_s: 120, run: case_pool_rope_f32 },
-    Q4Case { name: "qwen4_indexed_attention_pool_rope_bf16", timeout_s: 120, run: case_pool_rope_bf16 },
-    Q4Case { name: "qwen4_indexed_attention_select_batch_f32_route", timeout_s: 1500, run: case_select_f32 },
-    Q4Case { name: "qwen4_indexed_attention_select_batch_bf16_route", timeout_s: 1500, run: case_select_bf16 },
-    Q4Case { name: "qwen4_indexed_attention_attention_batch_f32_route", timeout_s: 600, run: case_attention_batch },
-    Q4Case { name: "qwen4_indexed_attention_attention_batch_f32_route_geometry", timeout_s: 600, run: case_attention_batch_geometry },
-    Q4Case { name: "qwen4_indexed_attention_reuse_selection", timeout_s: 60, run: case_reuse_selection },
-    Q4Case { name: "qwen4_indexed_attention_attention_f32_single", timeout_s: 120, run: case_attention_single },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_cache_append", timeout_s: 180, run: case_fp8_cache_append },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_decode_bits", timeout_s: 180, run: case_fp8_decode_bits },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_decode_prologue", timeout_s: 240, run: case_fp8_decode_prologue },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_attention_batch_route", timeout_s: 600, run: case_fp8_attention_batch },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_attention_single", timeout_s: 180, run: case_fp8_attention_single },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_select_attention_route", timeout_s: 600, run: case_fp8_select_attention },
-    Q4Case { name: "qwen4_qsa_fp8_fnuz_attention_batch_serial_equality", timeout_s: 600, run: case_fp8_attention_serial_equality },
-    Q4Case { name: "qwen4_qsa_parallel_select_scores_rows8_f32", timeout_s: 900, run: parallel_rows8 },
-    Q4Case { name: "qwen4_qsa_parallel_select_scores_rows16_f32", timeout_s: 900, run: parallel_rows16 },
-    Q4Case { name: "qwen4_qsa_parallel_select_scores_rows32_f32", timeout_s: 900, run: parallel_rows32 },
-    Q4Case { name: "qwen4_qsa_wide_decode_prologue_f32_one_row_bitwise", timeout_s: 1200, run: wide_prologue_f32 },
-    Q4Case { name: "qwen4_qsa_wide_decode_prologue_fp8_one_row_bitwise", timeout_s: 1200, run: wide_prologue_fp8 },
-    Q4Case { name: "qwen4_qsa_wide_pool_rope_f32_one_row_bitwise", timeout_s: 1200, run: wide_pool_f32 },
-    Q4Case { name: "qwen4_qsa_wide_pool_rope_bf16_one_row_bitwise", timeout_s: 1200, run: wide_pool_bf16 },
-    Q4Case { name: "qwen4_qsa_wide_attention_f32_one_row_bitwise", timeout_s: 1800, run: wide_attention_f32 },
-    Q4Case { name: "qwen4_qsa_parallel_select_f32_batched", timeout_s: 1200, run: parallel_select_f32 },
-    Q4Case { name: "qwen4_qsa_parallel_select_bf16_batched", timeout_s: 1200, run: parallel_select_bf16 },
-    Q4Case { name: "qwen4_qsa_parallel_attention_f32_batched", timeout_s: 600, run: parallel_attention_batched },
-    Q4Case { name: "qwen4_qsa_parallel_attention_f32_batched_hg4", timeout_s: 600, run: parallel_attention_hg4 },
-    Q4Case { name: "qwen4_qsa_parallel_attention_f32_batched_hg12", timeout_s: 600, run: parallel_attention_hg12 },
+    Q4Case {
+        name: "qwen4_qsa_gfx942_gates_and_kv_format_refusal",
+        timeout_s: 60,
+        run: case_gates,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_norm_rope_f32_batched",
+        timeout_s: 120,
+        run: case_norm_rope_batched,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_norm_rope_f32_single",
+        timeout_s: 60,
+        run: case_norm_rope_single,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_cache_append_f32_batched",
+        timeout_s: 60,
+        run: case_cache_append_batched,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_cache_append_f32_single",
+        timeout_s: 60,
+        run: case_cache_append_single,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_index_key_append_bf16_batched",
+        timeout_s: 60,
+        run: case_index_key_append,
+    },
+    Q4Case {
+        name: "qwen4_bf16_round_trip_f32_strided_qsa_index_k",
+        timeout_s: 60,
+        run: case_round_trip_strided,
+    },
+    Q4Case {
+        name: "qwen4_copy_rows_strided_f32_qsa_raw_index_keys",
+        timeout_s: 60,
+        run: case_copy_rows_strided,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_decode_prologue_f32",
+        timeout_s: 120,
+        run: case_decode_prologue,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_pool_rope_f32",
+        timeout_s: 120,
+        run: case_pool_rope_f32,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_pool_rope_bf16",
+        timeout_s: 120,
+        run: case_pool_rope_bf16,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_select_batch_f32_route",
+        timeout_s: 1500,
+        run: case_select_f32,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_select_batch_bf16_route",
+        timeout_s: 1500,
+        run: case_select_bf16,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_attention_batch_f32_route",
+        timeout_s: 600,
+        run: case_attention_batch,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_attention_batch_f32_route_geometry",
+        timeout_s: 600,
+        run: case_attention_batch_geometry,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_reuse_selection",
+        timeout_s: 60,
+        run: case_reuse_selection,
+    },
+    Q4Case {
+        name: "qwen4_indexed_attention_attention_f32_single",
+        timeout_s: 120,
+        run: case_attention_single,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_cache_append",
+        timeout_s: 180,
+        run: case_fp8_cache_append,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_decode_bits",
+        timeout_s: 180,
+        run: case_fp8_decode_bits,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_decode_prologue",
+        timeout_s: 240,
+        run: case_fp8_decode_prologue,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_attention_batch_route",
+        timeout_s: 600,
+        run: case_fp8_attention_batch,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_attention_single",
+        timeout_s: 180,
+        run: case_fp8_attention_single,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_select_attention_route",
+        timeout_s: 600,
+        run: case_fp8_select_attention,
+    },
+    Q4Case {
+        name: "qwen4_qsa_fp8_fnuz_attention_batch_serial_equality",
+        timeout_s: 600,
+        run: case_fp8_attention_serial_equality,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_select_scores_rows8_f32",
+        timeout_s: 900,
+        run: parallel_rows8,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_select_scores_rows16_f32",
+        timeout_s: 900,
+        run: parallel_rows16,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_select_scores_rows32_f32",
+        timeout_s: 900,
+        run: parallel_rows32,
+    },
+    Q4Case {
+        name: "qwen4_qsa_wide_decode_prologue_f32_one_row_bitwise",
+        timeout_s: 1200,
+        run: wide_prologue_f32,
+    },
+    Q4Case {
+        name: "qwen4_qsa_wide_decode_prologue_fp8_one_row_bitwise",
+        timeout_s: 1200,
+        run: wide_prologue_fp8,
+    },
+    Q4Case {
+        name: "qwen4_qsa_wide_pool_rope_f32_one_row_bitwise",
+        timeout_s: 1200,
+        run: wide_pool_f32,
+    },
+    Q4Case {
+        name: "qwen4_qsa_wide_pool_rope_bf16_one_row_bitwise",
+        timeout_s: 1200,
+        run: wide_pool_bf16,
+    },
+    Q4Case {
+        name: "qwen4_qsa_wide_attention_f32_one_row_bitwise",
+        timeout_s: 1800,
+        run: wide_attention_f32,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_select_f32_batched",
+        timeout_s: 1200,
+        run: parallel_select_f32,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_select_bf16_batched",
+        timeout_s: 1200,
+        run: parallel_select_bf16,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_attention_f32_batched",
+        timeout_s: 600,
+        run: parallel_attention_batched,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_attention_f32_batched_hg4",
+        timeout_s: 600,
+        run: parallel_attention_hg4,
+    },
+    Q4Case {
+        name: "qwen4_qsa_parallel_attention_f32_batched_hg12",
+        timeout_s: 600,
+        run: parallel_attention_hg12,
+    },
 ];
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
@@ -145,7 +293,9 @@ fn bf16_trunc_rne(v: f32) -> f32 {
 }
 
 fn dyadic(rng: &mut Rng, n: usize, denom: f32) -> Vec<f32> {
-    (0..n).map(|_| (rng.below(17) as f32 - 8.0) / denom).collect()
+    (0..n)
+        .map(|_| (rng.below(17) as f32 - 8.0) / denom)
+        .collect()
 }
 
 /// Compare `got` to `want`: elements where `exact_at(i)` bit-exactly, the rest
@@ -192,7 +342,13 @@ fn yarns() -> [(&'static str, RopeYarn); 2] {
 /// `angle = position * powf(1e7, -2*base/rotary_dim)` and the YaRN `sin_cos`
 /// host twin. The arch-qwen4 CPU twin is `ops.rs:464 rope_prefix_halfsplit`
 /// (same angle/yarn math; it has no RMS/learned-norm stage).
-fn norm_rope_head(x: &[f32], norm: &[f32], position: usize, rotary_dim: usize, yarn: RopeYarn) -> Vec<f32> {
+fn norm_rope_head(
+    x: &[f32],
+    norm: &[f32],
+    position: usize,
+    rotary_dim: usize,
+    yarn: RopeYarn,
+) -> Vec<f32> {
     let head_dim = x.len();
     let mut sum = 0.0f32;
     for &v in x {
@@ -421,14 +577,29 @@ fn select_rows_cpu(
     blocks: usize,
     position_start: usize,
 ) -> (Vec<i32>, Vec<f32>) {
-    select_rows_cpu_with(index_score, query, pooled, rows, blocks, position_start, BUDGET_BLOCKS, SEL_CAP)
+    select_rows_cpu_with(
+        index_score,
+        query,
+        pooled,
+        rows,
+        blocks,
+        position_start,
+        BUDGET_BLOCKS,
+        SEL_CAP,
+    )
 }
 
 /// A `[rows][blocks]` score table from rows laid out at `stride` (the CPU twin's
 /// `stride == blocks`, the fused selector's global rows
 /// `blocks.div_ceil(4) * 4`), with every slot a row does not score (blocks past
 /// its visible count) set to the kernels' NaN sentinel.
-fn masked_scores(table: &[f32], rows: usize, blocks: usize, stride: usize, position_start: usize) -> Vec<f32> {
+fn masked_scores(
+    table: &[f32],
+    rows: usize,
+    blocks: usize,
+    stride: usize,
+    position_start: usize,
+) -> Vec<f32> {
     let mut out = vec![f32::from_bits(0x7FC0_DEAD); rows * blocks];
     for r in 0..rows {
         let rbc = ((position_start + r + 1) / QSA_COMPRESS).min(blocks);
@@ -679,7 +850,12 @@ fn attn_inputs(seed: u64, rows: usize, end: usize) -> Result<AttnInputs, String>
 
 /// [`attn_inputs`] with the operands of `kind`: plain = uniform q in [-3, 3] and
 /// keys / values in [-1, 1]; realistic = [`realistic_attn_qkv`].
-fn attn_inputs_kind(seed: u64, rows: usize, end: usize, kind: DataKind) -> Result<AttnInputs, String> {
+fn attn_inputs_kind(
+    seed: u64,
+    rows: usize,
+    end: usize,
+    kind: DataKind,
+) -> Result<AttnInputs, String> {
     let position_start = end - rows;
     let selected = attn_selection(seed, rows, end)?;
     let (q, keys, values) = match kind {
@@ -708,7 +884,14 @@ fn attn_inputs_kind(seed: u64, rows: usize, end: usize, kind: DataKind) -> Resul
             end,
         ));
     }
-    Ok(AttnInputs { position_start, q, keys, values, selected, want })
+    Ok(AttnInputs {
+        position_start,
+        q,
+        keys,
+        values,
+        selected,
+        want,
+    })
 }
 
 // ── norm + RoPE ───────────────────────────────────────────────────────────────
@@ -720,18 +903,49 @@ struct NrConfig {
     row_stride: usize,
 }
 const NR_CONFIGS: [NrConfig; 3] = [
-    NrConfig { name: "index_q", heads: QSA_INDEX_HEADS, head_dim: IDX_DIM, head_stride: IDX_DIM, row_stride: IDX_W },
-    NrConfig { name: "q", heads: QSA_Q_HEADS, head_dim: HD, head_stride: 2 * HD, row_stride: QG_W },
-    NrConfig { name: "k", heads: QSA_KV_HEADS, head_dim: HD, head_stride: HD, row_stride: KV_W },
+    NrConfig {
+        name: "index_q",
+        heads: QSA_INDEX_HEADS,
+        head_dim: IDX_DIM,
+        head_stride: IDX_DIM,
+        row_stride: IDX_W,
+    },
+    NrConfig {
+        name: "q",
+        heads: QSA_Q_HEADS,
+        head_dim: HD,
+        head_stride: 2 * HD,
+        row_stride: QG_W,
+    },
+    NrConfig {
+        name: "k",
+        heads: QSA_KV_HEADS,
+        head_dim: HD,
+        head_stride: HD,
+        row_stride: KV_W,
+    },
 ];
 
-fn nr_want(cfg: &NrConfig, input: &[f32], norm: &[f32], rows: usize, pos0: usize, yarn: RopeYarn) -> (Vec<f32>, Vec<bool>) {
+fn nr_want(
+    cfg: &NrConfig,
+    input: &[f32],
+    norm: &[f32],
+    rows: usize,
+    pos0: usize,
+    yarn: RopeYarn,
+) -> (Vec<f32>, Vec<bool>) {
     let mut want = input.to_vec();
     let mut touched = vec![false; input.len()];
     for r in 0..rows {
         for h in 0..cfg.heads {
             let start = r * cfg.row_stride + h * cfg.head_stride;
-            let out = norm_rope_head(&input[start..start + cfg.head_dim], norm, pos0 + r, ROTARY, yarn);
+            let out = norm_rope_head(
+                &input[start..start + cfg.head_dim],
+                norm,
+                pos0 + r,
+                ROTARY,
+                yarn,
+            );
             want[start..start + cfg.head_dim].copy_from_slice(&out);
             for t in &mut touched[start..start + cfg.head_dim] {
                 *t = true;
@@ -789,7 +1003,15 @@ fn case_norm_rope_batched(gpu: &mut Gpu) -> Result<String, String> {
                 let input = rng.vec(rows * cfg.row_stride, -2.0, 2.0);
                 let values = up_f32(gpu, &input)?;
                 norm_rope_launch(
-                    gpu, &values, &norm_t, rows, pos0, yarn, cfg.heads, cfg.head_dim, cfg.head_stride,
+                    gpu,
+                    &values,
+                    &norm_t,
+                    rows,
+                    pos0,
+                    yarn,
+                    cfg.heads,
+                    cfg.head_dim,
+                    cfg.head_stride,
                     cfg.row_stride,
                 )?;
                 sync(gpu)?;
@@ -878,8 +1100,16 @@ fn case_cache_append_batched(gpu: &mut Gpu) -> Result<String, String> {
         let mut want_v = vec![sentinel; cap];
         want_k[pos0 * KV_W..].copy_from_slice(&key);
         want_v[pos0 * KV_W..].copy_from_slice(&value);
-        checks.push(exact_f32(&format!("rows{rows}/keys"), &down_f32(gpu, &fk)?, &want_k));
-        checks.push(exact_f32(&format!("rows{rows}/values"), &down_f32(gpu, &fv)?, &want_v));
+        checks.push(exact_f32(
+            &format!("rows{rows}/keys"),
+            &down_f32(gpu, &fk)?,
+            &want_k,
+        ));
+        checks.push(exact_f32(
+            &format!("rows{rows}/values"),
+            &down_f32(gpu, &fv)?,
+            &want_v,
+        ));
         free_all(gpu, vec![k_t, v_t, fk, fv])?;
     }
     all(checks)
@@ -980,8 +1210,16 @@ fn case_index_key_append(gpu: &mut Gpu) -> Result<String, String> {
                 want_raw[(pos0 + r) * IDX_DIM + i] = f32_to_bf16_bits(rounded);
             }
         }
-        checks.push(exact_f32(&format!("rows{rows}/index_rows"), &down_f32(gpu, &rows_t)?, &want_rows));
-        checks.push(exact_bf16(&format!("rows{rows}/raw"), &down_bf16(gpu, &raw)?, &want_raw));
+        checks.push(exact_f32(
+            &format!("rows{rows}/index_rows"),
+            &down_f32(gpu, &rows_t)?,
+            &want_rows,
+        ));
+        checks.push(exact_bf16(
+            &format!("rows{rows}/raw"),
+            &down_bf16(gpu, &raw)?,
+            &want_raw,
+        ));
         free_all(gpu, vec![rows_t, raw])?;
     }
     all(checks)
@@ -1000,7 +1238,8 @@ fn case_round_trip_strided(gpu: &mut Gpu) -> Result<String, String> {
             input[i] = s; // outside the rounded window: must stay untouched
         }
         let x = up_f32(gpu, &input)?;
-        gpu.bf16_round_trip_f32_strided(&x, rows, IDX_Q_W, IDX_W, IDX_DIM).map_err(e)?;
+        gpu.bf16_round_trip_f32_strided(&x, rows, IDX_Q_W, IDX_W, IDX_DIM)
+            .map_err(e)?;
         sync(gpu)?;
         let mut want = input.clone();
         for r in 0..rows {
@@ -1011,7 +1250,11 @@ fn case_round_trip_strided(gpu: &mut Gpu) -> Result<String, String> {
                 }
             }
         }
-        checks.push(exact_f32(&format!("rows{rows}"), &down_f32(gpu, &x)?, &want));
+        checks.push(exact_f32(
+            &format!("rows{rows}"),
+            &down_f32(gpu, &x)?,
+            &want,
+        ));
         free_all(gpu, vec![x])?;
     }
     all(checks)
@@ -1030,15 +1273,29 @@ fn case_copy_rows_strided(gpu: &mut Gpu) -> Result<String, String> {
         let batch = up_f32(gpu, &input)?;
         let keys = batch.sub_offset(IDX_Q_W, rows * IDX_W - IDX_Q_W);
         let raw = nan_f32(gpu, (pos0 + rows) * IDX_DIM)?;
-        gpu.copy_rows_strided_f32(&keys, &raw, rows, IDX_DIM, IDX_W, IDX_DIM, pos0 * IDX_DIM, Some(IDX_DIM))
-            .map_err(e)?;
+        gpu.copy_rows_strided_f32(
+            &keys,
+            &raw,
+            rows,
+            IDX_DIM,
+            IDX_W,
+            IDX_DIM,
+            pos0 * IDX_DIM,
+            Some(IDX_DIM),
+        )
+        .map_err(e)?;
         sync(gpu)?;
         let mut want = vec![f32::from_bits(0x7FC0_DEAD); (pos0 + rows) * IDX_DIM];
         for r in 0..rows {
             let src = r * IDX_W + IDX_Q_W;
-            want[(pos0 + r) * IDX_DIM..(pos0 + r + 1) * IDX_DIM].copy_from_slice(&input[src..src + IDX_DIM]);
+            want[(pos0 + r) * IDX_DIM..(pos0 + r + 1) * IDX_DIM]
+                .copy_from_slice(&input[src..src + IDX_DIM]);
         }
-        checks.push(exact_f32(&format!("rows{rows}"), &down_f32(gpu, &raw)?, &want));
+        checks.push(exact_f32(
+            &format!("rows{rows}"),
+            &down_f32(gpu, &raw)?,
+            &want,
+        ));
         free_all(gpu, vec![batch, raw])?; // `keys` is a view: not freed
     }
     all(checks)
@@ -1097,7 +1354,8 @@ fn prologue_want(
         }
         let rolled: Vec<f32> = w.keys[r * KV_W..(r + 1) * KV_W].to_vec();
         w.full_keys[pos * KV_W..(pos + 1) * KV_W].copy_from_slice(&rolled);
-        w.full_values[pos * KV_W..(pos + 1) * KV_W].copy_from_slice(&values[r * KV_W..(r + 1) * KV_W]);
+        w.full_values[pos * KV_W..(pos + 1) * KV_W]
+            .copy_from_slice(&values[r * KV_W..(r + 1) * KV_W]);
         for i in 0..IDX_DIM {
             let idx = r * IDX_W + IDX_Q_W + i;
             let v = index_row[idx];
@@ -1134,7 +1392,15 @@ impl PrologueGpu {
     fn free(self, gpu: &mut Gpu) -> Result<(), String> {
         free_all(
             gpu,
-            vec![self.index_row, self.qgate, self.keys, self.values, self.full_keys, self.full_values, self.raw],
+            vec![
+                self.index_row,
+                self.qgate,
+                self.keys,
+                self.values,
+                self.full_keys,
+                self.full_values,
+                self.raw,
+            ],
         )
     }
 }
@@ -1161,8 +1427,11 @@ fn case_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
                 rng.vec(rows * KV_W, -2.0, 2.0),
                 rng.vec(rows * KV_W, -2.0, 2.0),
             ];
-            let (iq_t, q_t, k_t) =
-                (bf16_vec(gpu, &iq_norm)?, bf16_vec(gpu, &q_norm)?, bf16_vec(gpu, &k_norm)?);
+            let (iq_t, q_t, k_t) = (
+                bf16_vec(gpu, &iq_norm)?,
+                bf16_vec(gpu, &q_norm)?,
+                bf16_vec(gpu, &k_norm)?,
+            );
             let label = format!("{yname}/rows{rows}");
 
             // Fused decode prologue.
@@ -1206,22 +1475,96 @@ fn case_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
                 &inputs[0], &inputs[1], &inputs[2], &inputs[3], &iq_norm, &q_norm, &k_norm, rows,
                 position, yarn,
             );
-            checks.push(cmp_split(&format!("{label}/index_row"), &got_index, &w.index_row, F32_ACCUM, |i| i % IDX_W >= IDX_Q_W));
-            checks.push(cmp_split(&format!("{label}/qgate"), &got_qgate, &w.qgate, F32_ACCUM, |i| i % (2 * HD) >= HD));
-            checks.push(close_f32(&format!("{label}/keys"), &got_keys, &w.keys, F32_ACCUM));
-            checks.push(cmp_split(&format!("{label}/full_keys"), &got_fk, &w.full_keys, F32_ACCUM, |i| i < position * KV_W));
-            checks.push(exact_f32(&format!("{label}/full_values"), &got_fv, &w.full_values));
-            checks.push(exact_f32(&format!("{label}/raw_index_keys"), &got_raw, &w.raw));
+            checks.push(cmp_split(
+                &format!("{label}/index_row"),
+                &got_index,
+                &w.index_row,
+                F32_ACCUM,
+                |i| i % IDX_W >= IDX_Q_W,
+            ));
+            checks.push(cmp_split(
+                &format!("{label}/qgate"),
+                &got_qgate,
+                &w.qgate,
+                F32_ACCUM,
+                |i| i % (2 * HD) >= HD,
+            ));
+            checks.push(close_f32(
+                &format!("{label}/keys"),
+                &got_keys,
+                &w.keys,
+                F32_ACCUM,
+            ));
+            checks.push(cmp_split(
+                &format!("{label}/full_keys"),
+                &got_fk,
+                &w.full_keys,
+                F32_ACCUM,
+                |i| i < position * KV_W,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/full_values"),
+                &got_fv,
+                &w.full_values,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/raw_index_keys"),
+                &got_raw,
+                &w.raw,
+            ));
 
             // The prefill chain the prologue replaces (bitwise).
             let c = PrologueGpu::new(gpu, &inputs, rows, position)?;
-            norm_rope_launch(gpu, &c.index_row, &iq_t, rows, position, yarn, QSA_INDEX_HEADS, IDX_DIM, IDX_DIM, IDX_W)?;
-            gpu.bf16_round_trip_f32_strided(&c.index_row, rows, IDX_Q_W, IDX_W, IDX_DIM).map_err(e)?;
-            let keys_view = c.index_row.sub_offset(IDX_Q_W, rows * IDX_W - IDX_Q_W);
-            gpu.copy_rows_strided_f32(&keys_view, &c.raw, rows, IDX_DIM, IDX_W, IDX_DIM, position * IDX_DIM, Some(IDX_DIM))
+            norm_rope_launch(
+                gpu,
+                &c.index_row,
+                &iq_t,
+                rows,
+                position,
+                yarn,
+                QSA_INDEX_HEADS,
+                IDX_DIM,
+                IDX_DIM,
+                IDX_W,
+            )?;
+            gpu.bf16_round_trip_f32_strided(&c.index_row, rows, IDX_Q_W, IDX_W, IDX_DIM)
                 .map_err(e)?;
-            norm_rope_launch(gpu, &c.qgate, &q_t, rows, position, yarn, QSA_Q_HEADS, HD, 2 * HD, QG_W)?;
-            norm_rope_launch(gpu, &c.keys, &k_t, rows, position, yarn, QSA_KV_HEADS, HD, HD, KV_W)?;
+            let keys_view = c.index_row.sub_offset(IDX_Q_W, rows * IDX_W - IDX_Q_W);
+            gpu.copy_rows_strided_f32(
+                &keys_view,
+                &c.raw,
+                rows,
+                IDX_DIM,
+                IDX_W,
+                IDX_DIM,
+                position * IDX_DIM,
+                Some(IDX_DIM),
+            )
+            .map_err(e)?;
+            norm_rope_launch(
+                gpu,
+                &c.qgate,
+                &q_t,
+                rows,
+                position,
+                yarn,
+                QSA_Q_HEADS,
+                HD,
+                2 * HD,
+                QG_W,
+            )?;
+            norm_rope_launch(
+                gpu,
+                &c.keys,
+                &k_t,
+                rows,
+                position,
+                yarn,
+                QSA_KV_HEADS,
+                HD,
+                HD,
+                KV_W,
+            )?;
             indexed_attention_cache_append_batch(
                 gpu,
                 &IndexedAttentionCacheAppendBatch {
@@ -1238,12 +1581,36 @@ fn case_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
             )
             .map_err(e)?;
             sync(gpu)?;
-            checks.push(exact_f32(&format!("{label}/chain==prologue index_row"), &down_f32(gpu, &c.index_row)?, &got_index));
-            checks.push(exact_f32(&format!("{label}/chain==prologue qgate"), &down_f32(gpu, &c.qgate)?, &got_qgate));
-            checks.push(exact_f32(&format!("{label}/chain==prologue keys"), &down_f32(gpu, &c.keys)?, &got_keys));
-            checks.push(exact_f32(&format!("{label}/chain==prologue full_keys"), &down_f32(gpu, &c.full_keys)?, &got_fk));
-            checks.push(exact_f32(&format!("{label}/chain==prologue full_values"), &down_f32(gpu, &c.full_values)?, &got_fv));
-            checks.push(exact_f32(&format!("{label}/chain==prologue raw"), &down_f32(gpu, &c.raw)?, &got_raw));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue index_row"),
+                &down_f32(gpu, &c.index_row)?,
+                &got_index,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue qgate"),
+                &down_f32(gpu, &c.qgate)?,
+                &got_qgate,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue keys"),
+                &down_f32(gpu, &c.keys)?,
+                &got_keys,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue full_keys"),
+                &down_f32(gpu, &c.full_keys)?,
+                &got_fk,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue full_values"),
+                &down_f32(gpu, &c.full_values)?,
+                &got_fv,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue raw"),
+                &down_f32(gpu, &c.raw)?,
+                &got_raw,
+            ));
             c.free(gpu)?;
 
             // Append prologue (heads == 0): same kernel, same bytes.
@@ -1272,11 +1639,31 @@ fn case_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
             )
             .map_err(e)?;
             sync(gpu)?;
-            checks.push(exact_f32(&format!("{label}/append==decode index_row"), &down_f32(gpu, &a.index_row)?, &got_index));
-            checks.push(exact_f32(&format!("{label}/append==decode keys"), &down_f32(gpu, &a.keys)?, &got_keys));
-            checks.push(exact_f32(&format!("{label}/append==decode full_keys"), &down_f32(gpu, &a.full_keys)?, &got_fk));
-            checks.push(exact_f32(&format!("{label}/append==decode full_values"), &down_f32(gpu, &a.full_values)?, &got_fv));
-            checks.push(exact_f32(&format!("{label}/append==decode raw"), &down_f32(gpu, &a.raw)?, &got_raw));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode index_row"),
+                &down_f32(gpu, &a.index_row)?,
+                &got_index,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode keys"),
+                &down_f32(gpu, &a.keys)?,
+                &got_keys,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode full_keys"),
+                &down_f32(gpu, &a.full_keys)?,
+                &got_fk,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode full_values"),
+                &down_f32(gpu, &a.full_values)?,
+                &got_fv,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode raw"),
+                &down_f32(gpu, &a.raw)?,
+                &got_raw,
+            ));
             a.free(gpu)?;
             p.free(gpu)?;
             free_all(gpu, vec![iq_t, q_t, k_t])?;
@@ -1300,8 +1687,16 @@ fn pool_rope_case(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
     let raw = rng.vec_bf16_exact(end * IDX_DIM, -2.0, 2.0);
     let norm = rng.vec_bf16_exact(IDX_DIM, -0.5, 0.5);
     let norm_t = bf16_vec(gpu, &norm)?;
-    let raw_t = if bf16_arena { bf16_vec(gpu, &raw)? } else { up_f32(gpu, &raw)? };
-    let sentinel = if bf16_arena { f32::from_bits(0x7FC0_0000) } else { f32::from_bits(0x7FC0_DEAD) };
+    let raw_t = if bf16_arena {
+        bf16_vec(gpu, &raw)?
+    } else {
+        up_f32(gpu, &raw)?
+    };
+    let sentinel = if bf16_arena {
+        f32::from_bits(0x7FC0_0000)
+    } else {
+        f32::from_bits(0x7FC0_DEAD)
+    };
     let new_pooled = |gpu: &mut Gpu| -> Result<GpuTensor, String> {
         if bf16_arena {
             bf16_vec(gpu, &vec![f32::NAN; POOLED_CAP * IDX_DIM])
@@ -1311,7 +1706,10 @@ fn pool_rope_case(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
     };
     let download = |gpu: &Gpu, t: &GpuTensor| -> Result<Vec<f32>, String> {
         if bf16_arena {
-            Ok(down_bf16(gpu, t)?.into_iter().map(bf16_bits_to_f32).collect())
+            Ok(down_bf16(gpu, t)?
+                .into_iter()
+                .map(bf16_bits_to_f32)
+                .collect())
         } else {
             down_f32(gpu, t)
         }
@@ -1339,7 +1737,10 @@ fn pool_rope_case(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
                     block_count: blocks,
                     compress: QSA_COMPRESS,
                     index_dim: IDX_DIM,
-                    position: Some(QsaPositionBinding { position_start, rows }),
+                    position: Some(QsaPositionBinding {
+                        position_start,
+                        rows,
+                    }),
                     grid_bound: POOLED_CAP,
                     yarn,
                 },
@@ -1459,7 +1860,11 @@ fn with_scope<T>(
 }
 
 fn scope_name(scope: bool) -> &'static str {
-    if scope { "prefill_scope" } else { "decode" }
+    if scope {
+        "prefill_scope"
+    } else {
+        "decode"
+    }
 }
 
 // ── select (route) ────────────────────────────────────────────────────────────
@@ -1499,7 +1904,11 @@ fn public_select(
     gpu.set_wide_verify_rows(0);
     let persisted = launched.map_err(e)?;
     sync(gpu)?;
-    let out = (down_i32(gpu, &selected)?, down_i32(gpu, &mirror)?, persisted);
+    let out = (
+        down_i32(gpu, &selected)?,
+        down_i32(gpu, &mirror)?,
+        persisted,
+    );
     free_all(gpu, vec![selected, mirror])?;
     Ok(out)
 }
@@ -1517,18 +1926,46 @@ struct SelectArm {
 /// scope on: rows16 throughout); budget 520 keeps the fused selector, scores in
 /// LDS and, with an oversized arena bound, in global rows.
 const F32_ARMS: [SelectArm; 3] = [
-    SelectArm { budget: BUDGET_BLOCKS, shape_blocks: POOLED_CAP, scopes: &[false, true] },
-    SelectArm { budget: FUSED_BUDGET_BLOCKS, shape_blocks: POOLED_CAP, scopes: &[false] },
-    SelectArm { budget: FUSED_BUDGET_BLOCKS, shape_blocks: GLOBAL_SHAPE_BLOCKS, scopes: &[false] },
+    SelectArm {
+        budget: BUDGET_BLOCKS,
+        shape_blocks: POOLED_CAP,
+        scopes: &[false, true],
+    },
+    SelectArm {
+        budget: FUSED_BUDGET_BLOCKS,
+        shape_blocks: POOLED_CAP,
+        scopes: &[false],
+    },
+    SelectArm {
+        budget: FUSED_BUDGET_BLOCKS,
+        shape_blocks: GLOBAL_SHAPE_BLOCKS,
+        scopes: &[false],
+    },
 ];
 
 /// BF16 pooled keys (FP8/Q8 KV states) never take the builder score pair off
 /// gfx1151: the fused selector at both budgets, LDS and global scores.
 const BF16_ARMS: [SelectArm; 4] = [
-    SelectArm { budget: BUDGET_BLOCKS, shape_blocks: POOLED_CAP, scopes: &[false] },
-    SelectArm { budget: BUDGET_BLOCKS, shape_blocks: GLOBAL_SHAPE_BLOCKS, scopes: &[false] },
-    SelectArm { budget: FUSED_BUDGET_BLOCKS, shape_blocks: POOLED_CAP, scopes: &[false] },
-    SelectArm { budget: FUSED_BUDGET_BLOCKS, shape_blocks: GLOBAL_SHAPE_BLOCKS, scopes: &[false] },
+    SelectArm {
+        budget: BUDGET_BLOCKS,
+        shape_blocks: POOLED_CAP,
+        scopes: &[false],
+    },
+    SelectArm {
+        budget: BUDGET_BLOCKS,
+        shape_blocks: GLOBAL_SHAPE_BLOCKS,
+        scopes: &[false],
+    },
+    SelectArm {
+        budget: FUSED_BUDGET_BLOCKS,
+        shape_blocks: POOLED_CAP,
+        scopes: &[false],
+    },
+    SelectArm {
+        budget: FUSED_BUDGET_BLOCKS,
+        shape_blocks: GLOBAL_SHAPE_BLOCKS,
+        scopes: &[false],
+    },
 ];
 
 /// The kernel arm the gfx942 launcher takes for `arm` (label only; derived from
@@ -1540,9 +1977,15 @@ fn select_arm_name(bf16: bool, arm: &SelectArm, rows: usize, scope: bool) -> &'s
         } else {
             rows
         };
-        return if route_rows > 8 { "rows16+from_scores" } else { "rows8+from_scores" };
+        return if route_rows > 8 {
+            "rows16+from_scores"
+        } else {
+            "rows8+from_scores"
+        };
     }
-    if arm.shape_blocks * 4 + rdna_compute::tensor_ops::QSA_SELECT_BATCHED_STATIC_LDS_BYTES > 64 * 1024 {
+    if arm.shape_blocks * 4 + rdna_compute::tensor_ops::QSA_SELECT_BATCHED_STATIC_LDS_BYTES
+        > 64 * 1024
+    {
         "fused_global_scores"
     } else {
         "fused_lds_scores"
@@ -1580,7 +2023,8 @@ fn select_route(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                     }
                     let capacity = cap_for(budget);
                     let seed = 0x7B00 + end as u64 + rows as u64 + budget as u64 + kind.seed();
-                    let (query, pooled) = gen_select_data_kind(seed, rows, blocks, budget, kind, bf16)?;
+                    let (query, pooled) =
+                        gen_select_data_kind(seed, rows, blocks, budget, kind, bf16)?;
                     let (want, _) = select_rows_cpu_with(
                         index_score_of(kind),
                         &query,
@@ -1592,7 +2036,11 @@ fn select_route(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                         capacity,
                     );
                     let query_t = up_f32(gpu, &query)?;
-                    let pooled_t = if bf16 { bf16_vec(gpu, &pooled)? } else { up_f32(gpu, &pooled)? };
+                    let pooled_t = if bf16 {
+                        bf16_vec(gpu, &pooled)?
+                    } else {
+                        up_f32(gpu, &pooled)?
+                    };
                     let run = SelectRun {
                         query: &query_t,
                         pooled: &pooled_t,
@@ -1609,8 +2057,9 @@ fn select_route(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                     };
                     for arm in arms.iter().filter(|a| a.budget == budget) {
                         for &scope in arm.scopes {
-                            let (selected, mirror, persisted) =
-                                with_scope(gpu, scope, |g| public_select(g, &run, arm.shape_blocks))?;
+                            let (selected, mirror, persisted) = with_scope(gpu, scope, |g| {
+                                public_select(g, &run, arm.shape_blocks)
+                            })?;
                             let label = format!(
                                 "{}/end{end}/rows{rows}/b{budget}/shape{}/{}/{}",
                                 kind.name(),
@@ -1631,7 +2080,9 @@ fn select_route(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                                 ));
                             }
                             if claim && !persisted {
-                                checks.push(Err(format!("{label}: launcher did not persist the mirror on gfx942")));
+                                checks.push(Err(format!(
+                                    "{label}: launcher did not persist the mirror on gfx942"
+                                )));
                             }
                             let want_mirror = if persisted {
                                 want[(rows - 1) * capacity..].to_vec()
@@ -1698,8 +2149,12 @@ struct AttnGeom {
     head_dim: usize,
 }
 
-const QWEN4_ATTN: AttnGeom =
-    AttnGeom { name: "qwen4_24x2x256", heads: QSA_Q_HEADS, kv_heads: QSA_KV_HEADS, head_dim: HD };
+const QWEN4_ATTN: AttnGeom = AttnGeom {
+    name: "qwen4_24x2x256",
+    heads: QSA_Q_HEADS,
+    kv_heads: QSA_KV_HEADS,
+    head_dim: HD,
+};
 
 impl AttnGeom {
     fn out_w(self) -> usize {
@@ -1871,7 +2326,11 @@ fn attn_claim(gpu: &Gpu, label: &str, got: &[f32], serial: &[f32]) -> Result<Str
 /// predicates `route_rows >= 16` + 12 heads per KV head (hg12), `route_rows >= 2`
 /// + head group % 4 (hg4), else the per-head parallel kernel).
 fn attn_arm(g: AttnGeom, rows: usize, scope: bool) -> &'static str {
-    let route_rows = if scope { rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS } else { rows };
+    let route_rows = if scope {
+        rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS
+    } else {
+        rows
+    };
     if g.head_dim == 256 && g.heads == g.kv_heads * 12 && route_rows >= 16 {
         "hg12"
     } else if g.head_dim == 256 && (g.heads / g.kv_heads) % 4 == 0 && route_rows >= 2 {
@@ -1917,8 +2376,18 @@ fn case_attention_batch(gpu: &mut Gpu) -> Result<String, String> {
                         scope_name(scope),
                         attn_arm(g, rows, scope)
                     );
-                    checks.push(close_f32(&format!("{label}/vs_cpu"), &got, &inp.want, F32_ACCUM));
-                    checks.push(attn_claim(gpu, &format!("{label}/vs_serial_hip"), &got, &serial));
+                    checks.push(close_f32(
+                        &format!("{label}/vs_cpu"),
+                        &got,
+                        &inp.want,
+                        F32_ACCUM,
+                    ));
+                    checks.push(attn_claim(
+                        gpu,
+                        &format!("{label}/vs_serial_hip"),
+                        &got,
+                        &serial,
+                    ));
                 }
                 free_attn(gpu, t)?;
             }
@@ -1936,31 +2405,58 @@ fn case_attention_batch_geometry(gpu: &mut Gpu) -> Result<String, String> {
     let end = 2802usize;
     let geoms = [
         QWEN4_ATTN,
-        AttnGeom { name: "group4_8x2x256", heads: 8, kv_heads: 2, head_dim: 256 },
-        AttnGeom { name: "group3_6x2x256", heads: 6, kv_heads: 2, head_dim: 256 },
-        AttnGeom { name: "hd128_24x2x128", heads: 24, kv_heads: 2, head_dim: 128 },
+        AttnGeom {
+            name: "group4_8x2x256",
+            heads: 8,
+            kv_heads: 2,
+            head_dim: 256,
+        },
+        AttnGeom {
+            name: "group3_6x2x256",
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 256,
+        },
+        AttnGeom {
+            name: "hd128_24x2x128",
+            heads: 24,
+            kv_heads: 2,
+            head_dim: 128,
+        },
     ];
     let mut checks = Vec::new();
     for g in geoms {
         for rows in [1usize, 7, 16, 33] {
-            let seed = 0x7E00 + end as u64 + rows as u64 + g.heads as u64 * 0x100 + g.head_dim as u64;
+            let seed =
+                0x7E00 + end as u64 + rows as u64 + g.heads as u64 * 0x100 + g.head_dim as u64;
             let position_start = end - rows;
             let selected = attn_selection(seed, rows, end)?;
-            let (q, keys, values) = realistic_attn_qkv(seed, rows, end, g.heads, g.kv_heads, g.head_dim);
+            let (q, keys, values) =
+                realistic_attn_qkv(seed, rows, end, g.heads, g.kv_heads, g.head_dim);
             let t = upload_attn(gpu, &q, &keys, &values, &selected)?;
             let serial = attn_serial(gpu, &t, g, rows, position_start, end)?;
             if !serial.iter().all(|v| v.is_finite()) {
-                checks.push(Err(format!("{}/rows{rows}: serial HIP output not finite", g.name)));
+                checks.push(Err(format!(
+                    "{}/rows{rows}: serial HIP output not finite",
+                    g.name
+                )));
             }
             for scope in [false, true] {
-                let got = with_scope(gpu, scope, |gp| attn_public(gp, &t, g, rows, position_start, end))?;
+                let got = with_scope(gpu, scope, |gp| {
+                    attn_public(gp, &t, g, rows, position_start, end)
+                })?;
                 let label = format!(
                     "{}/rows{rows}/{}/{}",
                     g.name,
                     scope_name(scope),
                     attn_arm(g, rows, scope)
                 );
-                checks.push(attn_claim(gpu, &format!("{label}/vs_serial_hip"), &got, &serial));
+                checks.push(attn_claim(
+                    gpu,
+                    &format!("{label}/vs_serial_hip"),
+                    &got,
+                    &serial,
+                ));
             }
             free_attn(gpu, t)?;
         }
@@ -1979,7 +2475,9 @@ struct ReuseScenario {
 fn reuse_scenarios() -> Vec<ReuseScenario> {
     let mut rng = Rng::new(0x7D01);
     let position = 3000usize;
-    let mut a: Vec<i32> = (0..600).map(|_| rng.below(position + 10) as i32 - 1).collect();
+    let mut a: Vec<i32> = (0..600)
+        .map(|_| rng.below(position + 10) as i32 - 1)
+        .collect();
     a.retain(|&t| t != position as i32);
     a[5] = position as i32 + 4; // above position: dropped
     let a_len = a.len();
@@ -1987,12 +2485,34 @@ fn reuse_scenarios() -> Vec<ReuseScenario> {
     b[123] = position as i32; // already present: not appended
     b[7] = -1;
     let b_len = b.len();
-    let c: Vec<i32> = (0..SEL_CAP).map(|i| (i as i32 * 3) % position as i32).collect();
+    let c: Vec<i32> = (0..SEL_CAP)
+        .map(|i| (i as i32 * 3) % position as i32)
+        .collect();
     vec![
-        ReuseScenario { name: "append_current", prior: a, selected_len: a_len, position },
-        ReuseScenario { name: "current_present", prior: b, selected_len: b_len, position },
-        ReuseScenario { name: "full_capacity_no_room", prior: c, selected_len: SEL_CAP, position },
-        ReuseScenario { name: "empty_prior", prior: vec![], selected_len: 0, position },
+        ReuseScenario {
+            name: "append_current",
+            prior: a,
+            selected_len: a_len,
+            position,
+        },
+        ReuseScenario {
+            name: "current_present",
+            prior: b,
+            selected_len: b_len,
+            position,
+        },
+        ReuseScenario {
+            name: "full_capacity_no_room",
+            prior: c,
+            selected_len: SEL_CAP,
+            position,
+        },
+        ReuseScenario {
+            name: "empty_prior",
+            prior: vec![],
+            selected_len: 0,
+            position,
+        },
     ]
 }
 
@@ -2035,8 +2555,16 @@ fn case_reuse_selection(gpu: &mut Gpu) -> Result<String, String> {
         .map_err(e)?;
         sync(gpu)?;
         let (want, want_len) = reuse_want(&s);
-        checks.push(exact_ints(&format!("{}/selected", s.name), &down_i32(gpu, &selected)?, &want));
-        checks.push(exact_ints(&format!("{}/len", s.name), &down_i32(gpu, &len_out)?, &[want_len][..]));
+        checks.push(exact_ints(
+            &format!("{}/selected", s.name),
+            &down_i32(gpu, &selected)?,
+            &want,
+        ));
+        checks.push(exact_ints(
+            &format!("{}/len", s.name),
+            &down_i32(gpu, &len_out)?,
+            &[want_len][..],
+        ));
         free_all(gpu, vec![selected, len_out])?;
     }
     all(checks)
@@ -2056,7 +2584,14 @@ fn case_attention_single(gpu: &mut Gpu) -> Result<String, String> {
     let q = rng.vec(QG_W, -3.0, 3.0);
     let keys = rng.vec(full_capacity * KV_W, -1.0, 1.0);
     let values = rng.vec(full_capacity * KV_W, -1.0, 1.0);
-    let want = attention_row_cpu(&q, &keys, &values, &sel[..count as usize], full_capacity, full_capacity);
+    let want = attention_row_cpu(
+        &q,
+        &keys,
+        &values,
+        &sel[..count as usize],
+        full_capacity,
+        full_capacity,
+    );
     let (q_t, k_t, v_t) = (up_f32(gpu, &q)?, up_f32(gpu, &keys)?, up_f32(gpu, &values)?);
     let sel_t = raw_i32(gpu, &sel)?;
     let out = nan_f32(gpu, Q_W)?;
@@ -2079,7 +2614,12 @@ fn case_attention_single(gpu: &mut Gpu) -> Result<String, String> {
     )
     .map_err(e)?;
     sync(gpu)?;
-    let r = close_f32("single-row attention", &down_f32(gpu, &out)?, &want, F32_ACCUM);
+    let r = close_f32(
+        "single-row attention",
+        &down_f32(gpu, &out)?,
+        &want,
+        F32_ACCUM,
+    );
     free_all(gpu, vec![q_t, k_t, v_t, sel_t, out])?;
     r
 }
@@ -2123,9 +2663,17 @@ fn f32_to_f16_bits(v: f32) -> u16 {
         }
         let mant = (a & 0x7F_FFFF) | 0x80_0000;
         let shift = 126 - exp;
-        (mant >> shift, mant & ((1 << shift) - 1), 1u32 << (shift - 1))
+        (
+            mant >> shift,
+            mant & ((1 << shift) - 1),
+            1u32 << (shift - 1),
+        )
     };
-    let h = if rem > half || (rem == half && (h & 1) == 1) { h + 1 } else { h };
+    let h = if rem > half || (rem == half && (h & 1) == 1) {
+        h + 1
+    } else {
+        h
+    };
     sign | h as u16
 }
 
@@ -2155,14 +2703,22 @@ fn e4m3_decode(code: u8) -> f32 {
     } else {
         (1.0 + m as f32 / 8.0) * f32::from_bits((e + 120) << 23) // 2^(e-7)
     };
-    if code & 0x80 != 0 { -mag } else { mag }
+    if code & 0x80 != 0 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 fn rne_u32(t: f32) -> u32 {
     let fl = t.floor();
     let d = t - fl;
     let r = fl as u32;
-    if d > 0.5 || (d == 0.5 && (r & 1) == 1) { r + 1 } else { r }
+    if d > 0.5 || (d == 0.5 && (r & 1) == 1) {
+        r + 1
+    } else {
+        r
+    }
 }
 
 /// OCP e4m3fn round-to-nearest-even encode of a finite f32; the sign comes
@@ -2202,14 +2758,22 @@ fn e4m3_encode(x: f32) -> u8 {
 
 /// The stored code of an OCP code on gfx942: 0x80 (-0) becomes +0.
 fn fp8_fold(code: u8) -> u8 {
-    if code == 0x80 { 0x00 } else { code }
+    if code == 0x80 {
+        0x00
+    } else {
+        code
+    }
 }
 
 /// Head scale as `qsa_kv_store` computes it: `(_Float16)(amax / 448)`, 1.0 for
 /// an all-zero head, the smallest subnormal if it underflows, bumped by one
 /// f16 ulp if `448 * scale < amax`. Returns `(f16 bits, f32 scale)`.
 fn fp8_scale(amax: f32) -> (u16, f32) {
-    let mut bits = if amax == 0.0 { 0x3C00 } else { f32_to_f16_bits(amax / 448.0) };
+    let mut bits = if amax == 0.0 {
+        0x3C00
+    } else {
+        f32_to_f16_bits(amax / 448.0)
+    };
     if amax > 0.0 && bits == 0 {
         bits = 1;
     }
@@ -2297,7 +2861,11 @@ fn fp8_heads(seed: u64, flip: bool) -> Vec<Vec<f32>> {
     let mut vals: Vec<f32> = Vec::new();
     for c in 0u8..0x7E {
         let mid = (e4m3_decode(c) + e4m3_decode(c + 1)) * 0.5;
-        for v in [mid, f32::from_bits(mid.to_bits() + 1), f32::from_bits(mid.to_bits() - 1)] {
+        for v in [
+            mid,
+            f32::from_bits(mid.to_bits() + 1),
+            f32::from_bits(mid.to_bits() - 1),
+        ] {
             vals.extend([v, -v]);
         }
     }
@@ -2305,7 +2873,14 @@ fn fp8_heads(seed: u64, flip: bool) -> Vec<Vec<f32>> {
         let v = e4m3_decode(c);
         vals.extend([v, -v]);
     }
-    vals.extend([1e-30, -1e-30, 1e-38, -1e-38, f32::from_bits(1), -f32::from_bits(1)]);
+    vals.extend([
+        1e-30,
+        -1e-30,
+        1e-38,
+        -1e-38,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+    ]);
     let mut heads: Vec<Vec<f32>> = Vec::new();
     for (i, chunk) in vals.chunks(HD - 3).enumerate() {
         let mut h = vec![if i % 2 == 0 { 448.0 } else { -448.0 }, -0.0, 0.0];
@@ -2316,12 +2891,29 @@ fn fp8_heads(seed: u64, flip: bool) -> Vec<Vec<f32>> {
     heads.push(vec![0.0; HD]);
     heads.push(vec![-0.0; HD]);
     let palette = [
-        1e-9f32, 1e-8, 3e-5, 1.0 / 3.0, 0.7, 5.3, 17.0, 448.0, 1000.0, 3.0e4, 2.5e5,
-        448.0 * 6.103_515_6e-5, 448.0 * 5.960_464_5e-8, 123.456, 0.0123,
+        1e-9f32,
+        1e-8,
+        3e-5,
+        1.0 / 3.0,
+        0.7,
+        5.3,
+        17.0,
+        448.0,
+        1000.0,
+        3.0e4,
+        2.5e5,
+        448.0 * 6.103_515_6e-5,
+        448.0 * 5.960_464_5e-8,
+        123.456,
+        0.0123,
     ];
     for round in 0..3 {
         for &a in &palette {
-            let amax = if round == 0 { a } else { a * (0.75 + 0.5 * rng.unit()) };
+            let amax = if round == 0 {
+                a
+            } else {
+                a * (0.75 + 0.5 * rng.unit())
+            };
             heads.push(fp8_rand_head(&mut rng, amax));
         }
     }
@@ -2350,13 +2942,27 @@ type NegZeroSplit = (usize, usize);
 /// Stored codes + scales vs the CPU OCP encoder: byte-exact except an OCP 0x80
 /// code, which must be stored 0x00 (counted: actual -0.0 input vs negative
 /// underflow). A stored 0x80 anywhere is a failure.
-fn cmp_fp8(label: &str, got: &[u8], want: &[u8], input: &[f32], nz: &mut NegZeroSplit) -> Result<String, String> {
+fn cmp_fp8(
+    label: &str,
+    got: &[u8],
+    want: &[u8],
+    input: &[f32],
+    nz: &mut NegZeroSplit,
+) -> Result<String, String> {
     if got.len() != want.len() || want.len() % FP8_ROW != 0 {
-        return Err(format!("{label}: byte lens got {} want {}", got.len(), want.len()));
+        return Err(format!(
+            "{label}: byte lens got {} want {}",
+            got.len(),
+            want.len()
+        ));
     }
     let rows = want.len() / FP8_ROW;
     if input.len() != rows * KV_W {
-        return Err(format!("{label}: input len {} != {}", input.len(), rows * KV_W));
+        return Err(format!(
+            "{label}: input len {} != {}",
+            input.len(),
+            rows * KV_W
+        ));
     }
     let (mut bad, mut first, mut split) = (0usize, None::<String>, (0usize, 0usize));
     for r in 0..rows {
@@ -2367,7 +2973,9 @@ fn cmp_fp8(label: &str, got: &[u8], want: &[u8], input: &[f32], nz: &mut NegZero
                 let x = input[r * KV_W + h * HD + c];
                 if g == 0x80 {
                     bad += 1;
-                    first.get_or_insert_with(|| format!("stored 0x80 at row{r} head{h} ch{c} (input {x:?})"));
+                    first.get_or_insert_with(|| {
+                        format!("stored 0x80 at row{r} head{h} ch{c} (input {x:?})")
+                    });
                 } else if g == w {
                     continue;
                 } else if w == 0x80 && g == 0x00 {
@@ -2387,13 +2995,19 @@ fn cmp_fp8(label: &str, got: &[u8], want: &[u8], input: &[f32], nz: &mut NegZero
             if got[o..o + 2] != want[o..o + 2] {
                 bad += 1;
                 first.get_or_insert_with(|| {
-                    format!("scale row{r} head{h}: got {:02x?} want {:02x?}", &got[o..o + 2], &want[o..o + 2])
+                    format!(
+                        "scale row{r} head{h}: got {:02x?} want {:02x?}",
+                        &got[o..o + 2],
+                        &want[o..o + 2]
+                    )
                 });
             }
         }
     }
     if let Some(f) = first {
-        return Err(format!("{label}: {bad} byte mismatches over {rows} rows; first {f}"));
+        return Err(format!(
+            "{label}: {bad} byte mismatches over {rows} rows; first {f}"
+        ));
     }
     nz.0 += split.0;
     nz.1 += split.1;
@@ -2439,9 +3053,13 @@ fn zero_sign_only(label: &str, stored: &[f32], ocp: &[f32]) -> Result<String, St
             flips += 1;
             continue;
         }
-        return Err(format!("{label}: @{i} stored decode {s:?} vs OCP decode {o:?} differ beyond the sign of zero"));
+        return Err(format!(
+            "{label}: @{i} stored decode {s:?} vs OCP decode {o:?} differ beyond the sign of zero"
+        ));
     }
-    Ok(format!("{label}: decoded == OCP decode except {flips} zero-sign differences"))
+    Ok(format!(
+        "{label}: decoded == OCP decode except {flips} zero-sign differences"
+    ))
 }
 
 fn fp8_append(
@@ -2473,7 +3091,10 @@ fn fp8_append(
 fn untouched(label: &str, bytes: &[u8]) -> Result<String, String> {
     match bytes.iter().position(|&b| b != 0xA5) {
         None => Ok(format!("{label}: {} untouched sentinel bytes", bytes.len())),
-        Some(i) => Err(format!("{label}: sentinel byte {i} overwritten ({:#04x})", bytes[i])),
+        Some(i) => Err(format!(
+            "{label}: sentinel byte {i} overwritten ({:#04x})",
+            bytes[i]
+        )),
     }
 }
 
@@ -2497,7 +3118,9 @@ fn case_fp8_cache_append(gpu: &mut Gpu) -> Result<String, String> {
     for (name, input, want) in [("K", &key, &want_k), ("V", &value, &want_v)] {
         let (under, zero) = fp8_population(input, want);
         if under == 0 || zero == 0 {
-            return Err(format!("{name} dataset lacks negative underflow ({under}) or -0 ({zero}) codes"));
+            return Err(format!(
+                "{name} dataset lacks negative underflow ({under}) or -0 ({zero}) codes"
+            ));
         }
         checks.push(Ok(format!("{name} dataset: {rows} rows, {under} negative-underflow OCP 0x80 codes, {zero} input -0.0")));
     }
@@ -2507,13 +3130,34 @@ fn case_fp8_cache_append(gpu: &mut Gpu) -> Result<String, String> {
     fp8_append(gpu, &k_t, &v_t, &fk, &fv, rows, pos0)?;
     sync(gpu)?;
     let (gk, gv) = (down_bytes(gpu, &fk)?, down_bytes(gpu, &fv)?);
-    checks.push(untouched("K rows before position_start", &gk[..pos0 * FP8_ROW]));
-    checks.push(untouched("V rows before position_start", &gv[..pos0 * FP8_ROW]));
-    checks.push(cmp_fp8("batch K", &gk[pos0 * FP8_ROW..], &want_k, &key, &mut nz));
-    checks.push(cmp_fp8("batch V", &gv[pos0 * FP8_ROW..], &want_v, &value, &mut nz));
+    checks.push(untouched(
+        "K rows before position_start",
+        &gk[..pos0 * FP8_ROW],
+    ));
+    checks.push(untouched(
+        "V rows before position_start",
+        &gv[..pos0 * FP8_ROW],
+    ));
+    checks.push(cmp_fp8(
+        "batch K",
+        &gk[pos0 * FP8_ROW..],
+        &want_k,
+        &key,
+        &mut nz,
+    ));
+    checks.push(cmp_fp8(
+        "batch V",
+        &gv[pos0 * FP8_ROW..],
+        &want_v,
+        &value,
+        &mut nz,
+    ));
     // Single-row launches (decode shape) == the batch bytes.
     let singles = 7usize;
-    let (sk, sv) = (fp8_cache(gpu, pos0 + singles)?, fp8_cache(gpu, pos0 + singles)?);
+    let (sk, sv) = (
+        fp8_cache(gpu, pos0 + singles)?,
+        fp8_cache(gpu, pos0 + singles)?,
+    );
     let mut temps = Vec::new();
     for r in 0..singles {
         let (a, b) = (
@@ -2526,16 +3170,32 @@ fn case_fp8_cache_append(gpu: &mut Gpu) -> Result<String, String> {
     sync(gpu)?;
     let lo = pos0 * FP8_ROW;
     let hi = (pos0 + singles) * FP8_ROW;
-    checks.push(exact_ints("single-row K == batch", &down_bytes(gpu, &sk)?[lo..hi], &gk[lo..hi]));
-    checks.push(exact_ints("single-row V == batch", &down_bytes(gpu, &sv)?[lo..hi], &gv[lo..hi]));
+    checks.push(exact_ints(
+        "single-row K == batch",
+        &down_bytes(gpu, &sk)?[lo..hi],
+        &gk[lo..hi],
+    ));
+    checks.push(exact_ints(
+        "single-row V == batch",
+        &down_bytes(gpu, &sv)?[lo..hi],
+        &gv[lo..hi],
+    ));
     temps.extend([k_t, v_t, fk, fv, sk, sv]);
     free_all(gpu, temps)?;
     // Device decode of the device-written rows.
     for (name, stored, want) in [("K", &gk[lo..], &want_k), ("V", &gv[lo..], &want_v)] {
         let (dv, _) = fp8_probe_decode(gpu, stored)?;
         let stored_dec = fp8_decode_rows(stored);
-        checks.push(exact_f32(&format!("{name}: device decode == CPU OCP decode of stored bytes"), &dv, &stored_dec));
-        checks.push(zero_sign_only(&format!("{name}: stored decode vs OCP-encoder decode"), &dv, &fp8_decode_rows(want)));
+        checks.push(exact_f32(
+            &format!("{name}: device decode == CPU OCP decode of stored bytes"),
+            &dv,
+            &stored_dec,
+        ));
+        checks.push(zero_sign_only(
+            &format!("{name}: stored decode vs OCP-encoder decode"),
+            &dv,
+            &fp8_decode_rows(want),
+        ));
     }
     checks.push(Ok(format!(
         "OCP 0x80 stored as 0x00 in batch: {} input -0.0, {} negative underflow",
@@ -2580,7 +3240,8 @@ const FP8_PROBE_SYM: &str = "qsa_tierc_fp8_decode_bits";
 /// The rows must not hold 0x80 or NaN codes.
 fn fp8_probe_decode(gpu: &mut Gpu, bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>), String> {
     let rows = bytes.len() / FP8_ROW;
-    gpu.ensure_kernel_public(FP8_PROBE_MODULE, FP8_PROBE_SRC, FP8_PROBE_SYM).map_err(e)?;
+    gpu.ensure_kernel_public(FP8_PROBE_MODULE, FP8_PROBE_SRC, FP8_PROBE_SYM)
+        .map_err(e)?;
     let rows_t = gpu.upload_raw(bytes, &[bytes.len()]).map_err(e)?;
     let values = nan_f32(gpu, rows * KV_W)?;
     let keys = nan_f32(gpu, rows * KV_W)?;
@@ -2591,8 +3252,14 @@ fn fp8_probe_decode(gpu: &mut Gpu, bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>),
     a.push_i32(QSA_KV_HEADS as i32);
     a.push_i32(HD as i32);
     a.pad_to(16);
-    gpu.launch_kernel_blob(FP8_PROBE_SYM, [QSA_KV_HEADS as u32, rows as u32, 1], [256, 1, 1], 0, a.as_mut_slice())
-        .map_err(e)?;
+    gpu.launch_kernel_blob(
+        FP8_PROBE_SYM,
+        [QSA_KV_HEADS as u32, rows as u32, 1],
+        [256, 1, 1],
+        0,
+        a.as_mut_slice(),
+    )
+    .map_err(e)?;
     sync(gpu)?;
     let out = (down_f32(gpu, &values)?, down_f32(gpu, &keys)?);
     free_all(gpu, vec![rows_t, values, keys])?;
@@ -2609,10 +3276,18 @@ fn case_fp8_decode_bits(gpu: &mut Gpu) -> Result<String, String> {
         return Ok(s);
     }
     let mut sets: Vec<(String, Vec<u8>)> = vec![
-        ("dataset K".into(), fp8_fold_rows(&fp8_encode_rows(&fp8_data(0x8101, false)))),
-        ("dataset V".into(), fp8_fold_rows(&fp8_encode_rows(&fp8_data(0x8102, true)))),
+        (
+            "dataset K".into(),
+            fp8_fold_rows(&fp8_encode_rows(&fp8_data(0x8101, false))),
+        ),
+        (
+            "dataset V".into(),
+            fp8_fold_rows(&fp8_encode_rows(&fp8_data(0x8102, true))),
+        ),
     ];
-    let scales: [u16; 8] = [0x3C00, 0x3555, 0x0001, 0x03FF, 0x0400, 0x7BFF, 0x1234, 0x5A5A];
+    let scales: [u16; 8] = [
+        0x3C00, 0x3555, 0x0001, 0x03FF, 0x0400, 0x7BFF, 0x1234, 0x5A5A,
+    ];
     let mut codes = Vec::new();
     for r in 0..scales.len() {
         let mut head0: Vec<u8> = (0..=255u8).collect();
@@ -2633,20 +3308,34 @@ fn case_fp8_decode_bits(gpu: &mut Gpu) -> Result<String, String> {
     sets.push(("all finite codes".into(), codes));
     let mut checks = Vec::new();
     for (name, bytes) in &sets {
-        if (0..bytes.len() / FP8_ROW).any(|r| bytes[r * FP8_ROW..r * FP8_ROW + KV_W].contains(&0x80)) {
+        if (0..bytes.len() / FP8_ROW)
+            .any(|r| bytes[r * FP8_ROW..r * FP8_ROW + KV_W].contains(&0x80))
+        {
             return Err(format!("{name}: probe rows hold a 0x80 code"));
         }
         let want = fp8_decode_rows(bytes);
         let (got_v, got_k) = fp8_probe_decode(gpu, bytes)?;
         checks.push(exact_f32(&format!("{name}: scalar decode"), &got_v, &want));
-        let want_k: Vec<f32> = want.iter().map(|&v| if v == 0.0 { 0.0 } else { v }).collect();
-        checks.push(exact_f32(&format!("{name}: one-hot QK decode"), &got_k, &want_k));
+        let want_k: Vec<f32> = want
+            .iter()
+            .map(|&v| if v == 0.0 { 0.0 } else { v })
+            .collect();
+        checks.push(exact_f32(
+            &format!("{name}: one-hot QK decode"),
+            &got_k,
+            &want_k,
+        ));
     }
     all(checks)
 }
 
 // ── prologue (decode + append) ──────────────────────────────────────────────
-fn fp8_prologue_gpu(gpu: &mut Gpu, i: &[Vec<f32>; 4], rows: usize, position: usize) -> Result<PrologueGpu, String> {
+fn fp8_prologue_gpu(
+    gpu: &mut Gpu,
+    i: &[Vec<f32>; 4],
+    rows: usize,
+    position: usize,
+) -> Result<PrologueGpu, String> {
     Ok(PrologueGpu {
         index_row: up_f32(gpu, &i[0])?,
         qgate: up_f32(gpu, &i[1])?,
@@ -2684,8 +3373,11 @@ fn case_fp8_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
                 rng.vec(rows * KV_W, -2.0, 2.0),
                 cycle_to(&fp8_data(0x8203, true), rows * KV_W),
             ];
-            let (iq_t, q_t, k_t) =
-                (bf16_vec(gpu, &iq_norm)?, bf16_vec(gpu, &q_norm)?, bf16_vec(gpu, &k_norm)?);
+            let (iq_t, q_t, k_t) = (
+                bf16_vec(gpu, &iq_norm)?,
+                bf16_vec(gpu, &q_norm)?,
+                bf16_vec(gpu, &k_norm)?,
+            );
             let label = format!("{yname}/rows{rows}");
 
             let p = fp8_prologue_gpu(gpu, &inputs, rows, position)?;
@@ -2727,12 +3419,39 @@ fn case_fp8_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
                 &inputs[0], &inputs[1], &inputs[2], &inputs[3], &iq_norm, &q_norm, &k_norm, rows,
                 position, yarn,
             );
-            checks.push(cmp_split(&format!("{label}/index_row"), &got_index, &w.index_row, F32_ACCUM, |i| i % IDX_W >= IDX_Q_W));
-            checks.push(cmp_split(&format!("{label}/qgate"), &got_qgate, &w.qgate, F32_ACCUM, |i| i % (2 * HD) >= HD));
-            checks.push(close_f32(&format!("{label}/keys"), &got_keys, &w.keys, F32_ACCUM));
-            checks.push(exact_f32(&format!("{label}/raw_index_keys (F32 arena)"), &got_raw, &w.raw));
-            checks.push(untouched(&format!("{label}/K rows before position"), &got_fk[..position * FP8_ROW]));
-            checks.push(untouched(&format!("{label}/V rows before position"), &got_fv[..position * FP8_ROW]));
+            checks.push(cmp_split(
+                &format!("{label}/index_row"),
+                &got_index,
+                &w.index_row,
+                F32_ACCUM,
+                |i| i % IDX_W >= IDX_Q_W,
+            ));
+            checks.push(cmp_split(
+                &format!("{label}/qgate"),
+                &got_qgate,
+                &w.qgate,
+                F32_ACCUM,
+                |i| i % (2 * HD) >= HD,
+            ));
+            checks.push(close_f32(
+                &format!("{label}/keys"),
+                &got_keys,
+                &w.keys,
+                F32_ACCUM,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/raw_index_keys (F32 arena)"),
+                &got_raw,
+                &w.raw,
+            ));
+            checks.push(untouched(
+                &format!("{label}/K rows before position"),
+                &got_fk[..position * FP8_ROW],
+            ));
+            checks.push(untouched(
+                &format!("{label}/V rows before position"),
+                &got_fv[..position * FP8_ROW],
+            ));
             checks.push(cmp_fp8(
                 &format!("{label}/K bytes"),
                 &got_fk[position * FP8_ROW..],
@@ -2750,21 +3469,96 @@ fn case_fp8_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
 
             // Prefill chain the prologue replaces.
             let c = fp8_prologue_gpu(gpu, &inputs, rows, position)?;
-            norm_rope_launch(gpu, &c.index_row, &iq_t, rows, position, yarn, QSA_INDEX_HEADS, IDX_DIM, IDX_DIM, IDX_W)?;
-            gpu.bf16_round_trip_f32_strided(&c.index_row, rows, IDX_Q_W, IDX_W, IDX_DIM).map_err(e)?;
-            let keys_view = c.index_row.sub_offset(IDX_Q_W, rows * IDX_W - IDX_Q_W);
-            gpu.copy_rows_strided_f32(&keys_view, &c.raw, rows, IDX_DIM, IDX_W, IDX_DIM, position * IDX_DIM, Some(IDX_DIM))
+            norm_rope_launch(
+                gpu,
+                &c.index_row,
+                &iq_t,
+                rows,
+                position,
+                yarn,
+                QSA_INDEX_HEADS,
+                IDX_DIM,
+                IDX_DIM,
+                IDX_W,
+            )?;
+            gpu.bf16_round_trip_f32_strided(&c.index_row, rows, IDX_Q_W, IDX_W, IDX_DIM)
                 .map_err(e)?;
-            norm_rope_launch(gpu, &c.qgate, &q_t, rows, position, yarn, QSA_Q_HEADS, HD, 2 * HD, QG_W)?;
-            norm_rope_launch(gpu, &c.keys, &k_t, rows, position, yarn, QSA_KV_HEADS, HD, HD, KV_W)?;
-            fp8_append(gpu, &c.keys, &c.values, &c.full_keys, &c.full_values, rows, position)?;
+            let keys_view = c.index_row.sub_offset(IDX_Q_W, rows * IDX_W - IDX_Q_W);
+            gpu.copy_rows_strided_f32(
+                &keys_view,
+                &c.raw,
+                rows,
+                IDX_DIM,
+                IDX_W,
+                IDX_DIM,
+                position * IDX_DIM,
+                Some(IDX_DIM),
+            )
+            .map_err(e)?;
+            norm_rope_launch(
+                gpu,
+                &c.qgate,
+                &q_t,
+                rows,
+                position,
+                yarn,
+                QSA_Q_HEADS,
+                HD,
+                2 * HD,
+                QG_W,
+            )?;
+            norm_rope_launch(
+                gpu,
+                &c.keys,
+                &k_t,
+                rows,
+                position,
+                yarn,
+                QSA_KV_HEADS,
+                HD,
+                HD,
+                KV_W,
+            )?;
+            fp8_append(
+                gpu,
+                &c.keys,
+                &c.values,
+                &c.full_keys,
+                &c.full_values,
+                rows,
+                position,
+            )?;
             sync(gpu)?;
-            checks.push(exact_f32(&format!("{label}/chain==prologue index_row"), &down_f32(gpu, &c.index_row)?, &got_index));
-            checks.push(exact_f32(&format!("{label}/chain==prologue qgate"), &down_f32(gpu, &c.qgate)?, &got_qgate));
-            checks.push(exact_f32(&format!("{label}/chain==prologue keys"), &down_f32(gpu, &c.keys)?, &got_keys));
-            checks.push(exact_ints(&format!("{label}/chain==prologue K bytes"), &down_bytes(gpu, &c.full_keys)?, &got_fk));
-            checks.push(exact_ints(&format!("{label}/chain==prologue V bytes"), &down_bytes(gpu, &c.full_values)?, &got_fv));
-            checks.push(exact_f32(&format!("{label}/chain==prologue raw"), &down_f32(gpu, &c.raw)?, &got_raw));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue index_row"),
+                &down_f32(gpu, &c.index_row)?,
+                &got_index,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue qgate"),
+                &down_f32(gpu, &c.qgate)?,
+                &got_qgate,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue keys"),
+                &down_f32(gpu, &c.keys)?,
+                &got_keys,
+            ));
+            checks.push(exact_ints(
+                &format!("{label}/chain==prologue K bytes"),
+                &down_bytes(gpu, &c.full_keys)?,
+                &got_fk,
+            ));
+            checks.push(exact_ints(
+                &format!("{label}/chain==prologue V bytes"),
+                &down_bytes(gpu, &c.full_values)?,
+                &got_fv,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/chain==prologue raw"),
+                &down_f32(gpu, &c.raw)?,
+                &got_raw,
+            ));
             c.free(gpu)?;
 
             // Append prologue (heads == 0): same kernel, same bytes.
@@ -2793,11 +3587,31 @@ fn case_fp8_decode_prologue(gpu: &mut Gpu) -> Result<String, String> {
             )
             .map_err(e)?;
             sync(gpu)?;
-            checks.push(exact_f32(&format!("{label}/append==decode index_row"), &down_f32(gpu, &a.index_row)?, &got_index));
-            checks.push(exact_f32(&format!("{label}/append==decode keys"), &down_f32(gpu, &a.keys)?, &got_keys));
-            checks.push(exact_ints(&format!("{label}/append==decode K bytes"), &down_bytes(gpu, &a.full_keys)?, &got_fk));
-            checks.push(exact_ints(&format!("{label}/append==decode V bytes"), &down_bytes(gpu, &a.full_values)?, &got_fv));
-            checks.push(exact_f32(&format!("{label}/append==decode raw"), &down_f32(gpu, &a.raw)?, &got_raw));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode index_row"),
+                &down_f32(gpu, &a.index_row)?,
+                &got_index,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode keys"),
+                &down_f32(gpu, &a.keys)?,
+                &got_keys,
+            ));
+            checks.push(exact_ints(
+                &format!("{label}/append==decode K bytes"),
+                &down_bytes(gpu, &a.full_keys)?,
+                &got_fk,
+            ));
+            checks.push(exact_ints(
+                &format!("{label}/append==decode V bytes"),
+                &down_bytes(gpu, &a.full_values)?,
+                &got_fv,
+            ));
+            checks.push(exact_f32(
+                &format!("{label}/append==decode raw"),
+                &down_f32(gpu, &a.raw)?,
+                &got_raw,
+            ));
             a.free(gpu)?;
             p.free(gpu)?;
             free_all(gpu, vec![iq_t, q_t, k_t])?;
@@ -2827,7 +3641,8 @@ fn attn_want_rows(
         let visible = position_start + r + 1;
         let block_count = visible / QSA_COMPRESS;
         let chosen = BUDGET_BLOCKS.min(block_count);
-        let selected_len = (chosen * QSA_COMPRESS + visible - block_count * QSA_COMPRESS).min(SEL_CAP);
+        let selected_len =
+            (chosen * QSA_COMPRESS + visible - block_count * QSA_COMPRESS).min(SEL_CAP);
         want.extend(attention_row_cpu(
             &q[r * QG_W..(r + 1) * QG_W],
             keys,
@@ -2899,13 +3714,26 @@ fn case_fp8_attention_batch(gpu: &mut Gpu) -> Result<String, String> {
             let inp = attn_inputs(0x8400 + end as u64 + rows as u64, rows, end)?;
             let (k, kd) = fp8_cache_from(gpu, &inp.keys)?;
             let (v, vd) = fp8_cache_from(gpu, &inp.values)?;
-            let want = attn_want_rows(&inp.q, &kd, &vd, &inp.selected, rows, inp.position_start, end);
+            let want = attn_want_rows(
+                &inp.q,
+                &kd,
+                &vd,
+                &inp.selected,
+                rows,
+                inp.position_start,
+                end,
+            );
             let q = up_f32(gpu, &inp.q)?;
             let sel = raw_i32(gpu, &inp.selected)?;
             let out = nan_f32(gpu, rows * Q_W)?;
             fp8_attention_batch(gpu, &q, &k, &v, &sel, &out, rows, inp.position_start, end)?;
             sync(gpu)?;
-            checks.push(close_f32(&format!("end{end}/rows{rows}"), &down_f32(gpu, &out)?, &want, F32_ACCUM));
+            checks.push(close_f32(
+                &format!("end{end}/rows{rows}"),
+                &down_f32(gpu, &out)?,
+                &want,
+                F32_ACCUM,
+            ));
             free_all(gpu, vec![q, k, v, sel, out])?;
         }
     }
@@ -2933,7 +3761,12 @@ fn case_fp8_attention_serial_equality(gpu: &mut Gpu) -> Result<String, String> {
                 let inp = attn_inputs_kind(0x8800 + end as u64 + rows as u64, rows, end, kind)?;
                 let (k, _) = fp8_cache_from(gpu, &inp.keys)?;
                 let (v, _) = fp8_cache_from(gpu, &inp.values)?;
-                let t = AttnTensors { q: up_f32(gpu, &inp.q)?, k, v, sel: raw_i32(gpu, &inp.selected)? };
+                let t = AttnTensors {
+                    q: up_f32(gpu, &inp.q)?,
+                    k,
+                    v,
+                    sel: raw_i32(gpu, &inp.selected)?,
+                };
                 let pos = inp.position_start;
                 let serial = attn_direct(
                     gpu,
@@ -2958,7 +3791,11 @@ fn case_fp8_attention_serial_equality(gpu: &mut Gpu) -> Result<String, String> {
                     pos,
                     end,
                 )?;
-                checks.push(exact_f32(&format!("{label}/direct_generic==serial_hip"), &generic, &serial));
+                checks.push(exact_f32(
+                    &format!("{label}/direct_generic==serial_hip"),
+                    &generic,
+                    &serial,
+                ));
                 let hg4 = attn_direct(
                     gpu,
                     "indexed_attention_attention_fp8_fnuz_batched_hg4",
@@ -2970,7 +3807,11 @@ fn case_fp8_attention_serial_equality(gpu: &mut Gpu) -> Result<String, String> {
                     pos,
                     end,
                 )?;
-                checks.push(exact_f32(&format!("{label}/direct_hg4==serial_hip"), &hg4, &serial));
+                checks.push(exact_f32(
+                    &format!("{label}/direct_hg4==serial_hip"),
+                    &hg4,
+                    &serial,
+                ));
                 for scope in [false, true] {
                     let out = nan_f32(gpu, rows * Q_W)?;
                     with_scope(gpu, scope, |gp| {
@@ -2988,7 +3829,11 @@ fn case_fp8_attention_serial_equality(gpu: &mut Gpu) -> Result<String, String> {
                         &format!(
                             "{label}/{}/{}==serial_hip",
                             scope_name(scope),
-                            if route_rows >= 2 { "hg4" } else { "generic_parallel" }
+                            if route_rows >= 2 {
+                                "hg4"
+                            } else {
+                                "generic_parallel"
+                            }
                         ),
                         &got,
                         &serial,
@@ -3015,7 +3860,14 @@ fn case_fp8_attention_single(gpu: &mut Gpu) -> Result<String, String> {
     let q = rng.vec(QG_W, -3.0, 3.0);
     let (k_t, kd) = fp8_cache_from(gpu, &rng.vec(full_capacity * KV_W, -1.0, 1.0))?;
     let (v_t, vd) = fp8_cache_from(gpu, &rng.vec(full_capacity * KV_W, -1.0, 1.0))?;
-    let want = attention_row_cpu(&q, &kd, &vd, &sel[..count as usize], full_capacity, full_capacity);
+    let want = attention_row_cpu(
+        &q,
+        &kd,
+        &vd,
+        &sel[..count as usize],
+        full_capacity,
+        full_capacity,
+    );
     let q_t = up_f32(gpu, &q)?;
     let sel_t = raw_i32(gpu, &sel)?;
     let out = nan_f32(gpu, Q_W)?;
@@ -3038,7 +3890,12 @@ fn case_fp8_attention_single(gpu: &mut Gpu) -> Result<String, String> {
     )
     .map_err(e)?;
     sync(gpu)?;
-    let r = close_f32("single-row fp8 attention", &down_f32(gpu, &out)?, &want, F32_ACCUM);
+    let r = close_f32(
+        "single-row fp8 attention",
+        &down_f32(gpu, &out)?,
+        &want,
+        F32_ACCUM,
+    );
     free_all(gpu, vec![q_t, k_t, v_t, sel_t, out])?;
     r
 }
@@ -3087,7 +3944,11 @@ fn case_fp8_select_attention(gpu: &mut Gpu) -> Result<String, String> {
         .map_err(e)?;
         sync(gpu)?;
         let label = format!("rows{rows}");
-        checks.push(exact_ints(&format!("{label}/selected"), &down_i32(gpu, &selected)?, &sel_cpu));
+        checks.push(exact_ints(
+            &format!("{label}/selected"),
+            &down_i32(gpu, &selected)?,
+            &sel_cpu,
+        ));
 
         let mut rng = Rng::new(seed ^ 0x77);
         let q = rng.vec(rows * QG_W, -3.0, 3.0);
@@ -3096,10 +3957,28 @@ fn case_fp8_select_attention(gpu: &mut Gpu) -> Result<String, String> {
         let want = attn_want_rows(&q, &kd, &vd, &sel_cpu, rows, position_start, end);
         let q_t = up_f32(gpu, &q)?;
         let out = nan_f32(gpu, rows * Q_W)?;
-        fp8_attention_batch(gpu, &q_t, &k_t, &v_t, &selected, &out, rows, position_start, end)?;
+        fp8_attention_batch(
+            gpu,
+            &q_t,
+            &k_t,
+            &v_t,
+            &selected,
+            &out,
+            rows,
+            position_start,
+            end,
+        )?;
         sync(gpu)?;
-        checks.push(close_f32(&format!("{label}/attention over device selection"), &down_f32(gpu, &out)?, &want, F32_ACCUM));
-        free_all(gpu, vec![query_t, pooled_t, selected, mirror, q_t, k_t, v_t, out])?;
+        checks.push(close_f32(
+            &format!("{label}/attention over device selection"),
+            &down_f32(gpu, &out)?,
+            &want,
+            F32_ACCUM,
+        ));
+        free_all(
+            gpu,
+            vec![query_t, pooled_t, selected, mirror, q_t, k_t, v_t, out],
+        )?;
     }
     all(checks)
 }
@@ -3145,12 +4024,21 @@ mod fp8_fnuz_codec_tests {
 
     #[test]
     fn negative_underflow_and_negative_zero_fold_to_plus_zero() {
-        for x in [-0.0f32, -1e-30, -f32::from_bits(1), -2f32.powi(-10), -(2f32.powi(-10) * 0.99)] {
+        for x in [
+            -0.0f32,
+            -1e-30,
+            -f32::from_bits(1),
+            -2f32.powi(-10),
+            -(2f32.powi(-10) * 0.99),
+        ] {
             assert_eq!(e4m3_encode(x), 0x80, "{x:?}");
             assert_eq!(fp8_fold(e4m3_encode(x)), 0x00, "{x:?}");
         }
         // Just above the half-subnormal tie rounds to the first negative code.
-        assert_eq!(e4m3_encode(-f32::from_bits(2f32.powi(-10).to_bits() + 1)), 0x81);
+        assert_eq!(
+            e4m3_encode(-f32::from_bits(2f32.powi(-10).to_bits() + 1)),
+            0x81
+        );
     }
 
     #[test]
@@ -3159,7 +4047,11 @@ mod fp8_fnuz_codec_tests {
         let mut xs: Vec<f32> = Vec::new();
         for c in 0u8..0x7E {
             let mid = (e4m3_decode(c) + e4m3_decode(c + 1)) * 0.5;
-            xs.extend([mid, f32::from_bits(mid.to_bits() + 1), f32::from_bits(mid.to_bits() - 1)]);
+            xs.extend([
+                mid,
+                f32::from_bits(mid.to_bits() + 1),
+                f32::from_bits(mid.to_bits() - 1),
+            ]);
         }
         for _ in 0..20000 {
             let k = rng.below(18) as i32 - 12;
@@ -3169,7 +4061,12 @@ mod fp8_fnuz_codec_tests {
             if a > 448.0 {
                 continue;
             }
-            assert_eq!(e4m3_encode(a), brute_encode(a), "{a:?} ({:#010x})", a.to_bits());
+            assert_eq!(
+                e4m3_encode(a),
+                brute_encode(a),
+                "{a:?} ({:#010x})",
+                a.to_bits()
+            );
             assert_eq!(e4m3_encode(-a), brute_encode(a) | 0x80, "{:?}", -a);
         }
     }
@@ -3217,7 +4114,9 @@ fn case_gates(gpu: &mut Gpu) -> Result<String, String> {
     for raw in ["", "auto", "bf16"] {
         let r = resolve_qwen4(raw, "gfx942")?;
         if !matches!(r.mode, KvMode::Bf16) {
-            return Err(format!("resolve_qwen4({raw:?}, gfx942) is not the F32 (Bf16) state"));
+            return Err(format!(
+                "resolve_qwen4({raw:?}, gfx942) is not the F32 (Bf16) state"
+            ));
         }
     }
     let r = resolve_qwen4("fp8", "gfx942")
@@ -3228,9 +4127,8 @@ fn case_gates(gpu: &mut Gpu) -> Result<String, String> {
     if resolve_qwen4("q8", "gfx942").is_ok() {
         return Err("resolve_qwen4(\"q8\", gfx942) must be refused".into());
     }
-    let mut notes = vec![
-        "resolve_qwen4(gfx942): auto/bf16 -> F32 state, fp8 accepted, q8 refused".to_string(),
-    ];
+    let mut notes =
+        vec!["resolve_qwen4(gfx942): auto/bf16 -> F32 state, fp8 accepted, q8 refused".to_string()];
     let f = QsaKvFormat::Fp8Fnuz;
     if !f.supports(QSA_KV_HEADS, HD)
         || f.kv_row_units(QSA_KV_HEADS, HD) != FP8_ROW
@@ -3250,7 +4148,10 @@ fn case_gates(gpu: &mut Gpu) -> Result<String, String> {
     }
     notes.push("Fp8Fnuz: 516 B Raw K/V rows, F32 index arenas".into());
     if gpu.arch != "gfx942" {
-        notes.push(format!("arch {} != gfx942: arch-conditional checks skipped", gpu.arch));
+        notes.push(format!(
+            "arch {} != gfx942: arch-conditional checks skipped",
+            gpu.arch
+        ));
         return Ok(notes.join("; "));
     }
     {
@@ -3259,7 +4160,12 @@ fn case_gates(gpu: &mut Gpu) -> Result<String, String> {
             return Err("gfx942 reports gfx11 SIMT / WMMA / gfx1151 capability".into());
         }
     }
-    for fmt in [QsaKvFormat::F32, QsaKvFormat::Q8, QsaKvFormat::Fp8, QsaKvFormat::Fp8Fnuz] {
+    for fmt in [
+        QsaKvFormat::F32,
+        QsaKvFormat::Q8,
+        QsaKvFormat::Fp8,
+        QsaKvFormat::Fp8Fnuz,
+    ] {
         if rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, fmt) {
             return Err(format!("gathered WMMA enabled for {fmt:?} on gfx942"));
         }
@@ -3309,9 +4215,13 @@ fn case_gates(gpu: &mut Gpu) -> Result<String, String> {
                 notes.push("cache_append_batch Fp8Fnuz accepted (bytes == CPU encoder)".into());
             }
             (QsaKvFormat::Fp8Fnuz, Err(err), _) => {
-                return Err(format!("cache_append_batch Fp8Fnuz refused on gfx942: {err}"));
+                return Err(format!(
+                    "cache_append_batch Fp8Fnuz refused on gfx942: {err}"
+                ));
             }
-            (_, Ok(()), _) => return Err(format!("cache_append_batch accepted {fmt:?} K/V on gfx942")),
+            (_, Ok(()), _) => {
+                return Err(format!("cache_append_batch accepted {fmt:?} K/V on gfx942"))
+            }
             (_, Err(err), _) => notes.push(format!("cache_append_batch {fmt:?} refused: {err}")),
         }
     }
@@ -3333,7 +4243,8 @@ const DIRECT_SRC: &str = concat!(
 const DIRECT_MODULE: &str = "qwen4_tierc_qsa_parallel_tensor_ops";
 
 fn direct_load(gpu: &mut Gpu, sym: &str) -> Result<(), String> {
-    gpu.ensure_kernel_public(DIRECT_MODULE, DIRECT_SRC, sym).map_err(e)
+    gpu.ensure_kernel_public(DIRECT_MODULE, DIRECT_SRC, sym)
+        .map_err(e)
 }
 
 fn direct_launch(
@@ -3345,7 +4256,8 @@ fn direct_launch(
     mut args: hip_bridge::KernargBlob,
 ) -> Result<(), String> {
     args.pad_to(16);
-    gpu.launch_kernel_blob(sym, grid, block, shared, args.as_mut_slice()).map_err(e)
+    gpu.launch_kernel_blob(sym, grid, block, shared, args.as_mut_slice())
+        .map_err(e)
 }
 
 /// One select launch's shared arguments (query rows are `IDX_W` wide, four
@@ -3406,7 +4318,12 @@ struct FusedOut {
 /// selector, block 256) with a non-null mirror. `global_scores`: score rows in
 /// a global buffer (the arena-past-LDS mode, no dynamic LDS); otherwise the
 /// scores live in `POOLED_CAP * 4` bytes of dynamic LDS.
-fn fused_select(gpu: &mut Gpu, r: &SelectRun, bf16: bool, global_scores: bool) -> Result<FusedOut, String> {
+fn fused_select(
+    gpu: &mut Gpu,
+    r: &SelectRun,
+    bf16: bool,
+    global_scores: bool,
+) -> Result<FusedOut, String> {
     let sym = if bf16 {
         "indexed_attention_select_bf16_batched"
     } else {
@@ -3416,7 +4333,11 @@ fn fused_select(gpu: &mut Gpu, r: &SelectRun, bf16: bool, global_scores: bool) -
     let stride = r.blocks.div_ceil(4) * 4;
     let selected = raw_i32(gpu, &vec![-7777; r.rows * r.capacity])?;
     let mirror = raw_i32(gpu, &vec![-7777; r.capacity])?;
-    let scores_t = if global_scores { Some(nan_f32(gpu, r.rows * stride)?) } else { None };
+    let scores_t = if global_scores {
+        Some(nan_f32(gpu, r.rows * stride)?)
+    } else {
+        None
+    };
     let mut a = hip_bridge::KernargBlob::new();
     a.push_ptr(r.query.buf.as_ptr());
     a.push_ptr(r.pooled.buf.as_ptr());
@@ -3445,7 +4366,11 @@ fn fused_select(gpu: &mut Gpu, r: &SelectRun, bf16: bool, global_scores: bool) -
             a.push_i32(0);
         }
     }
-    let shared = if global_scores { 0 } else { (POOLED_CAP * 4) as u32 };
+    let shared = if global_scores {
+        0
+    } else {
+        (POOLED_CAP * 4) as u32
+    };
     direct_launch(gpu, sym, [r.rows as u32, 1, 1], [256, 1, 1], shared, a)?;
     sync(gpu)?;
     let out = FusedOut {
@@ -3480,13 +4405,25 @@ fn rows_scores_and_select(
     a.push_ptr(r.query.buf.as_ptr());
     a.push_ptr(r.pooled.buf.as_ptr());
     a.push_ptr(scores_t.buf.as_ptr());
-    for v in [r.rows, IDX_W, r.blocks, IDX_DIM, QSA_COMPRESS, r.position_start, r.blocks] {
+    for v in [
+        r.rows,
+        IDX_W,
+        r.blocks,
+        IDX_DIM,
+        QSA_COMPRESS,
+        r.position_start,
+        r.blocks,
+    ] {
         a.push_i32(v as i32);
     }
     direct_launch(
         gpu,
         score_sym,
-        [r.blocks.div_ceil(256) as u32, r.rows.div_ceil(group_rows) as u32, 1],
+        [
+            r.blocks.div_ceil(256) as u32,
+            r.rows.div_ceil(group_rows) as u32,
+            1,
+        ],
         [256, 1, 1],
         0,
         a,
@@ -3495,7 +4432,14 @@ fn rows_scores_and_select(
     s.push_ptr(scores_t.buf.as_ptr());
     s.push_i32(r.blocks as i32); // score_stride
     s.push_ptr(selected.buf.as_ptr());
-    for v in [r.rows, r.blocks, r.budget, QSA_COMPRESS, r.position_start, r.capacity] {
+    for v in [
+        r.rows,
+        r.blocks,
+        r.budget,
+        QSA_COMPRESS,
+        r.position_start,
+        r.capacity,
+    ] {
         s.push_i32(v as i32);
     }
     s.push_ptr(std::ptr::null::<std::ffi::c_void>());
@@ -3558,8 +4502,16 @@ fn parallel_rows(gpu: &mut Gpu, group_rows: usize, score_sym: &str) -> Result<St
             let (scores, selected) = rows_scores_and_select(gpu, &run, group_rows, score_sym)?;
             let label = format!("{}/rows{rows}", kind.name());
             let twin = kind.twin_name();
-            checks.push(exact_f32(&format!("{label}/scores=={twin}"), &scores, &want_masked));
-            checks.push(exact_ints(&format!("{label}/selected=={twin}"), &selected, &want_sel));
+            checks.push(exact_f32(
+                &format!("{label}/scores=={twin}"),
+                &scores,
+                &want_masked,
+            ));
+            checks.push(exact_ints(
+                &format!("{label}/selected=={twin}"),
+                &selected,
+                &want_sel,
+            ));
             // Wide verify: every row of the batch is bitwise the one-row launch of
             // the same kernel at `position_start + r` (its own block count), scores
             // and selection.
@@ -3576,7 +4528,8 @@ fn parallel_rows(gpu: &mut Gpu, group_rows: usize, score_sym: &str) -> Result<St
                         budget: BUDGET_BLOCKS,
                         capacity: SEL_CAP,
                     };
-                    let (scores1, selected1) = rows_scores_and_select(gpu, &run1, group_rows, score_sym)?;
+                    let (scores1, selected1) =
+                        rows_scores_and_select(gpu, &run1, group_rows, score_sym)?;
                     checks.push(exact_f32(
                         &format!("{label}/row{r} scores==one-row launch"),
                         &scores[r * blocks..r * blocks + b_r],
@@ -3592,16 +4545,27 @@ fn parallel_rows(gpu: &mut Gpu, group_rows: usize, score_sym: &str) -> Result<St
             }
             if claim && kind == DataKind::Realistic {
                 let serial = serial_select(gpu, &run, false)?;
-                checks.push(exact_ints(&format!("{label}/selected==serial_hip"), &selected, &serial));
+                checks.push(exact_ints(
+                    &format!("{label}/selected==serial_hip"),
+                    &selected,
+                    &serial,
+                ));
                 let fused = fused_select(gpu, &run, false, true)?;
                 let fused_scores = masked_scores(
-                    fused.scores.as_deref().ok_or("fused select returned no scores")?,
+                    fused
+                        .scores
+                        .as_deref()
+                        .ok_or("fused select returned no scores")?,
                     rows,
                     blocks,
                     blocks.div_ceil(4) * 4,
                     position_start,
                 );
-                checks.push(exact_f32(&format!("{label}/scores==fused_score4_hip"), &scores, &fused_scores));
+                checks.push(exact_f32(
+                    &format!("{label}/scores==fused_score4_hip"),
+                    &scores,
+                    &fused_scores,
+                ));
             }
             free_all(gpu, vec![query_t, pooled_t])?;
         }
@@ -3652,18 +4616,31 @@ fn with_wide_gate<T>(gpu: &mut Gpu, rows: usize, f: impl FnOnce(&mut Gpu) -> T) 
 
 fn cmp_bytes(fails: &mut Vec<String>, label: &str, got: &[u8], want: &[u8]) {
     if got.len() != want.len() {
-        fails.push(format!("{label}: byte lens {} != {}", got.len(), want.len()));
+        fails.push(format!(
+            "{label}: byte lens {} != {}",
+            got.len(),
+            want.len()
+        ));
     } else if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
-        fails.push(format!("{label}: first differing byte @{i}: batched {:#04x} one-row {:#04x}", got[i], want[i]));
+        fails.push(format!(
+            "{label}: first differing byte @{i}: batched {:#04x} one-row {:#04x}",
+            got[i], want[i]
+        ));
     }
 }
 
 fn wide_verdict(name: &str, windows: usize, fails: Vec<String>) -> Result<String, String> {
     if fails.is_empty() {
-        Ok(format!("{name}: {windows} windows bit-exact vs n one-row calls"))
+        Ok(format!(
+            "{name}: {windows} windows bit-exact vs n one-row calls"
+        ))
     } else {
         let shown: Vec<String> = fails.iter().take(40).cloned().collect();
-        Err(format!("{name}: {} failure(s) in {windows} windows: {}", fails.len(), shown.join(" | ")))
+        Err(format!(
+            "{name}: {} failure(s) in {windows} windows: {}",
+            fails.len(),
+            shown.join(" | ")
+        ))
     }
 }
 
@@ -3675,15 +4652,29 @@ fn wide_verdict(name: &str, windows: usize, fails: Vec<String>) -> Result<String
 /// poisoned. End depths 8K..256K minus displacement 0..3; both RoPE settings.
 fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
     if !wide_arch(gpu) {
-        return Ok(format!("skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})", gpu.arch));
+        return Ok(format!(
+            "skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})",
+            gpu.arch
+        ));
     }
     if fp8 && gpu.arch != "gfx1201" {
-        return Ok(format!("skip: OCP FP8 K/V is gfx1201 only (got {})", gpu.arch));
+        return Ok(format!(
+            "skip: OCP FP8 K/V is gfx1201 only (got {})",
+            gpu.arch
+        ));
     }
-    let format = if fp8 { QsaKvFormat::Fp8 } else { QsaKvFormat::F32 };
+    let format = if fp8 {
+        QsaKvFormat::Fp8
+    } else {
+        QsaKvFormat::F32
+    };
     // The deepest end plus the canary row P+n after a window that ends there.
     let depth_max = WIDE_DEPTHS[WIDE_DEPTHS.len() - 1] + 1;
-    let (row_bytes, raw_unit) = if fp8 { (FP8_ROW, IDX_DIM * 2) } else { (KV_W * 4, IDX_DIM * 4) };
+    let (row_bytes, raw_unit) = if fp8 {
+        (FP8_ROW, IDX_DIM * 2)
+    } else {
+        (KV_W * 4, IDX_DIM * 4)
+    };
     let (k_cache, v_cache, raw) = if fp8 {
         (
             fp8_cache(gpu, depth_max)?,
@@ -3704,8 +4695,16 @@ fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
         let iq_norm = rng.vec_bf16_exact(IDX_DIM, -0.5, 0.5);
         let q_norm = rng.vec_bf16_exact(HD, -0.5, 0.5);
         let k_norm = rng.vec_bf16_exact(HD, -0.5, 0.5);
-        let (iq_t, q_t, k_t) = (bf16_vec(gpu, &iq_norm)?, bf16_vec(gpu, &q_norm)?, bf16_vec(gpu, &k_norm)?);
-        let launch = |gpu: &mut Gpu, t: [&GpuTensor; 4], position: usize, rows: usize| -> Result<(), String> {
+        let (iq_t, q_t, k_t) = (
+            bf16_vec(gpu, &iq_norm)?,
+            bf16_vec(gpu, &q_norm)?,
+            bf16_vec(gpu, &k_norm)?,
+        );
+        let launch = |gpu: &mut Gpu,
+                      t: [&GpuTensor; 4],
+                      position: usize,
+                      rows: usize|
+         -> Result<(), String> {
             with_wide_gate(gpu, rows, |g| {
                 indexed_attention_decode_prologue(
                     g,
@@ -3760,11 +4759,19 @@ fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
                         up_f32(gpu, &inputs[2])?,
                         up_f32(gpu, &inputs[3])?,
                     ];
-                    let caches = [(&k_cache, row_bytes), (&v_cache, row_bytes), (&raw, raw_unit)];
+                    let caches = [
+                        (&k_cache, row_bytes),
+                        (&v_cache, row_bytes),
+                        (&raw, raw_unit),
+                    ];
                     let poison = |gpu: &Gpu| -> Result<(), String> {
                         for (cache, unit) in caches {
                             gpu.hip
-                                .memcpy_htod_offset(&cache.buf, (ps - 1) * unit, &vec![0xA5u8; (n + 2) * unit])
+                                .memcpy_htod_offset(
+                                    &cache.buf,
+                                    (ps - 1) * unit,
+                                    &vec![0xA5u8; (n + 2) * unit],
+                                )
                                 .map_err(e)?;
                         }
                         Ok(())
@@ -3776,7 +4783,9 @@ fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
                         }
                         for (cache, unit) in caches {
                             let mut rows = vec![0u8; (n + 2) * unit];
-                            gpu.hip.memcpy_dtoh_at(&mut rows, &cache.buf, (ps - 1) * unit).map_err(e)?;
+                            gpu.hip
+                                .memcpy_dtoh_at(&mut rows, &cache.buf, (ps - 1) * unit)
+                                .map_err(e)?;
                             out.push(rows);
                         }
                         Ok(out)
@@ -3797,15 +4806,28 @@ fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
                     }
                     sync(gpu)?;
                     let one = observe(gpu, &b)?;
-                    for (i, what) in
-                        ["index_row", "qgate", "keys", "values", "K cache rows", "V cache rows", "raw index key rows"]
-                            .into_iter()
-                            .enumerate()
+                    for (i, what) in [
+                        "index_row",
+                        "qgate",
+                        "keys",
+                        "values",
+                        "K cache rows",
+                        "V cache rows",
+                        "raw index key rows",
+                    ]
+                    .into_iter()
+                    .enumerate()
                     {
                         cmp_bytes(&mut fails, &format!("{label}/{what}"), &batched[i], &one[i]);
                     }
-                    let values_in: Vec<u8> = inputs[3].iter().flat_map(|v| v.to_le_bytes()).collect();
-                    cmp_bytes(&mut fails, &format!("{label}/values untouched"), &batched[3], &values_in);
+                    let values_in: Vec<u8> =
+                        inputs[3].iter().flat_map(|v| v.to_le_bytes()).collect();
+                    cmp_bytes(
+                        &mut fails,
+                        &format!("{label}/values untouched"),
+                        &batched[3],
+                        &values_in,
+                    );
                     for (i, unit) in [(4usize, row_bytes), (5, row_bytes), (6, raw_unit)] {
                         let kept = batched[i][..unit].iter().all(|x| *x == 0xA5)
                             && batched[i][(n + 1) * unit..].iter().all(|x| *x == 0xA5);
@@ -3820,7 +4842,15 @@ fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
         free_all(gpu, vec![iq_t, q_t, k_t])?;
     }
     free_all(gpu, vec![k_cache, v_cache, raw])?;
-    wide_verdict(if fp8 { "wide prologue fp8" } else { "wide prologue f32" }, windows, fails)
+    wide_verdict(
+        if fp8 {
+            "wide prologue fp8"
+        } else {
+            "wide prologue f32"
+        },
+        windows,
+        fails,
+    )
 }
 
 fn wide_prologue_f32(gpu: &mut Gpu) -> Result<String, String> {
@@ -3837,7 +4867,10 @@ fn wide_prologue_fp8(gpu: &mut Gpu) -> Result<String, String> {
 /// blocks `P/4-1 ..= (P+n)/4` (one canary block each side) must be identical.
 fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
     if !wide_arch(gpu) {
-        return Ok(format!("skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})", gpu.arch));
+        return Ok(format!(
+            "skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})",
+            gpu.arch
+        ));
     }
     let depth_max = WIDE_DEPTHS[WIDE_DEPTHS.len() - 1];
     let max_blocks = depth_max / QSA_COMPRESS + 8;
@@ -3846,7 +4879,11 @@ fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
     let raw = rng.vec_bf16_exact(depth_max * IDX_DIM, -2.0, 2.0);
     let norm = rng.vec_bf16_exact(IDX_DIM, -0.5, 0.5);
     let norm_t = bf16_vec(gpu, &norm)?;
-    let raw_t = if bf16_arena { bf16_vec(gpu, &raw)? } else { up_f32(gpu, &raw)? };
+    let raw_t = if bf16_arena {
+        bf16_vec(gpu, &raw)?
+    } else {
+        up_f32(gpu, &raw)?
+    };
     drop(raw);
     let new_arena = |gpu: &mut Gpu| -> Result<GpuTensor, String> {
         if bf16_arena {
@@ -3859,7 +4896,11 @@ fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
     let mut fails = Vec::new();
     let mut windows = 0usize;
     for (yname, yarn) in yarns() {
-        let pool = |gpu: &mut Gpu, pooled: &GpuTensor, position_start: usize, rows: usize| -> Result<(), String> {
+        let pool = |gpu: &mut Gpu,
+                    pooled: &GpuTensor,
+                    position_start: usize,
+                    rows: usize|
+         -> Result<(), String> {
             with_wide_gate(gpu, rows, |g| {
                 indexed_attention_pool_rope_incremental(
                     g,
@@ -3870,7 +4911,10 @@ fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
                         block_count: (position_start + rows) / QSA_COMPRESS,
                         compress: QSA_COMPRESS,
                         index_dim: IDX_DIM,
-                        position: Some(QsaPositionBinding { position_start, rows }),
+                        position: Some(QsaPositionBinding {
+                            position_start,
+                            rows,
+                        }),
                         grid_bound: max_blocks,
                         yarn,
                     },
@@ -3887,9 +4931,14 @@ fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
                     let (first, last) = (ps / QSA_COMPRESS, end / QSA_COMPRESS);
                     let lo = first - 1;
                     let span = (last + 1 - lo + 1) * unit;
-                    let label = format!("{yname}/{}/E{end}/n{n}", if bf16_arena { "bf16" } else { "f32" });
+                    let label = format!(
+                        "{yname}/{}/E{end}/n{n}",
+                        if bf16_arena { "bf16" } else { "f32" }
+                    );
                     for arena in [&pooled_a, &pooled_b] {
-                        gpu.hip.memcpy_htod_offset(&arena.buf, lo * unit, &vec![0xA5u8; span]).map_err(e)?;
+                        gpu.hip
+                            .memcpy_htod_offset(&arena.buf, lo * unit, &vec![0xA5u8; span])
+                            .map_err(e)?;
                     }
                     pool(gpu, &pooled_a, ps, n)?;
                     for r in 0..n {
@@ -3897,9 +4946,18 @@ fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
                     }
                     sync(gpu)?;
                     let (mut got, mut want) = (vec![0u8; span], vec![0u8; span]);
-                    gpu.hip.memcpy_dtoh_at(&mut got, &pooled_a.buf, lo * unit).map_err(e)?;
-                    gpu.hip.memcpy_dtoh_at(&mut want, &pooled_b.buf, lo * unit).map_err(e)?;
-                    cmp_bytes(&mut fails, &format!("{label}/pooled blocks {lo}..={}", last + 1), &got, &want);
+                    gpu.hip
+                        .memcpy_dtoh_at(&mut got, &pooled_a.buf, lo * unit)
+                        .map_err(e)?;
+                    gpu.hip
+                        .memcpy_dtoh_at(&mut want, &pooled_b.buf, lo * unit)
+                        .map_err(e)?;
+                    cmp_bytes(
+                        &mut fails,
+                        &format!("{label}/pooled blocks {lo}..={}", last + 1),
+                        &got,
+                        &want,
+                    );
                     // The canary blocks outside [first, last) must be untouched.
                     let touched_outside = got[..unit].iter().any(|x| *x != 0xA5)
                         || got[(last - lo + 1) * unit..].iter().any(|x| *x != 0xA5);
@@ -3911,7 +4969,15 @@ fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
         }
     }
     free_all(gpu, vec![pooled_a, pooled_b, raw_t, norm_t])?;
-    wide_verdict(if bf16_arena { "wide pool bf16" } else { "wide pool f32" }, windows, fails)
+    wide_verdict(
+        if bf16_arena {
+            "wide pool bf16"
+        } else {
+            "wide pool f32"
+        },
+        windows,
+        fails,
+    )
 }
 
 fn wide_pool_f32(gpu: &mut Gpu) -> Result<String, String> {
@@ -3930,7 +4996,10 @@ fn wide_pool_bf16(gpu: &mut Gpu) -> Result<String, String> {
 /// 2802 and 8192 cached tokens.
 fn wide_attention_f32(gpu: &mut Gpu) -> Result<String, String> {
     if !wide_arch(gpu) {
-        return Ok(format!("skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})", gpu.arch));
+        return Ok(format!(
+            "skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})",
+            gpu.arch
+        ));
     }
     let g = QWEN4_ATTN;
     let q_row = 2 * g.heads * g.head_dim;
@@ -3946,9 +5015,15 @@ fn wide_attention_f32(gpu: &mut Gpu) -> Result<String, String> {
                 let (q, keys, values) = match kind {
                     DataKind::Plain => {
                         let mut rng = Rng::new(seed);
-                        (rng.vec(rows * QG_W, -3.0, 3.0), rng.vec(end * KV_W, -1.0, 1.0), rng.vec(end * KV_W, -1.0, 1.0))
+                        (
+                            rng.vec(rows * QG_W, -3.0, 3.0),
+                            rng.vec(end * KV_W, -1.0, 1.0),
+                            rng.vec(end * KV_W, -1.0, 1.0),
+                        )
                     }
-                    DataKind::Realistic => realistic_attn_qkv(seed, rows, end, QSA_Q_HEADS, QSA_KV_HEADS, HD),
+                    DataKind::Realistic => {
+                        realistic_attn_qkv(seed, rows, end, QSA_Q_HEADS, QSA_KV_HEADS, HD)
+                    }
                 };
                 let t = upload_attn(gpu, &q, &keys, &values, &selected)?;
                 let batched = attn_public(gpu, &t, g, rows, position_start, end)?;
@@ -3956,10 +5031,24 @@ fn wide_attention_f32(gpu: &mut Gpu) -> Result<String, String> {
                 for r in 0..rows {
                     let q_t = up_f32(gpu, &q[r * q_row..(r + 1) * q_row])?;
                     let sel_t = raw_i32(gpu, &selected[r * SEL_CAP..(r + 1) * SEL_CAP])?;
-                    one.extend(attn_public_parts(gpu, &q_t, &t.k, &t.v, &sel_t, g, 1, position_start + r, end)?);
+                    one.extend(attn_public_parts(
+                        gpu,
+                        &q_t,
+                        &t.k,
+                        &t.v,
+                        &sel_t,
+                        g,
+                        1,
+                        position_start + r,
+                        end,
+                    )?);
                     free_all(gpu, vec![q_t, sel_t])?;
                 }
-                if let Err(msg) = exact_f32(&format!("{}/E{end}/rows{rows}", kind.name()), &batched, &one) {
+                if let Err(msg) = exact_f32(
+                    &format!("{}/E{end}/rows{rows}", kind.name()),
+                    &batched,
+                    &one,
+                ) {
                     fails.push(msg);
                 }
                 free_attn(gpu, t)?;
@@ -4009,7 +5098,11 @@ fn parallel_select_fused(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                 );
                 let want_masked = masked_scores(&want_scores, rows, blocks, blocks, position_start);
                 let query_t = up_f32(gpu, &query)?;
-                let pooled_t = if bf16 { bf16_vec(gpu, &pooled)? } else { up_f32(gpu, &pooled)? };
+                let pooled_t = if bf16 {
+                    bf16_vec(gpu, &pooled)?
+                } else {
+                    up_f32(gpu, &pooled)?
+                };
                 let run = SelectRun {
                     query: &query_t,
                     pooled: &pooled_t,
@@ -4029,21 +5122,43 @@ fn parallel_select_fused(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                     let label = format!(
                         "{}/b{budget}/rows{rows}/{}",
                         kind.name(),
-                        if global { "global_scores" } else { "lds_scores" }
+                        if global {
+                            "global_scores"
+                        } else {
+                            "lds_scores"
+                        }
                     );
                     let twin = kind.twin_name();
-                    checks.push(exact_ints(&format!("{label}/selected=={twin}"), &out.selected, &want));
+                    checks.push(exact_ints(
+                        &format!("{label}/selected=={twin}"),
+                        &out.selected,
+                        &want,
+                    ));
                     checks.push(exact_ints(
                         &format!("{label}/mirror"),
                         &out.mirror,
                         &want[(rows - 1) * capacity..],
                     ));
                     if let Some(serial) = &serial {
-                        checks.push(exact_ints(&format!("{label}/selected==serial_hip"), &out.selected, serial));
+                        checks.push(exact_ints(
+                            &format!("{label}/selected==serial_hip"),
+                            &out.selected,
+                            serial,
+                        ));
                     }
                     if let Some(scores) = &out.scores {
-                        let got = masked_scores(scores, rows, blocks, blocks.div_ceil(4) * 4, position_start);
-                        checks.push(exact_f32(&format!("{label}/scores=={twin}"), &got, &want_masked));
+                        let got = masked_scores(
+                            scores,
+                            rows,
+                            blocks,
+                            blocks.div_ceil(4) * 4,
+                            position_start,
+                        );
+                        checks.push(exact_f32(
+                            &format!("{label}/scores=={twin}"),
+                            &got,
+                            &want_masked,
+                        ));
                     }
                 }
                 free_all(gpu, vec![query_t, pooled_t])?;
@@ -4067,7 +5182,12 @@ fn parallel_select_bf16(gpu: &mut Gpu) -> Result<String, String> {
 /// (raw F32 bits on gfx942). Both the uniform and the realistic data set (wide
 /// score range, outlier key channels, duplicated keys, sign-cancelling values),
 /// at row counts either side of the hg4 (2) and hg12 (16) route thresholds.
-fn parallel_attention(gpu: &mut Gpu, sym: &str, grid_x: u32, shared: u32) -> Result<String, String> {
+fn parallel_attention(
+    gpu: &mut Gpu,
+    sym: &str,
+    grid_x: u32,
+    shared: u32,
+) -> Result<String, String> {
     let g = QWEN4_ATTN;
     let mut checks = Vec::new();
     for end in [2802usize, 402] {
@@ -4088,8 +5208,18 @@ fn parallel_attention(gpu: &mut Gpu, sym: &str, grid_x: u32, shared: u32) -> Res
                 )?;
                 let serial = attn_serial(gpu, &t, g, rows, inp.position_start, end)?;
                 let label = format!("{}/end{end}/rows{rows}", kind.name());
-                checks.push(close_f32(&format!("{label}/vs_cpu"), &got, &inp.want, F32_ACCUM));
-                checks.push(attn_claim(gpu, &format!("{label}/vs_serial_hip"), &got, &serial));
+                checks.push(close_f32(
+                    &format!("{label}/vs_cpu"),
+                    &got,
+                    &inp.want,
+                    F32_ACCUM,
+                ));
+                checks.push(attn_claim(
+                    gpu,
+                    &format!("{label}/vs_serial_hip"),
+                    &got,
+                    &serial,
+                ));
                 free_attn(gpu, t)?;
             }
         }
@@ -4100,19 +5230,34 @@ fn parallel_attention(gpu: &mut Gpu, sym: &str, grid_x: u32, shared: u32) -> Res
 /// `indexed_attention_attention_f32_batched`: one 256-thread block per head,
 /// scores/tokens in dynamic LDS (8 B per selected row), width-32 `__shfl_xor`.
 fn parallel_attention_batched(gpu: &mut Gpu) -> Result<String, String> {
-    parallel_attention(gpu, "indexed_attention_attention_f32_batched", QSA_Q_HEADS as u32, (SEL_CAP * 8) as u32)
+    parallel_attention(
+        gpu,
+        "indexed_attention_attention_f32_batched",
+        QSA_Q_HEADS as u32,
+        (SEL_CAP * 8) as u32,
+    )
 }
 
 /// `indexed_attention_attention_f32_batched_hg4`: four heads per block, with the
 /// gfx942 buffer descriptor for the value loads (`0a739489d`).
 fn parallel_attention_hg4(gpu: &mut Gpu) -> Result<String, String> {
     let lds = SEL_CAP * (4 * 4 + 4) + 4 * (4 * 256 + 4);
-    parallel_attention(gpu, "indexed_attention_attention_f32_batched_hg4", (QSA_Q_HEADS / 4) as u32, lds as u32)
+    parallel_attention(
+        gpu,
+        "indexed_attention_attention_f32_batched_hg4",
+        (QSA_Q_HEADS / 4) as u32,
+        lds as u32,
+    )
 }
 
 /// `indexed_attention_attention_f32_batched_hg12`: one block per KV group (12
 /// heads), scores in registers (QSA_T = 9 tiles of 256 rows), same buffer
 /// descriptor fix.
 fn parallel_attention_hg12(gpu: &mut Gpu) -> Result<String, String> {
-    parallel_attention(gpu, "indexed_attention_attention_f32_batched_hg12", QSA_KV_HEADS as u32, 0)
+    parallel_attention(
+        gpu,
+        "indexed_attention_attention_f32_batched_hg12",
+        QSA_KV_HEADS as u32,
+        0,
+    )
 }
