@@ -1324,52 +1324,6 @@ pub fn attach_qwen4_ep_peers(
         .map_err(|error| format!("qwen4: expert parallelism mesh setup failed: {error}"))
 }
 
-/// Select the S1 slow-link prefill profile for a load, or `Ok(None)` for the
-/// incumbent. Probe-free checks run first; `link` (the host-link probe) runs
-/// only for a load that passed them, and `inputs` (the memory query, manifest
-/// scan and census inputs) only for a link that is narrow, so every other load
-/// does no S1 work and keeps its placement byte for byte. A forced selector
-/// fails the load only on a capacity refusal of an otherwise eligible load
-/// (exact byte deficit); every other decline is the incumbent.
-fn qwen4_slowlink_select(
-    mode: hipfire_arch_qwen4::slowlink_admission::SlowlinkMode,
-    shape: &hipfire_arch_qwen4::slowlink_admission::LoadShape<'_>,
-    link: impl FnOnce() -> hipfire_arch_qwen4::host_link::HostLink,
-    inputs: impl FnOnce(
-        f64,
-    ) -> Result<
-        hipfire_arch_qwen4::slowlink_admission::AdmissionInputs,
-        hipfire_arch_qwen4::slowlink_admission::SlowlinkDecline,
-    >,
-) -> Result<Option<hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile>, String> {
-    use hipfire_arch_qwen4::slowlink_admission as s1;
-    let decline = match s1::preflight(mode, shape) {
-        Err(decline) => decline,
-        Ok(()) => match s1::link_verdict(link())
-            .and_then(inputs)
-            .and_then(|inputs| s1::admit(&inputs))
-        {
-            Ok(profile) => {
-                eprintln!("  qwen4 {}", profile.describe());
-                return Ok(Some(profile));
-            }
-            Err(decline) => decline,
-        },
-    };
-    if mode == s1::SlowlinkMode::Force && decline.is_capacity() {
-        return Err(format!(
-            "qwen4: {}=1 cannot be admitted: {decline}",
-            s1::SLOWLINK_PREFILL_ENV
-        ));
-    }
-    if decline != s1::SlowlinkDecline::AutoNotQualified {
-        eprintln!(
-            "  qwen4 slow-link prefill (S1): not selected ({decline}); incumbent placement unchanged"
-        );
-    }
-    Ok(None)
-}
-
 /// What the expert placement is sized from, for one rank of a `ranks`-way
 /// load: the replicated non-expert bytes, one MoE layer's routed-expert bytes
 /// on this rank, the `auto` reserve ([`residency::AutoReserve`]: the larger
@@ -2293,59 +2247,23 @@ fn load_qwen4_rank_scoped(
             chunk_rows_env: chunk_rows_env.as_deref(),
             max_seq: ctx.max_seq,
         };
-        qwen4_slowlink_select(
+        s1::select_load_profile(
             slowlink_mode,
             &shape,
             || hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu),
-            |link_gbps| {
-                let geometry =
-                    s1::ModelGeometry::from_config(&config).map_err(s1::SlowlinkDecline::Geometry)?;
-                let (free, non_expert, layer_experts, base, ..) =
-                    auto_inputs_at(s1::S1_TILE_ROWS).map_err(s1::SlowlinkDecline::Geometry)?;
-                let incumbent = auto_inputs_at(placement_chunk)
-                    .map_err(s1::SlowlinkDecline::Geometry)?
-                    .3;
-                let baseline_layers = residency::PlacementCharges::new(layer_experts, false)
-                    .and_then(|charges| {
-                        residency::auto_placement_layers(
-                            free,
-                            non_expert,
-                            layer_experts,
-                            config.num_hidden_layers,
-                            incumbent.bytes(),
-                            &charges,
-                        )
-                    })
-                    .unwrap_or(0);
-                let (gate_up_layer_bytes, down_layer_bytes) =
-                    residency::routed_layer_payload_split(&manifest.weights, &bytes_of)
-                        .map_err(s1::SlowlinkDecline::Geometry)?;
-                // One session fixed-state snapshot (no context rows): the exact
-                // bytes each new boundary snapshot copies, charged once.
-                let fixed_state_bytes = hipfire_arch_qwen4::bundle::session_snapshot_bytes(
-                    &config,
-                    state_format,
-                    placement_native_mtp,
-                    0,
-                )
-                .ok_or_else(|| {
-                    s1::SlowlinkDecline::Geometry(
-                        "session fixed snapshot bytes overflow".to_string(),
-                    )
-                })?;
-                Ok(s1::AdmissionInputs {
-                    geometry,
+            || {
+                let (free, _, _, base, ..) = auto_inputs_at(s1::S1_TILE_ROWS)?;
+                let (.., incumbent, _, _) = auto_inputs_at(placement_chunk)?;
+                Ok(s1::LoadFacts {
+                    config: &config,
+                    weights: &manifest.weights,
+                    bytes_of: &bytes_of,
                     free,
-                    non_expert,
-                    layer_expert_bytes: layer_experts,
-                    gate_up_layer_bytes,
-                    down_layer_bytes,
-                    trunk_layers: config.num_hidden_layers,
-                    base_reserve: base.bytes(),
-                    baseline_layers,
-                    fixed_state_bytes,
+                    tile_reserve: base.bytes(),
+                    incumbent_reserve: incumbent.bytes(),
+                    state_format,
+                    native_mtp: placement_native_mtp,
                     window_rows: s1::S1_WINDOW_ROWS.min(ctx.max_seq),
-                    link_gbps,
                 })
             },
         )?
@@ -7684,7 +7602,6 @@ mod dir_template_provenance_tests {
 
 #[cfg(test)]
 mod qwen4_slowlink_tests {
-    use super::qwen4_slowlink_select;
     use hipfire_arch_qwen4::host_link::HostLink;
     use hipfire_arch_qwen4::slowlink_admission as s1;
     use std::cell::Cell;
@@ -7768,7 +7685,7 @@ mod qwen4_slowlink_tests {
         free: u64,
     ) -> (u32, u32, Result<Option<s1::SlowlinkProfile>, String>) {
         let (probes, builds) = (Cell::new(0), Cell::new(0));
-        let outcome = qwen4_slowlink_select(
+        let outcome = s1::select_profile(
             mode,
             &shape(arch),
             || {
@@ -7858,7 +7775,7 @@ mod qwen4_slowlink_tests {
     fn slowlink_ineligible_forced_loads_are_the_incumbent_not_an_error() {
         let mut load = shape("gfx1100");
         load.explicit_vram_layers = true;
-        let outcome = qwen4_slowlink_select(
+        let outcome = s1::select_profile(
             s1::SlowlinkMode::Force,
             &load,
             || unreachable!("probed"),
