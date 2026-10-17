@@ -440,7 +440,10 @@ pub(crate) fn attach_chunk_request(
 /// The session cache's checkpoint cadence (the stride of its boundary list and
 /// of the lineage split): a slow-link load's own `checkpoint_stride_rows`
 /// when it has a profile, else the forward's chunk, exactly as before.
-pub(crate) fn session_cadence(profile_stride: Option<usize>, forward_chunk: Option<usize>) -> Option<usize> {
+pub(crate) fn session_cadence(
+    profile_stride: Option<usize>,
+    forward_chunk: Option<usize>,
+) -> Option<usize> {
     match profile_stride {
         Some(stride) if stride > 0 => Some(stride),
         _ => forward_chunk,
@@ -452,7 +455,9 @@ pub(crate) fn session_cadence(profile_stride: Option<usize>, forward_chunk: Opti
 /// byte-for-byte unchanged and a slow-link scope can never alias an explicit
 /// chunk-1536 cadence or the incumbent chunk-8192 numerics.
 pub(crate) fn slowlink_scope_tag(profile: Option<(usize, usize)>) -> String {
-    profile.map_or_else(String::new, |(tile, cadence)| format!("/s1tile{tile}cut{cadence}"))
+    profile.map_or_else(String::new, |(tile, cadence)| {
+        format!("/s1tile{tile}cut{cadence}")
+    })
 }
 
 /// PLE token history after `tokens` follow `entry`.
@@ -770,7 +775,9 @@ impl Qwen4Bundle {
     /// admitted profile's checkpoint stride, else the forward chunk.
     pub(crate) fn session_cadence_rows(&self) -> Option<usize> {
         session_cadence(
-            self.slowlink.profile.map(|profile| profile.checkpoint_stride_rows),
+            self.slowlink
+                .profile
+                .map(|profile| profile.checkpoint_stride_rows),
             self.spec_chunk_rows(),
         )
     }
@@ -2463,7 +2470,8 @@ mod slowlink_txn_tests {
     }
 
     #[test]
-    fn session_pair_s1_checkpoint_cadence_shares_the_incumbent_boundaries_and_a_distinct_identity() {
+    fn session_pair_s1_checkpoint_cadence_shares_the_incumbent_boundaries_and_a_distinct_identity()
+    {
         let prompt = vec![1u32; 16384];
         // A slow-link load (mixer tile 1536, checkpoint cadence 8192) keeps
         // the incumbent chunk-8192 boundary list: one interior cut at 16K,
@@ -2471,11 +2479,21 @@ mod slowlink_txn_tests {
         let cadence = session_cadence(Some(8192), Some(1536)).unwrap();
         assert_eq!(cadence, 8192);
         let s1 = stride_boundaries(cadence, &prompt, None, 0, prompt.len());
-        let incumbent = stride_boundaries(session_cadence(None, Some(8192)).unwrap(), &prompt, None, 0, prompt.len());
+        let incumbent = stride_boundaries(
+            session_cadence(None, Some(8192)).unwrap(),
+            &prompt,
+            None,
+            0,
+            prompt.len(),
+        );
         assert_eq!(s1, [8192, 16384]);
         assert_eq!(s1, incumbent);
         assert_eq!(prompt_cuts_in(0, prompt.len(), &s1), [8192]);
-        assert_eq!(prompt_window_end(0, prompt.len(), &s1, PROMPT_TXN_MAX_CUTS), prompt.len(), "one window");
+        assert_eq!(
+            prompt_window_end(0, prompt.len(), &s1, PROMPT_TXN_MAX_CUTS),
+            prompt.len(),
+            "one window"
+        );
         // The incumbent loop (also a bypassed request on this load) stops at
         // the same session boundaries.
         let mut at = 0;
@@ -2487,13 +2505,22 @@ mod slowlink_txn_tests {
         assert_eq!(exits, s1);
         // The explicit chunk-1536 cadence would force ten interior cuts and
         // several windows at 16K: why the cadence is the profile's own.
-        let explicit = stride_boundaries(session_cadence(None, Some(1536)).unwrap(), &prompt, None, 0, prompt.len());
+        let explicit = stride_boundaries(
+            session_cadence(None, Some(1536)).unwrap(),
+            &prompt,
+            None,
+            0,
+            prompt.len(),
+        );
         assert_eq!(prompt_cuts_in(0, prompt.len(), &explicit).len(), 10);
         assert!(prompt_window_end(0, prompt.len(), &explicit, PROMPT_TXN_MAX_CUTS) < prompt.len());
         // Message-end cuts still union with the cadence (unchanged scheduling).
         let mut with_ends = prompt.clone();
         with_ends[2] = END;
-        assert_eq!(stride_boundaries(8192, &with_ends, Some(END), 0, with_ends.len()), [3, 8192, 16384]);
+        assert_eq!(
+            stride_boundaries(8192, &with_ends, Some(END), 0, with_ends.len()),
+            [3, 8192, 16384]
+        );
         // No profile: the forward chunk, as before; a zero stride is not a cadence.
         assert_eq!(session_cadence(None, Some(1536)), Some(1536));
         assert_eq!(session_cadence(Some(0), Some(1536)), Some(1536));

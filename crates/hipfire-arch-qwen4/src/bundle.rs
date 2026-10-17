@@ -1130,10 +1130,11 @@ impl Qwen4Bundle {
         // the PLE store's capacity must cover it, checked before any
         // allocation. Every other load keeps the incumbent request unchanged.
         let s1_tile = self.slowlink.profile.map(|profile| profile.tile_rows);
-        let requested = session_pair::attach_chunk_request(s1_tile, max_chunk, ple_rows_cap, || {
-            qwen4_prefill_chunk_requested(gpu, max_chunk)
-        })
-        .map_err(BundleError::Forward)?;
+        let requested =
+            session_pair::attach_chunk_request(s1_tile, max_chunk, ple_rows_cap, || {
+                qwen4_prefill_chunk_requested(gpu, max_chunk)
+            })
+            .map_err(BundleError::Forward)?;
         if requested == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 PLE row store cannot stage one chunk row".to_string(),
