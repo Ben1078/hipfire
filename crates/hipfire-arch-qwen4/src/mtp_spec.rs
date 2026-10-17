@@ -1185,13 +1185,18 @@ impl Qwen4Bundle {
         scratch: &mut dyn SpecScratch,
         read_picks: bool,
     ) -> Result<Vec<u32>, String> {
-        self.verify_block_rows(gpu, block, position, scratch, read_picks)
+        self.verify_block_rows(
+            &mut Qwen4Ops::Single(gpu),
+            block,
+            position,
+            scratch,
+            read_picks,
+        )
     }
 
-    /// Rewind a finished verify without committing: restore the scratch's
-    /// target snapshot ticket (the state the verify started from) and consume
-    /// it, the first step of `commit_prefix`'s partial-accept path minus the
-    /// replay.
+    /// Rewind a finished local verify without committing: take its target
+    /// ticket out of scratch, reject a mesh ticket, then restore and consume
+    /// the local snapshot (also releasing its arena entry on copy failure).
     pub(crate) fn dev_rollback_verify(
         &mut self,
         gpu: &mut Gpu,
@@ -1203,7 +1208,8 @@ impl Qwen4Bundle {
             .ok_or("Qwen4 rollback: scratch is not Qwen4SpecScratch")?
             .target_snapshot
             .take()
-            .ok_or("Qwen4 rollback: target snapshot is not active")?;
+            .ok_or("Qwen4 rollback: target snapshot is not active")?
+            .local()?;
         self.restore(gpu, snapshot)
             .map_err(|error| error.to_string())
     }
