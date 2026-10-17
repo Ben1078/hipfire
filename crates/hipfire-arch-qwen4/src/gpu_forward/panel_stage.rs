@@ -96,13 +96,16 @@ pub(crate) struct AliasExpert {
 /// expert id; `None` is an expert the layer does not hold (pruned).
 pub(crate) struct LayerExpertSources {
     layer: usize,
-    host_base: usize,
-    host_bytes: usize,
+    /// Host ranges `(base, bytes)`: one (gate/up and down share it) or two
+    /// (gate/up, then down: separate pinned allocations).
+    ranges: SmallVec<[(usize, usize); 2]>,
     experts: Vec<Option<ExpertSource>>,
     owner: Arc<dyn Any + Send + Sync>,
 }
 
 impl LayerExpertSources {
+    /// One host range holding every extent.
+    ///
     /// # Safety
     /// `[host_base, host_base + host_bytes)` must be readable pinned host
     /// memory that stays valid and unmodified for as long as `owner` (or a
@@ -114,24 +117,72 @@ impl LayerExpertSources {
         experts: Vec<Option<ExpertSource>>,
         owner: Arc<dyn Any + Send + Sync>,
     ) -> R<Self> {
+        let mut ranges = SmallVec::new();
+        ranges.push((host_base, host_bytes));
+        // SAFETY: forwarded from this function's contract.
+        unsafe { Self::build(layer, ranges, experts, owner) }
+    }
+
+    /// Gate/up extents in `gate_up` and down extents in `down`: two separate
+    /// pinned allocations. Extents of different ranges are never merged into
+    /// one copy, even when the ranges happen to be adjacent.
+    ///
+    /// # Safety
+    /// As [`Self::new`], for both `(base, bytes)` ranges.
+    pub(crate) unsafe fn new_split(
+        layer: usize,
+        gate_up: (usize, usize),
+        down: (usize, usize),
+        experts: Vec<Option<ExpertSource>>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
+        let mut ranges = SmallVec::new();
+        ranges.push(gate_up);
+        ranges.push(down);
+        // SAFETY: forwarded from this function's contract.
+        unsafe { Self::build(layer, ranges, experts, owner) }
+    }
+
+    /// `ranges[0]` bounds gate/up extents; `ranges[last]` bounds down extents.
+    unsafe fn build(
+        layer: usize,
+        ranges: SmallVec<[(usize, usize); 2]>,
+        experts: Vec<Option<ExpertSource>>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
         if experts.is_empty() || experts.len() > MAX_TABLE_EXPERTS {
             return Err(invalid(format!(
                 "panel sources layer {layer}: {} experts is outside 1..={MAX_TABLE_EXPERTS}",
                 experts.len()
             )));
         }
-        let host_end = host_base
-            .checked_add(host_bytes)
-            .ok_or_else(|| invalid(format!("panel sources layer {layer}: host range overflows")))?;
+        let mut ends = SmallVec::<[usize; 2]>::new();
+        for &(base, bytes) in &ranges {
+            ends.push(base.checked_add(bytes).ok_or_else(|| {
+                invalid(format!("panel sources layer {layer}: host range overflows"))
+            })?);
+        }
+        if ranges.len() == 2 {
+            let (a, b) = (ranges[0], ranges[1]);
+            if a.0 < ends[1] && b.0 < ends[0] {
+                return Err(invalid(format!(
+                    "panel sources layer {layer}: gate/up and down host ranges overlap"
+                )));
+            }
+        }
         for (id, expert) in experts.iter().enumerate() {
             let Some(expert) = expert else { continue };
-            for (name, extent) in [("gate_up", expert.gate_up), ("down", expert.down)] {
+            for (name, extent, range) in [
+                ("gate_up", expert.gate_up, 0),
+                ("down", expert.down, ranges.len() - 1),
+            ] {
+                let (host_base, host_bytes) = ranges[range];
                 let end = extent.addr.checked_add(extent.len).ok_or_else(|| {
                     invalid(format!(
                         "panel sources layer {layer} expert {id} {name} extent overflows"
                     ))
                 })?;
-                if extent.len == 0 || extent.addr < host_base || end > host_end {
+                if extent.len == 0 || extent.addr < host_base || end > ends[range] {
                     return Err(invalid(format!(
                         "panel sources layer {layer} expert {id} {name} extent [{:#x}, +{}) is outside the host owner [{host_base:#x}, +{host_bytes})",
                         extent.addr, extent.len
@@ -141,8 +192,7 @@ impl LayerExpertSources {
         }
         Ok(Self {
             layer,
-            host_base,
-            host_bytes,
+            ranges,
             experts,
             owner,
         })
@@ -162,35 +212,37 @@ impl LayerExpertSources {
         experts: &[Option<AliasExpert>],
         owner: Arc<dyn Any + Send + Sync>,
     ) -> R<Self> {
-        let translate = |id: usize, addr: usize| -> R<usize> {
-            addr.checked_sub(alias_base)
-                .filter(|offset| *offset < host_bytes)
-                .and_then(|offset| cpu_base.checked_add(offset))
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "panel sources layer {layer} expert {id}: alias {addr:#x} is outside the host owner [{alias_base:#x}, +{host_bytes})"
-                    ))
-                })
-        };
-        let mut out = Vec::with_capacity(experts.len());
-        for (id, expert) in experts.iter().enumerate() {
-            out.push(match expert {
-                None => None,
-                Some(e) => Some(ExpertSource {
-                    codec: e.codec,
-                    gate_up: ExpertExtent {
-                        addr: translate(id, e.gate_up_addr)?,
-                        len: e.gate_up_len,
-                    },
-                    down: ExpertExtent {
-                        addr: translate(id, e.down_addr)?,
-                        len: e.down_len,
-                    },
-                }),
-            });
-        }
+        let range = (cpu_base, alias_base, host_bytes);
+        let out = translate_alias(layer, range, range, experts)?;
         // SAFETY: forwarded from this function's contract.
         unsafe { Self::new(layer, cpu_base, host_bytes, out, owner) }
+    }
+
+    /// As [`Self::from_alias`] for an aggregate layer whose gate/up and down
+    /// payloads are two pinned allocations: `(cpu_base, alias_base, bytes)`
+    /// each. Every projection is translated and bounds-checked against its own
+    /// range only.
+    ///
+    /// # Safety
+    /// As [`Self::new_split`], for both CPU ranges.
+    pub(crate) unsafe fn from_alias_split(
+        layer: usize,
+        gate_up: (usize, usize, usize),
+        down: (usize, usize, usize),
+        experts: &[Option<AliasExpert>],
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> R<Self> {
+        let out = translate_alias(layer, gate_up, down, experts)?;
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            Self::new_split(
+                layer,
+                (gate_up.0, gate_up.2),
+                (down.0, down.2),
+                out,
+                owner,
+            )
+        }
     }
 
     pub(crate) fn layer(&self) -> usize {
@@ -205,8 +257,23 @@ impl LayerExpertSources {
         self.experts.get(id).and_then(Option::as_ref)
     }
 
+    /// Provenance: the gate/up (or only) host range `(base, bytes)`.
     pub(crate) fn host_range(&self) -> (usize, usize) {
-        (self.host_base, self.host_bytes)
+        self.ranges[0]
+    }
+
+    /// Every host range: one, or gate/up then down.
+    pub(crate) fn host_ranges(&self) -> &[(usize, usize)] {
+        &self.ranges
+    }
+
+    /// Range index of a projection's extents (0 gate/up; down is 1 when split).
+    fn range_of(&self, down: bool) -> usize {
+        if down {
+            self.ranges.len() - 1
+        } else {
+            0
+        }
     }
 
     /// The expert's own payload bytes (gate/up plus down), for receipt
@@ -219,6 +286,44 @@ impl LayerExpertSources {
     fn owner(&self) -> &Arc<dyn Any + Send + Sync> {
         &self.owner
     }
+}
+
+/// Translate alias addresses to CPU addresses; each projection against its own
+/// `(cpu_base, alias_base, bytes)` range.
+fn translate_alias(
+    layer: usize,
+    gate_up: (usize, usize, usize),
+    down: (usize, usize, usize),
+    experts: &[Option<AliasExpert>],
+) -> R<Vec<Option<ExpertSource>>> {
+    let translate = |id: usize, addr: usize, (cpu, alias, bytes): (usize, usize, usize)| {
+        addr.checked_sub(alias)
+            .filter(|offset| *offset < bytes)
+            .and_then(|offset| cpu.checked_add(offset))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "panel sources layer {layer} expert {id}: alias {addr:#x} is outside the host owner [{alias:#x}, +{bytes})"
+                ))
+            })
+    };
+    let mut out = Vec::with_capacity(experts.len());
+    for (id, expert) in experts.iter().enumerate() {
+        out.push(match expert {
+            None => None,
+            Some(e) => Some(ExpertSource {
+                codec: e.codec,
+                gate_up: ExpertExtent {
+                    addr: translate(id, e.gate_up_addr, gate_up)?,
+                    len: e.gate_up_len,
+                },
+                down: ExpertExtent {
+                    addr: translate(id, e.down_addr, down)?,
+                    len: e.down_len,
+                },
+            }),
+        });
+    }
+    Ok(out)
 }
 
 // ── groups and layout ────────────────────────────────────────────────
@@ -299,12 +404,15 @@ impl GroupLayout {
 }
 
 /// Lay out `experts` (ascending ids of `sources`). Extents are sorted by host
-/// address and merged where they touch or overlap; runs are packed back to back
-/// so that each run's page offset is congruent to its source address modulo
-/// [`EXTENT_ALIGN`], which preserves whatever alignment the source extents had.
+/// range then address and merged where they touch or overlap inside one range
+/// (never across the gate/up and down allocations of a split layer); runs are
+/// packed back to back so that each run's page offset is congruent to its
+/// source address modulo [`EXTENT_ALIGN`], which preserves whatever alignment
+/// the source extents had.
 fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<GroupLayout> {
-    // (addr, len, index in `experts`, is_down)
-    let mut items: SmallVec<[(usize, usize, usize, bool); 2 * MAX_GROUP_EXPERTS]> = SmallVec::new();
+    // (host range, addr, len, index in `experts`, is_down)
+    let mut items: SmallVec<[(usize, usize, usize, usize, bool); 2 * MAX_GROUP_EXPERTS]> =
+        SmallVec::new();
     for (index, &id) in experts.iter().enumerate() {
         let expert = sources.expert(id).ok_or_else(|| {
             invalid(format!(
@@ -312,36 +420,48 @@ fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<Group
                 sources.layer()
             ))
         })?;
-        items.push((expert.gate_up.addr, expert.gate_up.len, index, false));
-        items.push((expert.down.addr, expert.down.len, index, true));
+        items.push((
+            sources.range_of(false),
+            expert.gate_up.addr,
+            expert.gate_up.len,
+            index,
+            false,
+        ));
+        items.push((
+            sources.range_of(true),
+            expert.down.addr,
+            expert.down.len,
+            index,
+            true,
+        ));
     }
     items.sort_unstable();
     let overflow = || invalid("panel layout overflows");
-    // (source start, source end, page offset)
-    let mut runs: SmallVec<[(usize, usize, usize); 8]> = SmallVec::new();
+    // (host range, source start, source end, page offset)
+    let mut runs: SmallVec<[(usize, usize, usize, usize); 8]> = SmallVec::new();
     let mut item_run: SmallVec<[usize; 2 * MAX_GROUP_EXPERTS]> = SmallVec::new();
     let mut cursor = 0usize;
     let mut extent_bytes = 0usize;
-    for &(addr, len, _, _) in &items {
+    for &(range, addr, len, _, _) in &items {
         let end = addr.checked_add(len).ok_or_else(overflow)?;
         extent_bytes = extent_bytes.checked_add(len).ok_or_else(overflow)?;
         match runs.last_mut() {
-            Some(run) if addr <= run.1 => run.1 = run.1.max(end),
+            Some(run) if run.0 == range && addr <= run.2 => run.2 = run.2.max(end),
             _ => {
                 let dst = align_up(cursor, EXTENT_ALIGN)
                     .and_then(|aligned| aligned.checked_add(addr % EXTENT_ALIGN))
                     .ok_or_else(overflow)?;
-                runs.push((addr, end, dst));
+                runs.push((range, addr, end, dst));
             }
         }
         item_run.push(runs.len() - 1);
         let run = runs.last().expect("run exists");
-        cursor = run.2.checked_add(run.1 - run.0).ok_or_else(overflow)?;
+        cursor = run.3.checked_add(run.2 - run.1).ok_or_else(overflow)?;
     }
     let mut layout = GroupLayout {
         runs: runs
             .iter()
-            .map(|&(start, end, dst)| CopyRun {
+            .map(|&(_, start, end, dst)| CopyRun {
                 src: start,
                 dst,
                 len: end - start,
@@ -352,8 +472,8 @@ fn plan_group_layout(experts: &[usize], sources: &LayerExpertSources) -> R<Group
         used: cursor,
         extent_bytes,
     };
-    for (&(addr, _, index, down), &run) in items.iter().zip(&item_run) {
-        let (start, _, dst) = runs[run];
+    for (&(_, addr, _, index, down), &run) in items.iter().zip(&item_run) {
+        let (_, start, _, dst) = runs[run];
         let offset = dst + (addr - start);
         if down {
             layout.down[index] = offset;
@@ -2662,6 +2782,113 @@ mod slowlink_ring {
         assert_eq!(ring.backend.ops.len(), ops);
         assert!(!ring.is_quarantined());
         assert_eq!(ring.free.len(), 1, "the page stayed free");
+    }
+
+    #[test]
+    fn slowlink_ring_split_ranges_translate_per_projection_and_never_merge() {
+        let (a_gu, a_dn) = (0x5000_0000usize, 0x6000_0000usize);
+        let c_gu = HOST;
+        // Numerically adjacent CPU ranges: a merge across them would be tempting.
+        let c_dn = HOST + 64 * GU;
+        let e = |id: usize| AliasExpert {
+            codec: PanelCodec(1),
+            gate_up_addr: a_gu + id * GU,
+            gate_up_len: GU,
+            down_addr: a_dn + id * DN,
+            down_len: DN,
+        };
+        let experts: Vec<Option<AliasExpert>> = (0..8).map(|id| Some(e(id))).collect();
+        // SAFETY: never dereferenced.
+        let s = unsafe {
+            LayerExpertSources::from_alias_split(
+                3,
+                (c_gu, a_gu, 64 * GU),
+                (c_dn, a_dn, 64 * DN),
+                &experts,
+                Arc::new(0u8),
+            )
+        }
+        .unwrap();
+        assert_eq!(s.host_ranges(), &[(c_gu, 64 * GU), (c_dn, 64 * DN)]);
+        assert_eq!(s.expert(2).unwrap().gate_up.addr, c_gu + 2 * GU);
+        assert_eq!(s.expert(2).unwrap().down.addr, c_dn + 2 * DN);
+        let layout = plan_group_layout(&[0, 1, 2, 3], &s).unwrap();
+        assert_eq!(layout.runs.len(), 2);
+        assert_eq!(layout.runs[0].src, c_gu);
+        assert_eq!(layout.runs[0].len, 4 * GU);
+        assert_eq!(layout.runs[1].src, c_dn);
+        assert_eq!(layout.runs[1].len, 4 * DN);
+        assert_eq!(layout.submitted_bytes(), layout.extent_bytes);
+        assert_eq!(layout.gate_up[1] - layout.gate_up[0], GU);
+        assert_eq!(layout.down[1] - layout.down[0], DN);
+        // Adjacent ranges: the last gate/up byte and the first down byte stay
+        // two copies even though their CPU addresses touch.
+        let touching = vec![Some(ExpertSource {
+            codec: PanelCodec(1),
+            gate_up: ExpertExtent { addr: HOST, len: GU },
+            down: ExpertExtent { addr: HOST + GU, len: DN },
+        })];
+        // SAFETY: never dereferenced.
+        let one = unsafe {
+            LayerExpertSources::new(0, HOST, GU + DN, touching.clone(), Arc::new(0u8))
+        }
+        .unwrap();
+        assert_eq!(plan_group_layout(&[0], &one).unwrap().runs.len(), 1);
+        // SAFETY: never dereferenced.
+        let split = unsafe {
+            LayerExpertSources::new_split(
+                0,
+                (HOST, GU),
+                (HOST + GU, DN),
+                touching,
+                Arc::new(0u8),
+            )
+        }
+        .unwrap();
+        assert_eq!(plan_group_layout(&[0], &split).unwrap().runs.len(), 2);
+        // A projection naming the other projection's range is refused, as are
+        // overlapping ranges.
+        let mut bad = e(0);
+        bad.down_addr = a_gu;
+        // SAFETY: construction must fail.
+        assert!(unsafe {
+            LayerExpertSources::from_alias_split(
+                0,
+                (c_gu, a_gu, 64 * GU),
+                (c_dn, a_dn, 64 * DN),
+                &[Some(bad)],
+                Arc::new(0u8),
+            )
+        }
+        .is_err());
+        // SAFETY: construction must fail.
+        assert!(unsafe {
+            LayerExpertSources::new_split(
+                0,
+                (HOST, 2 * GU),
+                (HOST + GU, 2 * DN),
+                vec![None],
+                Arc::new(0u8),
+            )
+        }
+        .is_err());
+        // Direct extents are checked against their own range only.
+        let swapped = vec![Some(ExpertSource {
+            codec: PanelCodec(1),
+            gate_up: ExpertExtent { addr: HOST + GU, len: DN },
+            down: ExpertExtent { addr: HOST, len: GU },
+        })];
+        // SAFETY: construction must fail.
+        assert!(unsafe {
+            LayerExpertSources::new_split(
+                0,
+                (HOST, GU),
+                (HOST + GU, DN),
+                swapped,
+                Arc::new(0u8),
+            )
+        }
+        .is_err());
     }
 
     #[test]
