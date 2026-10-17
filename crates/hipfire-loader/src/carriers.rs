@@ -1948,10 +1948,8 @@ fn load_qwen4_rank_scoped(
     // device is classified without a copy) and is 8192 only on a narrow
     // discrete link, so the placement cedes resident layers for the wider
     // chunk there. Every other arch and any explicit value never probes.
-    let placement_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-        &*ctx.gpu,
-        ctx.max_seq,
-    );
+    let placement_chunk =
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&*ctx.gpu, ctx.max_seq);
     // What `auto` sizes its placement from: free VRAM, the non-expert and
     // per-layer expert bytes, and the reserve (with its native MTP and
     // QSA gather parts) at `placement_chunk`. Unified memory charges context
@@ -1959,7 +1957,17 @@ fn load_qwen4_rank_scoped(
     // `max_seq`), never their virtual extent; a discrete card charges legacy
     // storage of `max_seq` whatever the backend, so VMM growth stays inside
     // the reserve and placement matches legacy.
-    let auto_inputs_at = |chunk_rows: usize| -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
+    let auto_inputs_at = |chunk_rows: usize| -> Result<
+        (
+            u64,
+            u64,
+            u64,
+            residency::AutoReserve,
+            Option<u64>,
+            Option<u64>,
+        ),
+        String,
+    > {
         let (free, _) = ctx
             .gpu
             .device_mem_info()
@@ -2782,7 +2790,8 @@ fn load_qwen4_rank_scoped(
             write!(&mut digest_hex, "{byte:02x}").expect("writing to a String");
         }
         let sidecar = hotset.as_ref().expect("a hotset plan has a sidecar");
-        lease.bind_hotset_sidecar_sha256(sidecar.sha256())
+        lease
+            .bind_hotset_sidecar_sha256(sidecar.sha256())
             .map_err(|error| format!("hotset numerical identity: {error}"))?;
         eprintln!(
             "  qwen4 expert hot set: {} sha256 {}, budget {} MiB, {} experts in VRAM ({} MiB), {} host-mapped ({} MiB), generation {}, digest {}, bound to base {} B, index sha256 {}",
@@ -7144,12 +7153,8 @@ mod qwen4_ple_load_fill_tests {
             table
         );
         // Just enough RAM for the whole table plus the reserve.
-        let (budget, _) = ple_prewarm_budget_for(
-            Auto,
-            Some(table + PLE_PREWARM_RESERVE_BYTES),
-            false,
-            true,
-        );
+        let (budget, _) =
+            ple_prewarm_budget_for(Auto, Some(table + PLE_PREWARM_RESERVE_BYTES), false, true);
         assert_eq!(budget, table);
         assert_eq!(ple_resident_bytes(budget, 0, table), table);
         // One MiB short of that: a partial prewarm that keeps the reserve.
@@ -7209,7 +7214,10 @@ mod qwen4_ple_load_fill_tests {
             ple_prewarm_budget_for(Auto, Some(PLE_PREWARM_RESERVE_BYTES - 1), false, true),
             (0, false)
         );
-        assert_eq!(ple_prewarm_budget_for(Auto, Some(0), false, true), (0, false));
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(0), false, true),
+            (0, false)
+        );
         assert_eq!(ple_prewarm_budget_for(Auto, None, false, true), (0, false));
         assert_eq!(ple_resident_bytes(0, 0, 27 * GIB), 0);
         // One byte over the reserve is a one-byte budget.
@@ -7545,6 +7553,7 @@ mod qwen4_slowlink_tests {
             baseline_layers: 10,
             fixed_state_bytes: FIXED_STATE,
             pending_save_bytes: PENDING_SAVE,
+            checkpoint_stride_rows: 8192,
             window_rows: s1::S1_WINDOW_ROWS,
             link_gbps,
         }
@@ -7639,7 +7648,10 @@ mod qwen4_slowlink_tests {
         );
         assert_eq!(builds, 1);
         let error = outcome.unwrap_err();
-        assert!(error.contains("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1"), "{error}");
+        assert!(
+            error.contains("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1"),
+            "{error}"
+        );
         assert!(error.contains("keeps 9 of the required 10"), "{error}");
         assert!(error.contains(&(LAYER - 1).to_string()), "{error}");
     }

@@ -845,6 +845,10 @@ pub struct AdmissionInputs {
     pub fixed_state_bytes: u64,
     /// Entry `pending` hidden copy of a native-MTP request (0 for AR).
     pub pending_save_bytes: u64,
+    /// The incumbent's requested prefill chunk resolved at load: the non-S1
+    /// checkpoint cadence (8192 on the narrow target). NEVER used for
+    /// placement or scratch; those stay on the 1,536-row tile.
+    pub checkpoint_stride_rows: usize,
     pub window_rows: usize,
     pub link_gbps: f64,
 }
@@ -869,13 +873,37 @@ pub struct SlowlinkProfile {
     /// that can exceed the real incumbent's layer count. Never a measured or
     /// gating figure; the S1 floor ([`S1_MIN_RESIDENT_LAYERS`]) does not read it.
     pub baseline_layers: usize,
+    /// The non-S1 checkpoint cadence (see [`AdmissionInputs::checkpoint_stride_rows`]),
+    /// immutable for the life of the load. Never used for placement or scratch.
+    pub checkpoint_stride_rows: usize,
     pub link_gbps: f64,
+}
+
+/// Chunk exits strictly inside `(entry, end)` of an incumbent chunk-major
+/// prefill with chunk `stride`, relative to `entry`: `entry + k * stride`.
+/// A zero stride has no cadence.
+pub fn incumbent_checkpoint_boundaries(entry: usize, end: usize, stride: usize) -> Vec<usize> {
+    if stride == 0 {
+        return Vec::new();
+    }
+    (1..)
+        .map(|step| entry.saturating_add(step.saturating_mul(stride)))
+        .take_while(|&position| position < end)
+        .collect()
 }
 
 impl SlowlinkProfile {
     /// The one number placement charges for this profile.
     pub fn reserve_bytes(&self) -> Result<u64, String> {
         self.census.total()
+    }
+
+    /// Interior checkpoint boundaries of a prefill from `entry` to `end` at the
+    /// preserved non-S1 cadence ([`Self::checkpoint_stride_rows`]): the same
+    /// positions the incumbent chunk-major prefill exits at, whatever the S1
+    /// mixer tile is.
+    pub fn checkpoint_boundaries(&self, entry: usize, end: usize) -> Vec<usize> {
+        incumbent_checkpoint_boundaries(entry, end, self.checkpoint_stride_rows)
     }
 
     /// Windows a request of `rows` rows runs ([`S1_WINDOW_ROWS`] each, the
@@ -1017,6 +1045,7 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
         census,
         resident_layers: layers,
         baseline_layers: inputs.baseline_layers,
+        checkpoint_stride_rows: inputs.checkpoint_stride_rows,
         link_gbps: inputs.link_gbps,
     })
 }
@@ -1039,6 +1068,11 @@ pub struct LoadFacts<'a> {
     pub state_format: crate::Qwen4StateFormat,
     pub native_mtp: bool,
     pub window_rows: usize,
+    /// The incumbent's requested prefill chunk
+    /// ([`crate::gpu_forward::qwen4_prefill_chunk_requested`], 8192 on a narrow
+    /// gfx1100 link) resolved at load: the non-S1 checkpoint cadence an S1
+    /// load preserves. Never a placement or scratch input.
+    pub checkpoint_stride_rows: usize,
 }
 
 /// [`AdmissionInputs`] from [`LoadFacts`] and the measured narrow `link_gbps`:
@@ -1108,6 +1142,7 @@ pub fn load_admission_inputs(
         baseline_layers,
         fixed_state_bytes,
         pending_save_bytes,
+        checkpoint_stride_rows: facts.checkpoint_stride_rows,
         window_rows: facts.window_rows,
         link_gbps,
     })
@@ -1292,6 +1327,9 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
         state_format: load.state_format,
         native_mtp: load.native_mtp,
         window_rows: S1_WINDOW_ROWS.min(load.max_seq),
+        // The incumbent's own checkpoint cadence: the requested chunk resolved
+        // once, exactly as the non-S1 load sizes and chunks with it.
+        checkpoint_stride_rows: placement_chunk,
     })
 }
 
@@ -1434,9 +1472,36 @@ mod tests {
             baseline_layers: 10,
             fixed_state_bytes: 64 * MIB,
             pending_save_bytes: 4 * 2560 * 4,
+            checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
         }
+    }
+
+    /// The non-S1 checkpoint cadence survives an attached S1 profile: the
+    /// stride is the incumbent's requested chunk (8192 on the narrow target),
+    /// never the 1,536-row mixer tile, so a 16K prompt has the same single
+    /// interior boundary with S1 attached and without it.
+    #[test]
+    fn slowlink_admission_checkpoint_cadence_is_the_incumbent_chunk_not_the_tile() {
+        let profile = admit(&inputs(free_for(&inputs(0), 10))).unwrap();
+        assert_eq!(profile.tile_rows, 1536);
+        assert_eq!(profile.checkpoint_stride_rows, 8192);
+        let attached = profile.checkpoint_boundaries(0, 16384);
+        let incumbent = incumbent_checkpoint_boundaries(0, 16384, 8192);
+        assert_eq!(attached, incumbent);
+        assert_eq!(attached, vec![8192], "one interior boundary at 16K");
+        // Relative to the entry position, never an absolute multiple.
+        assert_eq!(profile.checkpoint_boundaries(4096, 16384), vec![12288]);
+        // A short prompt or an exact stride has no interior boundary.
+        assert!(profile.checkpoint_boundaries(0, 8192).is_empty());
+        assert!(profile.checkpoint_boundaries(0, 100).is_empty());
+        // The mixer tile would have placed ten interior boundaries: it is
+        // never the checkpoint cadence.
+        assert_eq!(incumbent_checkpoint_boundaries(0, 16384, S1_TILE_ROWS).len(), 10);
+        assert_ne!(attached, incumbent_checkpoint_boundaries(0, 16384, S1_TILE_ROWS));
+        // A zero stride has no cadence rather than looping.
+        assert!(incumbent_checkpoint_boundaries(0, 16384, 0).is_empty());
     }
 
     fn census_total(inputs: &AdmissionInputs) -> u64 {
@@ -1858,6 +1923,7 @@ mod tests {
             baseline_layers: 0,
             fixed_state_bytes: stage,
             pending_save_bytes: 0,
+            checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
         };
