@@ -926,38 +926,43 @@ impl SlowlinkProfile {
     }
 }
 
-/// The joint S1 placement: charge the tile, HC arena, route storage, A4 sidecars, page store
-/// and boundary state together, then count the layers that remain. Refuses,
-/// before anything is allocated, with the exact deficit when fewer than
-/// [`S1_MIN_RESIDENT_LAYERS`] stay resident.
-pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDecline> {
-    let geometry_error = SlowlinkDecline::Geometry;
+/// The layouts and the term-by-term census of an S1 profile for `inputs`,
+/// exactly what [`admit`] charges and the forward allocates from. Pure; the
+/// hold ledger reads it too, so no figure is computed twice.
+pub fn census_of(
+    inputs: &AdmissionInputs,
+) -> Result<(PanelPageLayout, PromptArenaLayout, SlowlinkCensus), String> {
     let window_rows = inputs.window_rows;
     let pages = PanelPageLayout::new(
         inputs.geometry.num_experts,
         inputs.gate_up_layer_bytes,
         inputs.down_layer_bytes,
-    )
-    .map_err(geometry_error)?;
-    let arena = PromptArenaLayout::new(&inputs.geometry, window_rows, S1_TILE_ROWS)
-        .map_err(SlowlinkDecline::Geometry)?;
-    let census = (|| -> Result<SlowlinkCensus, String> {
-        Ok(SlowlinkCensus {
-            ring: pages.ring_bytes()?,
-            lookahead: pages.lookahead_bytes()?,
-            route_storage: route_storage_bytes(&inputs.geometry, window_rows)?,
-            a4_sidecars: a4_sidecar_bytes(&inputs.geometry, window_rows)?,
-            group_scatter: group_scatter_bytes(&inputs.geometry, window_rows)?,
-            arena: arena.total_bytes,
-            boundary_state: checked_mul(
-                S1_MAX_BOUNDARY_SNAPSHOTS as u64,
-                inputs.fixed_state_bytes,
-                "boundary state",
-            )
-            .and_then(|stages| checked_add(stages, inputs.pending_save_bytes, "boundary state"))?,
-        })
-    })()
-    .map_err(SlowlinkDecline::Geometry)?;
+    )?;
+    let arena = PromptArenaLayout::new(&inputs.geometry, window_rows, S1_TILE_ROWS)?;
+    let census = SlowlinkCensus {
+        ring: pages.ring_bytes()?,
+        lookahead: pages.lookahead_bytes()?,
+        route_storage: route_storage_bytes(&inputs.geometry, window_rows)?,
+        a4_sidecars: a4_sidecar_bytes(&inputs.geometry, window_rows)?,
+        group_scatter: group_scatter_bytes(&inputs.geometry, window_rows)?,
+        arena: arena.total_bytes,
+        boundary_state: checked_mul(
+            S1_MAX_BOUNDARY_SNAPSHOTS as u64,
+            inputs.fixed_state_bytes,
+            "boundary state",
+        )
+        .and_then(|stages| checked_add(stages, inputs.pending_save_bytes, "boundary state"))?,
+    };
+    Ok((pages, arena, census))
+}
+
+/// The joint S1 placement: charge the tile, HC arena, route storage, A4 sidecars, page store
+/// and boundary state together, then count the layers that remain. Refuses,
+/// before anything is allocated, with the exact deficit when fewer than
+/// [`S1_MIN_RESIDENT_LAYERS`] stay resident.
+pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDecline> {
+    let (pages, arena, census) = census_of(inputs).map_err(SlowlinkDecline::Geometry)?;
+    let window_rows = inputs.window_rows;
     let charges = crate::expert_residency::PlacementCharges::new(inputs.layer_expert_bytes, false)
         .and_then(|charges| census.total().map(|bytes| charges.with_slowlink(bytes)))
         .map_err(SlowlinkDecline::Geometry)?;
@@ -1818,6 +1823,162 @@ mod tests {
         assert!(PromptArenaLayout::new(&geometry, 0, S1_TILE_ROWS).is_err());
         assert!(PromptArenaLayout::new(&geometry, 1, 0).is_err());
         assert!(PromptArenaLayout::new(&geometry, usize::MAX / 2, S1_TILE_ROWS).is_err());
+    }
+
+    /// Hold 1 residency ledger on the REAL compact Flash-Next config (the
+    /// persisted HFQ geometry): Full scratch, gfx1100 (no compact plan), a
+    /// 16,640-token context, the 1,536-row tile, Q8 GDN and Q8 QSA, no MTP.
+    /// Calls the actual census helpers (no reimplemented formula) and prints
+    /// one structured JSON ledger (`--nocapture`). The legacy context is the
+    /// discrete card's charge; the VMM 2 MiB row is conditional on the backend
+    /// the load actually observes.
+    #[test]
+    fn slowlink_residency_hold1_ledger_for_the_real_mq4_fixture() {
+        use crate::gpu_forward::Qwen4ForwardScratchMode::Full;
+        use rdna_compute::tensor_ops::QsaKvFormat;
+        let config = crate::config::compact_test_config();
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let (max_seq, tile) = (16_640usize, S1_TILE_ROWS);
+
+        // S1 layout: the known boundary stage and the known census total.
+        let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
+        assert_eq!(stage, 34_128_016, "target-only boundary stage (no MTP)");
+        let inputs = AdmissionInputs {
+            geometry: ModelGeometry::from_config(&config).unwrap(),
+            free: 0,
+            non_expert: 0,
+            layer_expert_bytes: GATE_UP_LAYER + DOWN_LAYER,
+            gate_up_layer_bytes: GATE_UP_LAYER,
+            down_layer_bytes: DOWN_LAYER,
+            trunk_layers: config.num_hidden_layers,
+            base_reserve: 0,
+            baseline_layers: 0,
+            fixed_state_bytes: stage,
+            pending_save_bytes: 0,
+            window_rows: S1_WINDOW_ROWS.min(max_seq),
+            link_gbps: 7.09,
+        };
+        let (pages, arena, census) = census_of(&inputs).unwrap();
+        let s1_total = census.total().unwrap();
+        assert_eq!(s1_total, 2_542_846_784, "S1 layout, no MTP");
+        assert_eq!(census.boundary_state, 4 * 34_128_016);
+        assert_eq!(pages.total_pages(), 18);
+
+        // The incumbent's tile reserve terms from the real helpers.
+        let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+            hidden_size: config.hidden_size,
+            moe_intermediate_size: config.moe_intermediate_size,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hc_count: config.hc_count,
+            hc_lowrank: config.hc_lowrank,
+            dense_gdn: false,
+            routed_i4: true,
+            include_short_tails: true,
+        };
+        let workspace = rdna_compute::scratch::qwen4_prefill_workspace_terms(tile, &dims)
+            .expect("workspace terms");
+        let workspace_total: u64 = workspace.iter().map(|(_, bytes)| *bytes).sum();
+        let forward = crate::gpu_forward::qwen4_forward_device_bytes(&config, tile, Full).unwrap();
+        let forward_census = crate::expert_residency::forward_census_scope(
+            &config,
+            tile,
+            Full,
+            &crate::weights::Qwen4BandScope::single(&config),
+        )
+        .unwrap();
+        assert_eq!(forward_census.total().unwrap(), forward);
+        let safety = crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES;
+
+        let mut contexts = Vec::new();
+        for (label, backend, granularity, conditional) in [
+            ("legacy", crate::Qwen4KvBackend::Legacy, 1usize, false),
+            ("vmm_2mib", crate::Qwen4KvBackend::Vmm, 2usize << 20, true),
+        ] {
+            let census_context =
+                crate::Qwen4ContextCommit::new(backend, max_seq, max_seq, granularity);
+            let reserve_context = crate::Qwen4ContextCommit::for_expert_reserve(
+                backend,
+                false,
+                max_seq,
+                tile,
+                granularity,
+            );
+            let state =
+                crate::expert_residency::state_census(&config, format, &census_context, tile, Full)
+                    .unwrap();
+            let historical = crate::expert_residency::auto_vram_reserve(
+                &config,
+                &reserve_context,
+                tile,
+                Full,
+                format.layout(),
+                None,
+                None,
+            )
+            .unwrap();
+            contexts.push(serde_json::json!({
+                "backend": label,
+                "conditional_on_observed_backend": conditional,
+                "qsa_context_bytes": state.qsa_context,
+                "state_bytes": state.state,
+                "forward_bytes": state.forward,
+                "historical_reserve_bytes": historical,
+            }));
+        }
+
+        let ledger = serde_json::json!({
+            "fixture": {
+                "config": "compact_test_config",
+                "arch": "gfx1100",
+                "scratch_mode": "Full",
+                "max_seq": max_seq,
+                "tile_rows": tile,
+                "window_rows": inputs.window_rows,
+                "state_format": { "qsa": "q8", "gdn": "q8" },
+                "native_mtp": false,
+            },
+            "tile": {
+                "forward_device_bytes": forward,
+                "forward_census": {
+                    "stage_shared": forward_census.stage_shared,
+                    "band_local": forward_census.band_local,
+                    "input_only": forward_census.input_only,
+                    "output_only": forward_census.output_only,
+                },
+                "workspace_total_bytes": workspace_total,
+                "workspace_terms": workspace
+                    .iter()
+                    .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
+                    .collect::<Vec<_>>(),
+            },
+            "contexts": contexts,
+            "safety_margin_bytes": safety,
+            "s1": {
+                "total_bytes": s1_total,
+                "terms": census
+                    .terms()
+                    .iter()
+                    .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
+                    .collect::<Vec<_>>(),
+                "boundary_stage_bytes": stage,
+                "boundary_stages": S1_MAX_BOUNDARY_SNAPSHOTS,
+                "hc_arena_bytes": arena.total_bytes,
+                "page_payload_bound_bytes": pages.payload_bytes,
+                "page_bytes": pages.page_bytes,
+                "page_count": pages.total_pages(),
+                "pinned_host_staging_bytes": pages.host_staging_bytes,
+            },
+        });
+        println!(
+            "SLOWLINK_RESIDENCY_LEDGER {}",
+            serde_json::to_string(&ledger).unwrap()
+        );
     }
 
     /// The fixture every layout test sizes from is the real MQ4 model, not a
