@@ -2338,8 +2338,7 @@ impl Qwen4State {
             .hc_count
             .checked_mul(config.hidden_size)?
             .checked_mul(f32_bytes)?;
-        let (gdn_layers, qsa_layers) =
-            scope_layer_counts(config, &Qwen4BandScope::single(config));
+        let (gdn_layers, qsa_layers) = scope_layer_counts(config, &Qwen4BandScope::single(config));
         recurrent
             .checked_add(conv)?
             .checked_mul(gdn_layers)?
@@ -3356,9 +3355,15 @@ impl Qwen4State {
     /// currently holds: the private per-layer cursor of a layer-major prompt
     /// window (the layer's own tile wrote them), read for a cut stage.
     pub(crate) fn qsa_cursor(&self, slot: usize) -> Option<(usize, usize, usize, usize, usize)> {
-        self.qsa
-            .get(slot)
-            .map(|q| (q.full_len, q.raw_len, q.pooled_len, q.selected_len, q.position))
+        self.qsa.get(slot).map(|q| {
+            (
+                q.full_len,
+                q.raw_len,
+                q.pooled_len,
+                q.selected_len,
+                q.position,
+            )
+        })
     }
 
     /// Whether every QSA layer's private cursor reached the end of a
@@ -3378,7 +3383,11 @@ impl Qwen4State {
                 ("QSA position at prompt commit", layer.position),
             ] {
                 if actual != end {
-                    return Err(StateError::Length { what, expected: end, actual });
+                    return Err(StateError::Length {
+                        what,
+                        expected: end,
+                        actual,
+                    });
                 }
             }
             if layer.pooled_len != end / self.qsa_compress {

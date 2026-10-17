@@ -1342,7 +1342,11 @@ impl Qwen4MoeLayerRuntime {
             return Err("expert-keep pruning mask");
         }
         if let Some(slab) = self.slab.as_ref() {
-            if slab.codecs.iter().any(|codec| *codec != crate::expert_arena::CODEC_MQ4) {
+            if slab
+                .codecs
+                .iter()
+                .any(|codec| *codec != crate::expert_arena::CODEC_MQ4)
+            {
                 return Err("mixed-codec slab layer");
             }
         }
@@ -1384,13 +1388,15 @@ impl Qwen4MoeLayerRuntime {
     /// one host range; the aggregate packed layer has one per projection.
     pub(crate) fn s1_host_sources(
         &self,
-        gpu: &Gpu,
+        gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         layer: usize,
     ) -> Result<panel_stage::LayerExpertSources, Qwen4GpuForwardError> {
         use panel_stage::{AliasExpert, LayerExpertSources, PanelCodec};
         self.s1_layer_check().map_err(|why| {
-            invalid(format!("slow-link layer {layer} is not S1 qualified: {why}"))
+            invalid(format!(
+                "slow-link layer {layer} is not S1 qualified: {why}"
+            ))
         })?;
         if !self.host_mapped {
             return Err(invalid(format!(
@@ -1399,13 +1405,16 @@ impl Qwen4MoeLayerRuntime {
         }
         let mut aliases: Vec<Option<AliasExpert>> = Vec::with_capacity(self.experts.len());
         for id in 0..self.experts.len() {
-            aliases.push(self.s1_expert_bytes(id).map(|(gate_up_len, down_len)| AliasExpert {
-                codec: PanelCodec(0),
-                gate_up_addr: self.expert_gate_up_entries[id],
-                gate_up_len,
-                down_addr: self.expert_down_entries[id],
-                down_len,
-            }));
+            aliases.push(
+                self.s1_expert_bytes(id)
+                    .map(|(gate_up_len, down_len)| AliasExpert {
+                        codec: PanelCodec(0),
+                        gate_up_addr: self.expert_gate_up_entries[id],
+                        gate_up_len,
+                        down_addr: self.expert_down_entries[id],
+                        down_len,
+                    }),
+            );
         }
         let weights = bundle
             .weights
@@ -1414,31 +1423,43 @@ impl Qwen4MoeLayerRuntime {
             .ffn
             .moe()
             .ok_or_else(|| invalid(format!("slow-link layer {layer} has no MoE weights")))?;
-        let host_range = |tensor: &GpuTensor| -> Result<(usize, usize, usize), Qwen4GpuForwardError> {
+        // Each pinned owner's range is paired with a PHYSICAL keepalive: a lease
+        // that holds the `hipHostMalloc` allocation until the last copy source
+        // drops, whatever happens to the weights, the registry or the `Gpu`.
+        fn leased_range(
+            gpu: &mut Gpu,
+            tensor: &GpuTensor,
+            layer: usize,
+        ) -> Result<((usize, usize, usize), rdna_compute::HostAllocLease), Qwen4GpuForwardError> {
+            let lease = gpu.lease_host_owner(tensor)?;
             let host = gpu.host_bytes(tensor).ok_or_else(|| {
                 invalid(format!(
                     "slow-link layer {layer}: a host expert owner has no pinned host bytes"
                 ))
             })?;
-            Ok((host.as_ptr() as usize, tensor.buf.as_ptr() as usize, host.len()))
-        };
-        // The pinned weight allocation outlives the forward (the bundle frees
-        // the forward, which drains the ring, before the weights), so the
-        // unit owner only marks provenance.
-        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+            if host.as_ptr() as usize != lease.host_ptr() as usize
+                || lease.device_alias() != tensor.buf.as_ptr() as usize
+            {
+                return Err(invalid(format!(
+                    "slow-link layer {layer}: the host lease names another allocation than its owner tensor"
+                )));
+            }
+            Ok(((host.as_ptr() as usize, lease.device_alias(), host.len()), lease))
+        }
         // SAFETY: each range is the pinned host allocation of the layer's own
-        // resident weight tensor, immutable and alive until `Qwen4Bundle::free_gpu`
-        // (after this forward and its ring are freed); every extent is bounds
-        // checked against its range by the constructor.
+        // resident weight tensor, immutable for as long as the lease (the
+        // sources' `owner`) lives; every extent is bounds checked against its
+        // range by the constructor.
         match (self.slab.as_ref(), weights.expert_arena.as_ref()) {
             (Some(slab), Some(arena_ref)) => {
                 let tensor = bundle.weights.resident(arena_ref)?;
-                let (cpu_base, _, host_len) = host_range(tensor)?;
-                if host_len < slab.arena_bytes {
+                let ((cpu_base, alias_base, host_len), lease) = leased_range(gpu, tensor, layer)?;
+                if host_len < slab.arena_bytes || alias_base != slab.arena_base {
                     return Err(invalid(format!(
-                        "slow-link layer {layer}: host slab arena is shorter than its plan"
+                        "slow-link layer {layer}: host slab arena does not match its plan"
                     )));
                 }
+                let owner = lease.keepalive();
                 unsafe {
                     LayerExpertSources::from_alias(
                         layer,
@@ -1451,8 +1472,12 @@ impl Qwen4MoeLayerRuntime {
                 }
             }
             _ => {
-                let gate_up = host_range(bundle.weights.resident(&weights.experts_gate_up)?)?;
-                let down = host_range(bundle.weights.resident(&weights.experts_down)?)?;
+                let (gate_up, gate_up_lease) =
+                    leased_range(gpu, bundle.weights.resident(&weights.experts_gate_up)?, layer)?;
+                let (down, down_lease) =
+                    leased_range(gpu, bundle.weights.resident(&weights.experts_down)?, layer)?;
+                let owner: Arc<dyn std::any::Any + Send + Sync> =
+                    Arc::new((gate_up_lease, down_lease));
                 unsafe {
                     LayerExpertSources::from_alias_split(layer, gate_up, down, &aliases, owner)
                 }
@@ -3875,10 +3900,10 @@ pub(crate) struct Qwen4ExpertStage {
     slab: Option<slab_stage::SlabStageMeta>,
 }
 
-mod slab_stage;
 /// S1 slow-link layer-major prefill transport: the bounded expert page ring
 /// and the layer-ahead weight schedule ([`crate::slowlink_prefill`]).
 pub(crate) mod panel_stage;
+mod slab_stage;
 
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
@@ -7029,7 +7054,8 @@ impl Qwen4GpuForward {
         cpu_splice::host_exec_identity(
             &cpu_all,
             &split,
-            tier.as_ref().map(|(digest, sidecar)| (digest, sidecar.as_deref())),
+            tier.as_ref()
+                .map(|(digest, sidecar)| (digest, sidecar.as_deref())),
         )
     }
     /// Configure the D2 parity/timing hooks of every armed layer (lab only).
@@ -7573,10 +7599,7 @@ impl Qwen4GpuForward {
                 "HIPFIRE_QWEN4_TOKEN_READBACK_EARLY",
                 true,
             ),
-            cpu_deferred_experts: moe
-                .iter()
-                .flatten()
-                .any(|layer| layer.cpu_deferred_experts),
+            cpu_deferred_experts: moe.iter().flatten().any(|layer| layer.cpu_deferred_experts),
             cpu_split_layers: moe
                 .iter()
                 .flatten()
@@ -8104,7 +8127,10 @@ impl Qwen4GpuForward {
     /// Hand the forward the S1 slow-link profile the load admitted
     /// (`Qwen4Bundle::attach_slowlink_profile`, before attach). The profile is
     /// immutable for the forward's life; nothing is allocated here.
-    pub(crate) fn set_slowlink_profile(&mut self, profile: crate::slowlink_admission::SlowlinkProfile) {
+    pub(crate) fn set_slowlink_profile(
+        &mut self,
+        profile: crate::slowlink_admission::SlowlinkProfile,
+    ) {
         self.slowlink.profile = Some(profile);
     }
 
@@ -8231,12 +8257,16 @@ impl Qwen4GpuForward {
         }
         // The S1 expert page ring and prompt storage drain their own streams
         // before freeing; a failed teardown is reported, never silenced.
-        if let Err(error) = slowlink.free_gpu(gpu) {
-            eprintln!("  qwen4 slow-link prefill teardown: {error}");
-        }
+        let slowlink_error = slowlink.free_gpu(gpu).err();
         // The PLE staging bytes may still be read by an enqueued upload:
         // retire it before the device buffers and the host bytes go.
         let mut first = host_ple.free_gpu(gpu);
+        if let Some(error) = slowlink_error {
+            first.get_or_insert(hip_bridge::HipError::new(
+                999,
+                &format!("slow-link expert ring teardown failed: {error}"),
+            ));
+        }
         if let Some(error) = mesh_tokens.free_gpu(gpu) {
             first.get_or_insert(error);
         }
@@ -11405,7 +11435,11 @@ mod tests {
             Unmeasured,
             Unified,
         ] {
-            assert_eq!(chunk("gfx1100", None, usize::MAX, || link), 1536, "{link:?}");
+            assert_eq!(
+                chunk("gfx1100", None, usize::MAX, || link),
+                1536,
+                "{link:?}"
+            );
         }
         // Every other arch keeps its baseline and never evaluates the link
         // (gfx1201, gfx1151 and the rest never probe).
@@ -11439,7 +11473,9 @@ mod tests {
             1536
         );
         assert_eq!(
-            chunk("gfx1100", Some("junk"), usize::MAX, || Discrete { gbps: 7.1 }),
+            chunk("gfx1100", Some("junk"), usize::MAX, || Discrete {
+                gbps: 7.1
+            }),
             8192
         );
         assert_eq!(

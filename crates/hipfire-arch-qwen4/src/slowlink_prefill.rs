@@ -52,8 +52,8 @@
 use crate::bundle::{PromptTxn, Qwen4Bundle, SlowlinkFailPoint};
 use crate::config::Qwen4Config;
 use crate::gpu_forward::panel_stage::{
-    ExpertGroupPlan, ExpertPanelRing, OverlapSummary, PanelBindingParts, PanelSchedule,
-    PanelStats, PanelTicket,
+    ExpertGroupPlan, ExpertPanelRing, OverlapSummary, PanelBindingParts, PanelSchedule, PanelStats,
+    PanelTicket,
 };
 use crate::gpu_forward::{
     f32_view, invalid, layer_desc, layer_scratch, matrix_view, program_dims, router_columns,
@@ -163,6 +163,9 @@ pub(crate) struct PromptByteCensus {
     /// maps, widened accumulator, saved shared activation).
     pub(crate) route_storage: u64,
     pub(crate) a4_sidecars: u64,
+    /// The window-wide stable-grouping scatter scratch (`qwen4_moe_group_layout`
+    /// at the window's slots), charged beside the A4 sidecars.
+    pub(crate) group_scatter: u64,
     /// Active ring pages / lookahead pages / pointer tables of the page pool.
     pub(crate) ring: u64,
     pub(crate) lookahead: u64,
@@ -180,6 +183,7 @@ impl PromptByteCensus {
             self.hc_streams,
             self.route_storage,
             self.a4_sidecars,
+            self.group_scatter,
             self.ring,
             self.lookahead,
             self.tables,
@@ -224,7 +228,10 @@ impl Qwen4PromptPlan {
     pub(crate) fn signatures(&self) -> Vec<(usize, TileRouting)> {
         let mut out: Vec<(usize, TileRouting)> = Vec::new();
         for tile in &self.tiles {
-            if !out.iter().any(|(rows, routing)| *rows == tile.rows && *routing == tile.routing) {
+            if !out
+                .iter()
+                .any(|(rows, routing)| *rows == tile.rows && *routing == tile.routing)
+            {
                 out.push((tile.rows, tile.routing));
             }
         }
@@ -251,7 +258,11 @@ pub(crate) struct PromptPlanInputs<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlanBypass {
     /// A window's K1 tail rows exceed what the route storage was sized for.
-    K1TailRows { window: usize, rows: usize, bound: usize },
+    K1TailRows {
+        window: usize,
+        rows: usize,
+        bound: usize,
+    },
     /// A window's tagged HC-stream regions (plus the one-tile view slack) do
     /// not fit the admitted arena.
     StreamArena { window: usize, need: u64, have: u64 },
@@ -456,7 +467,9 @@ pub(crate) fn plan_prompt_verdict(
     // size, so the arena also carries one tile of BF16 slack.
     let wide = profile.geometry.hc_count * profile.geometry.hidden;
     if wide % 8 != 0 {
-        return Err(invalid(format!("slow-link HC width {wide} is not a multiple of 8 elements")));
+        return Err(invalid(format!(
+            "slow-link HC width {wide} is not a multiple of 8 elements"
+        )));
     }
     let slack_bytes = (tile_rows * wide * 2) as u64;
     for window in windows.iter_mut() {
@@ -515,6 +528,7 @@ fn census_for(profile: &SlowlinkProfile, windows: &[WindowPlan]) -> R<PromptByte
         hc_streams: profile.arena.total_bytes,
         route_storage: profile.census.route_storage,
         a4_sidecars: profile.census.a4_sidecars,
+        group_scatter: profile.census.group_scatter,
         ring: page * spec.active_slots as u64,
         lookahead: page * spec.lookahead_pages as u64,
         tables: reserve.tables as u64,
@@ -527,7 +541,11 @@ fn census_for(profile: &SlowlinkProfile, windows: &[WindowPlan]) -> R<PromptByte
 /// The byte census of a plan ([`Qwen4PromptPlan::census`]) re-derived and
 /// checked against the plan.
 pub(crate) fn prompt_bytes(plan: &Qwen4PromptPlan) -> R<PromptByteCensus> {
-    if plan.windows.iter().any(|window| window.rows > plan.census.window_rows) {
+    if plan
+        .windows
+        .iter()
+        .any(|window| window.rows > plan.census.window_rows)
+    {
         return Err(invalid("slow-link plan window exceeds its census"));
     }
     Ok(plan.census)
@@ -537,7 +555,10 @@ pub(crate) fn prompt_bytes(plan: &Qwen4PromptPlan) -> R<PromptByteCensus> {
 /// covering `[0, num_experts)`, one per group (a pruned expert between two
 /// groups belongs to the earlier range; nothing routes to it). Index `i` is
 /// the group at position `i` of the layer's schedule.
-pub(crate) fn group_binding_ranges(groups: &[ExpertGroupPlan], num_experts: usize) -> Vec<(usize, usize)> {
+pub(crate) fn group_binding_ranges(
+    groups: &[ExpertGroupPlan],
+    num_experts: usize,
+) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(groups.len());
     let mut lo = 0usize;
     for (index, group) in groups.iter().enumerate() {
@@ -574,6 +595,18 @@ pub(crate) struct WindowReport {
     pub(crate) nonexpert_ms: f64,
 }
 
+impl WindowReport {
+    /// Submitted payload bytes the window's routed rows never read (the
+    /// untouched experts inside acquired groups plus any group never acquired):
+    /// `submitted - useful`. `None` when the useful count exceeds the
+    /// submission, a measurement that cannot be true.
+    pub(crate) fn unused_bytes(&self) -> Option<u64> {
+        self.stats
+            .submitted_payload_bytes
+            .checked_sub(self.useful_bytes)
+    }
+}
+
 /// Everything the layer-major receipt reports.
 pub(crate) struct ReceiptInputs<'a> {
     pub(crate) mode: SlowlinkMode,
@@ -582,7 +615,10 @@ pub(crate) struct ReceiptInputs<'a> {
     pub(crate) host_layers: usize,
     pub(crate) tile_scratch_bytes: u64,
     pub(crate) reports: &'a [WindowReport],
-    pub(crate) peak_vram_bytes: u64,
+    /// Device bytes in use (`total - free`) from ONE `hipMemGetInfo` sample
+    /// taken after the request; not a continuous peak. `None` when the query
+    /// failed. Reported under the frozen key `peak_vram_bytes`.
+    pub(crate) peak_vram_bytes: Option<u64>,
     /// `"ok"` or `"aborted: ..."`.
     pub(crate) status: String,
 }
@@ -621,10 +657,17 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
         "host_expert_bytes_total": host_expert_bytes_total,
         "submitted_bytes": sum_u(&|r| r.stats.submitted_payload_bytes),
         "useful_bytes": sum_u(&|r| r.useful_bytes),
-        "unused_prefetched_bytes": sum_u(&|r| r.stats.discarded_payload_bytes),
+        // Submitted payload no routed row read: the untouched experts inside
+        // acquired groups and the groups never acquired. `null` (missing) when a
+        // window's useful bytes exceed its submission, never an underflow.
+        "unused_prefetched_bytes": inputs
+            .reports
+            .iter()
+            .try_fold(0u64, |acc, r| acc.checked_add(r.unused_bytes()?)),
+        "discarded_group_payload_bytes": sum_u(&|r| r.stats.discarded_payload_bytes),
         "reserve": {
             "tile": inputs.tile_scratch_bytes,
-            "arena": census.hc_streams + census.route_storage + census.a4_sidecars,
+            "arena": census.hc_streams + census.route_storage + census.a4_sidecars + census.group_scatter,
             "ring": census.ring,
             "lookahead": census.lookahead,
             "tables": census.tables,
@@ -645,7 +688,13 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
             "copy_starved_stalls": sum_u(&|r| r.stats.copy_starved_stalls),
         },
         "timeline_overflow": sum_u(&|r| r.stats.timeline_overflow + r.stats.layer_mark_overflow),
+        // Frozen key name. The value is a single post-request device-memory
+        // sample (`vram_measurement` names the method); `null` if unavailable.
         "peak_vram_bytes": inputs.peak_vram_bytes,
+        "vram_measurement": {
+            "method": "hipMemGetInfo_post_request_sample",
+            "continuous_peak": false,
+        },
     })
 }
 
@@ -702,7 +751,9 @@ impl PromptOutput<'_> {
         match self {
             Self::Silent => None,
             Self::Final { logits, top1 } => Some((*logits, *top1)),
-            Self::Capture { head, .. } => head.as_ref().map(|(logits, top1)| (*logits, Some(*top1))),
+            Self::Capture { head, .. } => {
+                head.as_ref().map(|(logits, top1)| (*logits, Some(*top1)))
+            }
         }
     }
 }
@@ -713,7 +764,9 @@ fn bundle_err(what: &'static str) -> impl Fn(crate::bundle::BundleError) -> Qwen
     move |error| invalid(format!("slow-link {what}: {error}"))
 }
 
-fn dsp_err(what: &'static str) -> impl Fn(hipfire_dispatch::types::DispatchError) -> Qwen4GpuForwardError {
+fn dsp_err(
+    what: &'static str,
+) -> impl Fn(hipfire_dispatch::types::DispatchError) -> Qwen4GpuForwardError {
     move |error| Qwen4GpuForwardError::Dispatch(format!("slow-link {what}: {error:?}"))
 }
 
@@ -812,7 +865,7 @@ fn build_runtime(
             host_layer[layer] = true;
             sources.push(
                 runtime
-                    .s1_host_sources(&*gpu, bundle, layer)
+                    .s1_host_sources(&mut *gpu, bundle, layer)
                     .map_err(|error| error.to_string())?,
             );
         } else {
@@ -849,7 +902,8 @@ fn build_runtime(
     if profile.arena.total_bytes % 4 != 0 || stream_bytes > profile.arena.total_bytes {
         return Err("HC-stream arena bytes are not whole F32 elements".to_string());
     }
-    let schedule = PanelSchedule::new(sources, EXPERTS_PER_PAGE).map_err(|error| error.to_string())?;
+    let schedule =
+        PanelSchedule::new(sources, EXPERTS_PER_PAGE).map_err(|error| error.to_string())?;
     let ring = ExpertPanelRing::new(gpu, spec).map_err(|error| error.to_string())?;
     let route_region = match gpu.alloc_tensor(&[layout.total_bytes()], DType::Raw) {
         Ok(tensor) => tensor,
@@ -966,7 +1020,11 @@ struct PleCursor {
 
 impl PleCursor {
     /// The histories of `tiles` over `window_tokens`, from `entry`.
-    fn histories_for(entry: PleHistory, tiles: &[TilePlan], window_tokens: &[u32]) -> Vec<PleHistory> {
+    fn histories_for(
+        entry: PleHistory,
+        tiles: &[TilePlan],
+        window_tokens: &[u32],
+    ) -> Vec<PleHistory> {
         let mut history = entry;
         let mut out = Vec::with_capacity(tiles.len());
         for tile in tiles {
@@ -1178,14 +1236,16 @@ pub(crate) fn panels_by_group(
     let mut previous: Option<usize> = None;
     for (index, binding) in bindings.enumerate() {
         if binding >= groups {
-            return Err(invalid(format!("panel {index} names group {binding} of {groups}")));
+            return Err(invalid(format!(
+                "panel {index} names group {binding} of {groups}"
+            )));
         }
         if previous.is_some_and(|prev| binding < prev) {
             return Err(invalid("panels are not in ascending binding order"));
         }
         previous = Some(binding);
         let range = &mut out[binding];
-        if range.is_empty() {
+        if range.start >= range.end {
             *range = index..index + 1;
         } else if range.end != index {
             return Err(invalid("the panels of one binding are not contiguous"));
@@ -1257,15 +1317,26 @@ fn validate_head(
             return Err("head top1 output must be Raw with one i32".to_string());
         }
     }
-    let final_hyper = crate::gpu_forward::hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)
-        .map_err(|error| error.to_string())?;
+    let final_hyper =
+        crate::gpu_forward::hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)
+            .map_err(|error| error.to_string())?;
     let lm_head = crate::gpu_forward::dense_ref(&bundle.weights, &bundle.weights.root.lm_head)
         .map_err(|error| error.to_string())?;
-    let router_logits = matrix_view(&forward.scratch.router_logits, last_rows, router_columns(geo.dims))
-        .map_err(|error| error.to_string())?;
+    let router_logits = matrix_view(
+        &forward.scratch.router_logits,
+        last_rows,
+        router_columns(geo.dims),
+    )
+    .map_err(|error| error.to_string())?;
     let scratch_desc = layer_scratch(&forward.scratch, &router_logits);
-    validate_final_hyper(geo.dims, &final_hyper, &forward.scratch.streams, &scratch_desc, last_rows)
-        .map_err(|error| format!("validate final hyper: {error:?}"))?;
+    validate_final_hyper(
+        geo.dims,
+        &final_hyper,
+        &forward.scratch.streams,
+        &scratch_desc,
+        last_rows,
+    )
+    .map_err(|error| format!("validate final hyper: {error:?}"))?;
     let hidden = view(&forward.scratch.hc_mixed, 0, last_rows * geo.hidden);
     validate_lm_head(&lm_head, &hidden, logits, last_rows, 1)
         .map_err(|error| format!("validate LM head: {error:?}"))
@@ -1292,8 +1363,27 @@ fn preflight_tiles(
                 .is_some_and(|runtime| runtime.s1_host_mapped())
         })
         .ok_or_else(|| "no host-resident expert layer".to_string())?;
-    let mut first_arm: Option<[usize; 6]> = None;
-    for (rows, routing) in plan.signatures() {
+    let mut arms: Vec<([usize; 6], bool)> = Vec::new();
+    let mut signatures = plan.signatures();
+    // A window of one-row decode tiles only has no prefill tile to anchor the
+    // panel scratch: the sweep uses a stand-in prefill tile of the admitted tile
+    // rows, admitted here with the rest.
+    if plan.windows.iter().any(|window| {
+        plan.window_tiles(window)
+            .iter()
+            .all(|tile| tile.routing.route_rows == 1)
+    }) {
+        let rows = forward.scratch.max_chunk;
+        let routing = tile_routing(forward, gpu, rows);
+        if !signatures.iter().any(|(r, known)| {
+            *r == rows
+                && known.route_rows == routing.route_rows
+                && known.bf16_streams == routing.bf16_streams
+        }) {
+            signatures.push((rows, routing));
+        }
+    }
+    for (rows, routing) in signatures {
         let stub = TilePlan {
             index: 0,
             window: 0,
@@ -1321,26 +1411,28 @@ fn preflight_tiles(
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
                 dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position)
-                    .map(|call| call.arm_signature())
+                    .map(|call| (call.arm_signature(), call.is_k2()))
                     .map_err(dsp_err("admission"))
             },
         );
         Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-        let arm = result.map_err(|error| {
-            format!("tile of {rows} rows (route rows {}): {error}", routing.route_rows)
+        let (arm, is_k2) = result.map_err(|error| {
+            format!(
+                "tile of {rows} rows (route rows {}): {error}",
+                routing.route_rows
+            )
         })?;
-        // Tiles of one window may differ only in rows, routing rows, position
-        // and K1-versus-K2; the numerical arm itself must be one.
-        match first_arm {
-            None => first_arm = Some(arm),
-            Some(first) if first == arm => {}
-            Some(first) => {
-                return Err(format!(
-                    "tile of {rows} rows (route rows {}) seals arm {arm:?}, the first tile {first:?}",
-                    routing.route_rows
-                ))
-            }
-        }
+        arms.push((arm, is_k2));
+    }
+    // Every tile shares the layer geometry (the first five signature values);
+    // the grouped-path flag is the K2 tiles' one frozen arm. A few-row tail (a
+    // prefill K1 call or the one-row decode call) keeps its own original arm as
+    // a separate cohort, so it is compared on geometry alone and never refused
+    // for its arm. One shared rule with the dispatch crate's prepare.
+    if !dsp::window_arms_compatible(&arms) {
+        return Err(format!(
+            "the plan's tiles seal incompatible dispatch arms (signature, K2): {arms:?}"
+        ));
     }
     Ok(())
 }
@@ -1379,12 +1471,18 @@ fn select(
             bundle.state.max_seq_len
         ));
     }
-    if tokens.iter().any(|&token| token as usize >= bundle.config.vocab_size) {
+    if tokens
+        .iter()
+        .any(|&token| token as usize >= bundle.config.vocab_size)
+    {
         return Err("a token id is outside the embedding vocabulary".to_string());
     }
-    if forward.scratch.max_chunk < profile.tile_rows {
+    // The forward's scratch must be EXACTLY the admitted tile: a larger one
+    // (an incumbent 4096/8192-row chunk the caller asked for) would be retained
+    // scratch the profile never charged, and S1 never reroutes after allocation.
+    if forward.scratch.max_chunk != profile.tile_rows {
         return Err(format!(
-            "forward scratch holds {} rows, the S1 tile is {}",
+            "forward scratch holds {} rows, the admitted S1 tile is {}",
             forward.scratch.max_chunk, profile.tile_rows
         ));
     }
@@ -1410,7 +1508,8 @@ fn select(
     let verdict = {
         let cell = std::cell::RefCell::new(&mut *gpu);
         let routing_forward: &Qwen4GpuForward = &*forward;
-        let routing = |tile_rows: usize| tile_routing(routing_forward, &mut **cell.borrow_mut(), tile_rows);
+        let routing =
+            |tile_rows: usize| tile_routing(routing_forward, &mut **cell.borrow_mut(), tile_rows);
         plan_prompt_verdict(&PromptPlanInputs {
             profile: &profile,
             entry_pos: entry,
@@ -1499,51 +1598,102 @@ fn with_tile_frame<T>(
     layer_index: usize,
     f: impl FnOnce(&mut Gpu, &TileFrame<'_>) -> R<T>,
 ) -> R<T> {
-    let n = tile.rows;
-    let route_n = tile.routing.route_rows;
-    let tile_streams = f32_view(streams, tile.stream_offset, n * geo.wide);
+    with_tile_frames(
+        forward,
+        bundle,
+        gpu,
+        streams,
+        geo,
+        &[tile],
+        layer_index,
+        |gpu, frames| f(gpu, &frames[0]),
+    )
+}
+
+/// The frames of several tiles of one layer at once, all alive together (the
+/// panel scratch holds the operands of its one-row decode tiles for the whole
+/// sweep). `frames[i]` belongs to `tiles[i]`; the caller has entered whichever
+/// Gpu scope its own steps need.
+#[allow(clippy::too_many_arguments)]
+fn with_tile_frames<T>(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    streams: &GpuTensor,
+    geo: &RunGeo,
+    tiles: &[&TilePlan],
+    layer_index: usize,
+    f: impl FnOnce(&mut Gpu, &[TileFrame<'_>]) -> R<T>,
+) -> R<T> {
     let layer = bundle
         .weights
         .layer(layer_index)
         .ok_or_else(|| invalid(format!("layer {layer_index} is not owned by this band")))?;
-    let router_logits = matrix_view(&forward.scratch.router_logits, n, router_columns(geo.dims))?;
-    let scratch_desc = layer_scratch(&forward.scratch, &router_logits);
     let layer_moe = forward.moe.get(layer_index).and_then(Option::as_ref);
-    let description = layer_desc(
-        &bundle.weights,
-        layer,
-        layer_moe,
-        &geo.config,
-        &forward.decode_q8,
-        route_n,
-        geo.few_row_limit,
-        None,
-    )?;
+    let tile_streams: Vec<GpuTensor> = tiles
+        .iter()
+        .map(|tile| f32_view(streams, tile.stream_offset, tile.rows * geo.wide))
+        .collect();
+    let router_logits = tiles
+        .iter()
+        .map(|tile| {
+            matrix_view(
+                &forward.scratch.router_logits,
+                tile.rows,
+                router_columns(geo.dims),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let scratch_descs: Vec<_> = router_logits
+        .iter()
+        .map(|logits| layer_scratch(&forward.scratch, logits))
+        .collect();
+    let descriptions = tiles
+        .iter()
+        .map(|tile| {
+            layer_desc(
+                &bundle.weights,
+                layer,
+                layer_moe,
+                &geo.config,
+                &forward.decode_q8,
+                tile.routing.route_rows,
+                geo.few_row_limit,
+                None,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let ctx = DispatchCtx::new(gpu);
-    let env = LayerPhaseEnv {
-        scratch: &forward.scratch,
-        decode_q8: &forward.decode_q8,
-        trunk_zba: &forward.trunk_zba,
-        trunk_a4: &forward.trunk_a4,
-        prefill_scope: forward.prefill_scope,
-        bundle,
-        dims: geo.dims,
-        bf16_state: tile.routing.bf16_streams,
-        route_n,
-        few_row_limit: geo.few_row_limit,
-        rows: n,
-        start_position: tile.position,
-        streams: &tile_streams,
-        gates: &forward.scratch.hc_gates,
-    };
-    let frame = TileFrame {
-        env: &env,
-        description: &description,
-        ctx: &ctx,
-        scratch_desc: &scratch_desc,
-        layer,
-    };
-    f(gpu, &frame)
+    let envs: Vec<LayerPhaseEnv<'_>> = tiles
+        .iter()
+        .zip(&tile_streams)
+        .map(|(tile, tile_streams)| LayerPhaseEnv {
+            scratch: &forward.scratch,
+            decode_q8: &forward.decode_q8,
+            trunk_zba: &forward.trunk_zba,
+            trunk_a4: &forward.trunk_a4,
+            prefill_scope: forward.prefill_scope,
+            bundle,
+            dims: geo.dims,
+            bf16_state: tile.routing.bf16_streams,
+            route_n: tile.routing.route_rows,
+            few_row_limit: geo.few_row_limit,
+            rows: tile.rows,
+            start_position: tile.position,
+            streams: tile_streams,
+            gates: &forward.scratch.hc_gates,
+        })
+        .collect();
+    let frames: Vec<TileFrame<'_>> = (0..tiles.len())
+        .map(|index| TileFrame {
+            env: &envs[index],
+            description: &descriptions[index],
+            ctx: &ctx,
+            scratch_desc: &scratch_descs[index],
+            layer,
+        })
+        .collect();
+    f(gpu, &frames)
 }
 
 // ── the run ──────────────────────────────────────────────────────────
@@ -1678,8 +1828,13 @@ impl Run<'_, '_> {
                 )?;
             }
         }
-        if self.bundle.slowlink_take_injection(SlowlinkFailPoint::BeforeDma) {
-            return Err(invalid("injected slow-link failure before the first expert copy"));
+        if self
+            .bundle
+            .slowlink_take_injection(SlowlinkFailPoint::BeforeDma)
+        {
+            return Err(invalid(
+                "injected slow-link failure before the first expert copy",
+            ));
         }
         let wall = Instant::now();
         let mut dims = self.profile.route_dims();
@@ -1699,7 +1854,9 @@ impl Run<'_, '_> {
             }
             self.rt.ring.mark_layer_end(&*self.gpu, layer)?;
             if layer == geo.band.start
-                && self.bundle.slowlink_take_injection(SlowlinkFailPoint::AfterLayer)
+                && self
+                    .bundle
+                    .slowlink_take_injection(SlowlinkFailPoint::AfterLayer)
             {
                 return Err(invalid("injected slow-link failure after the first layer"));
             }
@@ -1719,6 +1876,12 @@ impl Run<'_, '_> {
             return Err(invalid(format!(
                 "slow-link window submitted {} payload bytes, one sweep is {sweep}",
                 stats.submitted_payload_bytes
+            )));
+        }
+        if report.useful_bytes > stats.submitted_payload_bytes {
+            return Err(invalid(format!(
+                "slow-link window read {} useful bytes of {} submitted",
+                report.useful_bytes, stats.submitted_payload_bytes
             )));
         }
         report.stats = stats;
@@ -1762,7 +1925,9 @@ impl Run<'_, '_> {
         report: &mut WindowReport,
     ) -> R<()> {
         let geo = self.geo;
-        self.rt.ring.enter_layer(&*self.gpu, &mut self.rt.schedule, layer)?;
+        self.rt
+            .ring
+            .enter_layer(&*self.gpu, &mut self.rt.schedule, layer)?;
         routes.reset_for_layer();
         for (ti, tile) in w.tiles.iter().enumerate() {
             if layer == geo.band.start {
@@ -1811,7 +1976,7 @@ impl Run<'_, '_> {
             .enumerate()
             .map(|(index, group)| GroupWork {
                 group: group.group,
-                bound: !by_group[index].is_empty(),
+                bound: by_group[index].start < by_group[index].end,
             })
             .collect();
         // Touched bytes: the experts any K2 row or the K1 cohort read, at the
@@ -1833,25 +1998,74 @@ impl Run<'_, '_> {
         let inject = self
             .bundle
             .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
-        let tile = &w.tiles[0];
-        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, tile.rows);
-        let result = with_tile_frame(
+        // The panel scratch is anchored on a prefill tile of the window; every
+        // one-row decode tile (the incumbent's decode call, original arithmetic)
+        // registers its own operands once. A window of decode tiles only has no
+        // prefill tile of its own: its anchor is a stand-in prefill tile of the
+        // admitted tile rows, used only to borrow the shared scratch views (it
+        // is never prepared, so no row reads or writes through it).
+        let decode_tiles: Vec<usize> = (0..w.tiles.len())
+            .filter(|&ti| w.tiles[ti].routing.route_rows == 1)
+            .collect();
+        let anchor_tile = (0..w.tiles.len()).find(|&ti| w.tiles[ti].routing.route_rows != 1);
+        let stand_in;
+        let anchor: &TilePlan = match anchor_tile {
+            Some(ti) => &w.tiles[ti],
+            None => {
+                let rows = self.profile.tile_rows;
+                stand_in = TilePlan {
+                    index: 0,
+                    window: w.window.index,
+                    prompt_row: 0,
+                    window_row: 0,
+                    stream_offset: 0,
+                    rows,
+                    position: w.tiles[0].position,
+                    routing: tile_routing(&*self.forward, &mut *self.gpu, rows),
+                    ends_at_cut: None,
+                    last_in_window: false,
+                };
+                &stand_in
+            }
+        };
+        let mut frame_tiles: Vec<&TilePlan> = vec![anchor];
+        frame_tiles.extend(decode_tiles.iter().map(|&ti| &w.tiles[ti]));
+        // The K2 panels run under the anchor tile's ambient scope; each decode
+        // or K1 step enters its own tile's scope through the hook.
+        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, anchor.rows);
+        let result = with_tile_frames(
             &*self.forward,
             &*self.bundle,
             &mut *self.gpu,
             &self.rt.streams,
             geo,
-            tile,
+            &frame_tiles,
             layer,
-            |gpu, frame| {
-                let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
-                    return Err(invalid("a host layer's FFN is not MoE"));
-                };
-                let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
-                let call = dsp::PreparedChunkCall::new(&*gpu, &sealed, tile.window_row, tile.position)
-                    .map_err(dsp_err("admission"))?;
-                let mut scratch = dsp::PanelScratch::new(&call, dsp::PanelLimits::S1)
+            |gpu, frames| {
+                let mut sealed = Vec::with_capacity(frames.len());
+                for frame in frames {
+                    let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
+                        return Err(invalid("a host layer's FFN is not MoE"));
+                    };
+                    sealed.push(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?);
+                }
+                // Each call is admitted under its own tile's scope (its routing
+                // rows), exactly as its route preparation was.
+                let mut calls = Vec::with_capacity(sealed.len());
+                for (tile, sealed) in frame_tiles.iter().zip(&sealed) {
+                    let (scopes, _) = self.forward.enter_tile_scopes(gpu, tile.rows);
+                    let call =
+                        dsp::PreparedChunkCall::new(&*gpu, sealed, tile.window_row, tile.position);
+                    Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                    calls.push(call.map_err(dsp_err("admission"))?);
+                }
+                let mut scratch = dsp::PanelScratch::new(&calls[0], dsp::PanelLimits::S1)
                     .map_err(dsp_err("panel scratch"))?;
+                for call in &calls[1..] {
+                    scratch
+                        .add_decode_tile(call)
+                        .map_err(dsp_err("decode tile"))?;
+                }
                 let mut cursor = dsp::OrderedCombineCursor::start(gpu, routes, &panels)
                     .map_err(dsp_err("combine start"))?;
                 let mut hook = ForwardScopeHook {
@@ -1863,49 +2077,43 @@ impl Run<'_, '_> {
                     ring: &mut self.rt.ring,
                     schedule: &mut self.rt.schedule,
                 };
-                walk_layer_groups(
-                    &mut ring,
-                    gpu,
-                    layer,
-                    &work,
-                    &mut |gpu, index, parts| {
-                        let parts =
-                            parts.ok_or_else(|| invalid("slow-link panel lease carries no binding"))?;
-                        if inject && Some(index) == first_bound {
-                            return Err(invalid("injected slow-link failure during a panel"));
-                        }
-                        let group = &groups[index];
-                        let (Some(&lo), Some(&last)) = (group.experts.first(), group.experts.last())
-                        else {
-                            return Err(invalid("an empty expert group"));
-                        };
-                        let binding = dsp::ExpertPanelBinding {
-                            layer,
-                            epoch: parts.epoch,
-                            expert_lo: lo,
-                            expert_hi: last + 1,
-                            gate_up_table: parts.gate_up_table,
-                            down_table: parts.down_table,
-                            codec: dsp::PanelCodec::Mq4,
-                            source: dsp::BindingSource::Staged {
-                                slot: parts.ticket.slot as u32,
-                            },
-                        };
-                        for panel_index in by_group[index].clone() {
-                            let panel = &panels[panel_index];
-                            dsp::execute_panel(
-                                gpu,
-                                binding,
-                                route_plan.view(routes, panel),
-                                &mut scratch,
-                                &mut cursor,
-                                &mut hook,
-                            )
-                            .map_err(dsp_err("panel"))?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                walk_layer_groups(&mut ring, gpu, layer, &work, &mut |gpu, index, parts| {
+                    let parts =
+                        parts.ok_or_else(|| invalid("slow-link panel lease carries no binding"))?;
+                    if inject && Some(index) == first_bound {
+                        return Err(invalid("injected slow-link failure during a panel"));
+                    }
+                    let group = &groups[index];
+                    let (Some(&lo), Some(&last)) = (group.experts.first(), group.experts.last())
+                    else {
+                        return Err(invalid("an empty expert group"));
+                    };
+                    let binding = dsp::ExpertPanelBinding {
+                        layer,
+                        epoch: parts.epoch,
+                        expert_lo: lo,
+                        expert_hi: last + 1,
+                        gate_up_table: parts.gate_up_table,
+                        down_table: parts.down_table,
+                        codec: dsp::PanelCodec::Mq4,
+                        source: dsp::BindingSource::Staged {
+                            slot: parts.ticket.slot as u32,
+                        },
+                    };
+                    for panel_index in by_group[index].clone() {
+                        let panel = &panels[panel_index];
+                        dsp::execute_panel(
+                            gpu,
+                            binding,
+                            route_plan.view(routes, panel),
+                            &mut scratch,
+                            &mut cursor,
+                            &mut hook,
+                        )
+                        .map_err(dsp_err("panel"))?;
+                    }
+                    Ok(())
+                })?;
                 dsp::finish_combine(gpu, routes, &mut cursor, &mut hook).map_err(dsp_err("combine"))
             },
         );
@@ -2034,7 +2242,8 @@ impl Run<'_, '_> {
                         qsa = Some(op.next_lengths().map_err(dsp_err("derive QSA state"))?);
                     }
                 }
-                execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("layer program"))?;
+                execute_validated_steps(gpu, frame.ctx, &steps)
+                    .map_err(dsp_err("layer program"))?;
                 if let Some(routes) = routes {
                     let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
                         return Err(invalid("a host layer's FFN is not MoE"));
@@ -2043,7 +2252,8 @@ impl Run<'_, '_> {
                     let call =
                         dsp::PreparedChunkCall::new(&*gpu, &sealed, tile.window_row, tile.position)
                             .map_err(dsp_err("admission"))?;
-                    dsp::prepare_routes(gpu, &call, routes).map_err(dsp_err("route preparation"))?;
+                    dsp::prepare_routes(gpu, &call, routes)
+                        .map_err(dsp_err("route preparation"))?;
                 }
                 Ok(qsa)
             },
@@ -2076,14 +2286,16 @@ impl Run<'_, '_> {
                     return Err(invalid("a host layer's FFN is not MoE"));
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
-                let call = dsp::PreparedChunkCall::new(&*gpu, &sealed, tile.window_row, tile.position)
-                    .map_err(dsp_err("admission"))?;
+                let call =
+                    dsp::PreparedChunkCall::new(&*gpu, &sealed, tile.window_row, tile.position)
+                        .map_err(dsp_err("admission"))?;
                 let mut hook = ForwardScopeHook {
                     forward: &*self.forward,
                     tiles: w.tiles,
                     open: Vec::new(),
                 };
-                dsp::finish_shared(gpu, routes, &call, &mut hook).map_err(dsp_err("shared expert"))?;
+                dsp::finish_shared(gpu, routes, &call, &mut hook)
+                    .map_err(dsp_err("shared expert"))?;
                 let mixed = f32_view(
                     routes.combined(),
                     tile.window_row * geo.hidden,
@@ -2133,7 +2345,9 @@ impl Run<'_, '_> {
                     dim: geo.hidden,
                 },
             )
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {error:?}")))?;
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {error:?}"))
+            })?;
             let tile_streams = f32_view(&self.rt.streams, tile.stream_offset, n * geo.wide);
             if tile.routing.bf16_streams {
                 self.gpu.hc_streams_init_from_embed_batched_bf16(
@@ -2191,7 +2405,9 @@ impl Run<'_, '_> {
                     .as_ref()
                     .ok_or_else(|| invalid("Qwen4 spec hidden is not allocated"))?;
                 if target.numel() < n * geo.wide {
-                    return Err(invalid("the wide-hidden capture buffer is narrower than the tile"));
+                    return Err(invalid(
+                        "the wide-hidden capture buffer is narrower than the tile",
+                    ));
                 }
                 let destination = f32_view(target, 0, n * geo.wide);
                 let source = view(&tile_streams, 0, n * geo.wide);
@@ -2203,7 +2419,8 @@ impl Run<'_, '_> {
                         n * geo.wide,
                     )?;
                 } else {
-                    self.gpu.copy_d2d(&source, &destination, source.byte_size())?;
+                    self.gpu
+                        .copy_d2d(&source, &destination, source.byte_size())?;
                 }
                 Some(destination)
             } else {
@@ -2223,14 +2440,35 @@ impl Run<'_, '_> {
                     &self.bundle.weights,
                     &self.bundle.weights.root.lm_head,
                 )?;
-                let router_logits = matrix_view(&scratch.router_logits, n, router_columns(geo.dims))?;
+                let router_logits =
+                    matrix_view(&scratch.router_logits, n, router_columns(geo.dims))?;
                 let scratch_desc = layer_scratch(scratch, &router_logits);
-                execute_final_hyper(&mut *self.gpu, geo.dims, &final_hyper, &tile_streams, &scratch_desc, n, bf16)
-                    .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}")))?;
+                execute_final_hyper(
+                    &mut *self.gpu,
+                    geo.dims,
+                    &final_hyper,
+                    &tile_streams,
+                    &scratch_desc,
+                    n,
+                    bf16,
+                )
+                .map_err(|error| {
+                    Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}"))
+                })?;
                 let final_hidden = view(&scratch.hc_mixed, 0, n * geo.hidden);
                 let head_rotation = view(&scratch.rotation, 0, n * geo.hidden);
-                execute_lm_head(&mut *self.gpu, &lm_head, &final_hidden, logits, n, 1, Some(&head_rotation))
-                    .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}")))?;
+                execute_lm_head(
+                    &mut *self.gpu,
+                    &lm_head,
+                    &final_hidden,
+                    logits,
+                    n,
+                    1,
+                    Some(&head_rotation),
+                )
+                .map_err(|error| {
+                    Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}"))
+                })?;
                 if let Some(top1) = top1 {
                     argmax_f32(
                         &mut *self.gpu,
@@ -2331,10 +2569,13 @@ pub(crate) fn try_run_prompt(
         outcome
     };
     forward.slowlink.runtime = Some(runtime);
-    let peak = gpu
+    // ONE `hipMemGetInfo` (total - free) sample after the request, outside every
+    // overlap loop: the device's used bytes at that moment, not a continuous
+    // peak. `None` (a null in the receipt) when the query fails.
+    let post_request_vram_used = gpu
         .device_mem_info()
-        .map(|(free, total)| total.saturating_sub(free) as u64)
-        .unwrap_or(0);
+        .ok()
+        .map(|(free, total)| total.saturating_sub(free) as u64);
     let receipt = |status: String| {
         layer_major_receipt(&ReceiptInputs {
             mode,
@@ -2343,7 +2584,7 @@ pub(crate) fn try_run_prompt(
             host_layers,
             tile_scratch_bytes,
             reports: &reports,
-            peak_vram_bytes: peak,
+            peak_vram_bytes: post_request_vram_used,
             status,
         })
     };
@@ -2369,16 +2610,16 @@ const SELFTEST_SEED: u64 = 0x5eed_51ee_d5b0_0001;
 /// `{"name","status":"pass","mismatches":0,"detail"}` of one dispatch
 /// primitive that observed every check; a failed check is an `Err` carrying
 /// the whole raw report (no mismatch count is invented).
-fn primitive_case_json(
-    name: &str,
-    report: &dsp::selftest::PrimitiveReport,
-) -> R<Value> {
+fn primitive_case_json(name: &str, report: &dsp::selftest::PrimitiveReport) -> R<Value> {
     let raw = report.to_json();
     if !report.ok {
         return Err(invalid(format!("slow-link primitive {name} failed: {raw}")));
     }
-    let detail: Value = serde_json::from_str(&raw)
-        .map_err(|error| invalid(format!("slow-link primitive {name}: unreadable report: {error}")))?;
+    let detail: Value = serde_json::from_str(&raw).map_err(|error| {
+        invalid(format!(
+            "slow-link primitive {name}: unreadable report: {error}"
+        ))
+    })?;
     Ok(json!({
         "name": name,
         "status": "pass",
@@ -2564,9 +2805,7 @@ fn dispatch_case(
                     "zero_row_panel" => {
                         dsp::selftest::zero_row_panel(gpu, &call, binding, limits, SELFTEST_SEED)
                     }
-                    other => {
-                        return Err(invalid(format!("{other:?} is not a dispatch primitive")))
-                    }
+                    other => return Err(invalid(format!("{other:?} is not a dispatch primitive"))),
                 }
                 .map_err(dsp_err("primitive"))?;
                 out = Some(primitive_case_json(name, &report));
@@ -2578,6 +2817,126 @@ fn dispatch_case(
     );
     Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
     result
+}
+
+/// The one-row decode tail beside a K2 tile, on a device-resident layer: the
+/// dispatch crate's `decode_tail_cohort` over the incumbent's real K2 prefill
+/// call (64 rows) and real decode call (1 row at window row 64), each sealed
+/// the way the model seals it, against the layer's resident all-expert binding
+/// (the router may select any expert, a staged 32-expert page cannot hold them).
+fn decode_tail_case(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    rt: &SlowlinkRuntime,
+    profile: &SlowlinkProfile,
+) -> R<Value> {
+    let few_row_limit = {
+        let (scopes, _) = forward.enter_tile_scopes(gpu, profile.tile_rows);
+        let limit = gpu.few_row_limit();
+        Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+        limit
+    };
+    let geo = RunGeo::new(forward, bundle, few_row_limit, profile.geometry.num_experts)?;
+    let layer = geo
+        .band
+        .clone()
+        .find(|&layer| {
+            forward
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check().is_ok())
+        })
+        .ok_or_else(|| {
+            invalid(
+                "the decode tail check needs a device-resident qualified expert layer; this placement has none",
+            )
+        })?;
+    let anchor_rows = dsp::selftest::DECODE_TAIL_ANCHOR_ROWS;
+    let position = bundle.state.position;
+    let anchor_tile = TilePlan {
+        index: 0,
+        window: 0,
+        prompt_row: 0,
+        window_row: 0,
+        stream_offset: 0,
+        rows: anchor_rows,
+        position,
+        routing: tile_routing(forward, gpu, anchor_rows),
+        ends_at_cut: None,
+        last_in_window: false,
+    };
+    let decode_tile = TilePlan {
+        index: 1,
+        window: 0,
+        prompt_row: anchor_rows,
+        window_row: anchor_rows,
+        stream_offset: anchor_rows * geo.wide,
+        rows: 1,
+        position: position + anchor_rows,
+        routing: tile_routing(forward, gpu, 1),
+        ends_at_cut: None,
+        last_in_window: true,
+    };
+    let tiles = [&anchor_tile, &decode_tile];
+    with_tile_frames(
+        forward,
+        bundle,
+        gpu,
+        &rt.streams,
+        &geo,
+        &tiles,
+        layer,
+        |gpu, frames| {
+            let mut sealed = Vec::with_capacity(frames.len());
+            for frame in frames {
+                let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
+                    return Err(invalid("a resident layer's FFN is not MoE"));
+                };
+                sealed.push(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?);
+            }
+            let mut calls = Vec::with_capacity(sealed.len());
+            for (tile, sealed) in tiles.iter().zip(&sealed) {
+                let (scopes, _) = forward.enter_tile_scopes(gpu, tile.rows);
+                let call =
+                    dsp::PreparedChunkCall::new(&*gpu, sealed, tile.window_row, tile.position);
+                Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                calls.push(call.map_err(dsp_err("admission"))?);
+            }
+            if !calls[0].is_k2() || calls[0].is_decode() || !calls[1].is_decode() {
+                return Err(invalid(format!(
+                    "the decode tail check expects a K2 anchor and a decode tile; the seals gave k2={} decode={} and decode={}",
+                    calls[0].is_k2(),
+                    calls[0].is_decode(),
+                    calls[1].is_decode()
+                )));
+            }
+            let Qwen4FfnBinding::Moe(moe) = &frames[0].description.ffn else {
+                return Err(invalid("a resident layer's FFN is not MoE"));
+            };
+            let binding = dsp::ExpertPanelBinding::resident(
+                layer,
+                geo.num_experts,
+                moe.expert_gate_up_ptrs,
+                moe.expert_down_ptrs,
+            );
+            let (scopes, _) = forward.enter_tile_scopes(gpu, anchor_rows);
+            let report = dsp::selftest::decode_tail_cohort(
+                gpu,
+                &calls[0],
+                &calls[1],
+                binding,
+                dsp::PanelLimits::S1,
+                SELFTEST_SEED,
+            );
+            Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+            primitive_case_json(
+                "decode_tail_cohort",
+                &report.map_err(dsp_err("primitive"))?,
+            )
+        },
+    )
 }
 
 /// One named primitive check on the attached forward's real owners; the
@@ -2593,7 +2952,9 @@ pub(crate) fn primitive_selftest(
         .copied()
         .ok_or_else(|| invalid("slow-link primitive check needs an admitted profile"))?;
     if let Some(why) = forward.slowlink_forward_blocker(&bundle.config) {
-        return Err(invalid(format!("slow-link primitive check cannot run: {why}")));
+        return Err(invalid(format!(
+            "slow-link primitive check cannot run: {why}"
+        )));
     }
     ensure_runtime(forward, &*bundle, gpu, &profile).map_err(invalid)?;
     let mut rt = forward
@@ -2609,9 +2970,26 @@ pub(crate) fn primitive_selftest(
         "canonical_combine_exact" => dsp::selftest::canonical_combine_exact(gpu, SELFTEST_SEED)
             .map_err(dsp_err("canonical combine check"))
             .and_then(|report| primitive_case_json(name, &report)),
-        "within_expert_panel_canary" | "k1_tail_cohort" | "zero_row_panel" => {
+        "within_expert_panel_canary" | "zero_row_panel" => {
             dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name)
         }
+        // The few-row cohort is two checks that must BOTH pass: the prefill K1
+        // tail on a staged host-layer binding, and the incumbent's REAL one-row
+        // decode call beside a K2 tile on a resident all-expert binding.
+        "k1_tail_cohort" => dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name)
+            .and_then(|prefill| {
+                decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
+                    json!({
+                        "name": name,
+                        "status": "pass",
+                        "mismatches": 0u64,
+                        "detail": {
+                            "prefill_k1": prefill["detail"],
+                            "decode_tail": decode["detail"],
+                        },
+                    })
+                })
+            }),
         other => Err(invalid(format!("unknown slow-link primitive {other:?}"))),
     };
     let drained = rt.ring.drain(&*gpu);
@@ -2636,8 +3014,7 @@ mod slowlink_prompt {
 
     /// The admitted profile of a Flash-Next MQ4 load with ample memory.
     pub(super) fn profile() -> SlowlinkProfile {
-        let geometry =
-            ModelGeometry::from_config(&crate::config::compact_test_config()).unwrap();
+        let geometry = ModelGeometry::from_config(&crate::config::compact_test_config()).unwrap();
         admit(&AdmissionInputs {
             geometry,
             free: 40 << 30,
@@ -2649,6 +3026,8 @@ mod slowlink_prompt {
             base_reserve: 5261 * MIB,
             baseline_layers: 10,
             fixed_state_bytes: 64 * MIB,
+            pending_save_bytes: 4 * 2560 * 4,
+            checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
         })
@@ -2707,7 +3086,11 @@ mod slowlink_prompt {
         let mut position = plan.entry_pos;
         let mut row = 0;
         for tile in &plan.tiles {
-            assert_eq!(tile.position, position, "tile {} starts at the previous end", tile.index);
+            assert_eq!(
+                tile.position, position,
+                "tile {} starts at the previous end",
+                tile.index
+            );
             assert_eq!(tile.prompt_row, row);
             assert!(tile.rows > 0 && tile.rows <= S1_TILE_ROWS);
             position += tile.rows;
@@ -2742,7 +3125,10 @@ mod slowlink_prompt {
         assert_eq!(rows, [vec![1536; 10], vec![1024]].concat());
         assert_eq!(plan.launch_cuts().last(), Some(&16384));
         assert!(plan.tiles.iter().all(|t| t.ends_at_cut.is_none()));
-        assert!(plan.tiles.iter().all(|t| t.routing == gfx1100_routing(t.rows)));
+        assert!(plan
+            .tiles
+            .iter()
+            .all(|t| t.routing == gfx1100_routing(t.rows)));
         assert_eq!(plan.k1_rows_max, 0);
     }
 
@@ -2761,6 +3147,8 @@ mod slowlink_prompt {
         // `prefill_final_from` split its chunk loop: segments between cuts,
         // each tiled by the tile size, never a tile across a cut.
         for cuts in [
+            vec![1],
+            vec![8],
             vec![3],
             vec![4],
             vec![1536],
@@ -2777,11 +3165,17 @@ mod slowlink_prompt {
                     "cut {cut} is a tile end"
                 );
                 assert!(
-                    plan.tiles.iter().all(|t| !(t.position < cut && cut < t.end_position())),
+                    plan.tiles
+                        .iter()
+                        .all(|t| !(t.position < cut && cut < t.end_position())),
                     "no tile straddles cut {cut}"
                 );
             }
-            assert_eq!(plan.windows.len(), 1, "{cuts:?} fit one window's boundary snapshots");
+            assert_eq!(
+                plan.windows.len(),
+                1,
+                "{cuts:?} fit one window's boundary snapshots"
+            );
             let window = &plan.windows[0];
             assert_eq!(window.cuts, cuts);
             for tile in plan.window_tiles(window) {
@@ -2794,12 +3188,25 @@ mod slowlink_prompt {
                 .iter()
                 .filter_map(|t| t.ends_at_cut.map(|index| window.cuts[index]))
                 .collect();
-            assert_eq!(ended, cuts, "every cut is staged by exactly one tile end, in order");
+            assert_eq!(
+                ended, cuts,
+                "every cut is staged by exactly one tile end, in order"
+            );
         }
         let at_3 = plan(0, 16384, &[3]);
         assert_eq!(at_3.tiles[0].rows, 3);
         assert_eq!(at_3.tiles[1].rows, 1536);
         assert_eq!(at_3.k1_rows_max, 3, "a 3-row head tile is a K1 tile");
+        // The 1-row and 8-row tails the mandatory short-tail contract names: each
+        // is its own few-row tile with the original routing rows (1 and 8), which
+        // the dispatch admission must take as a K1 cohort, never refuse.
+        for rows in [1usize, 8] {
+            let tail = plan(0, 16384, &[rows]);
+            assert_eq!(tail.tiles[0].rows, rows);
+            assert_eq!(tail.tiles[0].routing.route_rows, rows);
+            assert!(!tail.tiles[0].routing.bf16_streams);
+            assert_eq!(tail.k1_rows_max, rows);
+        }
     }
 
     #[test]
@@ -2815,12 +3222,16 @@ mod slowlink_prompt {
         assert_eq!(plan.windows[1].position, 8192);
         assert!(plan.windows[1].cuts.is_empty());
         assert!(
-            plan.windows.iter().all(|w| w.cuts.len() <= S1_MAX_BOUNDARY_SNAPSHOTS),
+            plan.windows
+                .iter()
+                .all(|w| w.cuts.len() <= S1_MAX_BOUNDARY_SNAPSHOTS),
             "no window exceeds the admitted boundary snapshots"
         );
         assert!(plan.windows[0].tiles.end == plan.windows[1].tiles.start);
         // The window END boundary is the commit's: its tile carries no cut.
-        assert!(plan.tiles[plan.windows[0].tiles.end - 1].ends_at_cut.is_none());
+        assert!(plan.tiles[plan.windows[0].tiles.end - 1]
+            .ends_at_cut
+            .is_none());
     }
 
     #[test]
@@ -2839,7 +3250,7 @@ mod slowlink_prompt {
             host_layers: 38,
             tile_scratch_bytes: 1 << 30,
             reports: &reports,
-            peak_vram_bytes: 0,
+            peak_vram_bytes: None,
             status: "ok".to_string(),
         });
         assert_eq!(receipt["sweeps"], 3);
@@ -2860,7 +3271,12 @@ mod slowlink_prompt {
                 .expect("plans");
             assert_chronology(&plan);
             for tile in &plan.tiles {
-                assert_eq!(tile.routing, routing(tile.rows), "tile of {} rows", tile.rows);
+                assert_eq!(
+                    tile.routing,
+                    routing(tile.rows),
+                    "tile of {} rows",
+                    tile.rows
+                );
             }
             let signatures = plan.signatures();
             assert!(signatures.iter().any(|(rows, _)| *rows == 3));
@@ -2883,8 +3299,13 @@ mod slowlink_prompt {
         );
         assert_ne!(tail.tiles[1].routing, tail.tiles[0].routing);
         assert!(!gfx1100_routing(3).bf16_streams && gfx1100_routing(1536).bf16_streams);
-        let canonical = plan_with(0, 5000, &[3], &canonical_routing, 8).unwrap().unwrap();
-        assert_eq!(canonical.tiles[0].routing.route_rows, QWEN4_F16_WMMA_MIN_TOKENS);
+        let canonical = plan_with(0, 5000, &[3], &canonical_routing, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            canonical.tiles[0].routing.route_rows,
+            QWEN4_F16_WMMA_MIN_TOKENS
+        );
         assert_eq!(canonical.k1_rows_max, 0, "canonical rows are never K1");
     }
 
@@ -2907,7 +3328,10 @@ mod slowlink_prompt {
     #[test]
     fn slowlink_prompt_malformed_cuts_are_errors_not_verdicts() {
         for cuts in [vec![0], vec![5, 5], vec![9, 4], vec![100]] {
-            assert!(plan_with(0, 100, &cuts, &gfx1100_routing, 8).is_err(), "{cuts:?}");
+            assert!(
+                plan_with(0, 100, &cuts, &gfx1100_routing, 8).is_err(),
+                "{cuts:?}"
+            );
         }
         assert!(plan_with(0, 0, &[], &gfx1100_routing, 8).is_err());
     }
@@ -2919,7 +3343,10 @@ mod slowlink_prompt {
         let entry = PleHistory::new(151_643);
         let histories = PleCursor::histories_for(entry, &plan.tiles, &tokens);
         assert_eq!(histories.len(), plan.tiles.len());
-        assert_eq!(histories[0], entry, "the first tile starts at the entry history");
+        assert_eq!(
+            histories[0], entry,
+            "the first tile starts at the entry history"
+        );
         for (index, tile) in plan.tiles.iter().enumerate().skip(1) {
             // The history at a tile is the entry history advanced by every
             // earlier token, exactly what the sequential chunk loop commits.
@@ -2956,12 +3383,18 @@ mod slowlink_prompt {
             );
             assert!(pair[0].rows <= S1_TILE_ROWS, "bounded capture rows");
         }
-        assert_eq!(plan.tiles[0].position, 0, "prompt position 0 pairs with itself");
+        assert_eq!(
+            plan.tiles[0].position, 0,
+            "prompt position 0 pairs with itself"
+        );
         // A resumed MTP fill starts mid-prompt: its first tile pairs with the
         // entry `pending` row saved before the window.
         let resumed_plan = plan_resumed();
         assert_eq!(resumed_plan.tiles[0].position, 3000);
-        assert_eq!(plan.tiles.iter().filter(|t| t.last_in_window).count(), plan.windows.len());
+        assert_eq!(
+            plan.tiles.iter().filter(|t| t.last_in_window).count(),
+            plan.windows.len()
+        );
     }
 
     #[test]
@@ -2972,7 +3405,10 @@ mod slowlink_prompt {
         let plan = plan(0, 1536 * 2 + 100, &[3]);
         let mut elements = 0usize;
         for tile in &plan.tiles {
-            assert_eq!(tile.stream_offset, elements, "tiles pack back to back in tag size");
+            assert_eq!(
+                tile.stream_offset, elements,
+                "tiles pack back to back in tag size"
+            );
             let bytes = if tile.routing.bf16_streams { 2 } else { 4 };
             elements += tile.rows * wide * bytes / 4;
         }
@@ -3002,22 +3438,58 @@ mod slowlink_prompt {
             few_row_limit: 8,
         })
         .unwrap();
-        assert!(matches!(verdict, Err(PlanBypass::StreamArena { window: 0, .. })));
+        assert!(matches!(
+            verdict,
+            Err(PlanBypass::StreamArena { window: 0, .. })
+        ));
     }
 
     #[test]
     fn slowlink_prompt_abort_phase_drains_before_restore() {
         // The cleanup of each named failure point.
-        let before_dma = Progress { txn_open: true, ring_primed: false };
-        assert_eq!(before_dma.abort_steps(), AbortSteps { drain_ring: false, abort_txn: true });
-        let during_panel = Progress { txn_open: true, ring_primed: true };
-        assert_eq!(during_panel.abort_steps(), AbortSteps { drain_ring: true, abort_txn: true });
+        let before_dma = Progress {
+            txn_open: true,
+            ring_primed: false,
+        };
+        assert_eq!(
+            before_dma.abort_steps(),
+            AbortSteps {
+                drain_ring: false,
+                abort_txn: true
+            }
+        );
+        let during_panel = Progress {
+            txn_open: true,
+            ring_primed: true,
+        };
+        assert_eq!(
+            during_panel.abort_steps(),
+            AbortSteps {
+                drain_ring: true,
+                abort_txn: true
+            }
+        );
         // After the window drained (commit stage) only the transaction remains
         // to restore; a commit failure already restored it itself.
-        let before_commit = Progress { txn_open: true, ring_primed: false };
-        assert_eq!(before_commit.abort_steps(), AbortSteps { drain_ring: false, abort_txn: true });
+        let before_commit = Progress {
+            txn_open: true,
+            ring_primed: false,
+        };
+        assert_eq!(
+            before_commit.abort_steps(),
+            AbortSteps {
+                drain_ring: false,
+                abort_txn: true
+            }
+        );
         let consumed = Progress::default();
-        assert_eq!(consumed.abort_steps(), AbortSteps { drain_ring: false, abort_txn: false });
+        assert_eq!(
+            consumed.abort_steps(),
+            AbortSteps {
+                drain_ring: false,
+                abort_txn: false
+            }
+        );
     }
 
     #[test]
@@ -3033,6 +3505,13 @@ mod slowlink_prompt {
         let reserve = spec.reserve().unwrap();
         assert_eq!(census.ring + census.lookahead, reserve.payload as u64);
         assert_eq!(census.tables, reserve.tables as u64);
+        assert_eq!(census.group_scatter, profile.census.group_scatter);
+        assert_eq!(
+            census.group_scatter,
+            crate::slowlink_admission::group_scatter_bytes(&profile.geometry, profile.window_rows)
+                .unwrap(),
+            "the receipt's scatter charge is the layout's, one source"
+        );
         let wide = profile.geometry.hc_count * profile.geometry.hidden;
         let slack = (profile.tile_rows * wide * 2) as u64;
         assert!(
@@ -3060,22 +3539,48 @@ mod slowlink_prompt {
             host_layers: 38,
             tile_scratch_bytes: 5 << 30,
             reports: &[report],
-            peak_vram_bytes: 22 << 30,
+            peak_vram_bytes: Some(22 << 30),
             status: "ok".to_string(),
         });
         for key in [
-            "schema", "route", "selected_by", "bypass_reason", "entry_pos", "prompt_rows",
-            "windows", "launch_cuts", "tile_rows", "retained_scratch_rows", "sweeps",
-            "resident_layers", "host_layers", "host_expert_bytes_total", "submitted_bytes",
-            "useful_bytes", "unused_prefetched_bytes", "reserve", "spans_ms", "overlap",
+            "schema",
+            "route",
+            "selected_by",
+            "bypass_reason",
+            "entry_pos",
+            "prompt_rows",
+            "windows",
+            "launch_cuts",
+            "tile_rows",
+            "retained_scratch_rows",
+            "sweeps",
+            "resident_layers",
+            "host_layers",
+            "host_expert_bytes_total",
+            "submitted_bytes",
+            "useful_bytes",
+            "unused_prefetched_bytes",
+            "reserve",
+            "spans_ms",
+            "overlap",
             "peak_vram_bytes",
         ] {
             assert!(receipt.get(key).is_some(), "receipt lacks {key}");
         }
+        // The VRAM figure is one post-request sample, and the receipt says so:
+        // never a continuous peak.
+        assert_eq!(
+            receipt["vram_measurement"],
+            json!({"method": "hipMemGetInfo_post_request_sample", "continuous_peak": false})
+        );
+        assert_eq!(receipt["peak_vram_bytes"], 22u64 << 30);
         assert_eq!(receipt["schema"], RECEIPT_SCHEMA);
         assert_eq!(receipt["route"], "layer-major");
         assert_eq!(receipt["selected_by"], "env1");
-        assert_eq!(receipt["sweeps"], receipt["windows"].as_array().unwrap().len());
+        assert_eq!(
+            receipt["sweeps"],
+            receipt["windows"].as_array().unwrap().len()
+        );
         assert!(receipt["retained_scratch_rows"].as_u64().unwrap() <= 1536);
         assert!(receipt["tile_rows"].as_u64().unwrap() <= 1536);
         assert_eq!(receipt["submitted_bytes"], 50_803_507_200u64);
@@ -3083,11 +3588,17 @@ mod slowlink_prompt {
             assert!(receipt["reserve"].get(key).is_some(), "reserve lacks {key}");
         }
         for key in ["wall", "copy", "compute", "route_barrier", "nonexpert"] {
-            assert!(receipt["spans_ms"].get(key).is_some(), "spans_ms lacks {key}");
+            assert!(
+                receipt["spans_ms"].get(key).is_some(),
+                "spans_ms lacks {key}"
+            );
         }
         for key in [
-            "cross_layer_intersections", "cross_layer_overlap_ms", "copy_idle_ms",
-            "page_full_stalls", "copy_starved_stalls",
+            "cross_layer_intersections",
+            "cross_layer_overlap_ms",
+            "copy_idle_ms",
+            "page_full_stalls",
+            "copy_starved_stalls",
         ] {
             assert!(receipt["overlap"].get(key).is_some(), "overlap lacks {key}");
         }
@@ -3098,9 +3609,72 @@ mod slowlink_prompt {
             .sum();
         assert!(total >= parts, "the charged total covers every named term");
     }
+
+    #[test]
+    fn slowlink_prompt_receipt_unused_bytes_include_untouched_experts_of_acquired_groups() {
+        let plan = plan(0, 16384, &[1536]);
+        let receipt_of = |reports: &[WindowReport]| {
+            layer_major_receipt(&ReceiptInputs {
+                mode: SlowlinkMode::Force,
+                plan: &plan,
+                resident_layers: 10,
+                host_layers: 38,
+                tile_scratch_bytes: 0,
+                reports,
+                peak_vram_bytes: None,
+                status: "ok".to_string(),
+            })
+        };
+        // Every group was acquired (the transport discarded nothing), yet the
+        // routed rows read only part of the experts inside them: the rest of
+        // the submitted payload was moved for nothing.
+        let partial = WindowReport {
+            sweep_bytes: 1000,
+            useful_bytes: 640,
+            stats: PanelStats {
+                submitted_payload_bytes: 1000,
+                discarded_payload_bytes: 0,
+                ..PanelStats::default()
+            },
+            ..WindowReport::default()
+        };
+        assert_eq!(partial.unused_bytes(), Some(360));
+        let receipt = receipt_of(&[partial, partial]);
+        assert_eq!(receipt["submitted_bytes"], 2000u64);
+        assert_eq!(receipt["useful_bytes"], 1280u64);
+        assert_eq!(
+            receipt["unused_prefetched_bytes"], 720u64,
+            "submitted minus useful, even with the discard counter at zero"
+        );
+        assert_eq!(receipt["discarded_group_payload_bytes"], 0u64);
+        // Wholly unused groups are part of the same difference, never added twice.
+        let with_discard = WindowReport {
+            useful_bytes: 640,
+            stats: PanelStats {
+                submitted_payload_bytes: 1000,
+                discarded_payload_bytes: 200,
+                ..PanelStats::default()
+            },
+            ..WindowReport::default()
+        };
+        let receipt = receipt_of(&[with_discard]);
+        assert_eq!(receipt["unused_prefetched_bytes"], 360u64);
+        assert_eq!(receipt["discarded_group_payload_bytes"], 200u64);
+        // Fully used: nothing unused. Useful above submitted is a broken
+        // measurement: the receipt reports it as missing, never underflows.
+        let full = WindowReport {
+            useful_bytes: 1000,
+            ..partial
+        };
+        assert_eq!(receipt_of(&[full])["unused_prefetched_bytes"], 0u64);
+        let broken = WindowReport {
+            useful_bytes: 1001,
+            ..partial
+        };
+        assert_eq!(broken.unused_bytes(), None);
+        assert!(receipt_of(&[broken])["unused_prefetched_bytes"].is_null());
+    }
 }
-
-
 
 #[cfg(test)]
 mod slowlink_overlap {
@@ -3248,7 +3822,9 @@ mod slowlink_overlap {
     impl Arena {
         fn new() -> Self {
             Self {
-                bytes: (0..EXPERTS * (GU + DN) + 4096).map(|i| (i % 251) as u8).collect(),
+                bytes: (0..EXPERTS * (GU + DN) + 4096)
+                    .map(|i| (i % 251) as u8)
+                    .collect(),
             }
         }
 
@@ -3258,7 +3834,10 @@ mod slowlink_overlap {
                 .map(|id| {
                     Some(ExpertSource {
                         codec: PanelCodec(0),
-                        gate_up: ExpertExtent { addr: base + id * GU, len: GU },
+                        gate_up: ExpertExtent {
+                            addr: base + id * GU,
+                            len: GU,
+                        },
                         down: ExpertExtent {
                             addr: base + EXPERTS * GU + id * DN,
                             len: DN,
@@ -3268,10 +3847,8 @@ mod slowlink_overlap {
                 .collect();
             // SAFETY: the extents lie inside `self.bytes`, which the test keeps
             // alive (and unmodified) for as long as the sources.
-            unsafe {
-                LayerExpertSources::new(layer, base, self.bytes.len(), experts, Arc::new(()))
-            }
-            .unwrap()
+            unsafe { LayerExpertSources::new(layer, base, self.bytes.len(), experts, Arc::new(())) }
+                .unwrap()
         }
     }
 
@@ -3282,18 +3859,26 @@ mod slowlink_overlap {
     fn fixture(host_layers: &[usize]) -> (Arena, RingCore<Model>, PanelSchedule) {
         let arena = Arena::new();
         let schedule =
-            PanelSchedule::new(host_layers.iter().map(|&l| arena.sources(l)).collect(), 32).unwrap();
+            PanelSchedule::new(host_layers.iter().map(|&l| arena.sources(l)).collect(), 32)
+                .unwrap();
         let core = RingCore::new(spec(), Model::new(PAGES)).unwrap();
         (arena, core, schedule)
     }
 
-    fn work(schedule: &PanelSchedule, layer: usize, bound: impl Fn(usize) -> bool) -> Vec<GroupWork> {
+    fn work(
+        schedule: &PanelSchedule,
+        layer: usize,
+        bound: impl Fn(usize) -> bool,
+    ) -> Vec<GroupWork> {
         schedule
             .layer_groups(layer)
             .unwrap()
             .iter()
             .enumerate()
-            .map(|(index, group)| GroupWork { group: group.group, bound: bound(index) })
+            .map(|(index, group)| GroupWork {
+                group: group.group,
+                bound: bound(index),
+            })
             .collect()
     }
 
@@ -3304,11 +3889,17 @@ mod slowlink_overlap {
         let (_arena, mut core, mut schedule) = fixture(&[10, 11, 12]);
         let issued = schedule.prime(&mut core, &()).unwrap();
         assert_eq!(issued, 16, "the whole first host layer fits the page store");
-        assert!(core.model_events().iter().all(|e| !matches!(e, Ev::Acquire { .. })));
+        assert!(core
+            .model_events()
+            .iter()
+            .all(|e| !matches!(e, Ev::Acquire { .. })));
         for group in 0..16u32 {
             assert!(schedule.ticket(10, group).is_some());
         }
-        assert!(schedule.ticket(11, 0).is_none(), "nothing of layer 11 until compute is on layer 10");
+        assert!(
+            schedule.ticket(11, 0).is_none(),
+            "nothing of layer 11 until compute is on layer 10"
+        );
     }
 
     #[test]
@@ -3318,15 +3909,23 @@ mod slowlink_overlap {
         // Compute reaches layer 10: its mixer and counts are still ahead, yet
         // the two pages the current layer does not hold already carry layer 11.
         schedule.enter_layer(&mut core, &(), 10).unwrap();
-        assert_eq!(core.stats().enqueued, 18, "16 current + 2 lookahead pages, no acquire yet");
+        assert_eq!(
+            core.stats().enqueued,
+            18,
+            "16 current + 2 lookahead pages, no acquire yet"
+        );
         assert_eq!(core.stats().acquired, 0);
         assert!(schedule.ticket(11, 0).is_some() && schedule.ticket(11, 1).is_some());
         assert!(schedule.ticket(11, 2).is_none(), "the page store is full");
         // Current-layer groups are enqueued before any next-layer group.
-        let order: Vec<usize> = core.model_events().iter().filter_map(|e| match e {
-            Ev::End { slot } => Some(*slot),
-            _ => None,
-        }).collect();
+        let order: Vec<usize> = core
+            .model_events()
+            .iter()
+            .filter_map(|e| match e {
+                Ev::End { slot } => Some(*slot),
+                _ => None,
+            })
+            .collect();
         assert_eq!(order.len(), 18);
     }
 
@@ -3340,7 +3939,10 @@ mod slowlink_overlap {
             // Every third group is read by no panel: retired unread, never refetched.
             let work = work(&schedule, layer, |index| index % 3 != 0);
             let summary = walk_layer_groups(
-                &mut CoreRing { core: &mut core, schedule: &mut schedule },
+                &mut CoreRing {
+                    core: &mut core,
+                    schedule: &mut schedule,
+                },
                 &mut (),
                 layer,
                 &work,
@@ -3360,7 +3962,10 @@ mod slowlink_overlap {
         assert_eq!(seen, sorted);
         assert_eq!(seen.len(), 3 * 10);
         let stats = core.stats();
-        assert_eq!(stats.enqueued, 48, "one transfer per group per window, no refetch");
+        assert_eq!(
+            stats.enqueued, 48,
+            "one transfer per group per window, no refetch"
+        );
         assert_eq!(stats.retired, 48, "every ticket of every layer retired");
         assert_eq!(stats.discarded, 18);
         assert_eq!(stats.acquired, 30);
@@ -3376,7 +3981,10 @@ mod slowlink_overlap {
             schedule.enter_layer(&mut core, &(), layer).unwrap();
             let work = work(&schedule, layer, |_| true);
             walk_layer_groups(
-                &mut CoreRing { core: &mut core, schedule: &mut schedule },
+                &mut CoreRing {
+                    core: &mut core,
+                    schedule: &mut schedule,
+                },
                 &mut (),
                 layer,
                 &work,
@@ -3390,19 +3998,34 @@ mod slowlink_overlap {
         for slot in 0..PAGES {
             let mut released = false;
             for event in events.iter().filter(|e| match e {
-                Ev::Begin { slot: s, .. } | Ev::End { slot: s } | Ev::Acquire { slot: s } | Ev::Release { slot: s } => *s == slot,
+                Ev::Begin { slot: s, .. }
+                | Ev::End { slot: s }
+                | Ev::Acquire { slot: s }
+                | Ev::Release { slot: s } => *s == slot,
                 Ev::Drain => false,
             }) {
                 match event {
                     Ev::Begin { wait_free, .. } => {
-                        assert_eq!(*wait_free, released, "slot {slot}: a reuse waits the free event");
+                        assert_eq!(
+                            *wait_free, released,
+                            "slot {slot}: a reuse waits the free event"
+                        );
                     }
                     Ev::Release { .. } => released = true,
                     _ => {}
                 }
             }
         }
-        assert!(events.iter().any(|e| matches!(e, Ev::Begin { wait_free: true, .. })), "pages were reused");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Ev::Begin {
+                    wait_free: true,
+                    ..
+                }
+            )),
+            "pages were reused"
+        );
     }
 
     #[test]
@@ -3415,7 +4038,10 @@ mod slowlink_overlap {
         let work = work(&schedule, 10, |_| true);
         let mut count = 0;
         let error = walk_layer_groups(
-            &mut CoreRing { core: &mut core, schedule: &mut schedule },
+            &mut CoreRing {
+                core: &mut core,
+                schedule: &mut schedule,
+            },
             &mut (),
             10,
             &work,
@@ -3432,11 +4058,18 @@ mod slowlink_overlap {
         assert!(error.to_string().contains("injected"));
         core.drain(&()).unwrap();
         assert!(core.model_events().contains(&Ev::Drain));
-        assert!(core.acquire(&(), stale).is_err(), "an old ticket cannot reach a page that may hold other bytes");
+        assert!(
+            core.acquire(&(), stale).is_err(),
+            "an old ticket cannot reach a page that may hold other bytes"
+        );
         // The next window starts clean: first host layer first, ascending.
         schedule.prime(&mut core, &()).unwrap();
         assert!(schedule.ticket(10, 0).is_some());
-        assert_eq!(core.stats().enqueued, 16, "statistics restart with the window");
+        assert_eq!(
+            core.stats().enqueued,
+            16,
+            "statistics restart with the window"
+        );
     }
 
     #[test]
@@ -3448,7 +4081,12 @@ mod slowlink_overlap {
         assert_eq!(ranges.first().unwrap().0, 0);
         assert_eq!(ranges.last().unwrap().1, EXPERTS);
         for (index, pair) in ranges.windows(2).enumerate() {
-            assert_eq!(pair[0].1, pair[1].0, "ranges {index}/{} are contiguous", index + 1);
+            assert_eq!(
+                pair[0].1,
+                pair[1].0,
+                "ranges {index}/{} are contiguous",
+                index + 1
+            );
         }
         for (range, group) in ranges.iter().zip(groups) {
             assert!(group.experts.iter().all(|&e| e >= range.0 && e < range.1));
@@ -3459,9 +4097,15 @@ mod slowlink_overlap {
     fn slowlink_overlap_panels_group_by_ascending_binding() {
         let by_group = panels_by_group([0usize, 0, 1, 3, 3, 3].into_iter(), 4).unwrap();
         assert_eq!(by_group, vec![0..2, 2..3, 0..0, 3..6]);
-        assert!(panels_by_group([1usize, 0].into_iter(), 2).is_err(), "bindings must ascend");
+        assert!(
+            panels_by_group([1usize, 0].into_iter(), 2).is_err(),
+            "bindings must ascend"
+        );
         assert!(panels_by_group([0usize, 1, 0].into_iter(), 2).is_err());
-        assert!(panels_by_group([2usize].into_iter(), 2).is_err(), "a panel names a real group");
+        assert!(
+            panels_by_group([2usize].into_iter(), 2).is_err(),
+            "a panel names a real group"
+        );
     }
 
     #[test]

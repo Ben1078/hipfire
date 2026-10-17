@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Fixed-state staging for a session boundary between pipeline banks.
 use super::*;
+use crate::ple::PleHistory;
 use hipfire_runtime::session_cache::StatePart;
 use rdna_compute::DType;
-use crate::ple::PleHistory;
 use serde_json::{json, Value};
 
 pub(crate) struct PairSessionStage {
@@ -14,33 +14,53 @@ pub(crate) struct PairSessionStage {
 }
 
 impl PairSessionStage {
-    pub(crate) fn copy(&self, gpu: &mut Gpu, index: usize, src: &GpuTensor) -> Result<(), BundleError> {
+    pub(crate) fn copy(
+        &self,
+        gpu: &mut Gpu,
+        index: usize,
+        src: &GpuTensor,
+    ) -> Result<(), BundleError> {
         self.copy_parts(gpu, index, [src])
     }
 
     pub(crate) fn copy_parts<const N: usize>(
-        &self, gpu: &mut Gpu, index: usize, src: [&GpuTensor; N],
+        &self,
+        gpu: &mut Gpu,
+        index: usize,
+        src: [&GpuTensor; N],
     ) -> Result<(), BundleError> {
-        let dst = self.fixed.get(index..index + N).ok_or_else(|| BundleError::Forward("paired snapshot fixed index mismatch".into()))?;
+        let dst = self
+            .fixed
+            .get(index..index + N)
+            .ok_or_else(|| BundleError::Forward("paired snapshot fixed index mismatch".into()))?;
         for (src, dst) in src.iter().zip(dst) {
             if src.byte_size() != dst.byte_size() || !src.byte_size().is_multiple_of(4) {
-                return Err(BundleError::Forward("paired snapshot state must use equal aligned device copies".into()));
+                return Err(BundleError::Forward(
+                    "paired snapshot state must use equal aligned device copies".into(),
+                ));
             }
         }
         // A copy kernel is stream-ordered even on the default stream;
         // copy_d2d's legacy-stream fallback would synchronize the host.
         let regions: [_; N] = std::array::from_fn(|i| rdna_compute::tensor_ops::CopyRegion {
-            dst: &dst[i].buf, dst_offset: 0, src: &src[i].buf, src_offset: 0,
+            dst: &dst[i].buf,
+            dst_offset: 0,
+            src: &src[i].buf,
+            src_offset: 0,
             bytes: src[i].byte_size(),
         });
         rdna_compute::tensor_ops::copy_regions(gpu, &regions).map_err(BundleError::Hip)
     }
 
     pub(crate) fn configure(
-        &mut self, state: &Qwen4State, history: crate::ple::PleHistory,
+        &mut self,
+        state: &Qwen4State,
+        history: crate::ple::PleHistory,
         commits: &[(usize, usize, usize, usize, usize)],
     ) -> Result<(), BundleError> {
-        let (meta, layout) = state.session_parts_at(self.position.expect("armed stage"), history, Some(commits)).map_err(BundleError::State)?;
+        let (meta, layout) = state
+            .session_parts_at(self.position.expect("armed stage"), history, Some(commits))
+            .map_err(BundleError::State)?;
         debug_assert_eq!(self.fixed.len(), layout.fixed.len());
         for (saved, part) in self.fixed.iter().zip(&layout.fixed) {
             debug_assert_eq!(saved.byte_size(), part.bytes);
@@ -50,19 +70,30 @@ impl PairSessionStage {
         {
             // The ordinary restore parser must reconstruct exactly the staged
             // boundary layout. This is host-only; never drain the HIP stream.
-            let sequential = state.session_layout_for_meta(&self.meta).map_err(BundleError::State)?;
+            let sequential = state
+                .session_layout_for_meta(&self.meta)
+                .map_err(BundleError::State)?;
             assert_layout_shape(
                 self.fixed.iter().map(GpuTensor::byte_size),
-                layout.rows.iter().map(|stream| (stream.row_bytes, stream.rows)),
+                layout
+                    .rows
+                    .iter()
+                    .map(|stream| (stream.row_bytes, stream.rows)),
                 sequential.fixed.iter().map(|part| part.bytes),
-                sequential.rows.iter().map(|stream| (stream.row_bytes, stream.rows)),
+                sequential
+                    .rows
+                    .iter()
+                    .map(|stream| (stream.row_bytes, stream.rows)),
             );
         }
         self.rows = layout.rows.iter().map(|stream| stream.rows).collect();
         Ok(())
     }
 
-    pub(super) fn snapshot_parts<'a>(&'a self, state: &'a Qwen4State) -> Result<SnapshotParts<'a>, StateError> {
+    pub(super) fn snapshot_parts<'a>(
+        &'a self,
+        state: &'a Qwen4State,
+    ) -> Result<SnapshotParts<'a>, StateError> {
         Ok(self.parts(state.session_layout_for_meta(&self.meta)?))
     }
 
@@ -71,24 +102,38 @@ impl PairSessionStage {
         debug_assert_eq!(self.rows.len(), live.rows.len());
         for (saved, part) in self.fixed.iter().zip(&mut live.fixed) {
             debug_assert_eq!(saved.byte_size(), part.bytes);
-            *part = StatePart { buf: &saved.buf, offset: 0, bytes: saved.byte_size() };
+            *part = StatePart {
+                buf: &saved.buf,
+                offset: 0,
+                bytes: saved.byte_size(),
+            };
         }
         for (&rows, stream) in self.rows.iter().zip(&mut live.rows) {
             debug_assert!(rows <= stream.rows);
             stream.rows = rows;
         }
-        SnapshotParts { meta: self.meta.clone(), layout: live }
+        SnapshotParts {
+            meta: self.meta.clone(),
+            layout: live,
+        }
     }
 }
 
 #[cfg(debug_assertions)]
 fn assert_layout_shape(
-    fixed: impl Iterator<Item = usize>, rows: impl Iterator<Item = (usize, usize)>,
+    fixed: impl Iterator<Item = usize>,
+    rows: impl Iterator<Item = (usize, usize)>,
     sequential_fixed: impl Iterator<Item = usize>,
     sequential_rows: impl Iterator<Item = (usize, usize)>,
 ) {
-    assert!(fixed.eq(sequential_fixed), "paired snapshot fixed layout differs from sequential");
-    assert!(rows.eq(sequential_rows), "paired snapshot row layout differs from sequential");
+    assert!(
+        fixed.eq(sequential_fixed),
+        "paired snapshot fixed layout differs from sequential"
+    );
+    assert!(
+        rows.eq(sequential_rows),
+        "paired snapshot row layout differs from sequential"
+    );
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -99,34 +144,50 @@ mod tests {
     fn staged_layout_matches_sequential_without_device_buffers() {
         let fixed = [64, 128, 32, 16];
         let rows = [(8, 8192), (8, 8192), (4, 8192), (4, 512)];
-        assert_layout_shape(fixed.into_iter(), rows.into_iter(), fixed.into_iter(), rows.into_iter());
+        assert_layout_shape(
+            fixed.into_iter(),
+            rows.into_iter(),
+            fixed.into_iter(),
+            rows.into_iter(),
+        );
     }
 
     #[test]
     #[should_panic(expected = "row layout differs")]
     fn pair_end_rows_cannot_be_published_at_a_boundary() {
-        assert_layout_shape([64].into_iter(), [(8, 16384)].into_iter(),
-            [64].into_iter(), [(8, 8192)].into_iter());
+        assert_layout_shape(
+            [64].into_iter(),
+            [(8, 16384)].into_iter(),
+            [64].into_iter(),
+            [(8, 8192)].into_iter(),
+        );
     }
 }
 
 impl Qwen4Bundle {
     pub(crate) fn prepare_pair_session_stage(
-        &mut self, gpu: &mut Gpu, position: usize,
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
     ) -> Result<Option<PairSessionStage>, BundleError> {
         if self.session.is_none() || self.session_next_boundary() != Some(position) {
             return Ok(None);
         }
         let (_, layout) = self.state.session_parts().map_err(BundleError::State)?;
         let mut stage = self.pair_session_stage.take().unwrap_or(PairSessionStage {
-            fixed: Vec::new(), meta: Vec::new(), rows: Vec::new(), position: None,
+            fixed: Vec::new(),
+            meta: Vec::new(),
+            rows: Vec::new(),
+            position: None,
         });
         if stage.fixed.is_empty() {
             for part in &layout.fixed {
                 match gpu.zeros(&[part.bytes], DType::Raw) {
                     Ok(tensor) => stage.fixed.push(tensor),
                     Err(error) => {
-                        for tensor in stage.fixed { let _ = gpu.free_tensor(tensor); }
+                        for tensor in stage.fixed {
+                            let _ = gpu.free_tensor(tensor);
+                        }
                         return Err(BundleError::Hip(error));
                     }
                 }
@@ -147,8 +208,14 @@ impl Qwen4Bundle {
 
     /// Use the retained canonical prefix, without allocating another token copy.
     /// MTP calls this only after A's head append and before B's append.
-    pub(crate) fn publish_pair_session_boundary(&mut self, gpu: &mut Gpu, position: usize) -> Result<(), BundleError> {
-        if self.session_next_boundary() != Some(position) { return Ok(()); }
+    pub(crate) fn publish_pair_session_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        if self.session_next_boundary() != Some(position) {
+            return Ok(());
+        }
         let result = self
             .ep_refuse("session_at_boundary outside a replicated call")
             .and_then(|()| {
@@ -156,7 +223,9 @@ impl Qwen4Bundle {
                     .unwrap_or(Ok(()))
                     .map_err(BundleError::Forward)
             });
-        if let Some(stage) = &mut self.pair_session_stage { stage.position = None; }
+        if let Some(stage) = &mut self.pair_session_stage {
+            stage.position = None;
+        }
         result
     }
 
@@ -206,10 +275,27 @@ pub const SLOWLINK_PRIMITIVES: [&str; 7] = [
 /// Keys every receipt carries (`injection_consumed` is added on read).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SLOWLINK_RECEIPT_KEYS: [&str; 21] = [
-    "schema", "route", "selected_by", "bypass_reason", "entry_pos", "prompt_rows", "windows",
-    "launch_cuts", "tile_rows", "retained_scratch_rows", "sweeps", "resident_layers",
-    "host_layers", "host_expert_bytes_total", "submitted_bytes", "useful_bytes",
-    "unused_prefetched_bytes", "reserve", "spans_ms", "overlap", "peak_vram_bytes",
+    "schema",
+    "route",
+    "selected_by",
+    "bypass_reason",
+    "entry_pos",
+    "prompt_rows",
+    "windows",
+    "launch_cuts",
+    "tile_rows",
+    "retained_scratch_rows",
+    "sweeps",
+    "resident_layers",
+    "host_layers",
+    "host_expert_bytes_total",
+    "submitted_bytes",
+    "useful_bytes",
+    "unused_prefetched_bytes",
+    "reserve",
+    "spans_ms",
+    "overlap",
+    "peak_vram_bytes",
 ];
 
 /// `(full, raw, pooled, selected, position)` of one QSA slot, the commit
@@ -255,10 +341,18 @@ impl SlowlinkScope {
         Self::default()
     }
     pub(crate) fn prompt() -> Self {
-        Self { cuts: true, publish_end: true, head: false }
+        Self {
+            cuts: true,
+            publish_end: true,
+            head: false,
+        }
     }
     pub(crate) fn capture() -> Self {
-        Self { cuts: true, publish_end: true, head: true }
+        Self {
+            cuts: true,
+            publish_end: true,
+            head: true,
+        }
     }
 }
 
@@ -273,13 +367,22 @@ pub(crate) struct PromptTxn {
 /// Pending session boundaries strictly inside `(entry, end)`, ascending.
 pub(crate) fn prompt_cuts_in(entry: usize, end: usize, pending: &[usize]) -> Vec<usize> {
     debug_assert!(pending.windows(2).all(|pair| pair[0] < pair[1]));
-    pending.iter().copied().filter(|&b| b > entry && b < end).collect()
+    pending
+        .iter()
+        .copied()
+        .filter(|&b| b > entry && b < end)
+        .collect()
 }
 
 /// Largest window end `<= end` holding at most `max_cuts` strictly-inside
 /// cuts: `end` itself when everything fits, else the `(max_cuts + 1)`-th
 /// pending boundary after `entry` (which then ends the window as a boundary).
-pub(crate) fn prompt_window_end(entry: usize, end: usize, pending: &[usize], max_cuts: usize) -> usize {
+pub(crate) fn prompt_window_end(
+    entry: usize,
+    end: usize,
+    pending: &[usize],
+    max_cuts: usize,
+) -> usize {
     pending
         .iter()
         .copied()
@@ -293,8 +396,63 @@ pub(crate) fn prompt_window_end(entry: usize, end: usize, pending: &[usize], max
 /// refreshed before EVERY window's transaction begins, so after a window
 /// restores its entry state the matching backup is that window's own and
 /// never an earlier window's (whose `pending` is the hidden of another row).
-pub(crate) fn pending_backup_applies(saved: bool, saved_for: Option<usize>, position: usize) -> bool {
+pub(crate) fn pending_backup_applies(
+    saved: bool,
+    saved_for: Option<usize>,
+    position: usize,
+) -> bool {
     saved && saved_for == Some(position)
+}
+
+/// The chunk rows [`Qwen4Bundle::attach_forward`] requests. With an admitted
+/// slow-link profile it is exactly the profile's charged tile: it must fit
+/// the S1 bound, the caller's capacity `max_chunk` and the PLE store's
+/// `ple_rows_cap`, or the attach is refused before any allocation (never a
+/// widened or narrowed chunk, never the incumbent helper). Without a profile
+/// it is the incumbent request, unchanged.
+pub(crate) fn attach_chunk_request(
+    tile_rows: Option<usize>,
+    max_chunk: usize,
+    ple_rows_cap: usize,
+    incumbent: impl FnOnce() -> usize,
+) -> Result<usize, String> {
+    let Some(tile) = tile_rows else {
+        return Ok(incumbent().min(ple_rows_cap));
+    };
+    if tile == 0 || tile > PROMPT_TILE_ROWS_MAX {
+        return Err(format!(
+            "slow-link profile tile {tile} is outside 1..={PROMPT_TILE_ROWS_MAX}"
+        ));
+    }
+    if max_chunk < tile {
+        return Err(format!(
+            "slow-link profile tile {tile} exceeds the caller's chunk capacity {max_chunk}"
+        ));
+    }
+    if ple_rows_cap < tile {
+        return Err(format!(
+            "slow-link profile tile {tile} exceeds the PLE row store's {ple_rows_cap}-row prefetch"
+        ));
+    }
+    Ok(tile)
+}
+
+/// The session cache's checkpoint cadence (the stride of its boundary list and
+/// of the lineage split): a slow-link load's own `checkpoint_stride_rows`
+/// when it has a profile, else the forward's chunk, exactly as before.
+pub(crate) fn session_cadence(profile_stride: Option<usize>, forward_chunk: Option<usize>) -> Option<usize> {
+    match profile_stride {
+        Some(stride) if stride > 0 => Some(stride),
+        _ => forward_chunk,
+    }
+}
+
+/// Identity suffix of a slow-link load's session scope: its mixer tile AND
+/// its checkpoint cadence. Empty for every other load, so their scopes are
+/// byte-for-byte unchanged and a slow-link scope can never alias an explicit
+/// chunk-1536 cadence or the incumbent chunk-8192 numerics.
+pub(crate) fn slowlink_scope_tag(profile: Option<(usize, usize)>) -> String {
+    profile.map_or_else(String::new, |(tile, cadence)| format!("/s1tile{tile}cut{cadence}"))
 }
 
 /// PLE token history after `tokens` follow `entry`.
@@ -318,7 +476,11 @@ pub(crate) struct StageLayout {
 
 impl StageLayout {
     pub(crate) fn of(state: &Qwen4State) -> Self {
-        Self { gdn: state.gdn.len(), qsa: state.qsa.len(), ple: state.ple_conv.is_some() }
+        Self {
+            gdn: state.gdn.len(),
+            qsa: state.qsa.len(),
+            ple: state.ple_conv.is_some(),
+        }
     }
     pub(crate) fn fixed_len(&self) -> usize {
         2 * self.gdn + self.qsa + usize::from(self.ple) + 1
@@ -356,8 +518,14 @@ impl CutBook {
     /// `[entry, entry + tokens.len())`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        entry: usize, tokens: &[u32], entry_history: PleHistory, cuts: Vec<usize>,
-        layers: usize, owned: usize, qsa_slots: usize, compress: usize,
+        entry: usize,
+        tokens: &[u32],
+        entry_history: PleHistory,
+        cuts: Vec<usize>,
+        layers: usize,
+        owned: usize,
+        qsa_slots: usize,
+        compress: usize,
     ) -> Result<Self, String> {
         let end = entry + tokens.len();
         if compress == 0 {
@@ -419,14 +587,22 @@ impl CutBook {
     /// A QSA layer staged `cut` with its private cursor `cursor`: the cursor
     /// must stand exactly at the cut.
     pub(crate) fn record_qsa(
-        &mut self, cut: usize, layer: usize, slot: usize, cursor: QsaCommit,
+        &mut self,
+        cut: usize,
+        layer: usize,
+        slot: usize,
+        cursor: QsaCommit,
     ) -> Result<(), String> {
         let position = *self
             .cuts
             .get(cut)
             .ok_or_else(|| format!("slow-link cut index {cut} is outside the window"))?;
         let (full, raw, pooled, _selected, at) = cursor;
-        if full != position || raw != position || at != position || pooled != position / self.compress {
+        if full != position
+            || raw != position
+            || at != position
+            || pooled != position / self.compress
+        {
             return Err(format!(
                 "slow-link QSA layer {layer} cursor {cursor:?} is not at cut {position}"
             ));
@@ -488,7 +664,12 @@ pub(crate) struct LiveTxn {
 /// Receipt of the most recent request, as stored.
 pub(crate) enum StoredReceipt {
     Json(Value),
-    Incumbent { reason: Option<String>, entry: usize, windows: Vec<(usize, usize)>, tile_rows: usize },
+    Incumbent {
+        reason: Option<String>,
+        entry: usize,
+        windows: Vec<(usize, usize)>,
+        tile_rows: usize,
+    },
 }
 
 /// Every slow-link owner field of a bundle.
@@ -519,7 +700,11 @@ impl SlowlinkOwner {
     /// Every device tensor the owner holds (stage parts, the saved pending
     /// hidden), for teardown.
     pub(crate) fn into_tensors(self) -> Vec<GpuTensor> {
-        let mut tensors: Vec<GpuTensor> = self.stages.into_iter().flat_map(|stage| stage.fixed).collect();
+        let mut tensors: Vec<GpuTensor> = self
+            .stages
+            .into_iter()
+            .flat_map(|stage| stage.fixed)
+            .collect();
         tensors.extend(self.pending_save);
         tensors
     }
@@ -535,7 +720,11 @@ impl SlowlinkOwner {
 
 /// The incumbent-route receipt: every S1-only number is zero.
 pub(crate) fn incumbent_receipt_json(
-    selected_by: &str, bypass: Option<&str>, entry: usize, windows: &[(usize, usize)], tile_rows: usize,
+    selected_by: &str,
+    bypass: Option<&str>,
+    entry: usize,
+    windows: &[(usize, usize)],
+    tile_rows: usize,
 ) -> Value {
     let rows: usize = windows.iter().map(|window| window.1).sum();
     json!({
@@ -577,11 +766,25 @@ impl Qwen4Bundle {
         self.slowlink.profile.as_ref()
     }
 
+    /// The session cache's boundary/lineage cadence of this bundle: the
+    /// admitted profile's checkpoint stride, else the forward chunk.
+    pub(crate) fn session_cadence_rows(&self) -> Option<usize> {
+        session_cadence(
+            self.slowlink.profile.map(|profile| profile.checkpoint_stride_rows),
+            self.spec_chunk_rows(),
+        )
+    }
+
     /// Receipt of the most recent prefill request (`None` before any).
     pub fn slowlink_receipt(&self) -> Option<Value> {
         let mut receipt = match self.slowlink.receipt.as_ref()? {
             StoredReceipt::Json(value) => value.clone(),
-            StoredReceipt::Incumbent { reason, entry, windows, tile_rows } => {
+            StoredReceipt::Incumbent {
+                reason,
+                entry,
+                windows,
+                tile_rows,
+            } => {
                 let selected_by = match crate::slowlink_admission::SlowlinkMode::from_env() {
                     crate::slowlink_admission::SlowlinkMode::Off => "env0",
                     crate::slowlink_admission::SlowlinkMode::Force => "env1",
@@ -593,7 +796,10 @@ impl Qwen4Bundle {
             }
         };
         if let Value::Object(map) = &mut receipt {
-            map.insert("injection_consumed".into(), json!(self.slowlink.injection_consumed));
+            map.insert(
+                "injection_consumed".into(),
+                json!(self.slowlink.injection_consumed),
+            );
         }
         Some(receipt)
     }
@@ -644,9 +850,15 @@ impl Qwen4Bundle {
     /// without an admitted profile, a bundle that cannot run it now (open
     /// window, other topology), a forward failure, or a case report that does
     /// not honor the frozen shape. Never a pass by default.
-    pub fn slowlink_primitive_selftest(&mut self, gpu: &mut Gpu, cases: &[&str]) -> Result<Value, BundleError> {
+    pub fn slowlink_primitive_selftest(
+        &mut self,
+        gpu: &mut Gpu,
+        cases: &[&str],
+    ) -> Result<Value, BundleError> {
         if cases.is_empty() {
-            return Err(BundleError::Forward("slow-link primitive check was asked for no cases".into()));
+            return Err(BundleError::Forward(
+                "slow-link primitive check was asked for no cases".into(),
+            ));
         }
         for &name in cases {
             if !SLOWLINK_PRIMITIVES.contains(&name) {
@@ -656,17 +868,22 @@ impl Qwen4Bundle {
             }
         }
         if self.slowlink.profile.is_none() {
-            return Err(BundleError::Forward("slow-link primitive check needs an admitted slow-link profile".into()));
+            return Err(BundleError::Forward(
+                "slow-link primitive check needs an admitted slow-link profile".into(),
+            ));
         }
-        self.slowlink_eligibility(SlowlinkScope::direct(), true).map_err(|reason| {
-            BundleError::Forward(format!("slow-link primitive check cannot run: {reason}"))
-        })?;
+        self.slowlink_eligibility(SlowlinkScope::direct(), true)
+            .map_err(|reason| {
+                BundleError::Forward(format!("slow-link primitive check cannot run: {reason}"))
+            })?;
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let mut reports: Vec<Result<Value, String>> = Vec::with_capacity(cases.len());
         for &name in cases {
-            let report = forward.slowlink_primitive_selftest(self, gpu, name).map_err(|error| error.to_string());
+            let report = forward
+                .slowlink_primitive_selftest(self, gpu, name)
+                .map_err(|error| error.to_string());
             let failed = report.is_err();
             reports.push(report);
             if failed {
@@ -677,10 +894,15 @@ impl Qwen4Bundle {
         let mut out = Vec::with_capacity(cases.len());
         for (&name, report) in cases.iter().zip(reports) {
             let case = report.map_err(|error| {
-                BundleError::Forward(format!("slow-link primitive {name:?} could not run: {error}"))
+                BundleError::Forward(format!(
+                    "slow-link primitive {name:?} could not run: {error}"
+                ))
             })?;
             let honored = case.get("name").and_then(Value::as_str) == Some(name)
-                && matches!(case.get("status").and_then(Value::as_str), Some("pass" | "fail"))
+                && matches!(
+                    case.get("status").and_then(Value::as_str),
+                    Some("pass" | "fail")
+                )
                 && case.get("mismatches").and_then(Value::as_u64).is_some()
                 && case.get("detail").is_some();
             if !honored {
@@ -708,7 +930,10 @@ impl Qwen4Bundle {
         if self.slowlink.receipt_fresh {
             return;
         }
-        let tile_rows = self.execution.as_ref().map_or(0, |forward| forward.scratch.max_chunk);
+        let tile_rows = self
+            .execution
+            .as_ref()
+            .map_or(0, |forward| forward.scratch.max_chunk);
         self.slowlink.receipt = Some(StoredReceipt::Incumbent {
             reason: self.slowlink.bypass.take(),
             entry,
@@ -733,7 +958,11 @@ impl Qwen4Bundle {
         self.slowlink_eligibility(SlowlinkScope::capture(), true)
     }
 
-    fn slowlink_eligibility(&self, scope: SlowlinkScope, need_execution: bool) -> Result<(), &'static str> {
+    fn slowlink_eligibility(
+        &self,
+        scope: SlowlinkScope,
+        need_execution: bool,
+    ) -> Result<(), &'static str> {
         if self.pp.is_some() {
             return Err("pipeline-parallel topology");
         }
@@ -768,12 +997,18 @@ impl Qwen4Bundle {
             if mtp.state.snapshot_active() {
                 return Err("an outstanding MTP head snapshot ticket");
             }
-            let (Some(_), Some(_), Some(hidden)) =
-                (self.spec_logits.as_ref(), self.spec_top1.as_ref(), self.spec_hidden.as_ref())
-            else {
+            let (Some(_), Some(_), Some(hidden)) = (
+                self.spec_logits.as_ref(),
+                self.spec_top1.as_ref(),
+                self.spec_hidden.as_ref(),
+            ) else {
                 return Err("speculative output buffers are not attached");
             };
-            let width = self.config.hc_count.saturating_mul(self.config.hidden_size).max(1);
+            let width = self
+                .config
+                .hc_count
+                .saturating_mul(self.config.hidden_size)
+                .max(1);
             if hidden.numel() / width < PROMPT_TILE_ROWS_MAX {
                 return Err("the wide-hidden capture buffer is narrower than a mixer tile");
             }
@@ -785,7 +1020,10 @@ impl Qwen4Bundle {
     /// orchestrator (`Ok(true)`) or leave it to the incumbent route
     /// (`Ok(false)`, decided before any mutation or S1 allocation).
     pub(crate) fn slowlink_dispatch(
-        &mut self, gpu: &mut Gpu, tokens: &[u32], output: crate::slowlink_prefill::PromptOutput<'_>,
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        output: crate::slowlink_prefill::PromptOutput<'_>,
         scope: SlowlinkScope,
     ) -> Result<bool, BundleError> {
         self.slowlink_begin_request();
@@ -806,7 +1044,8 @@ impl Qwen4Bundle {
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         self.slowlink.scope = scope;
-        let result = crate::slowlink_prefill::try_run_prompt(&mut forward, self, gpu, tokens, output);
+        let result =
+            crate::slowlink_prefill::try_run_prompt(&mut forward, self, gpu, tokens, output);
         self.slowlink.scope = SlowlinkScope::default();
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
@@ -819,7 +1058,9 @@ impl Qwen4Bundle {
         match (result, leaked) {
             (Ok(ran), None) => {
                 if !ran && !self.slowlink.receipt_fresh {
-                    self.slowlink.bypass.get_or_insert_with(|| "selector declined the request".into());
+                    self.slowlink
+                        .bypass
+                        .get_or_insert_with(|| "selector declined the request".into());
                 }
                 Ok(ran)
             }
@@ -831,7 +1072,8 @@ impl Qwen4Bundle {
                 if !self.slowlink.receipt_fresh {
                     let selected = self.slowlink.bypass.take();
                     self.slowlink.receipt = Some(StoredReceipt::Json({
-                        let mut value = incumbent_receipt_json("auto", selected.as_deref(), 0, &[], 0);
+                        let mut value =
+                            incumbent_receipt_json("auto", selected.as_deref(), 0, &[], 0);
                         if let Value::Object(map) = &mut value {
                             map.insert("status".into(), json!("error"));
                             map.insert("error".into(), json!(error.to_string()));
@@ -853,13 +1095,21 @@ impl Qwen4Bundle {
     /// it backs it up with [`Self::slowlink_save_pending`] only AFTER the
     /// request was selected and before its first phase.
     pub(crate) fn slowlink_try_capture(
-        &mut self, gpu: &mut Gpu, tokens: &[u32], pending: &GpuTensor,
-        sink: &mut dyn FnMut(&mut Gpu, &mut Qwen4Bundle, crate::slowlink_prefill::PromptTile<'_>) -> Result<(), String>,
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        pending: &GpuTensor,
+        sink: &mut dyn FnMut(
+            &mut Gpu,
+            &mut Qwen4Bundle,
+            crate::slowlink_prefill::PromptTile<'_>,
+        ) -> Result<(), String>,
     ) -> Result<Option<u32>, BundleError> {
         let (logits, top1) = match (self.spec_logits.as_ref(), self.spec_top1.as_ref()) {
-            (Some(logits), Some(top1)) => {
-                (logits.sub_offset(0, self.config.vocab_size), top1.sub_offset(0, std::mem::size_of::<i32>()))
-            }
+            (Some(logits), Some(top1)) => (
+                logits.sub_offset(0, self.config.vocab_size),
+                top1.sub_offset(0, std::mem::size_of::<i32>()),
+            ),
             _ => {
                 return Err(BundleError::Forward(
                     "Qwen4 spec output buffers are not attached".to_string(),
@@ -876,9 +1126,13 @@ impl Qwen4Bundle {
         }
         let bytes = std::mem::size_of::<i32>();
         if self.spec_host_top1.len() < bytes {
-            return Err(BundleError::Forward("Qwen4 spec host argmax capacity is too small".to_string()));
+            return Err(BundleError::Forward(
+                "Qwen4 spec host argmax capacity is too small".to_string(),
+            ));
         }
-        gpu.hip.memcpy_dtoh(&mut self.spec_host_top1[..bytes], &top1.buf).map_err(BundleError::Hip)?;
+        gpu.hip
+            .memcpy_dtoh(&mut self.spec_host_top1[..bytes], &top1.buf)
+            .map_err(BundleError::Hip)?;
         gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let b = &self.spec_host_top1[..bytes];
         Ok(Some(u32::from_ne_bytes([b[0], b[1], b[2], b[3]])))
@@ -888,12 +1142,22 @@ impl Qwen4Bundle {
     /// put it back (the drafter owns `pending`; the copy is stream ordered).
     /// Called by the orchestrator once, after the request was selected and
     /// before its first phase.
-    pub(crate) fn slowlink_save_pending(&mut self, gpu: &mut Gpu, pending: &GpuTensor) -> Result<(), BundleError> {
+    pub(crate) fn slowlink_save_pending(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), BundleError> {
         if self.slowlink.pending_save.is_none() {
-            self.slowlink.pending_save =
-                Some(gpu.zeros(&pending.shape, pending.dtype).map_err(BundleError::Hip)?);
+            self.slowlink.pending_save = Some(
+                gpu.zeros(&pending.shape, pending.dtype)
+                    .map_err(BundleError::Hip)?,
+            );
         }
-        let saved = self.slowlink.pending_save.as_ref().expect("allocated above");
+        let saved = self
+            .slowlink
+            .pending_save
+            .as_ref()
+            .expect("allocated above");
         copy_whole(gpu, pending, saved)?;
         self.slowlink.pending_saved = true;
         self.slowlink.pending_for = Some(self.state.position);
@@ -904,13 +1168,21 @@ impl Qwen4Bundle {
     /// a state restored to a window's entry restores exactly that window's
     /// `pending` (the hidden of `entry - 1`), never an earlier window's.
     pub(crate) fn slowlink_pending_restorable(&self) -> bool {
-        pending_backup_applies(self.slowlink.pending_saved, self.slowlink.pending_for, self.state.position)
+        pending_backup_applies(
+            self.slowlink.pending_saved,
+            self.slowlink.pending_for,
+            self.state.position,
+        )
     }
 
     /// Put the backed-up `pending` hidden back; an error when no backup was
     /// taken for the window the state now sits at (so an unselected request,
     /// or a later window, cannot restore stale bytes).
-    pub(crate) fn slowlink_restore_pending(&mut self, gpu: &mut Gpu, pending: &GpuTensor) -> Result<(), BundleError> {
+    pub(crate) fn slowlink_restore_pending(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), BundleError> {
         if !self.slowlink_pending_restorable() {
             return Err(BundleError::Forward(
                 "no MTP pending hidden was saved for the window the state was restored to".into(),
@@ -931,7 +1203,10 @@ impl Qwen4Bundle {
     }
 
     fn prompt_txn_pending(&self) -> Vec<usize> {
-        self.session.as_ref().map(SessionDriver::turn_boundaries).unwrap_or_default()
+        self.session
+            .as_ref()
+            .map(SessionDriver::turn_boundaries)
+            .unwrap_or_default()
     }
 
     /// Pending session boundaries strictly inside `(entry, end)`; empty for a
@@ -956,7 +1231,13 @@ impl Qwen4Bundle {
     pub(crate) fn prompt_txn_stage_bytes(&self) -> u64 {
         self.state
             .session_parts()
-            .map(|(_, layout)| layout.fixed.iter().map(|part| part.bytes as u64).sum::<u64>())
+            .map(|(_, layout)| {
+                layout
+                    .fixed
+                    .iter()
+                    .map(|part| part.bytes as u64)
+                    .sum::<u64>()
+            })
             .unwrap_or(0)
     }
 
@@ -969,7 +1250,9 @@ impl Qwen4Bundle {
             layout.fixed.iter().map(|part| part.bytes).collect()
         };
         if sizes.len() != StageLayout::of(&self.state).fixed_len() {
-            return Err(BundleError::Forward("slow-link stage layout differs from the session layout".into()));
+            return Err(BundleError::Forward(
+                "slow-link stage layout differs from the session layout".into(),
+            ));
         }
         while self.slowlink.stages.len() < count {
             let mut fixed = Vec::with_capacity(sizes.len());
@@ -984,7 +1267,12 @@ impl Qwen4Bundle {
                     }
                 }
             }
-            self.slowlink.stages.push(PairSessionStage { fixed, meta: Vec::new(), rows: Vec::new(), position: None });
+            self.slowlink.stages.push(PairSessionStage {
+                fixed,
+                meta: Vec::new(),
+                rows: Vec::new(),
+                position: None,
+            });
         }
         Ok(())
     }
@@ -993,31 +1281,52 @@ impl Qwen4Bundle {
 
     /// Open the transaction of one window of `tokens` at the live position.
     /// Everything that can refuse runs before the entry snapshot is taken.
-    pub(crate) fn prompt_txn_begin(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<PromptTxn, BundleError> {
+    pub(crate) fn prompt_txn_begin(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<PromptTxn, BundleError> {
         let scope = self.slowlink.scope;
         self.slowlink_eligibility(scope, false).map_err(|reason| {
             BundleError::Forward(format!("slow-link window transaction refused: {reason}"))
         })?;
         if tokens.is_empty() {
-            return Err(BundleError::Forward("slow-link window transaction has no rows".into()));
+            return Err(BundleError::Forward(
+                "slow-link window transaction has no rows".into(),
+            ));
         }
         let entry = self.state.position;
         let end = entry
             .checked_add(tokens.len())
             .filter(|&end| end <= self.state.max_seq_len)
-            .ok_or_else(|| BundleError::Forward("slow-link window exceeds the context capacity".into()))?;
+            .ok_or_else(|| {
+                BundleError::Forward("slow-link window exceeds the context capacity".into())
+            })?;
         if scope.head && self.mtp_position()? != entry {
-            return Err(BundleError::Forward("slow-link window: the MTP head is not at the entry position".into()));
+            return Err(BundleError::Forward(
+                "slow-link window: the MTP head is not at the entry position".into(),
+            ));
         }
         // Each window backs its entry `pending` up before it begins (the
         // orchestrator saves before EVERY begin): a window whose entry has no
         // backup would restore another window's hidden on failure.
-        if scope.head && !pending_backup_applies(self.slowlink.pending_saved, self.slowlink.pending_for, entry) {
+        if scope.head
+            && !pending_backup_applies(
+                self.slowlink.pending_saved,
+                self.slowlink.pending_for,
+                entry,
+            )
+        {
             return Err(BundleError::Forward(
-                "slow-link window: the MTP pending hidden was not saved for this window's entry".into(),
+                "slow-link window: the MTP pending hidden was not saved for this window's entry"
+                    .into(),
             ));
         }
-        let cuts = if scope.cuts { prompt_cuts_in(entry, end, &self.prompt_txn_pending()) } else { Vec::new() };
+        let cuts = if scope.cuts {
+            prompt_cuts_in(entry, end, &self.prompt_txn_pending())
+        } else {
+            Vec::new()
+        };
         let book = CutBook::new(
             entry,
             tokens,
@@ -1030,7 +1339,9 @@ impl Qwen4Bundle {
         )
         .map_err(BundleError::Forward)?;
         self.ensure_prompt_stages(gpu, book.cuts().len())?;
-        self.state.ensure_mapped_capacity(gpu, end).map_err(BundleError::State)?;
+        self.state
+            .ensure_mapped_capacity(gpu, end)
+            .map_err(BundleError::State)?;
         self.quiesce_ple()?;
         // Past this point only the snapshot arenas change; the live state is
         // untouched until the orchestrator's first layer runs.
@@ -1049,11 +1360,9 @@ impl Qwen4Bundle {
         // The HC feedback is read-only on this route: it joins every stage now.
         let feedback_index = StageLayout::of(&self.state).feedback_index();
         let copied = (|| -> Result<(), BundleError> {
-            let feedback = self
-                .state
-                .hyper_feedback
-                .as_ref()
-                .ok_or_else(|| BundleError::Forward("slow-link: hyper feedback is not owned".into()))?;
+            let feedback = self.state.hyper_feedback.as_ref().ok_or_else(|| {
+                BundleError::Forward("slow-link: hyper feedback is not owned".into())
+            })?;
             for stage in &self.slowlink.stages[..book.cuts().len()] {
                 stage.copy(gpu, feedback_index, feedback)?;
             }
@@ -1085,7 +1394,10 @@ impl Qwen4Bundle {
     }
 
     fn slowlink_release_tickets(
-        &mut self, gpu: &mut Gpu, state_ticket: Qwen4StateSnapshot, head_ticket: Option<MtpGpuStateSnapshot>,
+        &mut self,
+        gpu: &mut Gpu,
+        state_ticket: Qwen4StateSnapshot,
+        head_ticket: Option<MtpGpuStateSnapshot>,
     ) {
         let _ = self.state.commit(state_ticket, gpu);
         if let Some(head) = head_ticket {
@@ -1098,41 +1410,57 @@ impl Qwen4Bundle {
     /// Layer `layer` finished the tile that ends at cut `cut_index`: stage its
     /// fixed state (before its next tile advances it).
     pub(crate) fn prompt_txn_layer_cut(
-        &mut self, gpu: &mut Gpu, txn: &mut PromptTxn, cut_index: usize, layer: usize,
+        &mut self,
+        gpu: &mut Gpu,
+        txn: &mut PromptTxn,
+        cut_index: usize,
+        layer: usize,
     ) -> Result<(), BundleError> {
         let layout = StageLayout::of(&self.state);
         let SlowlinkOwner { live, stages, .. } = &mut self.slowlink;
         let live = live
             .as_mut()
             .filter(|live| live.id == txn.id)
-            .ok_or_else(|| BundleError::Forward("slow-link window transaction is not open".into()))?;
+            .ok_or_else(|| {
+                BundleError::Forward("slow-link window transaction is not open".into())
+            })?;
         let stage = stages
             .get(cut_index)
             .filter(|_| cut_index < live.book.cuts().len())
-            .ok_or_else(|| BundleError::Forward(format!("slow-link cut index {cut_index} is outside the window")))?;
-        let missing = || BundleError::Forward(format!("slow-link layer {layer} is not owned by this state"));
+            .ok_or_else(|| {
+                BundleError::Forward(format!(
+                    "slow-link cut index {cut_index} is outside the window"
+                ))
+            })?;
+        let missing = || {
+            BundleError::Forward(format!(
+                "slow-link layer {layer} is not owned by this state"
+            ))
+        };
         if let Some(slot) = self.state.gdn_local(layer) {
             let gdn = self.state.gdn.get(slot).ok_or_else(missing)?;
             let index = layout.gdn_index(slot).ok_or_else(missing)?;
             stage.copy_parts(gpu, index, [&gdn.recurrent, &gdn.conv])?;
-            live.book.record_gdn(cut_index, layer).map_err(BundleError::Forward)?;
+            live.book
+                .record_gdn(cut_index, layer)
+                .map_err(BundleError::Forward)?;
         } else if let Some(slot) = self.state.qsa_local(layer) {
             let qsa = self.state.qsa.get(slot).ok_or_else(missing)?;
             let index = layout.qsa_index(slot).ok_or_else(missing)?;
             let cursor = self.state.qsa_cursor(slot).ok_or_else(missing)?;
             // Validate before the copy: a cursor that is not at the cut is a
             // schedule bug, never a snapshot to publish.
-            live.book.record_qsa(cut_index, layer, slot, cursor).map_err(BundleError::Forward)?;
+            live.book
+                .record_qsa(cut_index, layer, slot, cursor)
+                .map_err(BundleError::Forward)?;
             stage.copy(gpu, index, &qsa.selected_indices)?;
         } else {
             return Err(missing());
         }
         if live.ple_layer == Some(layer) {
-            let ple = self
-                .state
-                .ple_conv
-                .as_ref()
-                .ok_or_else(|| BundleError::Forward("slow-link: PLE convolution state missing".into()))?;
+            let ple = self.state.ple_conv.as_ref().ok_or_else(|| {
+                BundleError::Forward("slow-link: PLE convolution state missing".into())
+            })?;
             let index = layout.ple_index().ok_or_else(missing)?;
             stage.copy(gpu, index, ple)?;
         }
@@ -1141,21 +1469,32 @@ impl Qwen4Bundle {
 
     /// Cut `position` is the next unpublished cut of the open window.
     pub(crate) fn slowlink_cut_due(&self, position: usize) -> bool {
-        self.slowlink.live.as_ref().is_some_and(|live| live.book.next_cut() == Some(position))
+        self.slowlink
+            .live
+            .as_ref()
+            .is_some_and(|live| live.book.next_cut() == Some(position))
     }
 
     /// MTP route: publish the next cut now. The target part comes from the
     /// cut's stage; the head is live at the cut (the sink just appended the
     /// tile) and `pending` holds the target hidden of `cut - 1`.
-    pub(crate) fn slowlink_publish_cut_mtp(&mut self, gpu: &mut Gpu, pending: &GpuTensor) -> Result<(), BundleError> {
+    pub(crate) fn slowlink_publish_cut_mtp(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), BundleError> {
         let Some(mut live) = self.slowlink.live.take() else {
-            return Err(BundleError::Forward("slow-link window transaction is not open".into()));
+            return Err(BundleError::Forward(
+                "slow-link window transaction is not open".into(),
+            ));
         };
         let index = live.book.published();
         let result = if !live.scope.head || index >= live.book.cuts().len() {
             Err(BundleError::Forward("slow-link: no cut is due".into()))
         } else if !live.book.complete(index) {
-            Err(BundleError::Forward(format!("slow-link cut {index} is not staged by every layer")))
+            Err(BundleError::Forward(format!(
+                "slow-link cut {index} is not staged by every layer"
+            )))
         } else {
             self.slowlink_publish_cut_at(gpu, &live, index, Some(pending))
         };
@@ -1167,7 +1506,11 @@ impl Qwen4Bundle {
     }
 
     fn slowlink_publish_cut_at(
-        &mut self, gpu: &mut Gpu, live: &LiveTxn, index: usize, pending: Option<&GpuTensor>,
+        &mut self,
+        gpu: &mut Gpu,
+        live: &LiveTxn,
+        index: usize,
+        pending: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
         let position = live.book.cuts()[index];
         let commits = live.book.commits_for(index).map_err(BundleError::Forward)?;
@@ -1201,16 +1544,27 @@ impl Qwen4Bundle {
 
     /// The one global commit of the window: publish, advance, consume the
     /// entry tickets. Any failure restores the entry state first.
-    pub(crate) fn prompt_txn_commit(&mut self, gpu: &mut Gpu, txn: PromptTxn, tokens: &[u32]) -> Result<(), BundleError> {
+    pub(crate) fn prompt_txn_commit(
+        &mut self,
+        gpu: &mut Gpu,
+        txn: PromptTxn,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
         let live = match self.slowlink.live.take() {
             Some(live) if live.id == txn.id => live,
             other => {
                 self.slowlink.live = other;
-                return Err(BundleError::Forward("slow-link window transaction is not open".into()));
+                return Err(BundleError::Forward(
+                    "slow-link window transaction is not open".into(),
+                ));
             }
         };
         if tokens.len() != live.rows {
-            let cause = format!("slow-link commit of {} rows closes a {}-row window", tokens.len(), live.rows);
+            let cause = format!(
+                "slow-link commit of {} rows closes a {}-row window",
+                tokens.len(),
+                live.rows
+            );
             return Err(self.slowlink_fail(gpu, live, &cause));
         }
         if self.slowlink_take_injection(SlowlinkFailPoint::BeforeCommit) {
@@ -1229,20 +1583,33 @@ impl Qwen4Bundle {
         }
     }
 
-    fn slowlink_commit_inner(&mut self, gpu: &mut Gpu, live: &mut LiveTxn, tokens: &[u32]) -> Result<(), BundleError> {
+    fn slowlink_commit_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        live: &mut LiveTxn,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
         for cut in 0..live.book.cuts().len() {
             if !live.book.complete(cut) {
-                return Err(BundleError::Forward(format!("slow-link cut {cut} is not staged by every layer")));
+                return Err(BundleError::Forward(format!(
+                    "slow-link cut {cut} is not staged by every layer"
+                )));
             }
         }
         if live.scope.head && live.book.published() != live.book.cuts().len() {
-            return Err(BundleError::Forward("slow-link: the head sink left a cut unpublished".into()));
+            return Err(BundleError::Forward(
+                "slow-link: the head sink left a cut unpublished".into(),
+            ));
         }
-        self.state.validate_commit(live.state_ticket).map_err(BundleError::State)?;
+        self.state
+            .validate_commit(live.state_ticket)
+            .map_err(BundleError::State)?;
         if let Some(head) = live.head_ticket {
             self.mtp_validate_commit(head)?;
         }
-        self.state.commit_prompt_window(tokens).map_err(BundleError::State)?;
+        self.state
+            .commit_prompt_window(tokens)
+            .map_err(BundleError::State)?;
         if !live.scope.head {
             while live.book.published() < live.book.cuts().len() {
                 let index = live.book.published();
@@ -1261,16 +1628,23 @@ impl Qwen4Bundle {
 
     /// Abort the open window: restore the entry state. A no-op `Ok` when the
     /// transaction was already consumed (a failed commit restored it).
-    pub(crate) fn prompt_txn_abort(&mut self, gpu: &mut Gpu, txn: PromptTxn) -> Result<(), BundleError> {
+    pub(crate) fn prompt_txn_abort(
+        &mut self,
+        gpu: &mut Gpu,
+        txn: PromptTxn,
+    ) -> Result<(), BundleError> {
         let live = match self.slowlink.live.take() {
             Some(live) if live.id == txn.id => live,
             Some(other) => {
                 self.slowlink.live = Some(other);
-                return Err(BundleError::Forward("slow-link abort names another window transaction".into()));
+                return Err(BundleError::Forward(
+                    "slow-link abort names another window transaction".into(),
+                ));
             }
             None => return Ok(()),
         };
-        self.slowlink_restore(gpu, live).map_err(BundleError::Forward)
+        self.slowlink_restore(gpu, live)
+            .map_err(BundleError::Forward)
     }
 
     fn slowlink_fail(&mut self, gpu: &mut Gpu, live: LiveTxn, cause: &str) -> BundleError {
@@ -1285,8 +1659,11 @@ impl Qwen4Bundle {
     /// uncommitted session captures dropped. A restore that cannot complete
     /// is contained by a full reset and reported.
     fn slowlink_restore(&mut self, gpu: &mut Gpu, live: LiveTxn) -> Result<(), String> {
-        let mut failure: Option<String> =
-            gpu.hip.device_synchronize().err().map(|error| format!("device drain failed: {error}"));
+        let mut failure: Option<String> = gpu
+            .hip
+            .device_synchronize()
+            .err()
+            .map(|error| format!("device drain failed: {error}"));
         if failure.is_none() {
             if let Err(error) = self.invalidate_ple_epoch() {
                 failure = Some(format!("PLE epoch invalidation failed: {error}"));
@@ -1327,10 +1704,16 @@ impl Qwen4Bundle {
 /// Stream-ordered whole-tensor device copy (no host synchronisation).
 fn copy_whole(gpu: &mut Gpu, src: &GpuTensor, dst: &GpuTensor) -> Result<(), BundleError> {
     if src.byte_size() != dst.byte_size() || !src.byte_size().is_multiple_of(4) {
-        return Err(BundleError::Forward("slow-link pending hidden copy needs equal aligned tensors".into()));
+        return Err(BundleError::Forward(
+            "slow-link pending hidden copy needs equal aligned tensors".into(),
+        ));
     }
     let regions = [rdna_compute::tensor_ops::CopyRegion {
-        dst: &dst.buf, dst_offset: 0, src: &src.buf, src_offset: 0, bytes: src.byte_size(),
+        dst: &dst.buf,
+        dst_offset: 0,
+        src: &src.buf,
+        src_offset: 0,
+        bytes: src.byte_size(),
     }];
     rdna_compute::tensor_ops::copy_regions(gpu, &regions).map_err(BundleError::Hip)
 }
@@ -1368,7 +1751,9 @@ mod slowlink_txn_tests {
     }
 
     fn tokens(count: usize) -> Vec<u32> {
-        (0..count).map(|i| ((i * 7919 + 13) % 1009) as u32).collect()
+        (0..count)
+            .map(|i| ((i * 7919 + 13) % 1009) as u32)
+            .collect()
     }
 
     struct Ctx {
@@ -1387,25 +1772,42 @@ mod slowlink_txn_tests {
         Ctx {
             gdn_slot: (0..layers).map(|layer| map.gdn_local(layer)).collect(),
             qsa_slot: (0..layers).map(|layer| map.qsa_local(layer)).collect(),
-            ple_layer: config
-                .ple
-                .as_ref()
-                .and_then(|_| config.ple_layer_ids.first().and_then(|id| id.checked_sub(1))),
-            layout: StageLayout { gdn: map.gdn_count(), qsa: map.qsa_count(), ple: config.ple.is_some() },
+            ple_layer: config.ple.as_ref().and_then(|_| {
+                config
+                    .ple_layer_ids
+                    .first()
+                    .and_then(|id| id.checked_sub(1))
+            }),
+            layout: StageLayout {
+                gdn: map.gdn_count(),
+                qsa: map.qsa_count(),
+                ple: config.ple.is_some(),
+            },
             compress: config.indexer_compress_ratio,
         }
     }
 
     fn mix(a: u64, b: u64) -> u64 {
-        (a ^ b.wrapping_mul(0x9E37_79B9_7F4A_7C15)).rotate_left(29).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        (a ^ b.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .rotate_left(29)
+            .wrapping_mul(0xBF58_476D_1CE4_E5B9)
     }
 
     fn step(state: u64, layer: usize, position: usize, token: u32) -> u64 {
-        mix(mix(state, layer as u64 + 1), mix(position as u64, u64::from(token)))
+        mix(
+            mix(state, layer as u64 + 1),
+            mix(position as u64, u64::from(token)),
+        )
     }
 
     fn marks(position: usize, compress: usize) -> QsaCommit {
-        (position, position, position / compress, position.min(2048), position)
+        (
+            position,
+            position,
+            position / compress,
+            position.min(2048),
+            position,
+        )
     }
 
     /// Everything one session snapshot of the target carries.
@@ -1539,7 +1941,11 @@ mod slowlink_txn_tests {
 
     impl Saved {
         fn take(m: &M) -> Self {
-            Self { saved: true, for_position: Some(m.position), pending: m.pending }
+            Self {
+                saved: true,
+                for_position: Some(m.position),
+                pending: m.pending,
+            }
         }
 
         /// `mtp_spec`'s error path, run after the transaction restored the
@@ -1579,7 +1985,12 @@ mod slowlink_txn_tests {
     /// One window transaction over the model. `Err` leaves `m` at the entry
     /// state, every stage unarmed and nothing published.
     fn run_window(
-        ctx: &Ctx, m: &mut M, stages: &mut Vec<Stage>, w: &Win<'_>, inject: Inject, out: &mut Vec<Pub>,
+        ctx: &Ctx,
+        m: &mut M,
+        stages: &mut Vec<Stage>,
+        w: &Win<'_>,
+        inject: Inject,
+        out: &mut Vec<Pub>,
     ) -> Result<(), String> {
         let entry_state = m.clone();
         let mut staged_out: Vec<Pub> = Vec::new();
@@ -1590,9 +2001,21 @@ mod slowlink_txn_tests {
             if inject == Inject::BeforeDma {
                 return Err("before_dma".into());
             }
-            let mut book = CutBook::new(w.entry, tokens, m.history, cuts.clone(), layers, layers, ctx.layout.qsa, ctx.compress)?;
+            let mut book = CutBook::new(
+                w.entry,
+                tokens,
+                m.history,
+                cuts.clone(),
+                layers,
+                layers,
+                ctx.layout.qsa,
+                ctx.compress,
+            )?;
             while stages.len() < cuts.len() {
-                stages.push(Stage { fixed: vec![0; ctx.layout.fixed_len()], position: None });
+                stages.push(Stage {
+                    fixed: vec![0; ctx.layout.fixed_len()],
+                    position: None,
+                });
             }
             for stage in &mut stages[..cuts.len()] {
                 stage.fixed[ctx.layout.feedback_index()] = m.feedback;
@@ -1626,8 +2049,15 @@ mod slowlink_txn_tests {
                         m.head_pos = exit;
                         m.pending = Some(exit - 1);
                         if let Some(k) = cut {
-                            assert_eq!(book.next_cut(), Some(exit), "a published cut is the next one");
-                            assert!(book.complete(k), "cut {exit} staged by every layer before its publication");
+                            assert_eq!(
+                                book.next_cut(),
+                                Some(exit),
+                                "a published cut is the next one"
+                            );
+                            assert!(
+                                book.complete(k),
+                                "cut {exit} staged by every layer before its publication"
+                            );
                             assert_eq!(m.head_pos, exit, "the head sits exactly at the cut");
                             staged_out.push(pub_from_stage(ctx, &stages[k], &book, k));
                             book.mark_published();
@@ -1690,7 +2120,13 @@ mod slowlink_txn_tests {
 
     /// Whole prompt as the bundle drives it: windows end where the cut budget
     /// forces (`prompt_window_end`), one transaction per window.
-    fn run_prompt(ctx: &Ctx, all: &[u32], entry: &M, boundaries: &[usize], head: bool) -> (M, Vec<Pub>, Vec<(usize, usize)>) {
+    fn run_prompt(
+        ctx: &Ctx,
+        all: &[u32],
+        entry: &M,
+        boundaries: &[usize],
+        head: bool,
+    ) -> (M, Vec<Pub>, Vec<(usize, usize)>) {
         let mut m = entry.clone();
         let mut stages = Vec::new();
         let mut out = Vec::new();
@@ -1699,8 +2135,15 @@ mod slowlink_txn_tests {
         while at < all.len() {
             let pending: Vec<usize> = boundaries.iter().copied().filter(|&b| b > at).collect();
             let end = prompt_window_end(at, all.len(), &pending, PROMPT_TXN_MAX_CUTS);
-            let w = Win { all, entry: at, end, boundaries: pending, head };
-            run_window(ctx, &mut m, &mut stages, &w, Inject::None, &mut out).expect("window commits");
+            let w = Win {
+                all,
+                entry: at,
+                end,
+                boundaries: pending,
+                head,
+            };
+            run_window(ctx, &mut m, &mut stages, &w, Inject::None, &mut out)
+                .expect("window commits");
             windows.push((at, end));
             at = end;
         }
@@ -1717,8 +2160,14 @@ mod slowlink_txn_tests {
         // that is the window end is not an interior cut.
         assert_eq!(prompt_cuts_in(3, 3072, &boundaries), [4, 1536, 1537]);
         assert_eq!(prompt_cuts_in(1536, 1537, &boundaries), Vec::<usize>::new());
-        assert_eq!(prompt_cuts_in(1537, prompt.len(), &boundaries), [3072, 4608, 6144, 7680, 8192]);
-        assert_eq!(prompt_cuts_in(8192, prompt.len(), &boundaries), Vec::<usize>::new());
+        assert_eq!(
+            prompt_cuts_in(1537, prompt.len(), &boundaries),
+            [3072, 4608, 6144, 7680, 8192]
+        );
+        assert_eq!(
+            prompt_cuts_in(8192, prompt.len(), &boundaries),
+            Vec::<usize>::new()
+        );
         // Four staged cuts per window: the cold prompt is two windows, the
         // first one ending on the fifth boundary after its entry.
         let mut at = 0;
@@ -1748,11 +2197,20 @@ mod slowlink_txn_tests {
         while pos < prompt.len() {
             let next = boundaries.iter().copied().find(|&b| b > pos);
             let after = next.and_then(|n| boundaries.iter().copied().find(|&b| b > n));
-            pos += qwen4_prefill_segment_rows(pos, prompt.len(), 1536, SessionBoundaries { next, after }, false);
+            pos += qwen4_prefill_segment_rows(
+                pos,
+                prompt.len(),
+                1536,
+                SessionBoundaries { next, after },
+                false,
+            );
             exits.push(pos);
         }
         for boundary in &boundaries {
-            assert!(exits.contains(boundary), "incumbent chunk ends at boundary {boundary}");
+            assert!(
+                exits.contains(boundary),
+                "incumbent chunk ends at boundary {boundary}"
+            );
         }
         for window in boundaries.chunks(PROMPT_TXN_MAX_CUTS) {
             assert!(window.len() <= PROMPT_TXN_MAX_CUTS);
@@ -1766,18 +2224,27 @@ mod slowlink_txn_tests {
         let mut seen = vec![false; layout.fixed_len()];
         for slot in 0..layout.gdn {
             // GDN recurrent then conv, per layer.
-            for part in [layout.gdn_index(slot).unwrap(), layout.gdn_index(slot).unwrap() + 1] {
+            for part in [
+                layout.gdn_index(slot).unwrap(),
+                layout.gdn_index(slot).unwrap() + 1,
+            ] {
                 assert!(!std::mem::replace(&mut seen[part], true));
             }
         }
         for slot in 0..layout.qsa {
-            assert!(!std::mem::replace(&mut seen[layout.qsa_index(slot).unwrap()], true));
+            assert!(!std::mem::replace(
+                &mut seen[layout.qsa_index(slot).unwrap()],
+                true
+            ));
         }
         if let Some(index) = layout.ple_index() {
             assert!(!std::mem::replace(&mut seen[index], true));
         }
         assert!(!std::mem::replace(&mut seen[layout.feedback_index()], true));
-        assert!(seen.iter().all(|&part| part), "every fixed part has exactly one index");
+        assert!(
+            seen.iter().all(|&part| part),
+            "every fixed part has exactly one index"
+        );
         assert_eq!(layout.gdn_index(layout.gdn), None);
         assert_eq!(layout.qsa_index(layout.qsa), None);
         assert_eq!((ctx.layout.gdn, ctx.layout.qsa), (36, 12));
@@ -1789,25 +2256,48 @@ mod slowlink_txn_tests {
         let all = tokens(9000);
         let cold = M::new(&ctx);
         for &(entry, head) in &[
-            (0usize, false), (0, true), (3, false), (4, true), (1536, false), (1537, true), (8192, false), (8192, true),
+            (0usize, false),
+            (0, true),
+            (3, false),
+            (4, true),
+            (1536, false),
+            (1537, true),
+            (8192, false),
+            (8192, true),
         ] {
             let entry_m = entry_at(&ctx, &all, entry);
             let (end_m, published, windows) = run_prompt(&ctx, &all, &entry_m, &BOUNDARIES, head);
-            let expected_positions: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > entry).collect();
+            let expected_positions: Vec<usize> =
+                BOUNDARIES.iter().copied().filter(|&b| b > entry).collect();
             let got: Vec<usize> = published.iter().map(|p| p.position).collect();
-            assert_eq!(got, expected_positions, "entry {entry} head {head}: every boundary once, in order");
+            assert_eq!(
+                got, expected_positions,
+                "entry {entry} head {head}: every boundary once, in order"
+            );
             for snapshot in &published {
                 let want = reference(&ctx, &cold, &all, snapshot.position).snapshot();
-                assert_eq!(snapshot, &want, "entry {entry} head {head}: snapshot at {}", snapshot.position);
+                assert_eq!(
+                    snapshot, &want,
+                    "entry {entry} head {head}: snapshot at {}",
+                    snapshot.position
+                );
             }
             let want_end = reference(&ctx, &cold, &all, all.len());
-            assert_eq!(end_m.snapshot(), want_end.snapshot(), "entry {entry} head {head}: window end state");
+            assert_eq!(
+                end_m.snapshot(),
+                want_end.snapshot(),
+                "entry {entry} head {head}: window end state"
+            );
             if head {
-                assert_eq!((end_m.head_pos, end_m.pending), (all.len(), Some(all.len() - 1)));
+                assert_eq!(
+                    (end_m.head_pos, end_m.pending),
+                    (all.len(), Some(all.len() - 1))
+                );
             }
             // Every window held at most the admitted number of cuts.
             for &(start, end) in &windows {
-                let pending: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > start).collect();
+                let pending: Vec<usize> =
+                    BOUNDARIES.iter().copied().filter(|&b| b > start).collect();
                 assert!(prompt_cuts_in(start, end, &pending).len() <= PROMPT_TXN_MAX_CUTS);
             }
             assert_eq!(windows.last().map(|w| w.1), Some(all.len()));
@@ -1833,9 +2323,16 @@ mod slowlink_txn_tests {
                 injections.extend([Inject::Sink(0), Inject::Sink(1)]);
             }
             for inject in injections {
-                let pending: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > entry).collect();
+                let pending: Vec<usize> =
+                    BOUNDARIES.iter().copied().filter(|&b| b > entry).collect();
                 let end = prompt_window_end(entry, all.len(), &pending, PROMPT_TXN_MAX_CUTS);
-                let w = Win { all: &all, entry, end, boundaries: pending, head };
+                let w = Win {
+                    all: &all,
+                    entry,
+                    end,
+                    boundaries: pending,
+                    head,
+                };
                 let mut m = entry_m.clone();
                 let mut stages = Vec::new();
                 let mut out = Vec::new();
@@ -1844,11 +2341,18 @@ mod slowlink_txn_tests {
                     .expect_err("the injected failure surfaces");
                 assert!(!error.is_empty());
                 saved.restore_into(&mut m);
-                assert_eq!(m, entry_m, "entry {entry} head {head} {inject:?}: every owner restored");
-                assert!(out.is_empty(), "{inject:?}: nothing is published by an aborted window");
+                assert_eq!(
+                    m, entry_m,
+                    "entry {entry} head {head} {inject:?}: every owner restored"
+                );
+                assert!(
+                    out.is_empty(),
+                    "{inject:?}: nothing is published by an aborted window"
+                );
                 assert!(stages.iter().all(|stage| stage.position.is_none()));
                 // The retry is a clean window: no contamination survived.
-                run_window(&ctx, &mut m, &mut stages, &w, Inject::None, &mut out).expect("retry commits");
+                run_window(&ctx, &mut m, &mut stages, &w, Inject::None, &mut out)
+                    .expect("retry commits");
                 let cold = M::new(&ctx);
                 assert_eq!(m.snapshot(), reference(&ctx, &cold, &all, end).snapshot());
             }
@@ -1871,42 +2375,188 @@ mod slowlink_txn_tests {
         assert_eq!(end1, 3072);
         let saved1 = Saved::take(&m);
         assert!(pending_backup_applies(saved1.saved, saved1.for_position, 0));
-        let w1 = Win { all: &all, entry: 0, end: end1, boundaries: pending1, head: true };
-        run_window(&ctx, &mut m, &mut stages, &w1, Inject::None, &mut out).expect("window 1 commits");
-        assert_eq!((m.position, m.head_pos, m.pending), (3072, 3072, Some(3071)));
+        let w1 = Win {
+            all: &all,
+            entry: 0,
+            end: end1,
+            boundaries: pending1,
+            head: true,
+        };
+        run_window(&ctx, &mut m, &mut stages, &w1, Inject::None, &mut out)
+            .expect("window 1 commits");
+        assert_eq!(
+            (m.position, m.head_pos, m.pending),
+            (3072, 3072, Some(3071))
+        );
 
         let pending2: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > 3072).collect();
         let end2 = prompt_window_end(3072, all.len(), &pending2, PROMPT_TXN_MAX_CUTS);
         assert_eq!(end2, all.len());
-        let w2 = Win { all: &all, entry: 3072, end: end2, boundaries: pending2, head: true };
+        let w2 = Win {
+            all: &all,
+            entry: 3072,
+            end: end2,
+            boundaries: pending2,
+            head: true,
+        };
         // Window 2 saves its own entry `pending` before it begins.
         let saved2 = Saved::take(&m);
-        assert!(pending_backup_applies(saved2.saved, saved2.for_position, 3072));
+        assert!(pending_backup_applies(
+            saved2.saved,
+            saved2.for_position,
+            3072
+        ));
         // The request-start backup does not apply to window 2: a begin
         // without a fresh save is refused before any mutation.
-        assert!(!pending_backup_applies(saved1.saved, saved1.for_position, 3072));
+        assert!(!pending_backup_applies(
+            saved1.saved,
+            saved1.for_position,
+            3072
+        ));
         let entry2 = m.clone();
         let published_before = out.len();
-        for inject in [Inject::AfterLayer(0), Inject::DuringPanel(ctx.gdn_slot.len() - 1), Inject::Sink(1), Inject::BeforeCommit] {
+        for inject in [
+            Inject::AfterLayer(0),
+            Inject::DuringPanel(ctx.gdn_slot.len() - 1),
+            Inject::Sink(1),
+            Inject::BeforeCommit,
+        ] {
             let mut failed = entry2.clone();
-            run_window(&ctx, &mut failed, &mut stages, &w2, inject, &mut out).expect_err("window 2 fails");
+            run_window(&ctx, &mut failed, &mut stages, &w2, inject, &mut out)
+                .expect_err("window 2 fails");
             saved2.restore_into(&mut failed);
-            assert_eq!(failed, entry2, "{inject:?}: target, head and pending are window 2's entry");
+            assert_eq!(
+                failed, entry2,
+                "{inject:?}: target, head and pending are window 2's entry"
+            );
             assert_eq!(failed.pending, Some(3071));
-            assert_eq!(out.len(), published_before, "{inject:?}: the failed window published nothing");
+            assert_eq!(
+                out.len(),
+                published_before,
+                "{inject:?}: the failed window published nothing"
+            );
         }
         // With only the request-start backup the head's `pending` would stay
         // at what window 2's first tile left in it: the inconsistent state
         // the per-window refresh and the begin check exist to prevent.
         let mut stale = entry2.clone();
-        run_window(&ctx, &mut stale, &mut stages, &w2, Inject::Sink(1), &mut out).expect_err("window 2 fails");
+        run_window(
+            &ctx,
+            &mut stale,
+            &mut stages,
+            &w2,
+            Inject::Sink(1),
+            &mut out,
+        )
+        .expect_err("window 2 fails");
         saved1.restore_into(&mut stale);
         assert_ne!(stale, entry2);
         // The retry from window 2's entry is a clean window.
-        run_window(&ctx, &mut m, &mut stages, &w2, Inject::None, &mut out).expect("window 2 commits");
+        run_window(&ctx, &mut m, &mut stages, &w2, Inject::None, &mut out)
+            .expect("window 2 commits");
         let cold = M::new(&ctx);
-        assert_eq!(m.snapshot(), reference(&ctx, &cold, &all, all.len()).snapshot());
+        assert_eq!(
+            m.snapshot(),
+            reference(&ctx, &cold, &all, all.len()).snapshot()
+        );
         assert_eq!((m.head_pos, m.pending), (all.len(), Some(all.len() - 1)));
+    }
+
+    #[test]
+    fn session_pair_s1_checkpoint_cadence_shares_the_incumbent_boundaries_and_a_distinct_identity() {
+        let prompt = vec![1u32; 16384];
+        // A slow-link load (mixer tile 1536, checkpoint cadence 8192) keeps
+        // the incumbent chunk-8192 boundary list: one interior cut at 16K,
+        // the end boundary published at the window's commit.
+        let cadence = session_cadence(Some(8192), Some(1536)).unwrap();
+        assert_eq!(cadence, 8192);
+        let s1 = stride_boundaries(cadence, &prompt, None, 0, prompt.len());
+        let incumbent = stride_boundaries(session_cadence(None, Some(8192)).unwrap(), &prompt, None, 0, prompt.len());
+        assert_eq!(s1, [8192, 16384]);
+        assert_eq!(s1, incumbent);
+        assert_eq!(prompt_cuts_in(0, prompt.len(), &s1), [8192]);
+        assert_eq!(prompt_window_end(0, prompt.len(), &s1, PROMPT_TXN_MAX_CUTS), prompt.len(), "one window");
+        // The incumbent loop (also a bypassed request on this load) stops at
+        // the same session boundaries.
+        let mut at = 0;
+        let mut exits = Vec::new();
+        while at < prompt.len() {
+            at = s1.iter().copied().find(|&b| b > at).unwrap_or(prompt.len());
+            exits.push(at);
+        }
+        assert_eq!(exits, s1);
+        // The explicit chunk-1536 cadence would force ten interior cuts and
+        // several windows at 16K: why the cadence is the profile's own.
+        let explicit = stride_boundaries(session_cadence(None, Some(1536)).unwrap(), &prompt, None, 0, prompt.len());
+        assert_eq!(prompt_cuts_in(0, prompt.len(), &explicit).len(), 10);
+        assert!(prompt_window_end(0, prompt.len(), &explicit, PROMPT_TXN_MAX_CUTS) < prompt.len());
+        // Message-end cuts still union with the cadence (unchanged scheduling).
+        let mut with_ends = prompt.clone();
+        with_ends[2] = END;
+        assert_eq!(stride_boundaries(8192, &with_ends, Some(END), 0, with_ends.len()), [3, 8192, 16384]);
+        // No profile: the forward chunk, as before; a zero stride is not a cadence.
+        assert_eq!(session_cadence(None, Some(1536)), Some(1536));
+        assert_eq!(session_cadence(Some(0), Some(1536)), Some(1536));
+        assert_eq!(session_cadence(None, None), None);
+        // Identity: tile 1536 + cadence 8192 is neither the explicit
+        // chunk-1536 scope nor the incumbent chunk-8192 scope, and another
+        // cadence is a third scope.
+        let base = |chunk: usize| format!("qwen4/Ar/chunk{chunk}/F");
+        let s1_scope = format!("{}{}", base(1536), slowlink_scope_tag(Some((1536, 8192))));
+        let explicit_scope = format!("{}{}", base(1536), slowlink_scope_tag(None));
+        let incumbent_scope = format!("{}{}", base(8192), slowlink_scope_tag(None));
+        let other_cadence = format!("{}{}", base(1536), slowlink_scope_tag(Some((1536, 4096))));
+        let scopes = [&s1_scope, &explicit_scope, &incumbent_scope, &other_cadence];
+        for (i, a) in scopes.iter().enumerate() {
+            for b in &scopes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(slowlink_scope_tag(None), "");
+    }
+
+    #[test]
+    fn session_pair_attach_chunk_is_the_exact_profile_tile_or_the_unchanged_incumbent() {
+        use std::cell::Cell;
+        let widened = |calls: &Cell<u32>| {
+            calls.set(calls.get() + 1);
+            8192
+        };
+        // No profile: the incumbent request, capped by the PLE store, exactly as before.
+        let calls = Cell::new(0);
+        assert_eq!(
+            attach_chunk_request(None, 16640, usize::MAX, || widened(&calls)),
+            Ok(8192)
+        );
+        assert_eq!(
+            attach_chunk_request(None, 16640, 4096, || widened(&calls)),
+            Ok(4096)
+        );
+        assert_eq!(calls.get(), 2);
+        // A profile: the charged tile for the product carrier (1536) and for a
+        // caller passing the whole context (16640); the incumbent helper is
+        // never consulted, so 8192 / 4096 scratch cannot be retained.
+        let calls = Cell::new(0);
+        assert_eq!(
+            attach_chunk_request(Some(1536), 1536, usize::MAX, || widened(&calls)),
+            Ok(1536)
+        );
+        assert_eq!(
+            attach_chunk_request(Some(1536), 16640, usize::MAX, || widened(&calls)),
+            Ok(1536)
+        );
+        assert_eq!(
+            attach_chunk_request(Some(1024), 16640, 2048, || widened(&calls)),
+            Ok(1024)
+        );
+        assert_eq!(calls.get(), 0);
+        // Capacity shortfalls and a tile beyond the S1 bound refuse, never resize.
+        assert!(attach_chunk_request(Some(1536), 1024, usize::MAX, || 0).is_err());
+        assert!(attach_chunk_request(Some(1536), 16640, 512, || 0).is_err());
+        assert!(
+            attach_chunk_request(Some(PROMPT_TILE_ROWS_MAX + 1), 16640, usize::MAX, || 0).is_err()
+        );
+        assert!(attach_chunk_request(Some(0), 16640, usize::MAX, || 0).is_err());
     }
 
     #[test]
@@ -1925,19 +2575,54 @@ mod slowlink_txn_tests {
         let compress = ctx().compress;
         for cut in [3usize, 4, 1536, 1537, 8192] {
             let pooled_len = cut / compress;
-            for start in [cut, cut + 1, cut + compress - 1, cut + TILE, cut + 3 * TILE + 1] {
-                assert!(start / compress >= pooled_len, "cut {cut}: launch at {start} re-pools only blocks >= {pooled_len}");
+            for start in [
+                cut,
+                cut + 1,
+                cut + compress - 1,
+                cut + TILE,
+                cut + 3 * TILE + 1,
+            ] {
+                assert!(
+                    start / compress >= pooled_len,
+                    "cut {cut}: launch at {start} re-pools only blocks >= {pooled_len}"
+                );
                 assert!(start >= cut, "rows are written at positions >= {start}");
             }
             // The marks the stage records for the cut.
-            let mut book = CutBook::new(0, &tokens(cut + 1), PleHistory::new(2), vec![cut], 2, 1, 1, compress).unwrap();
-            assert!(book.record_qsa(0, 0, 0, (cut, cut, pooled_len, 0, cut)).is_ok());
+            let mut book = CutBook::new(
+                0,
+                &tokens(cut + 1),
+                PleHistory::new(2),
+                vec![cut],
+                2,
+                1,
+                1,
+                compress,
+            )
+            .unwrap();
+            assert!(book
+                .record_qsa(0, 0, 0, (cut, cut, pooled_len, 0, cut))
+                .is_ok());
         }
         // A cursor at the wrong pooled length (a partially pooled block) is
         // refused, never staged.
-        let mut book = CutBook::new(0, &tokens(2000), PleHistory::new(2), vec![1537], 2, 1, 1, compress).unwrap();
-        assert!(book.record_qsa(0, 0, 0, (1537, 1537, 385, 0, 1537)).is_err());
-        assert!(book.record_qsa(0, 0, 0, (1536, 1536, 384, 0, 1536)).is_err());
+        let mut book = CutBook::new(
+            0,
+            &tokens(2000),
+            PleHistory::new(2),
+            vec![1537],
+            2,
+            1,
+            1,
+            compress,
+        )
+        .unwrap();
+        assert!(book
+            .record_qsa(0, 0, 0, (1537, 1537, 385, 0, 1537))
+            .is_err());
+        assert!(book
+            .record_qsa(0, 0, 0, (1536, 1536, 384, 0, 1536))
+            .is_err());
         assert!(book.record_qsa(0, 0, 0, (1537, 1537, 384, 0, 1537)).is_ok());
     }
 
@@ -1946,16 +2631,30 @@ mod slowlink_txn_tests {
         let compress = ctx().compress;
         let history = PleHistory::new(2);
         // Too many cuts, a cut at the window end, a cut at the entry.
-        assert!(CutBook::new(0, &tokens(100), history, vec![1, 2, 3, 4, 5], 2, 2, 1, compress).is_err());
+        assert!(CutBook::new(
+            0,
+            &tokens(100),
+            history,
+            vec![1, 2, 3, 4, 5],
+            2,
+            2,
+            1,
+            compress
+        )
+        .is_err());
         assert!(CutBook::new(0, &tokens(100), history, vec![100], 2, 2, 1, compress).is_err());
         assert!(CutBook::new(10, &tokens(100), history, vec![10], 2, 2, 1, compress).is_err());
         assert!(CutBook::new(0, &tokens(100), history, vec![5, 5], 2, 2, 1, compress).is_err());
-        let mut book = CutBook::new(0, &tokens(100), history, vec![8, 20], 2, 2, 1, compress).unwrap();
+        let mut book =
+            CutBook::new(0, &tokens(100), history, vec![8, 20], 2, 2, 1, compress).unwrap();
         assert!(!book.complete(0));
         book.record_gdn(0, 0).unwrap();
         assert!(book.record_gdn(0, 0).is_err(), "a layer stages a cut once");
         assert!(!book.complete(0));
-        assert!(book.commits_for(0).is_err(), "marks are missing until the QSA layer stages");
+        assert!(
+            book.commits_for(0).is_err(),
+            "marks are missing until the QSA layer stages"
+        );
         book.record_qsa(0, 1, 0, (8, 8, 2, 3, 8)).unwrap();
         assert!(book.complete(0) && !book.complete(1));
         assert_eq!(book.next_cut(), Some(8));
@@ -1974,13 +2673,23 @@ mod slowlink_txn_tests {
         // last row, so a cut published after the tile holds hidden `cut - 1`.
         for &entry in &[0usize, 3, 4, 1536, 1537, 8192] {
             let end = 9000usize;
-            let pending_cuts: Vec<usize> = BOUNDARIES.iter().copied().filter(|&b| b > entry).collect();
+            let pending_cuts: Vec<usize> =
+                BOUNDARIES.iter().copied().filter(|&b| b > entry).collect();
             let mut at = entry;
             let mut pending = entry.checked_sub(1);
             let mut pairs = Vec::new();
             let mut held_at_cut = Vec::new();
             while at < end {
-                let window_end = prompt_window_end(at, end, &pending_cuts.iter().copied().filter(|&b| b > at).collect::<Vec<_>>(), PROMPT_TXN_MAX_CUTS);
+                let window_end = prompt_window_end(
+                    at,
+                    end,
+                    &pending_cuts
+                        .iter()
+                        .copied()
+                        .filter(|&b| b > at)
+                        .collect::<Vec<_>>(),
+                    PROMPT_TXN_MAX_CUTS,
+                );
                 let cuts = prompt_cuts_in(at, window_end, &pending_cuts);
                 let mut start = at;
                 for exit in tile_exits(at, window_end, &cuts) {
@@ -2002,17 +2711,31 @@ mod slowlink_txn_tests {
                 }
                 at = window_end;
             }
-            let sequential: Vec<(usize, usize)> = (entry..end).map(|p| (p, p.saturating_sub(1))).collect();
-            assert_eq!(pairs, sequential, "entry {entry}: bounded tiles reproduce the sequential p-1 pairing");
+            let sequential: Vec<(usize, usize)> =
+                (entry..end).map(|p| (p, p.saturating_sub(1))).collect();
+            assert_eq!(
+                pairs, sequential,
+                "entry {entry}: bounded tiles reproduce the sequential p-1 pairing"
+            );
             for (cut, held) in held_at_cut {
-                assert_eq!(held, cut - 1, "the cut's boundary hidden is the target hidden of cut - 1");
+                assert_eq!(
+                    held,
+                    cut - 1,
+                    "the cut's boundary hidden is the target hidden of cut - 1"
+                );
             }
         }
     }
 
     #[test]
     fn session_pair_incumbent_receipt_has_every_required_key() {
-        let receipt = incumbent_receipt_json("auto", Some("selector declined"), 3, &[(0, 1533), (1533, 4)], 1536);
+        let receipt = incumbent_receipt_json(
+            "auto",
+            Some("selector declined"),
+            3,
+            &[(0, 1533), (1533, 4)],
+            1536,
+        );
         for key in SLOWLINK_RECEIPT_KEYS {
             assert!(receipt.get(key).is_some(), "receipt key {key}");
         }
