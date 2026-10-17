@@ -542,9 +542,10 @@ impl PanelPageLayout {
 /// streams and the layer's combined output), so no gate is saved per window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArenaField {
-    /// Four hyper-connection branch streams of every window row, reserved at
-    /// F32 width (the widest tag a tile can exit with; the per-tile BF16/F32
-    /// tags are host-side metadata).
+    /// Four hyper-connection branch streams of every window row, each tile
+    /// packed at its own tag width (BF16 from `QWEN4_F16_WMMA_MIN_TOKENS` rows
+    /// up, F32 below): `(window + S1_F32_STREAM_ROWS + tile) * wide * 2` bytes,
+    /// the last term slack for F32-typed validation views.
     HcStreams,
 }
 
@@ -783,7 +784,9 @@ pub struct AdmissionInputs {
     pub trunk_layers: usize,
     /// [`crate::expert_residency::AutoReserve::bytes`] at [`S1_TILE_ROWS`].
     pub base_reserve: u64,
-    /// The incumbent 1,536-row placement's layers, for the log only.
+    /// Layers the incumbent placement at the requested chunk would keep with
+    /// the safety margin and no dedicated G2 stage charge (log only; see
+    /// [`SlowlinkProfile::baseline_layers`]).
     pub baseline_layers: usize,
     /// Bytes of ONE boundary stage: the target's session fixed parts (GDN
     /// recurrent and conv, QSA selections, PLE conv, hyper feedback; no context
@@ -810,7 +813,11 @@ pub struct SlowlinkProfile {
     /// Layers the charged placement keeps resident (at least
     /// [`S1_MIN_RESIDENT_LAYERS`]).
     pub resident_layers: usize,
-    /// Layers the incumbent 1,536-row placement kept, for comparison.
+    /// Layers the incumbent placement at the requested prefill chunk
+    /// (8192 rows on a narrow gfx1100 link) would keep with the safety margin
+    /// but WITHOUT the dedicated G2 stage charge: a log-only no-stage baseline
+    /// that can exceed the real incumbent's layer count. Never a measured or
+    /// gating figure; the S1 floor ([`S1_MIN_RESIDENT_LAYERS`]) does not read it.
     pub baseline_layers: usize,
     pub link_gbps: f64,
 }
@@ -854,7 +861,7 @@ impl SlowlinkProfile {
     pub fn describe(&self) -> String {
         format!(
             "slow-link prefill (S1): {} MiB charged [{}], {}-row tile, {}-row window, \
-             {} resident layers (1536-row baseline {}), {}+{} expert pages of {} bytes ({} KiB pinned host table staging), link {:.1} GB/s",
+             {} resident layers (no-stage incumbent baseline {}), {}+{} expert pages of {} bytes ({} KiB pinned host table staging), link {:.1} GB/s",
             self.census.total().unwrap_or(0) >> 20,
             self.census.describe(),
             self.tile_rows,
@@ -1636,10 +1643,19 @@ mod tests {
         // Saved prepared input, route maps and accumulator belong to the
         // dispatch crate's route storage, never duplicated in the arena.
         assert_eq!(ARENA_FIELDS, [ArenaField::HcStreams]);
-        assert_eq!(arena.span(ArenaField::HcStreams).bytes, rows * wide * 4);
+        // Predicate pins: a tile of >= 512 rows is BF16; at most six
+        // sub-512-row (F32) tiles per window; the arena changes with either.
+        assert_eq!(S1_F32_TILE_ROWS_MAX, 511);
+        assert_eq!(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS, 512);
+        assert_eq!(S1_F32_STREAM_ROWS, 6 * 511);
+        assert_eq!(S1_F32_STREAM_ROWS, 3066);
+        let bytes = (rows + 3066 + S1_TILE_ROWS as u64) * wide * 2;
+        assert_eq!(arena.span(ArenaField::HcStreams).bytes, bytes);
         assert_eq!(arena.span(ArenaField::HcStreams).offset, 0);
         assert_eq!(arena.total_bytes % S1_ALIGN, 0);
-        assert!(arena.total_bytes >= rows * wide * 4);
+        assert!(arena.total_bytes >= bytes);
+        // Far below the all-F32 window, which a BF16-off load must bypass.
+        assert!(arena.total_bytes < rows * wide * 4);
         assert!(arena.total_bytes - arena.span(ArenaField::HcStreams).end() < S1_ALIGN);
         // One window row more or fewer changes the allocation and the census alike.
         let shorter = PromptArenaLayout::new(&geometry, S1_WINDOW_ROWS - 1, S1_TILE_ROWS).unwrap();
