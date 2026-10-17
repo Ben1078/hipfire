@@ -879,31 +879,10 @@ pub struct SlowlinkProfile {
     pub link_gbps: f64,
 }
 
-/// Chunk exits strictly inside `(entry, end)` of an incumbent chunk-major
-/// prefill with chunk `stride`, relative to `entry`: `entry + k * stride`.
-/// A zero stride has no cadence.
-pub fn incumbent_checkpoint_boundaries(entry: usize, end: usize, stride: usize) -> Vec<usize> {
-    if stride == 0 {
-        return Vec::new();
-    }
-    (1..)
-        .map(|step| entry.saturating_add(step.saturating_mul(stride)))
-        .take_while(|&position| position < end)
-        .collect()
-}
-
 impl SlowlinkProfile {
     /// The one number placement charges for this profile.
     pub fn reserve_bytes(&self) -> Result<u64, String> {
         self.census.total()
-    }
-
-    /// Interior checkpoint boundaries of a prefill from `entry` to `end` at the
-    /// preserved non-S1 cadence ([`Self::checkpoint_stride_rows`]): the same
-    /// positions the incumbent chunk-major prefill exits at, whatever the S1
-    /// mixer tile is.
-    pub fn checkpoint_boundaries(&self, entry: usize, end: usize) -> Vec<usize> {
-        incumbent_checkpoint_boundaries(entry, end, self.checkpoint_stride_rows)
     }
 
     /// Windows a request of `rows` rows runs ([`S1_WINDOW_ROWS`] each, the
@@ -1480,28 +1459,36 @@ mod tests {
 
     /// The non-S1 checkpoint cadence survives an attached S1 profile: the
     /// stride is the incumbent's requested chunk (8192 on the narrow target),
-    /// never the 1,536-row mixer tile, so a 16K prompt has the same single
-    /// interior boundary with S1 attached and without it.
+    /// never the 1,536-row mixer tile. The boundaries are the incumbent's own
+    /// planner (`session_cache::stride_boundaries`, GLOBAL multiples of the
+    /// stride in `(entry, end]`), fed the profile's stride: a 16K prompt has
+    /// one interior boundary, resumed or not.
     #[test]
     fn slowlink_admission_checkpoint_cadence_is_the_incumbent_chunk_not_the_tile() {
+        use hipfire_runtime::session_cache::stride_boundaries;
         let profile = admit(&inputs(free_for(&inputs(0), 10))).unwrap();
         assert_eq!(profile.tile_rows, 1536);
         assert_eq!(profile.checkpoint_stride_rows, 8192);
-        let attached = profile.checkpoint_boundaries(0, 16384);
-        let incumbent = incumbent_checkpoint_boundaries(0, 16384, 8192);
-        assert_eq!(attached, incumbent);
-        assert_eq!(attached, vec![8192], "one interior boundary at 16K");
-        // Relative to the entry position, never an absolute multiple.
-        assert_eq!(profile.checkpoint_boundaries(4096, 16384), vec![12288]);
+        let stride = profile.checkpoint_stride_rows;
+        let interior = |stride: usize, entry: usize, end: usize| -> Vec<usize> {
+            stride_boundaries(stride, &[], None, entry, end)
+                .into_iter()
+                .filter(|&boundary| boundary < end)
+                .collect()
+        };
+        // Fresh 16K: exactly one interior boundary.
+        assert_eq!(interior(stride, 0, 16384), vec![8192]);
+        // Resumed entries: global multiples, never entry + k * stride.
+        assert_eq!(interior(stride, 3, 16384), vec![8192], "not 8195");
+        assert_eq!(interior(stride, 1537, 16384), vec![8192]);
+        assert_eq!(interior(stride, 8193, 16384), Vec::<usize>::new());
         // A short prompt or an exact stride has no interior boundary.
-        assert!(profile.checkpoint_boundaries(0, 8192).is_empty());
-        assert!(profile.checkpoint_boundaries(0, 100).is_empty());
+        assert!(interior(stride, 0, 8192).is_empty());
+        assert!(interior(stride, 0, 100).is_empty());
         // The mixer tile would have placed ten interior boundaries: it is
         // never the checkpoint cadence.
-        assert_eq!(incumbent_checkpoint_boundaries(0, 16384, S1_TILE_ROWS).len(), 10);
-        assert_ne!(attached, incumbent_checkpoint_boundaries(0, 16384, S1_TILE_ROWS));
-        // A zero stride has no cadence rather than looping.
-        assert!(incumbent_checkpoint_boundaries(0, 16384, 0).is_empty());
+        assert_eq!(interior(S1_TILE_ROWS, 0, 16384).len(), 10);
+        assert_ne!(interior(stride, 0, 16384), interior(S1_TILE_ROWS, 0, 16384));
     }
 
     fn census_total(inputs: &AdmissionInputs) -> u64 {
