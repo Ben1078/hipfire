@@ -1426,13 +1426,13 @@ pub const DECISIONS: &[Decision] = &[
     },
     Decision {
         id: "qwen4-cpu-splice-eager-only",
-        predicates: &[IsRecording, CaptureMode, GraphSlotCapturing],
-        condition: "hipfire-arch-qwen4 ensure_cpu_splice_eager (run before a forward that executes a CPU routed-expert splice) and Qwen4GpuForward::new_inner (when trunk layers are armed with `cpu_deferred_experts`, gpu_forward.rs): the call errors when `gpu.graphs.capture_mode || gpu.replay.is_recording() || stream_is_capturing(active_stream)`, because a host-executed splice cannot be retained in a captured or recorded tape",
+        predicates: &[IsRecording, CaptureMode, GraphSlotCapturing, ReplayState],
+        condition: "the host-executed CPU routed-expert splice and the D2 CPU tier split are eager-only. D1 admission: hipfire-arch-qwen4 ensure_cpu_splice_eager (run before a forward that executes a CPU routed-expert splice) and Qwen4GpuForward::new_inner (when trunk layers are armed with `cpu_deferred_experts`, gpu_forward.rs) error when `gpu.graphs.capture_mode || gpu.replay.is_recording() || stream_is_capturing(active_stream)`, because a host-executed splice cannot be retained in a captured or recorded tape. D2 admission: when `cpu_split_layers > 0` ensure_cpu_splice_eager additionally refuses a specialized verify/replay `capturing` slot, a retained body, AQL/PM4 routing, a shadow body route or `replay.state() == ShadowValidated` (so it consults capture_mode, is_recording, the verify and replay `capturing` slots and `replay.state()`: 5 tokens), at admission instead of at the first split call. D2 execution: the same refusal set is enforced again before any state of a split call is mutated by cpu_split.rs CpuSplitExecutor::gate (capture_mode, verify/replay `capturing` slots, active-stream capture, is_recording, retained body, AQL/PM4, shadow body, `replay.state()`: 5 predicate tokens; run by the prepare/join/finish split entries) and by hipfire-dispatch pipeline/moe_program.rs CpuSplitRunGate (the `graph_capture` struct field; `observe`, which snapshots capture_mode, the verify/replay `capturing` slots, is_recording and `replay.state()` into the fields; and `refusal`, which maps graph_capture to a named refusal reason; consumed by split_run_gate before the split's host-synchronous router wait)",
         effect: Refusal,
-        switches: "error before any launch (message names replay.backend=hip or memory.offload_exec=pcie); the CPU splice runs only eager (HIP launches)",
+        switches: "error before any launch (message names replay.backend=hip or memory.offload_exec=pcie, or the refusing state: graph capture, replay recording, retained PM4/AQL body, shadow-validated body); the CPU splice and the D2 split's host slot arithmetic run only eager (HIP launches)",
         kernels: &[],
         verdict: Invariant,
-        evidence: "the refused branch launches nothing; a CPU routed-expert forward never runs recorded or captured, so no recorded program is produced that differs from the eager one",
+        evidence: "the refused branches launch nothing and mutate no split state; the D2 split blocks the host between the router and the routed tail and a CPU routed-expert forward never runs recorded, captured, replayed or shadow-validated, so no recorded program is produced that differs from the eager one. The D2 gate sites only widen the same refusal to the specialized capture slots and retained transports; there is no arithmetic or lifecycle change",
         reaches: &[],
     },
 ];
@@ -1765,7 +1765,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
         function: "ensure_cpu_splice_eager",
-        occurrences: 2,
+        occurrences: 5,
         decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
@@ -1871,6 +1871,18 @@ pub const SITES: &[Site] = &[
         decisions: &["redline-oracle-diagnostics"],
     },
     Site {
+        file: "hipfire-dispatch/src/cpu_split.rs",
+        function: "gate",
+        occurrences: 5,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
         function: "absorbs_clear",
         occurrences: 2,
@@ -1881,6 +1893,18 @@ pub const SITES: &[Site] = &[
         function: "owner_assign",
         occurrences: 4,
         decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "observe",
+        occurrences: 6,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "refusal",
+        occurrences: 1,
+        decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
