@@ -1423,6 +1423,24 @@ impl AutoReserve {
         }
     }
 
+    /// The base reserve a whole-layer placement is sized from. Every load that
+    /// is not an admitted S1 load (`slowlink == false`: the incumbent, fast
+    /// links, unified memory, every opt-out) reads exactly [`Self::bytes`],
+    /// byte for byte. An admitted S1 load reads the bottom-up census alone
+    /// ([`Self::census_total`]): the historical floor is a stale measured
+    /// formula (5,517,207,808 B at the 1,536-row tile against a 2,237,111,724 B
+    /// census) that would put the ten-layer floor out of reach, and the S1
+    /// profile adds its own explicit terms and the safety margin on top
+    /// ([`PlacementCharges`]); the Hold 1 gate verifies the measured peak
+    /// against census + safety + allowance.
+    pub fn placement_bytes(&self, slowlink: bool) -> u64 {
+        if slowlink {
+            self.census_total
+        } else {
+            self.bytes()
+        }
+    }
+
     /// Which formula set [`Self::bytes`].
     pub fn winner(&self) -> &'static str {
         match self.historical {
