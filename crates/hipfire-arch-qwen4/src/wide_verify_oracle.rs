@@ -74,6 +74,8 @@ pub fn dev_position(bundle: &Qwen4Bundle) -> usize {
 /// The state is left advanced by `block.len()` with the verify's snapshot
 /// ticket active in `scratch`; finish with `SpecTarget::commit_prefix` or
 /// [`dev_rollback_verify`].
+/// A logits synchronization, view or download failure rolls the verify back
+/// and consumes its ticket; a rollback failure is reported with the read error.
 pub fn dev_verify_logits(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -82,14 +84,24 @@ pub fn dev_verify_logits(
 ) -> Result<(Vec<u32>, Vec<f32>), String> {
     let position = bundle.state.position;
     let picks = bundle.dev_verify_block_rows(gpu, block, position, scratch, true)?;
-    gpu.hip
-        .device_synchronize()
-        .map_err(|error| error.to_string())?;
-    let rows = bundle
-        .spec_logits_rows(0, block.len())
-        .map_err(|error| error.to_string())?;
-    let logits = gpu.download_f32(&rows).map_err(|error| error.to_string())?;
-    Ok((picks, logits))
+    let result = (|| -> Result<Vec<f32>, String> {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let rows = bundle
+            .spec_logits_rows(0, block.len())
+            .map_err(|error| error.to_string())?;
+        gpu.download_f32(&rows).map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(logits) => Ok((picks, logits)),
+        Err(error) => {
+            bundle
+                .dev_rollback_verify(gpu, scratch)
+                .map_err(|rollback| format!("{error}; target rollback failed: {rollback}"))?;
+            Err(error)
+        }
+    }
 }
 
 /// The same verify transaction with the logits left resident and no pick
