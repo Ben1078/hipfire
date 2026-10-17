@@ -1865,7 +1865,18 @@ mod tests {
         };
         let (pages, arena, census) = census_of(&inputs).unwrap();
         let s1_total = census.total().unwrap();
-        assert_eq!(s1_total, 2_542_846_784, "S1 layout, no MTP");
+        // Route storage includes D's `k1_shared` (245,760 B): 386,070,784 B,
+        // charged with A4 and the grouped-scatter scratch at 471,924,992 B.
+        assert_eq!(s1_total, 2_543_092_544, "S1 layout, no MTP");
+        // Native MTP adds exactly the entry pending copy (hc * hidden * 4 B).
+        let mtp_pending = (config.hc_count * config.hidden_size * 4) as u64;
+        assert_eq!(mtp_pending, 40_960);
+        let (_, _, mtp_census) = census_of(&AdmissionInputs {
+            pending_save_bytes: mtp_pending,
+            ..inputs
+        })
+        .unwrap();
+        assert_eq!(mtp_census.total().unwrap(), 2_543_133_504, "S1 layout, native MTP");
         assert_eq!(census.boundary_state, 4 * 34_128_016);
         assert_eq!(pages.total_pages(), 18);
 
