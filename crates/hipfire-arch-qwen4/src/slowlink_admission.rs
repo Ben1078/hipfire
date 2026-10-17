@@ -1927,7 +1927,11 @@ mod tests {
             ..inputs
         })
         .unwrap();
-        assert_eq!(mtp_census.total().unwrap(), 2_543_133_504, "S1 layout, native MTP");
+        assert_eq!(
+            mtp_census.total().unwrap(),
+            2_543_133_504,
+            "S1 layout, native MTP"
+        );
         assert_eq!(census.boundary_state, 4 * 34_128_016);
         assert_eq!(pages.total_pages(), 18);
 
@@ -2102,7 +2106,12 @@ mod tests {
         assert!(profile.tile_rows <= 1536);
         assert_eq!(profile.window_rows, 16384);
         // Seven charged terms, every one itemised in log order.
-        let names: Vec<&str> = profile.census.terms().iter().map(|(name, _)| *name).collect();
+        let names: Vec<&str> = profile
+            .census
+            .terms()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         assert_eq!(
             names,
             [
@@ -2372,7 +2381,10 @@ mod tests {
             "census and allocation read one layout"
         );
         assert_eq!(profile.census.a4_sidecars, layout.a4_sidecar_bytes() as u64);
-        assert_eq!(profile.census.group_scatter, layout.group_scatter_bytes() as u64);
+        assert_eq!(
+            profile.census.group_scatter,
+            layout.group_scatter_bytes() as u64
+        );
         // Full window grouped-scatter scratch at N=16384 slots=163840, E=512:
         // the 1536-tile's 309,248 B stays in the base reserve (replacement
         // peak holds old + new), so the full figure is charged on top.
