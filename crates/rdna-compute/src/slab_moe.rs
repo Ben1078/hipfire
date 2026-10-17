@@ -1440,6 +1440,297 @@ impl Gpu {
             reservation,
         ))
     }
+
+    /// S1 slow-link layer-major prefill: apply one panel of grouped BF16 down rows to the
+    /// ordered combine accumulator `acc` (`[tokens, hidden]` F32 holding the BF16 running sum).
+    /// `y` holds the panel's rows `[panel_rows, hidden]` BF16 (panel-local); the panel covers
+    /// the window's grouped rows `[row_base, row_base + panel_rows)` of an `inverse` map over
+    /// `grouped_rows` window rows, and additionally owns the slots with a valid id in
+    /// `[own_lo, own_hi)` whose grouped row is invalid (see
+    /// [`slowlink_panel_owns`]).  Panels of one layer must be launched in ascending
+    /// `row_base` order; [`Gpu::slowlink_combine_pad`] runs once after the last.
+    #[allow(clippy::too_many_arguments)]
+    pub fn slowlink_combine_panel(
+        &mut self,
+        y: &GpuTensor,
+        inverse: &GpuTensor,
+        topk: &GpuTensor,
+        weights: &GpuTensor,
+        acc: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+        n_experts: usize,
+        grouped_rows: usize,
+        row_base: usize,
+        panel_rows: usize,
+        own_lo: usize,
+        own_hi: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if hidden == 0 || hidden % 8 != 0 || tokens == 0 || own_lo > own_hi || own_hi > n_experts {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_combine_panel: need hidden % 8 == 0, tokens > 0 and own_lo <= own_hi <= n_experts",
+            ));
+        }
+        if row_base.checked_add(panel_rows).is_none_or(|end| end > grouped_rows) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_combine_panel: the panel exceeds the window's grouped rows",
+            ));
+        }
+        for value in [hidden, tokens, n_experts, grouped_rows, row_base, panel_rows] {
+            if i32::try_from(value).is_err() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "slowlink_combine_panel: extent exceeds i32",
+                ));
+            }
+        }
+        crate::moe::require_span(y, &[panel_rows, hidden, 2], "slowlink_combine_panel panel rows")?;
+        crate::moe::require_span(inverse, &[tokens, 10, 4], "slowlink_combine_panel inverse permutation")?;
+        crate::moe::require_span(topk, &[tokens, 10, 4], "slowlink_combine_panel expert ids")?;
+        crate::moe::require_span(weights, &[tokens, 10, 4], "slowlink_combine_panel weights")?;
+        crate::moe::require_span(acc, &[tokens, hidden, 4], "slowlink_combine_panel accumulator")?;
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const FUNC: &str = "slowlink_combine_panel";
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let (yp, ip, tp, wp, ap) = (
+            y.buf.as_ptr(),
+            inverse.buf.as_ptr(),
+            topk.buf.as_ptr(),
+            weights.buf.as_ptr(),
+            acc.buf.as_ptr(),
+        );
+        let words = [
+            hidden as i32,
+            tokens as i32,
+            n_experts as i32,
+            grouped_rows as i32,
+            row_base as i32,
+            panel_rows as i32,
+            own_lo as i32,
+            own_hi as i32,
+        ];
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+        ];
+        params.extend(words.iter().map(|w| w as *const i32 as *mut c_void));
+        let bytes = panel_rows * hidden * 2 + 2 * tokens * hidden * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [(hidden as u32 / 8).div_ceil(64), tokens as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp);
+                b.push_ptr(ip);
+                b.push_ptr(tp);
+                b.push_ptr(wp);
+                b.push_ptr(ap);
+                for w in words {
+                    b.push_i32(w);
+                }
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The canonical combine's terminal `(10 - valid)` +0 products, once per layer after the
+    /// last [`Gpu::slowlink_combine_panel`] (only a -0 accumulator changes).
+    pub fn slowlink_combine_pad(
+        &mut self,
+        topk: &GpuTensor,
+        acc: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+        n_experts: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if hidden == 0 || hidden % 8 != 0 || tokens == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_combine_pad: need hidden % 8 == 0 and tokens > 0",
+            ));
+        }
+        for value in [hidden, tokens, n_experts] {
+            if i32::try_from(value).is_err() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "slowlink_combine_pad: extent exceeds i32",
+                ));
+            }
+        }
+        crate::moe::require_span(topk, &[tokens, 10, 4], "slowlink_combine_pad expert ids")?;
+        crate::moe::require_span(acc, &[tokens, hidden, 4], "slowlink_combine_pad accumulator")?;
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const FUNC: &str = "slowlink_combine_pad";
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let (tp, ap) = (topk.buf.as_ptr(), acc.buf.as_ptr());
+        let (hv, tv, nx) = (hidden as i32, tokens as i32, n_experts as i32);
+        let mut params = [
+            &tp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(hidden as u32 / 8).div_ceil(64), tokens as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(ap);
+                b.push_i32(hv);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b
+            },
+        )
+    }
+
+    /// Fill the first `bytes` of `tensor` with the byte `value` on the active stream (blocking
+    /// when none): `0` clears F32/I32 words to +0 / 0, `0xFF` sets I32 words to -1.
+    pub fn slowlink_fill_bytes(
+        &mut self,
+        tensor: &GpuTensor,
+        value: u8,
+        bytes: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if bytes > tensor.buf.size() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_fill_bytes: the span exceeds the tensor",
+            ));
+        }
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&tensor.buf, i32::from(value), bytes, stream),
+            None => self.hip.memset(&tensor.buf, i32::from(value), bytes),
+        }
+    }
+
+    /// `out[i] = ids[i]` when `lo <= ids[i] < hi`, else `-1`, for `n` I32 ids (the K1-cohort
+    /// view of a short-tail tile's routes against one expert binding).
+    pub fn slowlink_mask_ids(
+        &mut self,
+        ids: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        lo: usize,
+        hi: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n == 0 || lo > hi || [n, lo, hi].iter().any(|&v| i32::try_from(v).is_err()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_mask_ids: need n > 0, lo <= hi and i32 extents",
+            ));
+        }
+        crate::moe::require_span(ids, &[n, 4], "slowlink_mask_ids ids")?;
+        crate::moe::require_span(out, &[n, 4], "slowlink_mask_ids output")?;
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const FUNC: &str = "slowlink_mask_ids";
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let (ip, op) = (ids.buf.as_ptr(), out.buf.as_ptr());
+        let (nv, lv, hv) = (n as i32, lo as i32, hi as i32);
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(n as u32).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(nv);
+                b.push_i32(lv);
+                b.push_i32(hv);
+                b
+            },
+        )
+    }
+
+    /// The one S1 count barrier: complete the active stream, then read the first `words`
+    /// little-endian i32 of `tensor` back.
+    pub fn slowlink_sync_download_i32(
+        &mut self,
+        tensor: &GpuTensor,
+        words: usize,
+    ) -> HipResult<Vec<i32>> {
+        self.bind_thread()?;
+        if words.checked_mul(4).is_none_or(|bytes| bytes > tensor.buf.size()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_sync_download_i32: the span exceeds the tensor",
+            ));
+        }
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.stream_synchronize(stream)?,
+            None => self.hip.device_synchronize()?,
+        }
+        let mut bytes = vec![0u8; words * 4];
+        self.hip.memcpy_dtoh(&mut bytes, &tensor.buf)?;
+        self.take_device_wait_error()?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+}
+
+/// Whether the S1 ordered-combine panel `[row_base, row_base + panel_rows)` of the window's
+/// `grouped_rows` rows, owning the invalid-row slots of experts `[own_lo, own_hi)`, applies the
+/// route slot `(id, row)`: exactly the predicate `slowlink_combine_panel` evaluates per slot.
+/// A slot whose id is outside `[0, n_experts)` is never applied here (the canonical kernel
+/// skips it and pads once, [`Gpu::slowlink_combine_pad`]); a slot with a valid grouped row
+/// belongs to the panel holding that row; a valid-id slot whose grouped row is invalid (the
+/// canonical kernel multiplies +0 by its weight) belongs to the one panel whose ownership
+/// range holds its id.  The ownership ranges of a layer's panels partition `[0, n_experts)`.
+#[allow(clippy::too_many_arguments)]
+pub fn slowlink_panel_owns(
+    id: i32,
+    row: i32,
+    n_experts: usize,
+    grouped_rows: usize,
+    row_base: usize,
+    panel_rows: usize,
+    own_lo: usize,
+    own_hi: usize,
+) -> bool {
+    if id < 0 || id as usize >= n_experts {
+        return false;
+    }
+    if row >= 0 && (row as usize) < grouped_rows {
+        let row = row as usize;
+        row >= row_base && row - row_base < panel_rows
+    } else {
+        let id = id as usize;
+        id >= own_lo && id < own_hi
+    }
 }
 
 #[cfg(test)]
@@ -2178,6 +2469,465 @@ mod tests {
             assert_eq!(word(72), n_experts, "n_experts@72");
             assert_eq!(word(76), 0, "reserved@76");
             assert_eq!(geo.m as usize % MQ_I4_MOE_GEMV_C1_ROWS_PER_WG, 0);
+        }
+    }
+}
+
+/// CPU models of the S1 ordered panel combine (`slowlink_combine_panel` + `slowlink_combine_pad`)
+/// against the canonical monolithic BF16-row combine (`moe_combine_order_top10` +
+/// `moe_down_combine_grouped_top10_bf16in`).  No HIP.
+#[cfg(test)]
+mod slowlink_combine_tests {
+    use super::slowlink_panel_owns;
+
+    const K: usize = 10;
+    const EXPERTS: usize = 512;
+    const CLASSES: usize = 12;
+    const HIDDEN: usize = 24;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn unit(&mut self) -> f32 {
+            ((self.next() >> 40) as f32) / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+    }
+
+    fn rbf(x: f32) -> f32 {
+        if x.is_nan() {
+            return f32::NAN;
+        }
+        let u = x.to_bits();
+        if (!u & 0x7f80_0000) != 0 {
+            f32::from_bits(u.wrapping_add(0x7fff + ((u >> 16) & 1)) & 0xffff_0000)
+        } else {
+            f32::from_bits(u & 0xffff_0000)
+        }
+    }
+    fn bf(x: f32) -> u16 {
+        (rbf(x).to_bits() >> 16) as u16
+    }
+    fn wd(b: u16) -> f32 {
+        f32::from_bits((b as u32) << 16)
+    }
+    fn same(a: f32, b: f32) -> bool {
+        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+    }
+
+    struct Case {
+        tokens: usize,
+        /// Window grouped rows (pad16 per expert).
+        g: usize,
+        /// First grouped row of every expert, `[EXPERTS + 1]`.
+        start: Vec<usize>,
+        down: Vec<u16>,
+        inv: Vec<i32>,
+        topk: Vec<i32>,
+        w: Vec<f32>,
+        init: Vec<f32>,
+    }
+
+    fn palette(class: usize, rng: &mut Rng) -> u16 {
+        let pick = |rng: &mut Rng, v: &[f32]| bf(v[rng.below(v.len())]);
+        match class {
+            6 => pick(rng, &[3.38e38, -3.38e38, 1.0e30, 2.0, 3.0e38]),
+            7 => pick(rng, &[1.0e30, -1.0e30, 1.0, 1.0e-3, -1.0, 7.0e29]),
+            8 => pick(rng, &[0.00390625, 1.0, -0.00390625, 0.005859375, -1.0]),
+            9 => [0x0000u16, 0x8000, bf(1.0), bf(-1.0), bf(0.5)][rng.below(5)],
+            11 => {
+                let m = (1 + rng.below(0x7f)) as u16;
+                if rng.below(2) == 0 {
+                    m
+                } else {
+                    m | 0x8000
+                }
+            }
+            _ => bf(rng.unit() * 2.0),
+        }
+    }
+
+    fn weight(class: usize, rng: &mut Rng) -> f32 {
+        match class {
+            6 => [1.0f32, 2.0, -1.0, 1.0][rng.below(4)],
+            7 => [1.0f32, -1.0, 1.0, 0.5][rng.below(4)],
+            8 => 1.0,
+            9 => [0.0f32, -0.0, 1.0, -1.0, 0.25][rng.below(5)],
+            11 => [1.0e-30f32, -1.0e-30, 3.0e-39, 1.0][rng.below(4)],
+            _ => rng.unit(),
+        }
+    }
+
+    fn distinct(rng: &mut Rng) -> [i32; K] {
+        let mut ids = [0i32; K];
+        let mut n = 0;
+        while n < K {
+            let c = rng.below(EXPERTS) as i32;
+            if !ids[..n].contains(&c) {
+                ids[n] = c;
+                n += 1;
+            }
+        }
+        ids
+    }
+
+    /// Every adversarial class, grouped the way the stable scatter groups (`(expert, slot)`
+    /// order, each expert padded to 16), with some valid ids whose grouped row is invalid.
+    fn make_case(seed: u64, tokens_per_class: usize) -> Case {
+        let mut rng = Rng(seed | 1);
+        let tokens = CLASSES * tokens_per_class;
+        let mut topk = vec![0i32; tokens * K];
+        let mut w = vec![0f32; tokens * K];
+        let mut class_of = vec![0usize; tokens];
+        for tok in 0..tokens {
+            let c = tok % CLASSES;
+            class_of[tok] = c;
+            let ids: [i32; K] = match c {
+                1 => [7; K],
+                2 => [5, 5, 9, 9, 9, 1, 1, 300, 300, 511],
+                3 => [-1, 512, 40, 1000, -7, 3, i32::MIN, i32::MAX, 17, 17],
+                4 => [-1; K],
+                5 => {
+                    let mut v = [if rng.below(2) == 0 { -1 } else { 600 }; K];
+                    v[rng.below(K)] = rng.below(EXPERTS) as i32;
+                    v
+                }
+                8 => [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                9 => [4, 4, 4, 100, 100, 200, 200, 200, 511, 0],
+                _ => distinct(&mut rng),
+            };
+            for r in 0..K {
+                topk[tok * K + r] = ids[r];
+                w[tok * K + r] = weight(c, &mut rng);
+            }
+        }
+        // Stable grouping: (expert, flat slot), pad16 per expert.
+        let mut count = vec![0usize; EXPERTS];
+        for &id in &topk {
+            if (0..EXPERTS as i32).contains(&id) {
+                count[id as usize] += 1;
+            }
+        }
+        let mut start = vec![0usize; EXPERTS + 1];
+        for e in 0..EXPERTS {
+            start[e + 1] = start[e] + count[e].div_ceil(16) * 16;
+        }
+        let g = start[EXPERTS].max(16);
+        let mut fill = vec![0usize; EXPERTS];
+        let mut inv = vec![-1i32; tokens * K];
+        let mut down = vec![0u16; g * HIDDEN];
+        for slot in 0..tokens * K {
+            let id = topk[slot];
+            if !(0..EXPERTS as i32).contains(&id) {
+                continue;
+            }
+            let e = id as usize;
+            let row = start[e] + fill[e];
+            fill[e] += 1;
+            let c = class_of[slot / K];
+            for col in 0..HIDDEN {
+                down[row * HIDDEN + col] = palette(c, &mut rng);
+            }
+            // Class 10: most slots lose their grouped row but keep their (valid) id.
+            inv[slot] = if c == 10 && rng.below(3) != 0 {
+                [-1i32, g as i32 + 7, i32::MAX][rng.below(3)]
+            } else {
+                row as i32
+            };
+        }
+        let init = (0..tokens * HIDDEN)
+            .map(|i| match i % 5 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => rbf(rng.unit()),
+                3 => rbf(1.0e30),
+                _ => rbf(-3.0e38),
+            })
+            .collect();
+        Case { tokens, g, start, down, inv, topk, w, init }
+    }
+
+    /// The ten (grouped row or -1, BF16 weight) slots of a token in
+    /// `moe_combine_order_top10`'s order, then (-1, +0) pads.
+    fn order_slots(c: &Case, tok: usize) -> [(i32, f32); K] {
+        let base = tok * K;
+        let mut used = [false; K];
+        for r in 0..K {
+            let id = c.topk[base + r];
+            used[r] = !(0..EXPERTS as i32).contains(&id);
+        }
+        let mut out = [(-1i32, 0.0f32); K];
+        for slot in out.iter_mut() {
+            let mut sel = None;
+            let mut sel_id = i32::MAX;
+            for r in 0..K {
+                if !used[r] && c.topk[base + r] < sel_id {
+                    sel_id = c.topk[base + r];
+                    sel = Some(r);
+                }
+            }
+            let Some(r) = sel else { continue };
+            used[r] = true;
+            let row = c.inv[base + r];
+            *slot = (
+                if row >= 0 && (row as usize) < c.g { row } else { -1 },
+                rbf(c.w[base + r]),
+            );
+        }
+        out
+    }
+
+    fn canonical(c: &Case) -> Vec<f32> {
+        let mut out = vec![0f32; c.tokens * HIDDEN];
+        for tok in 0..c.tokens {
+            let slots = order_slots(c, tok);
+            for col in 0..HIDDEN {
+                let mut acc = rbf(c.init[tok * HIDDEN + col]);
+                for &(row, wt) in &slots {
+                    let y = if row >= 0 { wd(c.down[row as usize * HIDDEN + col]) } else { 0.0 };
+                    acc = rbf(acc + rbf(rbf(y) * wt));
+                }
+                out[tok * HIDDEN + col] = acc;
+            }
+        }
+        out
+    }
+
+    /// One panel of `slowlink_combine_panel`.
+    fn apply_panel(c: &Case, acc: &mut [f32], row_base: usize, rows: usize, own: (usize, usize)) {
+        for tok in 0..c.tokens {
+            let base = tok * K;
+            let mut ents: Vec<(i32, usize)> = (0..K)
+                .filter(|&r| {
+                    slowlink_panel_owns(
+                        c.topk[base + r],
+                        c.inv[base + r],
+                        EXPERTS,
+                        c.g,
+                        row_base,
+                        rows,
+                        own.0,
+                        own.1,
+                    )
+                })
+                .map(|r| (c.topk[base + r], r))
+                .collect();
+            ents.sort();
+            for (_, r) in ents {
+                let row = c.inv[base + r];
+                let wt = rbf(c.w[base + r]);
+                for col in 0..HIDDEN {
+                    let y = if row >= 0 && (row as usize) < c.g {
+                        wd(c.down[row as usize * HIDDEN + col])
+                    } else {
+                        0.0
+                    };
+                    let a = &mut acc[tok * HIDDEN + col];
+                    *a = rbf(*a + rbf(rbf(y) * wt));
+                }
+            }
+        }
+    }
+
+    /// `slowlink_combine_pad`.
+    fn apply_pad(c: &Case, acc: &mut [f32]) {
+        for tok in 0..c.tokens {
+            let valid = (0..K)
+                .filter(|&r| (0..EXPERTS as i32).contains(&c.topk[tok * K + r]))
+                .count();
+            for col in 0..HIDDEN {
+                let a = &mut acc[tok * HIDDEN + col];
+                for _ in valid..K {
+                    *a = rbf(*a + rbf(0.0 * 0.0));
+                }
+            }
+        }
+    }
+
+    fn expert_of_row(c: &Case, row: usize) -> usize {
+        c.start.partition_point(|&s| s <= row) - 1
+    }
+
+    /// Panels `[cuts[k], cuts[k+1])` of the window's rows with the ownership partition the
+    /// scheduler builds: the last expert of each panel closes its range, the last panel
+    /// closes at `EXPERTS`.
+    fn panels(c: &Case, cuts: &[usize]) -> Vec<(usize, usize, (usize, usize))> {
+        let mut out = Vec::new();
+        let mut prev_hi = 0;
+        for (k, win) in cuts.windows(2).enumerate() {
+            let (lo, hi) = (win[0], win[1]);
+            let last = k + 2 == cuts.len();
+            let own_hi = if last {
+                EXPERTS
+            } else if hi > lo {
+                (expert_of_row(c, hi - 1) + 1).max(prev_hi)
+            } else {
+                prev_hi
+            };
+            out.push((lo, hi - lo, (prev_hi, own_hi)));
+            prev_hi = own_hi;
+        }
+        out
+    }
+
+    fn run(c: &Case, cuts: &[usize], ascending: bool, pad: bool) -> Vec<f32> {
+        let mut acc: Vec<f32> = c.init.iter().map(|&v| rbf(v)).collect();
+        let ps = panels(c, cuts);
+        let order: Vec<usize> = if ascending {
+            (0..ps.len()).collect()
+        } else {
+            (0..ps.len()).rev().collect()
+        };
+        for i in order {
+            let (base, rows, own) = ps[i];
+            apply_panel(c, &mut acc, base, rows, own);
+        }
+        if pad {
+            apply_pad(c, &mut acc);
+        }
+        acc
+    }
+
+    fn diffs(a: &[f32], b: &[f32]) -> usize {
+        a.iter().zip(b).filter(|(x, y)| !same(**x, **y)).count()
+    }
+
+    /// Random row cuts (some mid-expert, some not tile-aligned) plus the one-row and whole-window
+    /// extremes.
+    fn partitions(c: &Case, rng: &mut Rng) -> Vec<Vec<usize>> {
+        let mut out = vec![vec![0, c.g]];
+        out.push((0..=c.g.div_ceil(16)).map(|i| (i * 16).min(c.g)).collect());
+        for _ in 0..24 {
+            let k = 1 + rng.below(40);
+            let mut cuts: Vec<usize> = (0..k)
+                .map(|_| {
+                    let r = rng.below(c.g + 1);
+                    if rng.below(3) == 0 { r } else { r / 16 * 16 }
+                })
+                .collect();
+            cuts.extend([0, c.g]);
+            cuts.sort();
+            cuts.dedup();
+            out.push(cuts);
+        }
+        // Cuts exactly inside the heavy experts (7: all ten ranks x tokens; 5/9/300).
+        for e in [7usize, 5, 9, 300, 511] {
+            let mid = (c.start[e] + c.start[e + 1]) / 2;
+            let mut cuts = vec![0, c.start[e], mid, c.start[e + 1], c.g];
+            cuts.sort();
+            cuts.dedup();
+            out.push(cuts);
+        }
+        out
+    }
+
+    #[test]
+    fn slowlink_combine_panels_equal_the_canonical_combine() {
+        for seed in [0x51_0e_1u64, 0xC0B1, 0xDEAD_BEEF, 7] {
+            let case = make_case(seed, 6);
+            let want = canonical(&case);
+            let mut rng = Rng(seed ^ 0x9e37_79b9);
+            for cuts in partitions(&case, &mut rng) {
+                let got = run(&case, &cuts, true, true);
+                assert_eq!(diffs(&got, &want), 0, "seed {seed:#x}, cuts {cuts:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_combine_each_valid_slot_is_applied_exactly_once() {
+        for seed in [3u64, 0xFEED] {
+            let case = make_case(seed, 5);
+            let mut rng = Rng(seed ^ 0x77);
+            for cuts in partitions(&case, &mut rng) {
+                let ps = panels(&case, &cuts);
+                // The ownership ranges partition [0, EXPERTS) in panel order.
+                let mut next = 0;
+                for &(_, _, (lo, hi)) in &ps {
+                    assert_eq!(lo, next, "ownership gap/overlap, cuts {cuts:?}");
+                    assert!(hi >= lo);
+                    next = hi;
+                }
+                assert_eq!(next, EXPERTS);
+                for slot in 0..case.tokens * K {
+                    let id = case.topk[slot];
+                    let owners = ps
+                        .iter()
+                        .filter(|&&(base, rows, (lo, hi))| {
+                            slowlink_panel_owns(id, case.inv[slot], EXPERTS, case.g, base, rows, lo, hi)
+                        })
+                        .count();
+                    let valid = (0..EXPERTS as i32).contains(&id);
+                    assert_eq!(owners, usize::from(valid), "slot {slot} id {id}, cuts {cuts:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_combine_terminal_pad_runs_once_and_only_matters_for_negative_zero() {
+        let case = make_case(0xA11CE, 8);
+        let want = canonical(&case);
+        let cuts = vec![0, case.g / 3, case.g];
+        // Without the terminal products, only accumulators that are still -0 differ: tokens
+        // with fewer than ten valid ids (signed-zero and invalid-id classes).
+        let bare = run(&case, &cuts, true, false);
+        let wrong = diffs(&bare, &want);
+        assert!(wrong > 0, "the fixture must exercise a -0 terminal pad");
+        for (i, (a, b)) in bare.iter().zip(&want).enumerate() {
+            if !same(*a, *b) {
+                assert_eq!(a.to_bits(), 0x8000_0000, "elt {i}: only -0 may differ");
+                assert_eq!(b.to_bits(), 0, "elt {i}: the pad turns -0 into +0");
+            }
+        }
+        // One pad per layer (not per panel): padding twice is idempotent but a per-panel
+        // pad would already have been wrong for a panel that precedes a negative product.
+        let mut twice = run(&case, &cuts, true, true);
+        apply_pad(&case, &mut twice);
+        assert_eq!(diffs(&twice, &want), 0);
+    }
+
+    #[test]
+    fn slowlink_combine_panel_order_matters() {
+        // Negative control: ascending expert order is the contract; reversed panels differ.
+        let case = make_case(0xBADD, 8);
+        let want = canonical(&case);
+        let cuts: Vec<usize> = (0..=case.g.div_ceil(16)).map(|i| (i * 16).min(case.g)).collect();
+        assert_eq!(diffs(&run(&case, &cuts, true, true), &want), 0);
+        assert!(diffs(&run(&case, &cuts, false, true), &want) > 0);
+    }
+
+    #[test]
+    fn slowlink_combine_skipped_slots_add_no_zero_terms() {
+        // A one-slot token under a split with absent panels must not see +0 additions from
+        // panels that do not own its slot: -0 stays -0 until the single terminal pad.
+        let mut case = make_case(0x2, 2);
+        // Token 0: one valid slot (expert 3, positive weight, +0 payload), accumulator -0.
+        for r in 0..K {
+            case.topk[r] = -1;
+            case.inv[r] = -1;
+        }
+        case.topk[4] = 3;
+        case.w[4] = -1.0;
+        let row = case.start[3];
+        case.inv[4] = row as i32;
+        for col in 0..HIDDEN {
+            case.down[row * HIDDEN + col] = 0;
+            case.init[col] = -0.0;
+        }
+        let want = canonical(&case);
+        // -0 + (+0 * -1 = -0) stays -0, then nine +0 pads make it +0.
+        for cuts in [vec![0, case.g], vec![0, row, row + 16, case.g], (0..=case.g / 16).map(|i| i * 16).collect()] {
+            let got = run(&case, &cuts, true, true);
+            assert_eq!(diffs(&got[..HIDDEN], &want[..HIDDEN]), 0, "cuts {cuts:?}");
+            assert!(got[..HIDDEN].iter().all(|v| v.to_bits() == 0));
         }
     }
 }

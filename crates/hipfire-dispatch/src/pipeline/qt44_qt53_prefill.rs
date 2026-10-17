@@ -2920,14 +2920,17 @@ fn fp8_combine(
 // ───────────── S1 slow-link layer-major prefill hooks (`slowlink_prefill`) ─────────────
 
 /// Pre-mutation admission of one tile call into the S1 layer-major window: the sealed
-/// expert-slab K2 route over a uniform MQ4 layer, the plain grouped tail (no EP, CPU
+/// expert-slab route over a uniform MQ4 layer, the plain grouped tail (no EP, CPU
 /// split/splice, stage tables, routed-out partial or FP8), BF16-row combine arithmetic
-/// and a shared down after the combine.  `Err` means the caller must stay on the
-/// incumbent route; nothing has been launched or written.
+/// and a shared down after the combine.  Returns whether the tile runs the K2 grouped
+/// kernels (`true`) or is a K1 short-tail tile (`route_rows <= few_row_limit`, the
+/// lane-union GEMV arithmetic of the incumbent, run per expert binding by
+/// [`slowlink_k1_panel`]).  `Err` means the caller must stay on the incumbent route; nothing
+/// has been launched or written.
 pub(super) fn slowlink_admission(
     gpu: &Gpu,
     p: &MoePrefillParams<'_>,
-) -> Result<(), DispatchError> {
+) -> Result<bool, DispatchError> {
     use rdna_compute::slab_moe::SlabBuckets;
     let refuse = |why: &str| {
         Err(DispatchError::Hip(format!(
@@ -2943,9 +2946,6 @@ pub(super) fn slowlink_admission(
     if !grouped_geometry(p) {
         return refuse("the declared grouped geometry is not admitted");
     }
-    if !slab_k2(gpu, p) {
-        return refuse("the tile is not a K2 grouped call at its route rows");
-    }
     if p.batch_size == 0
         || p.k_top != 10
         || p.cpu_deferred_experts
@@ -2956,7 +2956,11 @@ pub(super) fn slowlink_admission(
     {
         return refuse("the call is not a plain single-device grouped tail");
     }
-    if !p.recipe.bf16_round_trip() || !p.recipe.shared_after_combine() {
+    if !p.recipe.bf16_round_trip()
+        || !p.recipe.shared_after_combine()
+        || p.x_norm_batch.dtype != DType::F32
+        || p.down_k != p.mi
+    {
         return refuse("the recipe is not the BF16-row combine with the shared down after it");
     }
     if p.down_m % 64 != 0
@@ -2965,7 +2969,7 @@ pub(super) fn slowlink_admission(
         || p.down_k % 128 != 0
         || (gpu.arch == "gfx1100" && p.down_k != 640)
     {
-        return refuse("the projection geometry is not the K2 sealed geometry");
+        return refuse("the projection geometry is not the sealed slab geometry");
     }
     let layer = super::slab_route::layer(
         &gpu.arch,
@@ -2974,23 +2978,80 @@ pub(super) fn slowlink_admission(
         p.expert_dtype_tags,
     )?;
     match layer.buckets {
-        SlabBuckets::Uniform(bucket) if bucket != 0 => Ok(()),
-        _ => refuse("the layer is not uniform MQ4"),
+        SlabBuckets::Uniform(bucket) if bucket != 0 => {}
+        _ => return refuse("the layer is not uniform MQ4"),
     }
+    // The recipe/dtype/geometry predicates of `slab_k2` hold, so it differs from a K1 call
+    // only in the route rows.
+    Ok(slab_k2(gpu, p))
+}
+
+/// One expert binding of the K1 short-tail cohort of one tile: the incumbent's K1 path (rotate,
+/// lane-union gate/up GEMV, BF16 round trips, SwiGLU + 128-wide rotation, lane-union down GEMV)
+/// over `ids` (the tile's route ids masked to the binding, so slots whose expert the binding does
+/// not hold take the kernels' no-load exit and leave their rows untouched), reading the
+/// binding's GLOBAL-id pointer tables and writing the unweighted F32 down rows of the binding's
+/// slots into `y0` (`[rows * 10, down_m]`).  `p` is the tile's call with `x_norm_batch` restored.
+pub(super) fn slowlink_k1_panel(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    ids: &GpuTensor,
+    gate_up_table: &GpuTensor,
+    down_table: &GpuTensor,
+    y0: &GpuTensor,
+) -> Result<(), DispatchError> {
+    if slab_k2(gpu, p) {
+        return Err(DispatchError::Hip(
+            "slowlink layer-major prefill: the K1 cohort tile is a K2 call".into(),
+        ));
+    }
+    let layer = super::slab_route::layer(
+        &gpu.arch,
+        p.route_policy.as_ref(),
+        &p.dtypes,
+        p.expert_dtype_tags,
+    )?;
+    let total_slots = p.batch_size * p.k_top;
+    hip(gpu.rotate_x_mq_batched(p.x_norm_batch, p.x_rot_batch, p.gate_up_k, p.batch_size))?;
+    super::slab_route::k1_gate_up(
+        gpu,
+        layer,
+        gate_up_table,
+        ids,
+        p.x_rot_batch,
+        p.gate_batch,
+        p.up_batch,
+        p.batch_size,
+    )?;
+    let active = total_slots * p.mi;
+    let (gate, up, rot) = (
+        f32_view(p.gate_batch, 0, active),
+        f32_view(p.up_batch, 0, active),
+        f32_view(p.rot_batch, 0, active),
+    );
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    hip(gpu.bf16_round_trip_f32(&up))?;
+    hip(gpu.silu_mul_f32(&gate, &up, &rot))?;
+    hip(gpu.bf16_round_trip_f32(&rot))?;
+    hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))?;
+    let rot = f32_view(p.rot_batch, 0, active);
+    super::slab_route::k1_down(gpu, layer, ids, down_table, &rot, y0, p.batch_size)
 }
 
 /// The shared down of one tile, accumulating into `target` (the tile's rows of the
 /// window combine accumulator) instead of the call's own target.  The selector and
-/// activation tensors are the call's, restored by the caller.
+/// activation tensors are the call's, restored by the caller; `use_path2` is the
+/// call's own (it picked the shared gate/up form).
 pub(super) fn slowlink_shared_down(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
+    use_path2: bool,
     target: &GpuTensor,
 ) -> Result<(), DispatchError> {
     let mut view: MoePrefillParams<'_> = *p;
     view.x_batch = target;
     view.routed_out = None;
-    shared_down(gpu, &view, true)
+    shared_down(gpu, &view, use_path2)
 }
 
 #[cfg(test)]
