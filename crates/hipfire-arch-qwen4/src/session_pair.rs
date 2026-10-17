@@ -844,7 +844,10 @@ impl Qwen4Bundle {
 
     /// Start a request's verdict with the incumbent route already decided
     /// for `reason` (before any S1 work).
-    pub(crate) fn slowlink_note_bypass(&mut self, reason: impl Into<std::borrow::Cow<'static, str>>) {
+    pub(crate) fn slowlink_note_bypass(
+        &mut self,
+        reason: impl Into<std::borrow::Cow<'static, str>>,
+    ) {
         self.slowlink_begin_request();
         self.slowlink.bypass = Some(reason.into());
     }
