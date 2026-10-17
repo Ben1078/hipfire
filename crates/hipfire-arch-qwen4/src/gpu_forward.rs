@@ -5818,6 +5818,369 @@ pub(crate) fn layer_scratch<'a>(
     }
 }
 
+/// The Gpu scope values [`Qwen4GpuForward::enter_tile_scopes`] replaced.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TileScopes {
+    scope: bool,
+    invariant: bool,
+    f16_moe: bool,
+    ragged: bool,
+}
+
+/// Typed per-layer step construction shared by the chunk-major forward
+/// (`forward_chunk_scoped`) and the S1 layer-major prompt schedule
+/// (`crate::slowlink_prefill`). Every lowering of a layer's HC read / mixer /
+/// HC write / dense FFN into [`Step`]s lives in these methods; callers choose
+/// only the tensors (`streams`, `gates`, the MoE output) and row geometry.
+///
+/// Borrowed views only: the step list may not outlive `'a`, and building one
+/// never touches the device.
+pub(crate) struct LayerPhaseEnv<'a> {
+    pub(crate) scratch: &'a Qwen4GpuForwardScratch,
+    pub(crate) decode_q8: &'a [GpuTensor],
+    pub(crate) trunk_zba: &'a [Option<GpuTensor>],
+    pub(crate) trunk_a4: &'a [u16],
+    pub(crate) prefill_scope: bool,
+    pub(crate) bundle: &'a Qwen4Bundle,
+    pub(crate) dims: Qwen4ProgramDims,
+    /// Decided once per program: every op touching the HC streams agrees.
+    pub(crate) bf16_state: bool,
+    /// The routing row count every row-count decision of the program sees.
+    pub(crate) route_n: usize,
+    pub(crate) few_row_limit: usize,
+    /// Launch rows of this program (a tile, for S1).
+    pub(crate) rows: usize,
+    /// Absolute position of the program's first row (the GDN recurrence base).
+    pub(crate) start_position: usize,
+    /// The HC stream tensor the layer reads and writes: `scratch.streams`, or
+    /// a row view of the S1 prompt arena.
+    pub(crate) streams: &'a GpuTensor,
+    /// The HC gate tensor of both hyper writes of the layer.
+    pub(crate) gates: &'a GpuTensor,
+}
+
+impl<'a> LayerPhaseEnv<'a> {
+    /// The PLE depthwise step of the PLE layer and whether it stages its rows
+    /// as F16 (decided once; the staging closure agrees on it).
+    pub(crate) fn ple_step(
+        &self,
+        gpu: &Gpu,
+        ple_weights: &crate::weights::PleWeights,
+        ple_head_count: usize,
+        ple_row_width: usize,
+    ) -> Result<(Step<'a>, bool), Qwen4GpuForwardError> {
+        let (scratch, bundle) = (self.scratch, self.bundle);
+        let config = &bundle.config;
+        let ple = ple_desc(&bundle.weights, ple_weights)?;
+        let rows_f16 = qwen4_ple_rows_f16(
+            gpu,
+            self.bf16_state,
+            self.dims.hc_count,
+            config.hidden_size,
+            &ple,
+            self.rows,
+        );
+        let step = Step::GroupedDepthwise(GroupedDepthwiseOp {
+            rotation: &scratch.rotation,
+            state_bf16: self.bf16_state,
+            rows_f16,
+            key: ple.key,
+            value: ple.value,
+            norm_key: ple.norm_key,
+            norm_query: ple.norm_query,
+            norm_conv: ple.norm_conv,
+            conv: ple.conv,
+            state: bundle
+                .state
+                .ple_conv
+                .as_ref()
+                .ok_or_else(|| invalid("PLE conv state missing"))?,
+            streams: self.streams,
+            rows_tensor: &scratch.ple_rows,
+            query: &scratch.ple_query,
+            key_scratch: &scratch.ple_key,
+            value_scratch: &scratch.ple_value,
+            gated: &scratch.ple_gated,
+            normed: &scratch.ple_normed,
+            output: &scratch.ple_output,
+            rows: self.rows,
+            branches: self.dims.hc_count,
+            hidden: config.hidden_size,
+            embed_dim: ple_head_count * ple_row_width,
+            kernel_size: self.dims.ple_conv_kernel_dim,
+            dilation: config.ple_conv_dilation(),
+            epsilon: EPSILON,
+        });
+        Ok((step, rows_f16))
+    }
+
+    /// The layer's prefix: attention HC read, the mixer (GDN or QSA), the
+    /// attention HC write and the MLP HC read. After it the prepared MLP input
+    /// is in `scratch.hc_mixed`.
+    pub(crate) fn push_mixer_prefix(
+        &self,
+        steps: &mut Vec<Step<'a>>,
+        layer_index: usize,
+        layer: &Qwen4LayerWeights,
+        description: &Qwen4LayerDescription<'a>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let (scratch, bundle, dims) = (self.scratch, self.bundle, self.dims);
+        let config = &bundle.config;
+        let (n, route_n, few_row_limit) = (self.rows, self.route_n, self.few_row_limit);
+        let bf16_state = self.bf16_state;
+        let attn_read = &description.attn_hyper.read;
+        if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+            return Err(invalid(
+                "Qwen4 generic layer program inline capacity exhausted",
+            ));
+        }
+        steps.push(Step::HyperRead(HyperReadOp {
+            rotation: &scratch.rotation,
+            state_bf16: bf16_state,
+            input: self.streams,
+            norm_weight: attn_read.norm,
+            input_mix_down: decode_copy(
+                self.decode_q8,
+                layer_index * DECODE_Q8_PER_LAYER,
+                route_n,
+                few_row_limit,
+                attn_read.input_mix_down,
+            ),
+            input_mix_up: decode_copy(
+                self.decode_q8,
+                layer_index * DECODE_Q8_PER_LAYER + 1,
+                route_n,
+                few_row_limit,
+                attn_read.input_mix_up,
+            ),
+            normalized: &scratch.hc_normalized,
+            low: &scratch.hc_low,
+            up: &scratch.hc_up,
+            mixed: &scratch.hc_mixed,
+            rows: n,
+            branches: dims.hc_count,
+            hidden: config.hidden_size,
+            low_rank: dims.hc_lowrank,
+        }));
+
+        match layer.kind {
+            LayerType::LinearAttention => {
+                let gdn_slot = bundle
+                    .state
+                    .gdn_local(layer_index)
+                    .ok_or_else(|| invalid("GDN state slot missing"))?;
+                let state = &bundle.state.gdn[gdn_slot];
+                let weights = match &description.attention {
+                    Qwen4AttentionWeights::Linear(weights) => weights,
+                    _ => return Err(invalid("GDN descriptor kind mismatch")),
+                };
+                steps.push(Step::GatedDeltaNet(GatedDeltaNetOp {
+                    rotation: &scratch.rotation,
+                    qkv: weights.qkv,
+                    conv: weights.conv,
+                    in_proj_a: weights.in_proj_a,
+                    in_proj_b: weights.in_proj_b,
+                    a_log: weights.a_log,
+                    dt_bias: weights.dt_bias,
+                    z: weights.z,
+                    norm: weights.norm,
+                    output: weights.output,
+                    recurrent: &state.recurrent,
+                    conv_state: &state.conv,
+                    projection: &scratch.projection,
+                    projection2: &scratch.projection2,
+                    a: &scratch.gdn_a,
+                    b: &scratch.gdn_b,
+                    gate: &scratch.gdn_gate,
+                    beta: &scratch.gdn_beta,
+                    recurrent_output: &scratch.gdn_recurrent_output,
+                    bf16_scratch: &scratch.gdn_bf16,
+                    z_output: &scratch.gdn_z,
+                    output_scratch: &scratch.gdn_output,
+                    input: &scratch.hc_mixed,
+                    output_tensor: &scratch.attention_output,
+                    rows: n,
+                    start_position: self.start_position,
+                    key_heads: dims.linear_num_key_heads,
+                    value_heads: dims.linear_num_value_heads,
+                    key_dim: dims.linear_key_head_dim,
+                    value_dim: dims.linear_value_head_dim,
+                    conv_kernel: dims.linear_conv_kernel_dim,
+                    input_width: dims.hidden,
+                    row_capture: bundle.state.gdn_row_capture(gdn_slot, n),
+                    zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
+                    trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
+                    phase: MixerPhase::Whole,
+                }));
+            }
+            LayerType::FullAttention => {
+                let state = bundle
+                    .state
+                    .qsa_by_layer(layer_index)
+                    .ok_or_else(|| invalid("QSA state slot missing"))?;
+                let weights = match &description.attention {
+                    Qwen4AttentionWeights::Full(weights) => weights,
+                    _ => return Err(invalid("QSA descriptor kind mismatch")),
+                };
+                steps.push(Step::IndexedAttention(IndexedAttentionOp {
+                    rotation: &scratch.rotation,
+                    mode: IndexedAttentionMode::Full,
+                    indexer_qk: weights.indexer_qk,
+                    indexer_q_norm: weights.indexer_q_norm,
+                    indexer_k_norm: weights.indexer_k_norm,
+                    q: weights.q,
+                    k: weights.k,
+                    v: weights.v,
+                    q_norm: weights.q_norm,
+                    k_norm: weights.k_norm,
+                    output: weights.output,
+                    state: IndexedAttentionState {
+                        format: state.format,
+                        full_keys: &state.full_keys,
+                        full_values: &state.full_values,
+                        raw_index_keys: &state.raw_index_keys,
+                        pooled_keys: &state.pooled_keys,
+                        selected_indices: &state.selected_indices,
+                        // Decode and speculative verify never consume the arena.
+                        f16_arena: if self.prefill_scope {
+                            state.f16_arena_ref()
+                        } else {
+                            None
+                        },
+                        // The pooled BF16 mirror feeds decode and prefill scoring alike.
+                        pooled_bf16: state.pooled_bf16_ref(),
+                        full_capacity: state.full_capacity,
+                        raw_capacity: state.raw_capacity,
+                        pooled_capacity: state.pooled_capacity,
+                        selected_capacity: state.selected_capacity,
+                        position_capacity: state.position_capacity,
+                        full_len: state.full_len,
+                        raw_len: state.raw_len,
+                        pooled_len: state.pooled_len,
+                        selected_len: state.selected_len,
+                        position: state.position,
+                    },
+                    input: &scratch.hc_mixed,
+                    index_scratch: &scratch.qsa_index,
+                    qgate_scratch: &scratch.qsa_qgate,
+                    k_scratch: &scratch.qsa_k,
+                    v_scratch: &scratch.qsa_v,
+                    qsa_output: &scratch.qsa_output,
+                    selected_scratch: &scratch.qsa_selected,
+                    attention_output: &scratch.attention_output,
+                    bf16_scratch: &scratch.gdn_bf16,
+                    rows: n,
+                    index_heads: dims.indexer_n_heads,
+                    index_kv_heads: dims.indexer_kv_heads,
+                    index_dim: dims.indexer_head_dim,
+                    budget: dims.indexer_budget,
+                    compress: dims.indexer_compress_ratio,
+                    heads: dims.num_attention_heads,
+                    kv_heads: dims.num_key_value_heads,
+                    head_dim: dims.head_dim,
+                    rotary_dim: config.rotary_dim(),
+                    rope: config.rope(),
+                    input_width: dims.hidden,
+                    trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
+                    phase: MixerPhase::Whole,
+                }));
+            }
+        }
+
+        let attn_write = &description.attn_hyper.write;
+        steps.push(Step::HyperWrite(HyperWriteOp {
+            rotation: &scratch.rotation,
+            state_bf16: bf16_state,
+            input: self.streams,
+            norm_weight: attn_write.norm,
+            block_inject: attn_write.block_inject,
+            normalized: &scratch.hc_normalized,
+            mixed: &scratch.attention_output,
+            gates: self.gates,
+            output: self.streams,
+            rows: n,
+            branches: dims.hc_count,
+            hidden: config.hidden_size,
+        }));
+
+        let mlp_read = &description.mlp_hyper.read;
+        steps.push(Step::HyperRead(HyperReadOp {
+            rotation: &scratch.rotation,
+            state_bf16: bf16_state,
+            input: self.streams,
+            norm_weight: mlp_read.norm,
+            input_mix_down: decode_copy(
+                self.decode_q8,
+                layer_index * DECODE_Q8_PER_LAYER + 2,
+                route_n,
+                few_row_limit,
+                mlp_read.input_mix_down,
+            ),
+            input_mix_up: decode_copy(
+                self.decode_q8,
+                layer_index * DECODE_Q8_PER_LAYER + 3,
+                route_n,
+                few_row_limit,
+                mlp_read.input_mix_up,
+            ),
+            normalized: &scratch.hc_normalized,
+            low: &scratch.hc_low,
+            up: &scratch.hc_up,
+            mixed: &scratch.hc_mixed,
+            rows: n,
+            branches: dims.hc_count,
+            hidden: config.hidden_size,
+            low_rank: dims.hc_lowrank,
+        }));
+        Ok(())
+    }
+
+    /// The dense FFN step (a non-MoE layer): reads `scratch.hc_mixed`, writes
+    /// `scratch.ffn_output`.
+    pub(crate) fn dense_step(&self, dense: &Qwen4DenseBinding<'a>) -> Step<'a> {
+        let scratch = self.scratch;
+        Step::DenseFfn(DenseFfnOp {
+            recipe: DenseFfnRecipe::SiluBf16Source,
+            gate: dense.gate,
+            up: dense.up,
+            down: dense.down,
+            input: &scratch.hc_mixed,
+            gate_scratch: &scratch.moe_gate_batch,
+            up_scratch: &scratch.moe_up_batch,
+            output: &scratch.ffn_output,
+            rotation: &scratch.rotation,
+            rows: self.rows,
+            hidden: self.bundle.config.hidden_size,
+            intermediate: dense.intermediate,
+        })
+    }
+
+    /// The MLP HC write closing the layer; `mixed` is the FFN output rows
+    /// (`scratch.ffn_output`, or the S1 combined-output rows).
+    pub(crate) fn mlp_write_step(
+        &self,
+        description: &Qwen4LayerDescription<'a>,
+        mixed: &'a GpuTensor,
+    ) -> Step<'a> {
+        let scratch = self.scratch;
+        let mlp_write = &description.mlp_hyper.write;
+        Step::HyperWrite(HyperWriteOp {
+            rotation: &scratch.rotation,
+            state_bf16: self.bf16_state,
+            input: self.streams,
+            norm_weight: mlp_write.norm,
+            block_inject: mlp_write.block_inject,
+            normalized: &scratch.hc_normalized,
+            mixed,
+            gates: self.gates,
+            output: self.streams,
+            rows: self.rows,
+            branches: self.dims.hc_count,
+            hidden: self.bundle.config.hidden_size,
+        })
+    }
+}
+
 /// Parity-harness observer run after each QSA layer's step on the ordinary HIP
 /// route: `(gpu, qsa_slot, op)`, with the op's scratch and state holding that
 /// layer's inputs, selection and attention output for the forward's rows.
@@ -8417,6 +8780,58 @@ impl Qwen4GpuForward {
         result
     }
 
+    /// Set the Gpu routing scopes one forward of `rows` rows runs under and
+    /// return the previous values (restore with [`Self::leave_tile_scopes`]):
+    /// [`Gpu::qwen4_scope`] (admits the Qwen4-only MQ6 X-LDS defaults), the
+    /// canonical-routing switch (see `rdna_compute::prefill_invariant`: set by
+    /// the batch-invariant prefill profile or by the agent-turn append route,
+    /// so every row-count routing decision of the forward sees the canonical
+    /// chunk size while launches keep the real row count) and the ragged IU4
+    /// trunk scope. The ordinary plan dedicates HcMixed/GdnZ/GdnA/GdnB to
+    /// max_chunk rows and only `[0,n)` contains live tokens: compact scratch
+    /// may alias live fields, so its in-place padding is never armed. Returns
+    /// whether the append route applies. Shared by the chunk-major forward and
+    /// every S1 layer-major tile so both see identical routing.
+    pub(crate) fn enter_tile_scopes(&self, gpu: &mut Gpu, rows: usize) -> (TileScopes, bool) {
+        let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
+        let (pm_invariant, append) = Self::route_scopes(self.prefill_scope, gpu, rows);
+        if append {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "qwen4 append route: prefill tiles of {}..511 rows on the canonical (>= 512-row) routes, MoE F16 WMMA (HIPFIRE_QWEN4_APPEND_WMMA)",
+                    rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows()
+                );
+            });
+        }
+        let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
+        let f16_moe = std::mem::replace(&mut gpu.qwen4_append_f16_moe_scope, append);
+        let ragged_scope = native_trunk_prefill_scope(
+            self.prefill_scope,
+            gpu.qwen4_trunk_iu4,
+            &gpu.arch,
+            self.scratch.mode,
+        );
+        let ragged = std::mem::replace(&mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope);
+        (
+            TileScopes {
+                scope,
+                invariant,
+                f16_moe,
+                ragged,
+            },
+            append,
+        )
+    }
+
+    /// Restore the values [`Self::enter_tile_scopes`] replaced.
+    pub(crate) fn leave_tile_scopes(gpu: &mut Gpu, saved: TileScopes) {
+        gpu.qwen4_scope = saved.scope;
+        gpu.prefill_invariant_scope = saved.invariant;
+        gpu.qwen4_append_f16_moe_scope = saved.f16_moe;
+        gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
+    }
+
     /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
     /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
     #[allow(clippy::too_many_arguments)]
@@ -8431,35 +8846,7 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
-        let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-        // The canonical-routing switch (see `rdna_compute::prefill_invariant`):
-        // set by the batch-invariant prefill profile or by the agent-turn
-        // append route below. Every row-count routing decision of this forward
-        // then sees the canonical chunk size; launches keep the real row
-        // count. Restored below on the single return path.
-        let (pm_invariant, append) = Self::route_scopes(self.prefill_scope, gpu, tokens.len());
-        if append {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                eprintln!(
-                    "qwen4 append route: prefill tiles of {}..511 rows on the canonical (>= 512-row) routes, MoE F16 WMMA (HIPFIRE_QWEN4_APPEND_WMMA)",
-                    rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows()
-                );
-            });
-        }
-        let prior_invariant =
-            std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
-        let prior_f16_moe = std::mem::replace(&mut gpu.qwen4_append_f16_moe_scope, append);
-        // The ordinary plan dedicates HcMixed/GdnZ/GdnA/GdnB to max_chunk
-        // rows (plan allocations at 2677/2682/2683/2688). Only [0,n)
-        // contains live tokens. Compact scratch may alias live fields: never
-        // arm its in-place padding, even if a facade appears large enough.
-        let ragged_scope = native_trunk_prefill_scope(
-            self.prefill_scope,
-            gpu.qwen4_trunk_iu4,
-            &gpu.arch,
-            self.scratch.mode,
-        );
+        let (scopes, _append) = self.enter_tile_scopes(gpu, tokens.len());
         // A verify forward (not a prefill tile, 2+ rows) runs row-exact up to
         // the arch's proven limit: the few-row decode-twin routes widen to it
         // (`Gpu::few_row_limit`), so each row is bitwise the sequential decode
@@ -8474,7 +8861,6 @@ impl Qwen4GpuForward {
             0
         };
         let prior_wide_verify = gpu.set_wide_verify_rows(wide_verify);
-        let prior_ragged = std::mem::replace(&mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope);
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -8485,10 +8871,7 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_policy,
         );
-        gpu.qwen4_scope = scope;
-        gpu.prefill_invariant_scope = prior_invariant;
-        gpu.qwen4_append_f16_moe_scope = prior_f16_moe;
-        gpu.qwen4_trunk_iu4_prefill_scope = prior_ragged;
+        Self::leave_tile_scopes(gpu, scopes);
         gpu.set_wide_verify_rows(prior_wide_verify);
         result
     }
@@ -8896,6 +9279,25 @@ impl Qwen4GpuForward {
         let cut_layers = self.cut_layers;
         let mut cut_steps = [0usize; MAX_CUT_LAYERS];
         let mut cut_count = 0usize;
+        // One typed per-layer step builder serves this chunk-major program and the S1
+        // layer-major prompt schedule (`crate::slowlink_prefill`): the phase methods of
+        // `LayerPhaseEnv` are the only place those steps are lowered.
+        let layer_env = LayerPhaseEnv {
+            scratch: &self.scratch,
+            decode_q8: &self.decode_q8,
+            trunk_zba: &self.trunk_zba,
+            trunk_a4: &self.trunk_a4,
+            prefill_scope: self.prefill_scope,
+            bundle: &*bundle,
+            dims,
+            bf16_state,
+            route_n,
+            few_row_limit,
+            rows: n,
+            start_position: bundle.state.position,
+            streams: &self.scratch.streams,
+            gates: &self.scratch.hc_gates,
+        };
         for layer_index in band.clone() {
             if let Some(cuts) = cut_layers.as_ref() {
                 if cuts.contains(layer_index) {
@@ -8917,40 +9319,10 @@ impl Qwen4GpuForward {
                         "Qwen4 generic layer program inline capacity exhausted",
                     ));
                 }
-                let ple = ple_desc(&bundle.weights, ple_weights)?;
-                ple_rows_f16 =
-                    qwen4_ple_rows_f16(gpu, bf16_state, dims.hc_count, config.hidden_size, &ple, n);
-                steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
-                    rotation: &self.scratch.rotation,
-                    state_bf16: bf16_state,
-                    rows_f16: ple_rows_f16,
-                    key: ple.key,
-                    value: ple.value,
-                    norm_key: ple.norm_key,
-                    norm_query: ple.norm_query,
-                    norm_conv: ple.norm_conv,
-                    conv: ple.conv,
-                    state: bundle
-                        .state
-                        .ple_conv
-                        .as_ref()
-                        .ok_or_else(|| invalid("PLE conv state missing"))?,
-                    streams: &self.scratch.streams,
-                    rows_tensor: &self.scratch.ple_rows,
-                    query: &self.scratch.ple_query,
-                    key_scratch: &self.scratch.ple_key,
-                    value_scratch: &self.scratch.ple_value,
-                    gated: &self.scratch.ple_gated,
-                    normed: &self.scratch.ple_normed,
-                    output: &self.scratch.ple_output,
-                    rows: n,
-                    branches: dims.hc_count,
-                    hidden: config.hidden_size,
-                    embed_dim: ple_head_count * ple_row_width,
-                    kernel_size: dims.ple_conv_kernel_dim,
-                    dilation: config.ple_conv_dilation(),
-                    epsilon: EPSILON,
-                }));
+                let (ple_step, rows_f16) =
+                    layer_env.ple_step(gpu, ple_weights, ple_head_count, ple_row_width)?;
+                ple_rows_f16 = rows_f16;
+                steps.push(ple_step);
             }
 
             // Balanced ownership: a host-mapped trunk layer of a gathered EP
@@ -9007,210 +9379,7 @@ impl Qwen4GpuForward {
                     });
                 }
             }
-            let attn_read = &description.attn_hyper.read;
-            if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
-                return Err(invalid(
-                    "Qwen4 generic layer program inline capacity exhausted",
-                ));
-            }
-            steps.push(Step::HyperRead(HyperReadOp {
-                rotation: &self.scratch.rotation,
-                state_bf16: bf16_state,
-                input: &self.scratch.streams,
-                norm_weight: attn_read.norm,
-                input_mix_down: decode_copy(
-                    &self.decode_q8,
-                    layer_index * DECODE_Q8_PER_LAYER,
-                    route_n,
-                    few_row_limit,
-                    attn_read.input_mix_down,
-                ),
-                input_mix_up: decode_copy(
-                    &self.decode_q8,
-                    layer_index * DECODE_Q8_PER_LAYER + 1,
-                    route_n,
-                    few_row_limit,
-                    attn_read.input_mix_up,
-                ),
-                normalized: &self.scratch.hc_normalized,
-                low: &self.scratch.hc_low,
-                up: &self.scratch.hc_up,
-                mixed: &self.scratch.hc_mixed,
-                rows: n,
-                branches: dims.hc_count,
-                hidden: config.hidden_size,
-                low_rank: dims.hc_lowrank,
-            }));
-
-            match layer.kind {
-                LayerType::LinearAttention => {
-                    let gdn_slot = bundle
-                        .state
-                        .gdn_local(layer_index)
-                        .ok_or_else(|| invalid("GDN state slot missing"))?;
-                    let state = &bundle.state.gdn[gdn_slot];
-                    let weights = match &description.attention {
-                        Qwen4AttentionWeights::Linear(weights) => weights,
-                        _ => return Err(invalid("GDN descriptor kind mismatch")),
-                    };
-                    steps.push(Step::GatedDeltaNet(GatedDeltaNetOp {
-                        rotation: &self.scratch.rotation,
-                        qkv: weights.qkv,
-                        conv: weights.conv,
-                        in_proj_a: weights.in_proj_a,
-                        in_proj_b: weights.in_proj_b,
-                        a_log: weights.a_log,
-                        dt_bias: weights.dt_bias,
-                        z: weights.z,
-                        norm: weights.norm,
-                        output: weights.output,
-                        recurrent: &state.recurrent,
-                        conv_state: &state.conv,
-                        projection: &self.scratch.projection,
-                        projection2: &self.scratch.projection2,
-                        a: &self.scratch.gdn_a,
-                        b: &self.scratch.gdn_b,
-                        gate: &self.scratch.gdn_gate,
-                        beta: &self.scratch.gdn_beta,
-                        recurrent_output: &self.scratch.gdn_recurrent_output,
-                        bf16_scratch: &self.scratch.gdn_bf16,
-                        z_output: &self.scratch.gdn_z,
-                        output_scratch: &self.scratch.gdn_output,
-                        input: &self.scratch.hc_mixed,
-                        output_tensor: &self.scratch.attention_output,
-                        rows: n,
-                        start_position: bundle.state.position,
-                        key_heads: dims.linear_num_key_heads,
-                        value_heads: dims.linear_num_value_heads,
-                        key_dim: dims.linear_key_head_dim,
-                        value_dim: dims.linear_value_head_dim,
-                        conv_kernel: dims.linear_conv_kernel_dim,
-                        input_width: dims.hidden,
-                        row_capture: bundle.state.gdn_row_capture(gdn_slot, n),
-                        zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
-                        trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
-                        phase: MixerPhase::Whole,
-                    }));
-                }
-                LayerType::FullAttention => {
-                    let state = bundle
-                        .state
-                        .qsa_by_layer(layer_index)
-                        .ok_or_else(|| invalid("QSA state slot missing"))?;
-                    let weights = match &description.attention {
-                        Qwen4AttentionWeights::Full(weights) => weights,
-                        _ => return Err(invalid("QSA descriptor kind mismatch")),
-                    };
-                    steps.push(Step::IndexedAttention(IndexedAttentionOp {
-                        rotation: &self.scratch.rotation,
-                        mode: IndexedAttentionMode::Full,
-                        indexer_qk: weights.indexer_qk,
-                        indexer_q_norm: weights.indexer_q_norm,
-                        indexer_k_norm: weights.indexer_k_norm,
-                        q: weights.q,
-                        k: weights.k,
-                        v: weights.v,
-                        q_norm: weights.q_norm,
-                        k_norm: weights.k_norm,
-                        output: weights.output,
-                        state: IndexedAttentionState {
-                            format: state.format,
-                            full_keys: &state.full_keys,
-                            full_values: &state.full_values,
-                            raw_index_keys: &state.raw_index_keys,
-                            pooled_keys: &state.pooled_keys,
-                            selected_indices: &state.selected_indices,
-                            // Decode and speculative verify never consume the arena.
-                            f16_arena: if self.prefill_scope {
-                                state.f16_arena_ref()
-                            } else {
-                                None
-                            },
-                            // The pooled BF16 mirror feeds decode and prefill scoring alike.
-                            pooled_bf16: state.pooled_bf16_ref(),
-                            full_capacity: state.full_capacity,
-                            raw_capacity: state.raw_capacity,
-                            pooled_capacity: state.pooled_capacity,
-                            selected_capacity: state.selected_capacity,
-                            position_capacity: state.position_capacity,
-                            full_len: state.full_len,
-                            raw_len: state.raw_len,
-                            pooled_len: state.pooled_len,
-                            selected_len: state.selected_len,
-                            position: state.position,
-                        },
-                        input: &self.scratch.hc_mixed,
-                        index_scratch: &self.scratch.qsa_index,
-                        qgate_scratch: &self.scratch.qsa_qgate,
-                        k_scratch: &self.scratch.qsa_k,
-                        v_scratch: &self.scratch.qsa_v,
-                        qsa_output: &self.scratch.qsa_output,
-                        selected_scratch: &self.scratch.qsa_selected,
-                        attention_output: &self.scratch.attention_output,
-                        bf16_scratch: &self.scratch.gdn_bf16,
-                        rows: n,
-                        index_heads: dims.indexer_n_heads,
-                        index_kv_heads: dims.indexer_kv_heads,
-                        index_dim: dims.indexer_head_dim,
-                        budget: dims.indexer_budget,
-                        compress: dims.indexer_compress_ratio,
-                        heads: dims.num_attention_heads,
-                        kv_heads: dims.num_key_value_heads,
-                        head_dim: dims.head_dim,
-                        rotary_dim: config.rotary_dim(),
-                        rope: config.rope(),
-                        input_width: dims.hidden,
-                        trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
-                        phase: MixerPhase::Whole,
-                    }));
-                }
-            }
-
-            let attn_write = &description.attn_hyper.write;
-            steps.push(Step::HyperWrite(HyperWriteOp {
-                rotation: &self.scratch.rotation,
-                state_bf16: bf16_state,
-                input: &self.scratch.streams,
-                norm_weight: attn_write.norm,
-                block_inject: attn_write.block_inject,
-                normalized: &self.scratch.hc_normalized,
-                mixed: &self.scratch.attention_output,
-                gates: &self.scratch.hc_gates,
-                output: &self.scratch.streams,
-                rows: n,
-                branches: dims.hc_count,
-                hidden: config.hidden_size,
-            }));
-
-            let mlp_read = &description.mlp_hyper.read;
-            steps.push(Step::HyperRead(HyperReadOp {
-                rotation: &self.scratch.rotation,
-                state_bf16: bf16_state,
-                input: &self.scratch.streams,
-                norm_weight: mlp_read.norm,
-                input_mix_down: decode_copy(
-                    &self.decode_q8,
-                    layer_index * DECODE_Q8_PER_LAYER + 2,
-                    route_n,
-                    few_row_limit,
-                    mlp_read.input_mix_down,
-                ),
-                input_mix_up: decode_copy(
-                    &self.decode_q8,
-                    layer_index * DECODE_Q8_PER_LAYER + 3,
-                    route_n,
-                    few_row_limit,
-                    mlp_read.input_mix_up,
-                ),
-                normalized: &self.scratch.hc_normalized,
-                low: &self.scratch.hc_low,
-                up: &self.scratch.hc_up,
-                mixed: &self.scratch.hc_mixed,
-                rows: n,
-                branches: dims.hc_count,
-                hidden: config.hidden_size,
-                low_rank: dims.hc_lowrank,
-            }));
+            layer_env.push_mixer_prefix(&mut steps, layer_index, layer, &description)?;
 
             match &description.ffn {
                 Qwen4FfnBinding::Moe(moe) => {
@@ -9234,38 +9403,11 @@ impl Qwen4GpuForward {
                     steps.push(Step::Moe(sealed));
                 }
                 Qwen4FfnBinding::Dense(dense) => {
-                    steps.push(Step::DenseFfn(DenseFfnOp {
-                        recipe: DenseFfnRecipe::SiluBf16Source,
-                        gate: dense.gate,
-                        up: dense.up,
-                        down: dense.down,
-                        input: &self.scratch.hc_mixed,
-                        gate_scratch: &self.scratch.moe_gate_batch,
-                        up_scratch: &self.scratch.moe_up_batch,
-                        output: &self.scratch.ffn_output,
-                        rotation: &self.scratch.rotation,
-                        rows: n,
-                        hidden: config.hidden_size,
-                        intermediate: dense.intermediate,
-                    }));
+                    steps.push(layer_env.dense_step(dense));
                 }
             }
 
-            let mlp_write = &description.mlp_hyper.write;
-            steps.push(Step::HyperWrite(HyperWriteOp {
-                rotation: &self.scratch.rotation,
-                state_bf16: bf16_state,
-                input: &self.scratch.streams,
-                norm_weight: mlp_write.norm,
-                block_inject: mlp_write.block_inject,
-                normalized: &self.scratch.hc_normalized,
-                mixed: &self.scratch.ffn_output,
-                gates: &self.scratch.hc_gates,
-                output: &self.scratch.streams,
-                rows: n,
-                branches: dims.hc_count,
-                hidden: config.hidden_size,
-            }));
+            steps.push(layer_env.mlp_write_step(&description, &self.scratch.ffn_output));
             if chunk_dump.is_some_and(|dump| dump.wants(layer_index)) {
                 let bf16_grouped = layer_moe.is_some_and(|moe| moe.symmetric)
                     && gpu.qwen4_moe_sym_iu4_applies(route_n);
