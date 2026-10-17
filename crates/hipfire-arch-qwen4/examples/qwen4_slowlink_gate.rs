@@ -949,6 +949,7 @@ fn run(args: &Args) -> Result<bool, String> {
         Mode::Perf => perf_required(&fixture),
     };
     required.push("identity.manifest".to_string());
+    required.push("load.placement".to_string());
     let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
     let mut checks = Checks::new(&required_refs);
     checks.push(
@@ -959,14 +960,62 @@ fn run(args: &Args) -> Result<bool, String> {
     );
     let mut out = serde_json::Map::new();
     if identity_problems.is_empty() {
+        let mut fixture = fixture;
         let session_cache = (args.mode == Mode::State).then_some(fixture.session_cache_bytes);
-        let loaded = slowlink_load_bundle(&mut gpu, &args.model, fixture.max_seq, fixture.expert_vram_layers, session_cache)?;
+        let loaded = slowlink_load_bundle(&mut gpu, &args.model, fixture.max_seq, session_cache)?;
         let vocab = loaded.vocab;
         out.insert("load".into(), json!({
             "num_layers": loaded.num_layers, "host_mapped_tensors": loaded.host_mapped_tensors,
-            "expert_vram_layers": loaded.expert_vram_layers, "ple_format": loaded.ple_format,
+            "resident_layers": loaded.resident_layers, "placement": loaded.placement,
+            "slowlink_profile": loaded.slowlink_profile, "ple_format": loaded.ple_format,
             "vocab": vocab, "max_seq": fixture.max_seq,
         }));
+        // The placement the load actually made: a forced layer-major run needs
+        // the S1 admission's joint placement (>= 10 resident layers); the
+        // incumbent arm must not carry a profile.
+        let mut placement_problems = Vec::new();
+        match args.route {
+            Expect::LayerMajor => {
+                if !loaded.slowlink_profile || loaded.placement != "slowlink-profile" {
+                    placement_problems.push(format!(
+                        "layer-major was forced but the load did not admit the S1 profile (placement {})",
+                        loaded.placement
+                    ));
+                }
+                if (loaded.resident_layers as u64) < MIN_RESIDENT_LAYERS {
+                    placement_problems.push(format!(
+                        "resident layers {} < {MIN_RESIDENT_LAYERS}",
+                        loaded.resident_layers
+                    ));
+                }
+            }
+            Expect::Incumbent => {
+                if loaded.slowlink_profile {
+                    placement_problems.push("the incumbent arm loaded an S1 profile".to_string());
+                }
+            }
+        }
+        checks.push(
+            "load.placement",
+            placement_problems,
+            json!({"placement": loaded.placement, "resident_layers": loaded.resident_layers,
+                   "host_mapped_tensors": loaded.host_mapped_tensors, "slowlink_profile": loaded.slowlink_profile}),
+        );
+        // Natural-text prompts are tokenized with the artifact's own tokenizer.
+        for prompt in fixture.prompts.iter_mut() {
+            if let Some(text) = &prompt.text {
+                prompt.prompt_ids = loaded.tokenizer.encode(text);
+                if prompt.prompt_ids.is_empty()
+                    || prompt.prompt_ids.len() + fixture.decode_tokens + 1 > fixture.max_seq
+                {
+                    return Err(format!(
+                        "natural prompt {} tokenizes to {} ids, outside 1..max_seq",
+                        prompt.id,
+                        prompt.prompt_ids.len()
+                    ));
+                }
+            }
+        }
         let logits = gpu.zeros(&[vocab], DType::F32).map_err(|e| e.to_string())?;
         let mut ctx = Ctx {
             gpu,
@@ -1311,7 +1360,7 @@ mod slowlink_receipt_tests {
         prompts.push(json!({"id": "bnd", "kind": "boundary", "prompt_ids": vec![7u32; 9000], "requested_boundaries": [3, 4, 1536, 1537, 8192]}));
         prompts.push(json!({"id": "nat", "kind": "natural", "prompt_ids": vec![7u32; 100]}));
         json!({
-            "schema": FIXTURE_SCHEMA, "max_seq": 16640, "expert_vram_layers": 10, "decode_tokens": 8,
+            "schema": FIXTURE_SCHEMA, "max_seq": 16640, "decode_tokens": 8,
             "repeats": 3, "head_rows": 4, "prompts": prompts, "continuation_ids": [5, 6, 7],
             "failure_injections": FAILURE_POINTS,
         })

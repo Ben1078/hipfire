@@ -352,6 +352,43 @@ impl Model {
     /// without MTP, the session cache or the PLE hot store: none of them
     /// changes the numerics of a cold AR request.
     fn load(path: &Path, max_seq: usize) -> Result<Self, String> {
+        // S1 candidate arm (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`): the shared
+        // admission-first loader (the product's selection and joint
+        // placement); a pinned `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` then
+        // declines S1 and the receipt shows the incumbent. The baseline arm
+        // keeps the loader below unchanged.
+        if hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env()
+            == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
+        {
+            let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+            let loaded = hipfire_arch_qwen4::slowlink_load::slowlink_load_bundle(
+                &mut gpu, path, max_seq, None,
+            )?;
+            let prompt_logits = gpu
+                .zeros(&[loaded.vocab], DType::F32)
+                .map_err(|e| e.to_string())?;
+            let decode_logits = gpu
+                .zeros(&[loaded.vocab], DType::F32)
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "qwen4_greedy_ids: loaded {} on {} via the slowlink loader (vocab {}, max_seq {max_seq}, ple rows {})",
+                path.display(),
+                gpu.arch,
+                loaded.vocab,
+                loaded.ple_format
+            );
+            return Ok(Self {
+                gpu,
+                bundle: loaded.bundle,
+                prompt_logits,
+                decode_logits,
+                vocab: loaded.vocab,
+                eos_token: loaded.eos_token,
+                max_seq,
+                tokenizer: loaded.tokenizer,
+                template: loaded.chat_template,
+            });
+        }
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)

@@ -4366,14 +4366,14 @@ fn run() -> Result<(), String> {
 }
 
 /// The `--mode slowlink-state` prompt file: `{"prompt_ids": [..], "max_seq":
-/// N, "repeats": R (default 3), "expert_vram_layers": N (optional)}`. The
-/// ids are used verbatim; `max_seq` must hold the whole prompt.
+/// N, "repeats": R (default 3)}`. The ids are used verbatim; `max_seq` must
+/// hold the whole prompt. Placement is the loader's own (the S1 profile's
+/// joint placement when admitted, else the incumbent's automatic one).
 #[derive(Debug, PartialEq, Eq)]
 struct SlowlinkStateFixture {
     prompt_ids: Vec<u32>,
     max_seq: usize,
     repeats: usize,
-    expert_vram_layers: Option<usize>,
 }
 
 fn parse_slowlink_state_fixture(value: &Value) -> Result<SlowlinkStateFixture, String> {
@@ -4411,7 +4411,6 @@ fn parse_slowlink_state_fixture(value: &Value) -> Result<SlowlinkStateFixture, S
         prompt_ids,
         max_seq,
         repeats,
-        expert_vram_layers: unsigned("expert_vram_layers")?,
     })
 }
 
@@ -4424,7 +4423,6 @@ fn run_slowlink_state(model: &Path, fixture: &Path, output: &Path) -> Result<(),
     let report = hipfire_arch_qwen4::state_parity::run_slowlink_prefill_state(
         model,
         &fixture.prompt_ids,
-        fixture.expert_vram_layers,
         fixture.max_seq,
         fixture.repeats,
     )?;
@@ -4451,7 +4449,7 @@ mod slowlink_state_fixture_tests {
     #[test]
     fn slowlink_state_fixture_requires_ids_context_and_a_repeat() {
         let ok = parse_slowlink_state_fixture(&json!({
-            "prompt_ids": [1, 2, 3], "max_seq": 16, "expert_vram_layers": 10
+            "prompt_ids": [1, 2, 3], "max_seq": 16
         }))
         .unwrap();
         assert_eq!(
@@ -4460,7 +4458,6 @@ mod slowlink_state_fixture_tests {
                 prompt_ids: vec![1, 2, 3],
                 max_seq: 16,
                 repeats: 3,
-                expert_vram_layers: Some(10)
             }
         );
         for bad in [

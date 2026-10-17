@@ -275,6 +275,39 @@ impl Model {
         ple_hot: Option<u64>,
         pin: &HotsetPin,
     ) -> Result<Self, String> {
+        // S1 candidate arm (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`): the shared
+        // admission-first loader, so the profile and its joint placement are
+        // the product's. Pinned hot sets and the PLE hot store are other
+        // routes and are refused with it; the baseline arm keeps the loader
+        // below unchanged.
+        if hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env()
+            == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
+        {
+            if ple_hot.is_some() || pin.budget_mib.is_some() || pin.sidecar.is_some() {
+                return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 excludes --ple-hot, --hotset and --hot-budget-mib".into());
+            }
+            let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+            let loaded = hipfire_arch_qwen4::slowlink_load::slowlink_load_bundle(
+                &mut gpu, path, n_ctx, None,
+            )?;
+            let logits = gpu
+                .zeros(&[logit_rows * loaded.vocab], DType::F32)
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "qwen4_kld: loaded {} on {} via the slowlink loader (vocab {})",
+                path.display(),
+                gpu.arch,
+                loaded.vocab
+            );
+            return Ok(Self {
+                gpu,
+                bundle: loaded.bundle,
+                logits,
+                vocab: loaded.vocab,
+                arch_id: loaded.arch_id,
+                tokenizer: loaded.tokenizer,
+            });
+        }
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
