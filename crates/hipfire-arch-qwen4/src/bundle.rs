@@ -48,7 +48,8 @@ use std::time::Duration;
 
 #[path = "session_pair.rs"]
 mod session_pair;
-pub(crate) use session_pair::PairSessionStage;
+pub(crate) use session_pair::{PairSessionStage, PromptTxn, SlowlinkFailPoint, SlowlinkOwner, SlowlinkScope};
+pub use session_pair::SLOWLINK_PRIMITIVES;
 
 #[path = "bundle/pp.rs"]
 mod pp;
@@ -190,6 +191,9 @@ pub struct Qwen4Bundle {
     /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
     session: Option<SessionDriver>,
     pub(crate) pair_session_stage: Option<PairSessionStage>,
+    /// Slow-link (S1) layer-major prompt transaction owner: admitted profile,
+    /// boundary stages, the open window, receipt and failure injection.
+    pub(crate) slowlink: SlowlinkOwner,
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
     turn_snapshots: bool,
@@ -299,6 +303,14 @@ pub fn session_snapshot_bytes(
             .checked_add(part(feedback)?)?;
     }
     u64::try_from(total).ok()
+}
+
+/// Device bytes one slow-link boundary stage costs (the target's fixed state:
+/// GDN recurrent + conv, QSA selections, PLE convolution, HC feedback, each
+/// part rounded to the cache's 256-byte packing): a snapshot of zero rows per
+/// stream. The entry snapshot reuses the state's existing arena and adds none.
+pub fn prompt_stage_bytes(config: &Qwen4Config, format: Qwen4StateFormat) -> Option<u64> {
+    session_snapshot_bytes(config, format, false, 0)
 }
 
 /// Host-only session settings every PP band must share with the root: they shape
@@ -430,7 +442,8 @@ impl SessionState for Qwen4Bundle {
         let staged = self
             .pair_session_stage
             .as_ref()
-            .filter(|stage| stage.position == Some(position));
+            .filter(|stage| stage.position == Some(position))
+            .or_else(|| self.slowlink.stages.iter().find(|stage| stage.position == Some(position)));
         if (staged.is_none() && self.state.position != position)
             || mtp.is_some_and(|mtp| mtp.position() != position)
         {
@@ -568,6 +581,7 @@ impl SessionState for Qwen4Bundle {
         if let Some(stage) = &mut self.pair_session_stage {
             stage.position = None;
         }
+        self.slowlink.clear_active();
         self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
         self.state.reset_for_side(gpu).map_err(|e| e.to_string())?;
         if let Some(mtp) = self.mtp.as_mut() {
@@ -830,6 +844,7 @@ impl Qwen4Bundle {
             penalty_stage: None,
             session: None,
             pair_session_stage: None,
+            slowlink: SlowlinkOwner::default(),
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
             tail_snapshot: hipfire_config::developer_bool(TAIL_SNAPSHOT_ENV, true),
             tail_snapshot_min_gap: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_GAP_ENV)
@@ -1162,7 +1177,7 @@ impl Qwen4Bundle {
             })
             .unwrap_or_else(|| requested.min(1536));
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
-        let forward = Qwen4GpuForward::new_inner(
+        let mut forward = Qwen4GpuForward::new_inner(
             gpu,
             self,
             max_chunk,
@@ -1171,6 +1186,9 @@ impl Qwen4Bundle {
             Some(npu_prepared),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
+        if let Some(profile) = self.slowlink.profile {
+            forward.set_slowlink_profile(profile);
+        }
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
@@ -2741,6 +2759,30 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_forward_chunk(gpu, tokens, logits, top1, true);
         }
+        // The one selector verdict of this request, before any mutation: a
+        // qualified request runs layer-major, every other one the incumbent
+        // chunk-major forward below.
+        let entry = self.state.position;
+        let output = crate::slowlink_prefill::PromptOutput::Final { logits, top1 };
+        if self.slowlink_dispatch(gpu, tokens, output, SlowlinkScope::direct())? {
+            return Ok(());
+        }
+        let result = self.forward_chunk_final_incumbent(gpu, tokens, logits, top1);
+        if result.is_ok() {
+            self.slowlink_record_incumbent(entry, &[(0, tokens.len())]);
+        }
+        result
+    }
+
+    /// The incumbent chunk-major body of [`Self::forward_chunk_final`]: no
+    /// selector, no receipt (the prompt loop calls it once per chunk).
+    fn forward_chunk_final_incumbent(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2774,6 +2816,24 @@ impl Qwen4Bundle {
             return Err(pp_owner_required());
         }
         self.ep_refuse("silent chunk forward outside a replicated call")?;
+        let entry = self.state.position;
+        let output = crate::slowlink_prefill::PromptOutput::Silent;
+        if self.slowlink_dispatch(gpu, tokens, output, SlowlinkScope::direct())? {
+            return Ok(());
+        }
+        let result = self.forward_chunk_silent_incumbent(gpu, tokens);
+        if result.is_ok() {
+            self.slowlink_record_incumbent(entry, &[(0, tokens.len())]);
+        }
+        result
+    }
+
+    /// The incumbent chunk-major body of [`Self::forward_chunk_silent`].
+    fn forward_chunk_silent_incumbent(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2837,6 +2897,7 @@ impl Qwen4Bundle {
         if let Some(stage) = &mut self.pair_session_stage {
             stage.position = None;
         }
+        self.slowlink.clear_active();
         // `None` while the cache itself resets (it drives `self` then).
         if let Some(session) = self.session.as_mut() {
             session.forget_live();
@@ -3366,7 +3427,20 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
+        // The one selector verdict of the WHOLE remaining prompt, before the
+        // session-boundary split below: a layer-major request keeps its
+        // boundaries as in-window cuts, so it sweeps the experts once per
+        // window rather than once per boundary chunk.
+        if reused < prompt.len() && self.state.position == reused {
+            let output = crate::slowlink_prefill::PromptOutput::Final { logits, top1: None };
+            if self.slowlink_dispatch(gpu, &prompt[reused..], output, SlowlinkScope::prompt())? {
+                return Ok(());
+            }
+        } else {
+            self.slowlink_note_bypass("no rows, or the entry position differs from the session start");
+        }
         let mut pos = reused;
+        let mut windows: Vec<(usize, usize)> = Vec::new();
         while pos < prompt.len() {
             self.poll_npu_trunk(gpu)?;
             let end = if self.npu_trunk_planned() {
@@ -3380,15 +3454,17 @@ impl Qwen4Bundle {
             };
             self.set_ple_lookahead(&prompt[end..]);
             if end < prompt.len() {
-                self.forward_chunk_silent(gpu, &prompt[pos..end])?;
+                self.forward_chunk_silent_incumbent(gpu, &prompt[pos..end])?;
             } else {
-                self.forward_chunk_final(gpu, &prompt[pos..end], logits, None)?;
+                self.forward_chunk_final_incumbent(gpu, &prompt[pos..end], logits, None)?;
             }
+            windows.push((pos - reused, end - pos));
             if self.session_next_boundary() == Some(end) {
                 self.session_at_boundary(gpu, &prompt[..end])?;
             }
             pos = end;
         }
+        self.slowlink_record_incumbent(reused, &windows);
         Ok(())
     }
 
@@ -4010,6 +4086,7 @@ impl Qwen4Bundle {
             spec_hidden,
             session,
             pair_session_stage,
+            slowlink,
             penalty_stage,
             lanes,
             ..
@@ -4034,6 +4111,11 @@ impl Qwen4Bundle {
                 if let Err(error) = gpu.free_tensor(tensor) {
                     pair_stage_error.get_or_insert(error);
                 }
+            }
+        }
+        for tensor in slowlink.into_tensors() {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                pair_stage_error.get_or_insert(error);
             }
         }
         let ple_result = ple_rows
