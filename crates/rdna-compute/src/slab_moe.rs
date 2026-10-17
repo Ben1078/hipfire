@@ -1625,6 +1625,53 @@ impl Gpu {
         }
     }
 
+    /// Fold the K1 cohort's route ids into the stable grouping's count words: `counts[id] +=
+    /// 1 << 20` per valid id of `ids` (`n` I32).  The caller guarantees the padded K2 counts
+    /// stay below `1 << 20` and each expert's K1 slots below `1 << 10`.
+    pub fn slowlink_fold_k1_counts(
+        &mut self,
+        ids: &GpuTensor,
+        counts: &GpuTensor,
+        n: usize,
+        n_experts: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n == 0 || n_experts == 0 || [n, n_experts].iter().any(|&v| i32::try_from(v).is_err()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_fold_k1_counts: need n > 0, experts > 0 and i32 extents",
+            ));
+        }
+        crate::moe::require_span(ids, &[n, 4], "slowlink_fold_k1_counts ids")?;
+        crate::moe::require_span(counts, &[n_experts, 4], "slowlink_fold_k1_counts counts")?;
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const FUNC: &str = "slowlink_fold_k1_counts";
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let (ip, cp) = (ids.buf.as_ptr(), counts.buf.as_ptr());
+        let (nv, ev) = (n as i32, n_experts as i32);
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(n as u32).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_i32(nv);
+                b.push_i32(ev);
+                b
+            },
+        )
+    }
+
     /// `out[i] = ids[i]` when `lo <= ids[i] < hi`, else `-1`, for `n` I32 ids (the K1-cohort
     /// view of a short-tail tile's routes against one expert binding).
     pub fn slowlink_mask_ids(
@@ -1674,8 +1721,10 @@ impl Gpu {
         )
     }
 
-    /// The one S1 count barrier: complete the active stream, then read the first `words`
-    /// little-endian i32 of `tensor` back.
+    /// The one S1 count barrier: a stream-ordered D2H of the first `words` i32 of `tensor` on
+    /// the ACTIVE compute stream, then one wait on that stream alone (never the transport
+    /// owner's copy stream, never the legacy/null stream, never a device-wide sync).  Needs an
+    /// active stream.
     pub fn slowlink_sync_download_i32(
         &mut self,
         tensor: &GpuTensor,
@@ -1688,17 +1737,20 @@ impl Gpu {
                 "slowlink_sync_download_i32: the span exceeds the tensor",
             ));
         }
-        match self.active_stream.as_ref() {
-            Some(stream) => self.hip.stream_synchronize(stream)?,
-            None => self.hip.device_synchronize()?,
-        }
-        let mut bytes = vec![0u8; words * 4];
-        self.hip.memcpy_dtoh(&mut bytes, &tensor.buf)?;
+        let Some(stream) = self.active_stream.as_ref() else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_sync_download_i32: the S1 count barrier needs the active compute stream",
+            ));
+        };
+        let mut host = vec![0i32; words];
+        // SAFETY: `host` owns `words * 4` initialized bytes, i32 has no padding, and the slice
+        // is used only for this copy, which completes at the stream wait below.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, words * 4) };
+        self.hip.memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
+        self.hip.stream_synchronize(stream)?;
         self.take_device_wait_error()?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+        Ok(host)
     }
 }
 

@@ -107,6 +107,52 @@ impl PanelLimits {
     }
 }
 
+// ───────────────────────────── tile scopes ─────────────────────────────
+
+/// The architecture's per-tile scope switch.  A tile's numerics can depend on ambient `Gpu`
+/// state set per call (`route_rows`, the prefill-invariant, append-F16-MoE and trunk-IU4
+/// scopes, the BF16-stream arm).  The K2 grouped panels of a window run under the ambient
+/// scope of the FIRST tile (the frozen K2 arm: every K2 tile of a window shares it); the
+/// steps that belong to one tile alone are bracketed with that tile's own scope:
+///
+/// * the K1 cohort of a short-tail tile (its input restore, id mask and K1 launches), per
+///   binding, in [`execute_panel`];
+/// * the tile's K1 canonical combine, in [`finish_combine`];
+/// * the tile's saved-activation restore and shared down, in [`finish_shared`].
+///
+/// `enter` installs the scope of the tile starting at window row `row0`, `leave` restores the
+/// ambient one; `leave` runs even when the bracketed step failed.
+pub trait TileScopeHook {
+    fn enter(&mut self, gpu: &mut Gpu, row0: usize) -> Result<(), DispatchError>;
+    fn leave(&mut self, gpu: &mut Gpu, row0: usize) -> Result<(), DispatchError>;
+}
+
+/// The identity hook: every tile runs under the ambient scope (diagnostics and tests).
+pub struct NoScope;
+
+impl TileScopeHook for NoScope {
+    fn enter(&mut self, _gpu: &mut Gpu, _row0: usize) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn leave(&mut self, _gpu: &mut Gpu, _row0: usize) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
+fn scoped<T>(
+    gpu: &mut Gpu,
+    hook: &mut dyn TileScopeHook,
+    row0: usize,
+    body: impl FnOnce(&mut Gpu) -> Result<T, DispatchError>,
+) -> Result<T, DispatchError> {
+    hook.enter(gpu, row0)?;
+    let result = body(gpu);
+    let left = hook.leave(gpu, row0);
+    let value = result?;
+    left?;
+    Ok(value)
+}
+
 // ───────────────────────────── layout ─────────────────────────────
 
 /// Window geometry the route storage is sized from.
@@ -155,6 +201,19 @@ impl PromptRouteLayout {
         }
         if d.hidden % 8 != 0 || i32::try_from(d.rows).is_err() || d.n_exp > 1024 {
             return Err(bail(format!("unsupported route storage dimensions {d:?}")));
+        }
+        // The single count readback packs the K2 padded count (< 2^20) and the K1 slot count
+        // (< 2^10) of an expert into one word.
+        if d.rows * K_TOP + (MOE_GROUPED_BLOCK_M - 1) >= 1 << COUNT_BITS
+            || d.k1_rows * K_TOP >= 1 << (31 - COUNT_BITS)
+        {
+            return Err(bail(format!(
+                "the window exceeds the packed count fields (rows {} <= {}, K1 rows {} <= {})",
+                d.rows,
+                ((1usize << COUNT_BITS) - MOE_GROUPED_BLOCK_M) / K_TOP,
+                d.k1_rows,
+                ((1usize << (31 - COUNT_BITS)) - 1) / K_TOP
+            )));
         }
         let slots = mul(d.rows, K_TOP)?;
         let grouped_rows = checked_grouped_m_total_bound(slots, d.n_exp, MOE_GROUPED_BLOCK_M)?;
@@ -351,8 +410,14 @@ impl<'a> PreparedChunkCall<'a> {
             .expect("admitted at construction")
     }
 
-    /// The numerical/shape signature every tile of one window must share.
-    fn signature(&self) -> [usize; 6] {
+    /// The numerical/shape signature every tile of one window must share: hidden width,
+    /// expert count, expert intermediate width, routed down width, shared intermediate width
+    /// (0 = none) and whether the call sealed the grouped (path-2) lowering.  A window's tiles
+    /// may differ ONLY in rows, `route_rows`, position and K1-vs-K2 ([`Self::is_k2`]): a K1
+    /// short-tail tile beside K2 tiles is legal, any other difference in these six values is
+    /// refused by [`prepare_routes`] before it launches anything.  The selector compares every
+    /// distinct tile's signature before the first mutation to bypass instead.
+    pub fn arm_signature(&self) -> [usize; 6] {
         [
             self.hidden,
             self.n_exp,
@@ -361,6 +426,10 @@ impl<'a> PreparedChunkCall<'a> {
             self.shared_intermediate,
             usize::from(self.use_path2),
         ]
+    }
+
+    fn signature(&self) -> [usize; 6] {
+        self.arm_signature()
     }
 }
 
@@ -824,36 +893,46 @@ pub fn finish_route_plan(
         d.n_exp,
         layout.grouped_rows,
     ))?;
-    // The one count barrier: complete the stream, read the padded counts (and the K1
-    // cohort's route ids, a few rows).
-    let started = Instant::now();
-    let counts_host = hip(gpu.slowlink_sync_download_i32(&counts, d.n_exp))?;
-    let mut downloaded = d.n_exp * I32_BYTES;
-    let mut used = vec![false; d.n_exp];
+    // K1 short-tail cohort: fold its per-expert slot counts into the same count words on the
+    // device (K2 padded count in the low 20 bits, K1 slot count above), so the ONE readback of
+    // `n_exp` words carries both and no token-route id ever reaches the host.
     for tile in routes.tiles.iter().filter(|t| t.k1) {
         let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
-        let host = hip(gpu.slowlink_sync_download_i32(&ids, tile.rows * K_TOP))?;
-        downloaded += tile.rows * K_TOP * I32_BYTES;
-        for id in host {
-            if id >= 0 && (id as usize) < d.n_exp {
-                used[id as usize] = true;
-            }
-        }
+        hip(gpu.slowlink_fold_k1_counts(&ids, &counts, tile.rows * K_TOP, d.n_exp))?;
     }
+    // The one count barrier: one stream-ordered D2H on the compute stream, one stream wait.
+    let started = Instant::now();
+    let packed = hip(gpu.slowlink_sync_download_i32(&counts, d.n_exp))?;
     let barrier = BarrierCost {
         sync_ms: started.elapsed().as_secs_f64() * 1e3,
-        bytes_downloaded: downloaded,
+        bytes_downloaded: d.n_exp * I32_BYTES,
     };
-    let k1_experts = used
-        .iter()
-        .enumerate()
-        .filter_map(|(e, &u)| u.then_some(e))
-        .collect();
+    let (counts_host, k1_experts) = unpack_counts(&packed)?;
     let plan = LayerRoutePlan::from_counts(&counts_host, k1_experts, barrier)?;
     if plan.total_rows > layout.grouped_rows {
         return Err(bail("the stable grouping exceeds its row bound"));
     }
     Ok(plan)
+}
+
+/// Bits of a packed count word holding the K2 padded count; the K1 slot count sits above.
+const COUNT_BITS: u32 = 20;
+
+/// Split the packed count words into the K2 padded counts and the experts the K1 cohort
+/// routes to (`word >> 20 > 0`).
+fn unpack_counts(packed: &[i32]) -> Result<(Vec<i32>, Vec<usize>), DispatchError> {
+    let mut counts = Vec::with_capacity(packed.len());
+    let mut k1 = Vec::new();
+    for (e, &word) in packed.iter().enumerate() {
+        if word < 0 {
+            return Err(bail(format!("the packed count of expert {e} is negative")));
+        }
+        counts.push(word & ((1 << COUNT_BITS) - 1));
+        if word >> COUNT_BITS != 0 {
+            k1.push(e);
+        }
+    }
+    Ok((counts, k1))
 }
 
 // ───────────────────────────── weights and panels ─────────────────────────────
@@ -1032,6 +1111,7 @@ pub fn execute_panel(
     panel: RoutedPanelView<'_>,
     scratch: &mut PanelScratch<'_>,
     combine: &mut OrderedCombineCursor<'_>,
+    hook: &mut dyn TileScopeHook,
 ) -> Result<(), DispatchError> {
     let (routes, range) = (panel.routes, panel.panel);
     let layout = &routes.layout;
@@ -1123,7 +1203,7 @@ pub fn execute_panel(
         range.own_hi,
     ))?;
     if range.k1 {
-        run_k1_cohort(gpu, &params, routes, &weights, range)?;
+        run_k1_cohort(gpu, &params, routes, &weights, range, hook)?;
     }
     combine.panels_done += 1;
     combine.next_row_base = range.row_base + range.rows;
@@ -1138,6 +1218,7 @@ fn run_k1_cohort(
     routes: &PromptRouteStorage,
     weights: &ExpertPanelBinding<'_>,
     range: &PanelRange,
+    hook: &mut dyn TileScopeHook,
 ) -> Result<(), DispatchError> {
     let layout = &routes.layout;
     let d = layout.dims;
@@ -1151,32 +1232,35 @@ fn run_k1_cohort(
         {
             return Err(bail("the model's scratch cannot hold a K1 short-tail tile"));
         }
-        // Restore the tile's prepared input into the model's scratch.
-        hip(gpu.memcpy_dtod_at_ordered_async(
-            &params.x_norm_batch.buf,
-            0,
-            &routes.region.buf,
-            layout.x_norm + tile.row0 * d.hidden * F32_BYTES,
-            tile.rows * d.hidden * F32_BYTES,
-        ))?;
         let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
         let masked = routes.view(
             layout.k1_ids + tile.k1_row0 * K_TOP * I32_BYTES,
             slots * I32_BYTES,
             DType::Raw,
         );
-        hip(gpu.slowlink_mask_ids(&ids, &masked, slots, range.bind_lo, range.bind_hi))?;
         let y0 = routes.f32_rows(layout.k1_y0, tile.k1_row0 * K_TOP, slots, d.hidden);
         let mut view = *params;
         view.batch_size = tile.rows;
-        super::qt44_qt53_prefill::slowlink_k1_panel(
-            gpu,
-            &view,
-            &masked,
-            weights.gate_up_table,
-            weights.down_table,
-            &y0,
-        )?;
+        // Under the tile's own scope (its route rows, few-row limit and arm flags): restore
+        // its prepared input into the model's scratch, mask its ids to the binding, run K1.
+        scoped(gpu, hook, tile.row0, |gpu| {
+            hip(gpu.memcpy_dtod_at_ordered_async(
+                &params.x_norm_batch.buf,
+                0,
+                &routes.region.buf,
+                layout.x_norm + tile.row0 * d.hidden * F32_BYTES,
+                tile.rows * d.hidden * F32_BYTES,
+            ))?;
+            hip(gpu.slowlink_mask_ids(&ids, &masked, slots, range.bind_lo, range.bind_hi))?;
+            super::qt44_qt53_prefill::slowlink_k1_panel(
+                gpu,
+                &view,
+                &masked,
+                weights.gate_up_table,
+                weights.down_table,
+                &y0,
+            )
+        })?;
     }
     Ok(())
 }
@@ -1188,6 +1272,7 @@ pub fn finish_combine(
     gpu: &mut Gpu,
     routes: &PromptRouteStorage,
     combine: &mut OrderedCombineCursor<'_>,
+    hook: &mut dyn TileScopeHook,
 ) -> Result<(), DispatchError> {
     if combine.combined || combine.panels_done != combine.expected_panels {
         return Err(bail("the ordered combine is incomplete or already finished"));
@@ -1208,9 +1293,12 @@ pub fn finish_combine(
         let target = routes
             .combined
             .sub_offset(tile.row0 * d.hidden, tile.rows * d.hidden);
-        hip(gpu.moe_down_combine_top10_batched(
-            &y0, &ids, &weights, &target, d.hidden, tile.rows, d.n_exp,
-        ))?;
+        // The tile's own scope: its canonical K1 combine under its own route rows.
+        scoped(gpu, hook, tile.row0, |gpu| {
+            hip(gpu.moe_down_combine_top10_batched(
+                &y0, &ids, &weights, &target, d.hidden, tile.rows, d.n_exp,
+            ))
+        })?;
     }
     combine.combined = true;
     Ok(())
@@ -1222,6 +1310,7 @@ pub fn finish_shared(
     gpu: &mut Gpu,
     routes: &PromptRouteStorage,
     call: &PreparedChunkCall<'_>,
+    hook: &mut dyn TileScopeHook,
 ) -> Result<(), DispatchError> {
     let layout = &routes.layout;
     let d = layout.dims;
@@ -1234,23 +1323,25 @@ pub fn finish_shared(
     let target = routes
         .combined
         .sub_offset(rec.row0 * d.hidden, rec.rows * d.hidden);
-    if let Some(shared) = params.prelude.shared.as_ref() {
-        hip(gpu.memcpy_dtod_at_ordered_async(
-            &shared.rotated.buf,
-            0,
-            &routes.region.buf,
-            layout.shared_hidden + rec.row0 * d.shared_intermediate * F32_BYTES,
-            rec.rows * d.shared_intermediate * F32_BYTES,
-        ))?;
-        hip(gpu.memcpy_dtod_at_ordered_async(
-            &shared.scalar.buf,
-            0,
-            &routes.region.buf,
-            layout.shared_scalar + rec.row0 * F32_BYTES,
-            rec.rows * F32_BYTES,
-        ))?;
-    }
-    super::qt44_qt53_prefill::slowlink_shared_down(gpu, params, call.use_path2, &target)
+    scoped(gpu, hook, rec.row0, |gpu| {
+        if let Some(shared) = params.prelude.shared.as_ref() {
+            hip(gpu.memcpy_dtod_at_ordered_async(
+                &shared.rotated.buf,
+                0,
+                &routes.region.buf,
+                layout.shared_hidden + rec.row0 * d.shared_intermediate * F32_BYTES,
+                rec.rows * d.shared_intermediate * F32_BYTES,
+            ))?;
+            hip(gpu.memcpy_dtod_at_ordered_async(
+                &shared.scalar.buf,
+                0,
+                &routes.region.buf,
+                layout.shared_scalar + rec.row0 * F32_BYTES,
+                rec.rows * F32_BYTES,
+            ))?;
+        }
+        super::qt44_qt53_prefill::slowlink_shared_down(gpu, params, call.use_path2, &target)
+    })
 }
 
 // ───────────────────────────── real-device primitive self-tests ─────────────────────────────
@@ -1535,6 +1626,7 @@ pub mod selftest {
                     plan.view(shared, panel),
                     &mut scratch,
                     &mut cursor,
+                    &mut NoScope,
                 )?;
                 if panel.rows > 0 {
                     sync(gpu)?;
@@ -1554,7 +1646,7 @@ pub mod selftest {
                     }
                 }
             }
-            finish_combine(gpu, shared, &mut cursor)?;
+            finish_combine(gpu, shared, &mut cursor, &mut NoScope)?;
         }
         sync(gpu)?;
         let acc = hip(gpu.download_f32(routes.combined()))?;
@@ -2292,5 +2384,34 @@ mod slowlink_panel_tests {
         assert!(PanelLimits { experts_per_slot: 32, max_grouped_rows: usize::MAX & !15 }
             .scratch_bytes(640, 2560)
             .is_err());
+    }
+
+    #[test]
+    fn slowlink_panel_packed_counts_carry_k2_padding_and_k1_touch_in_one_word() {
+        // Device words: K2 padded count in the low 20 bits, K1 slot count above.
+        let packed = [0, 32, (3 << COUNT_BITS) | 48, 1 << COUNT_BITS, 16, (480 << COUNT_BITS) | ((1 << COUNT_BITS) - 16)];
+        let (counts, k1) = unpack_counts(&packed).unwrap();
+        assert_eq!(counts, vec![0, 32, 48, 0, 16, (1 << COUNT_BITS) - 16]);
+        assert_eq!(k1, vec![2, 3, 5]);
+        assert!(unpack_counts(&[-1]).is_err());
+        // The unpacked counts are exactly what the plan consumes.
+        let plan = LayerRoutePlan::from_counts(&counts[..5], k1[..2].to_vec(), BarrierCost::default()).unwrap();
+        assert_eq!(plan.total_rows, 96);
+        assert_eq!(plan.k1_experts, vec![2, 3]);
+    }
+
+    #[test]
+    fn slowlink_panel_packed_count_fields_are_bounded_before_any_mutation() {
+        // The largest window the K2 field holds: rows*10 + 15 < 2^20.
+        let mut d = dims(104_856);
+        d.k1_rows = 48;
+        assert!(PromptRouteLayout::new(&d).is_ok());
+        assert!(PromptRouteLayout::new(&dims(104_858)).is_err());
+        // K1 slot counts per expert stay below 2^10: at most 102 K1 rows.
+        let mut d = dims(16_384);
+        d.k1_rows = 102;
+        assert!(PromptRouteLayout::new(&d).is_ok());
+        d.k1_rows = 103;
+        assert!(PromptRouteLayout::new(&d).is_err());
     }
 }
