@@ -8191,7 +8191,11 @@ mod tests {
                 assert!(!ordinary.contains(&MoeStage::PrepareSplit), "{ordinary:?}");
                 assert!(!ordinary.contains(&MoeStage::JoinSplit), "{ordinary:?}");
                 let split = split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap();
-                assert_eq!(without_split(split), ordinary, "prefill rows={rows} {route:?}");
+                assert_eq!(
+                    without_split(split),
+                    ordinary,
+                    "prefill rows={rows} {route:?}"
+                );
             }
         }
     }
@@ -8223,17 +8227,33 @@ mod tests {
             "mutually exclusive",
         );
         split_refused(
-            split_prefill_stages(4, route, true, |params| params.cpu_deferred_experts = true, |_| {}),
+            split_prefill_stages(
+                4,
+                route,
+                true,
+                |params| params.cpu_deferred_experts = true,
+                |_| {},
+            ),
             "split + deferred params",
             "mutually exclusive",
         );
         split_refused(
-            split_decode_stages(route, true, |params| params.cpu_deferred_experts = true, |_| {}),
+            split_decode_stages(
+                route,
+                true,
+                |params| params.cpu_deferred_experts = true,
+                |_| {},
+            ),
             "decode split + deferred params",
             "mutually exclusive",
         );
         split_refused(
-            split_decode_stages(route, true, |_| {}, |selection| selection.cpu_deferred_experts = true),
+            split_decode_stages(
+                route,
+                true,
+                |_| {},
+                |selection| selection.cpu_deferred_experts = true,
+            ),
             "decode split + deferred selection",
             "mutually exclusive",
         );
@@ -8283,7 +8303,13 @@ mod tests {
             "single-device",
         );
         split_refused(
-            split_prefill_stages(2, route, true, |p| p.ep_row_gather = Some(&NoopGather), |_| {}),
+            split_prefill_stages(
+                2,
+                route,
+                true,
+                |p| p.ep_row_gather = Some(&NoopGather),
+                |_| {},
+            ),
             "prefill gather",
             "single-device",
         );
@@ -8303,7 +8329,12 @@ mod tests {
             "single-device",
         );
         split_refused(
-            split_decode_stages(route, true, |p| p.ep_mode = MoeEpMode::RootRoutedPartial, |_| {}),
+            split_decode_stages(
+                route,
+                true,
+                |p| p.ep_mode = MoeEpMode::RootRoutedPartial,
+                |_| {},
+            ),
             "decode root partial",
             "single-device",
         );
@@ -8394,7 +8425,7 @@ mod tests {
             );
             moe_program::split_phase_probe(&call).unwrap();
         }
-        {
+        for batch_size in 1..=4usize {
             let table = table(4, DType::MQ4G256);
             let mut cache = table.prepare_binding(0, 1, 0).unwrap();
             let fixture = live_fixture(&table, 0xFB_0000);
@@ -8403,7 +8434,7 @@ mod tests {
             let ctx = DispatchCtx::for_test("gfx1201");
             let scratch = prefill_scratch(0xFC_0000);
             let mut params = MoePrefillParams {
-                batch_size: 3,
+                batch_size,
                 recipe: MoeRecipe::SoftmaxGatedShared {
                     bf16_round_trip: true,
                     shared_after_combine: true,
@@ -8430,7 +8461,8 @@ mod tests {
                 MoeKernelSelection::Prefill(selection),
                 SealedParams::Prefill(params),
             );
-            moe_program::split_phase_probe(&call).unwrap();
+            moe_program::split_phase_probe(&call)
+                .unwrap_or_else(|e| panic!("prefill batch_size={batch_size}: {e}"));
         }
     }
 
@@ -8440,19 +8472,70 @@ mod tests {
         assert_eq!(CpuSplitRunGate::default().refusal(), None);
         CpuSplitRunGate::default().require_eager().unwrap();
         let cases = [
-            (CpuSplitRunGate { graph_capture: true, ..Default::default() }, "graph capture"),
-            (CpuSplitRunGate { verify_capture: true, ..Default::default() }, "graph capture"),
-            (CpuSplitRunGate { replay_capture: true, ..Default::default() }, "graph capture"),
-            (CpuSplitRunGate { stream_capture: true, ..Default::default() }, "graph capture"),
-            (CpuSplitRunGate { recording: true, ..Default::default() }, "replay recording"),
-            (CpuSplitRunGate { pm4: true, ..Default::default() }, "PM4"),
-            (CpuSplitRunGate { aql: true, ..Default::default() }, "AQL"),
-            (CpuSplitRunGate { shadow: true, ..Default::default() }, "shadow"),
+            (
+                CpuSplitRunGate {
+                    graph_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    verify_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    replay_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    stream_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    recording: true,
+                    ..Default::default()
+                },
+                "replay recording",
+            ),
+            (
+                CpuSplitRunGate {
+                    pm4: true,
+                    ..Default::default()
+                },
+                "PM4",
+            ),
+            (
+                CpuSplitRunGate {
+                    aql: true,
+                    ..Default::default()
+                },
+                "AQL",
+            ),
+            (
+                CpuSplitRunGate {
+                    shadow: true,
+                    ..Default::default()
+                },
+                "shadow",
+            ),
         ];
         for (gate, name) in cases {
             let error = gate.require_eager().expect_err(name);
             let text = format!("{error:?}");
-            assert!(text.contains(name) && text.contains("CPU tier split"), "{gate:?}: {text}");
+            assert!(
+                text.contains(name) && text.contains("CPU tier split"),
+                "{gate:?}: {text}"
+            );
         }
     }
 
