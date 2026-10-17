@@ -9,8 +9,8 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 
-mod error;
 mod emu_budget;
+mod error;
 mod ffi;
 mod kernarg;
 mod launch_grid;
@@ -30,11 +30,10 @@ pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
-    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module,
-    HostAllocOwner, PinnedHostBuffer, PinnedTransferBuffer, Stream,
-    HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_HOST_MALLOC_COHERENT, HIP_HOST_MALLOC_MAPPED, HIP_MEM_ACCESS_FLAGS_PROT_READ,
-    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, HostAllocOwner,
+    Module, PinnedHostBuffer, PinnedTransferBuffer, Stream, HIP_ERROR_NOT_READY,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM, HIP_HOST_MALLOC_COHERENT,
+    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
     HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
 };

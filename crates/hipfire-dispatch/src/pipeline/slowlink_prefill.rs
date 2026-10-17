@@ -247,7 +247,10 @@ impl PromptRouteLayout {
         })?;
         let k1_y0 = field(mul(mul(mul(d.k1_rows, K_TOP)?, d.hidden)?, F32_BYTES)?)?;
         let k1_ids = field(mul(mul(d.k1_rows, K_TOP)?, I32_BYTES)?)?;
-        let k1_shared = field(mul(mul(mul(d.k1_rows, 2)?, d.shared_intermediate)?, F32_BYTES)?)?;
+        let k1_shared = field(mul(
+            mul(mul(d.k1_rows, 2)?, d.shared_intermediate)?,
+            F32_BYTES,
+        )?)?;
         Ok(Self {
             dims: d,
             grouped_rows,
@@ -725,7 +728,9 @@ impl PromptRouteStorage {
 // ───────────────────────────── prepare ─────────────────────────────
 
 /// The decode selection of a one-row decode tile.
-fn decode_selection<'c>(call: &'c PreparedChunkCall<'_>) -> &'c super::moe_program::MoeDecodeSelection {
+fn decode_selection<'c>(
+    call: &'c PreparedChunkCall<'_>,
+) -> &'c super::moe_program::MoeDecodeSelection {
     match call.call.kernel_selection() {
         super::moe_program::MoeKernelSelection::Decode(selection) => selection,
         super::moe_program::MoeKernelSelection::Prefill(_) => {
@@ -783,7 +788,9 @@ pub fn prepare_routes(
     }
     if let (true, Some(arm)) = (call.k2, dst.k2_arm) {
         if arm != sig[5] {
-            return Err(bail("a K2 tile's numerical arm differs from the window's K2 arm"));
+            return Err(bail(
+                "a K2 tile's numerical arm differs from the window's K2 arm",
+            ));
         }
     }
     let k1 = !call.k2;
@@ -828,7 +835,12 @@ pub fn prepare_routes(
         // shared activation is fused into the routed activation, so it is recomputed from
         // them when the shared down runs.
         let shared_row = layout.k1_shared + dst.k1_used * 2 * d.shared_intermediate * F32_BYTES;
-        copy(gpu, shared_row, shared.gate_out, d.shared_intermediate * F32_BYTES)?;
+        copy(
+            gpu,
+            shared_row,
+            shared.gate_out,
+            d.shared_intermediate * F32_BYTES,
+        )?;
         copy(
             gpu,
             shared_row + d.shared_intermediate * F32_BYTES,
@@ -1350,7 +1362,10 @@ impl<'a> PanelScratch<'a> {
 
     /// Register a one-row decode tile's call: its K1 stack runs with these operands against
     /// every binding.  Call once per decode tile of the layer, before the first panel.
-    pub fn add_decode_tile(&mut self, call: &'a PreparedChunkCall<'a>) -> Result<(), DispatchError> {
+    pub fn add_decode_tile(
+        &mut self,
+        call: &'a PreparedChunkCall<'a>,
+    ) -> Result<(), DispatchError> {
         if !call.decode {
             return Err(bail("only a one-row decode tile registers decode operands"));
         }
@@ -2150,8 +2165,12 @@ pub mod selftest {
     ) -> Result<Window, DispatchError> {
         let decode_rows = decode.map_or(0, |d| d.rows);
         let rows: usize = tiles.iter().map(SynthTile::rows).sum::<usize>() + decode_rows;
-        let k1_rows: usize =
-            tiles.iter().filter(|t| t.k1).map(SynthTile::rows).sum::<usize>() + decode_rows;
+        let k1_rows: usize = tiles
+            .iter()
+            .filter(|t| t.k1)
+            .map(SynthTile::rows)
+            .sum::<usize>()
+            + decode_rows;
         let layout = PromptRouteLayout::new(&PromptRouteDims {
             rows,
             hidden: call.hidden,
@@ -2822,18 +2841,30 @@ pub mod selftest {
         }
         let (lo, hi) = (binding.expert_lo, binding.expert_hi);
         if hi - lo < 2 || hi > anchor.n_exp {
-            return Err(bail("the decode tail test needs a binding of at least two experts"));
+            return Err(bail(
+                "the decode tail test needs a binding of at least two experts",
+            ));
         }
         let mid = lo + (hi - lo) / 2;
         let halves = [
-            ExpertPanelBinding { expert_hi: mid, ..binding },
-            ExpertPanelBinding { expert_lo: mid, ..binding },
+            ExpertPanelBinding {
+                expert_hi: mid,
+                ..binding
+            },
+            ExpertPanelBinding {
+                expert_lo: mid,
+                ..binding
+            },
         ];
         let width = hi - lo;
         let mut rng = model::Rng(seed | 1);
-        let k2_tile = synth_tile(&mut rng, DECODE_TAIL_ANCHOR_ROWS, anchor.hidden, false, |tok, r| {
-            (lo + (tok * 11 + r * 5) % width) as i32
-        });
+        let k2_tile = synth_tile(
+            &mut rng,
+            DECODE_TAIL_ANCHOR_ROWS,
+            anchor.hidden,
+            false,
+            |tok, r| (lo + (tok * 11 + r * 5) % width) as i32,
+        );
         let (k2_ids, k2_weights) = (k2_tile.ids.clone(), k2_tile.weights.clone());
         let window = run_window(
             gpu,
@@ -2880,7 +2911,10 @@ pub mod selftest {
         rep.check(
             "scratch_guard_canaries_intact",
             window.canary_violations == 0,
-            format!("{} of {} guard bytes overwritten", window.canary_violations, window.canary_checks),
+            format!(
+                "{} of {} guard bytes overwritten",
+                window.canary_violations, window.canary_checks
+            ),
         );
         // The K2 anchor rows against the CPU canonical combine (the decode row carries no
         // K2 ids).
@@ -2893,7 +2927,10 @@ pub mod selftest {
         rep.check(
             "k2_rows_equal_cpu_canonical_beside_the_decode_tile",
             diffs(&window.acc[..n], &want[..n]) == 0,
-            format!("{} mismatching elements", diffs(&window.acc[..n], &want[..n])),
+            format!(
+                "{} mismatching elements",
+                diffs(&window.acc[..n], &want[..n])
+            ),
         );
         // The incumbent's own decode stages over the same ids/input/shared state.
         let params = *decode_call.decode_params();
@@ -2909,7 +2946,12 @@ pub mod selftest {
         let restore = |gpu: &Gpu, dst: &hip_bridge::DeviceBuffer, src_off: usize, bytes: usize| {
             hip(gpu.memcpy_dtod_at_ordered_async(dst, 0, region, src_off, bytes))
         };
-        restore(gpu, &input.buf, layout.x_norm + rec.row0 * d.hidden * F32_BYTES, d.hidden * F32_BYTES)?;
+        restore(
+            gpu,
+            &input.buf,
+            layout.x_norm + rec.row0 * d.hidden * F32_BYTES,
+            d.hidden * F32_BYTES,
+        )?;
         restore(
             gpu,
             &params.topk_indices.buf,
@@ -2923,8 +2965,18 @@ pub mod selftest {
             K_TOP * F32_BYTES,
         )?;
         restore(gpu, &shared.gate_out.buf, saved, smi * F32_BYTES)?;
-        restore(gpu, &shared.up_out.buf, saved + smi * F32_BYTES, smi * F32_BYTES)?;
-        restore(gpu, &shared.scalar.buf, layout.shared_scalar + rec.row0 * F32_BYTES, F32_BYTES)?;
+        restore(
+            gpu,
+            &shared.up_out.buf,
+            saved + smi * F32_BYTES,
+            smi * F32_BYTES,
+        )?;
+        restore(
+            gpu,
+            &shared.scalar.buf,
+            layout.shared_scalar + rec.row0 * F32_BYTES,
+            F32_BYTES,
+        )?;
         let mut p = params;
         p.expert_gate_up_ptrs = binding.gate_up_table;
         p.expert_down_ptrs = binding.down_table;
@@ -2932,7 +2984,14 @@ pub mod selftest {
         let up = super::super::slice_moe_f32_view(shared.up_out, 0, smi);
         let target = hip(gpu.zeros(&[d.hidden], DType::F32))?;
         let reference = (|| -> Result<Vec<f32>, DispatchError> {
-            super::super::decode_gate_up_stage(gpu, &p, selection.resolution, input, false, selection.route)?;
+            super::super::decode_gate_up_stage(
+                gpu,
+                &p,
+                selection.resolution,
+                input,
+                false,
+                selection.route,
+            )?;
             super::super::decode_activation_stage(
                 gpu,
                 &p,
@@ -2972,7 +3031,11 @@ pub mod selftest {
         rep.check(
             "decode_row_equals_the_incumbent_decode_stages",
             diffs(got, &reference) == 0,
-            format!("{} mismatching elements of {}", diffs(got, &reference), d.hidden),
+            format!(
+                "{} mismatching elements of {}",
+                diffs(got, &reference),
+                d.hidden
+            ),
         );
         window.routes.release(gpu);
         Ok(rep)
@@ -3140,7 +3203,10 @@ mod slowlink_panel_tests {
         let mut d = dims(1536);
         d.shared_intermediate = 0;
         d.k1_rows = 8;
-        assert_eq!(PromptRouteLayout::new(&d).unwrap().k1_bytes(), 8 * K_TOP * (2560 * 4 + 4));
+        assert_eq!(
+            PromptRouteLayout::new(&d).unwrap().k1_bytes(),
+            8 * K_TOP * (2560 * 4 + 4)
+        );
     }
 
     #[test]
@@ -3163,7 +3229,11 @@ mod slowlink_panel_tests {
         assert_eq!(decode.host_peak, 99_041_064, "{:?}", decode.host_parts);
         let canary = diagnostic_bytes(
             DiagCase::WithinExpertCanary,
-            &DiagGeometry { binding_experts: 32, shared_intermediate: 0, ..g },
+            &DiagGeometry {
+                binding_experts: 32,
+                shared_intermediate: 0,
+                ..g
+            },
             limits,
         )
         .unwrap();
@@ -3180,8 +3250,14 @@ mod slowlink_panel_tests {
         let decode = ([2560, 512, 640, 2560, 640, 0], false);
         assert!(window_arms_compatible(&[k2, k2, k1_tail]));
         assert!(window_arms_compatible(&[k2, k2, decode]));
-        assert!(window_arms_compatible(&[k1_tail, k2, k2, decode]), "a window may open with K1");
-        assert!(window_arms_compatible(&[decode, k1_tail]), "a K1-only window");
+        assert!(
+            window_arms_compatible(&[k1_tail, k2, k2, decode]),
+            "a window may open with K1"
+        );
+        assert!(
+            window_arms_compatible(&[decode, k1_tail]),
+            "a K1-only window"
+        );
         // Two K2 tiles on different K2 arms never share a window, even when a K1 tile opens it.
         let other_arm = ([2560, 512, 640, 2560, 640, 0], true);
         assert!(!window_arms_compatible(&[k2, other_arm]));

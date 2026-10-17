@@ -5591,7 +5591,10 @@ impl Gpu {
     pub fn lease_host_owner(&mut self, tensor: &GpuTensor) -> HipResult<HostAllocLease> {
         self.bind_thread()?;
         if !tensor.buf.is_host_mapped() {
-            return Err(HipError::new(0, "lease_host_owner: not a host-mapped tensor"));
+            return Err(HipError::new(
+                0,
+                "lease_host_owner: not a host-mapped tensor",
+            ));
         }
         let key = tensor.buf.as_ptr() as usize;
         let host_ptr = *self.host_mapped.get(&key).ok_or_else(|| {
@@ -8495,7 +8498,9 @@ pub(crate) struct HostLeaseTable<O> {
 
 impl<O> HostLeaseTable<O> {
     pub(crate) fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self {
+            map: HashMap::new(),
+        }
     }
 
     #[cfg(test)]
@@ -8629,7 +8634,11 @@ mod slowlink_host_lease_tests {
         }
         drop(t);
         assert_eq!(freed(a), 0, "a stream-held lease survives the Gpu");
-        assert_eq!(freed(b), 1, "an allocation nobody holds is freed by the drain itself");
+        assert_eq!(
+            freed(b),
+            1,
+            "an allocation nobody holds is freed by the drain itself"
+        );
         drop(la);
         assert_eq!(freed(a), 1);
     }
@@ -8668,10 +8677,16 @@ mod slowlink_host_lease_tests {
                 Ok(FakeOwner(key))
             })
             .unwrap();
-        assert_eq!(adoptions, 1, "a second lease clones the owner, never re-adopts");
+        assert_eq!(
+            adoptions, 1,
+            "a second lease clones the owner, never re-adopts"
+        );
         assert!(Arc::ptr_eq(&first, &second));
         assert!(t.release(key).is_some());
-        assert!(t.release(key).is_none(), "double release never frees or returns twice");
+        assert!(
+            t.release(key).is_none(),
+            "double release never frees or returns twice"
+        );
         drop((first, second));
         assert_eq!(freed(key), 1);
     }
@@ -8684,10 +8699,18 @@ mod slowlink_host_lease_tests {
         let mut t = HostLeaseTable::new();
         let owner = lease(&mut t, key);
         let keep: Arc<dyn std::any::Any + Send + Sync> = owner.clone();
-        assert_eq!(Arc::strong_count(&owner), 3, "registry + owner + keepalive share one Arc");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            3,
+            "registry + owner + keepalive share one Arc"
+        );
         drop(owner);
         drop(t.release(key));
-        assert_eq!(freed(key), 0, "the erased keepalive alone keeps the bytes alive");
+        assert_eq!(
+            freed(key),
+            0,
+            "the erased keepalive alone keeps the bytes alive"
+        );
         drop(keep);
         assert_eq!(freed(key), 1, "the last holder frees exactly once");
     }
