@@ -1430,7 +1430,8 @@ impl Qwen4MoeLayerRuntime {
             gpu: &mut Gpu,
             tensor: &GpuTensor,
             layer: usize,
-        ) -> Result<((usize, usize, usize), rdna_compute::HostAllocLease), Qwen4GpuForwardError> {
+        ) -> Result<((usize, usize, usize), rdna_compute::HostAllocLease), Qwen4GpuForwardError>
+        {
             let lease = gpu.lease_host_owner(tensor)?;
             let host = gpu.host_bytes(tensor).ok_or_else(|| {
                 invalid(format!(
@@ -1444,7 +1445,10 @@ impl Qwen4MoeLayerRuntime {
                     "slow-link layer {layer}: the host lease names another allocation than its owner tensor"
                 )));
             }
-            Ok(((host.as_ptr() as usize, lease.device_alias(), host.len()), lease))
+            Ok((
+                (host.as_ptr() as usize, lease.device_alias(), host.len()),
+                lease,
+            ))
         }
         // SAFETY: each range is the pinned host allocation of the layer's own
         // resident weight tensor, immutable for as long as the lease (the
@@ -1472,8 +1476,11 @@ impl Qwen4MoeLayerRuntime {
                 }
             }
             _ => {
-                let (gate_up, gate_up_lease) =
-                    leased_range(gpu, bundle.weights.resident(&weights.experts_gate_up)?, layer)?;
+                let (gate_up, gate_up_lease) = leased_range(
+                    gpu,
+                    bundle.weights.resident(&weights.experts_gate_up)?,
+                    layer,
+                )?;
                 let (down, down_lease) =
                     leased_range(gpu, bundle.weights.resident(&weights.experts_down)?, layer)?;
                 let owner: Arc<dyn std::any::Any + Send + Sync> =

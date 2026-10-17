@@ -2931,10 +2931,7 @@ fn decode_tail_case(
                 SELFTEST_SEED,
             );
             Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-            primitive_case_json(
-                "decode_tail_cohort",
-                &report.map_err(dsp_err("primitive"))?,
-            )
+            primitive_case_json("decode_tail_cohort", &report.map_err(dsp_err("primitive"))?)
         },
     )
 }
@@ -3364,7 +3361,10 @@ mod slowlink_prompt {
         let resumed = PleHistory::from_previous(151_643, [11, 22]);
         let from_resume = PleCursor::histories_for(resumed, &plan.tiles, &tokens);
         assert_eq!(from_resume[0], resumed);
-        assert_ne!(from_resume[0], histories[0], "the entry history is the base");
+        assert_ne!(
+            from_resume[0], histories[0],
+            "the entry history is the base"
+        );
         // The history is the last TWO tokens: once a tile has consumed two rows
         // the entry no longer matters, so a full-size tile's successors agree.
         assert_eq!(
