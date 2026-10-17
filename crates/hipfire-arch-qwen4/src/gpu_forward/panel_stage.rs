@@ -209,6 +209,13 @@ impl LayerExpertSources {
         (self.host_base, self.host_bytes)
     }
 
+    /// The expert's own payload bytes (gate/up plus down), for receipt
+    /// "touched" counts; `None` for an expert the layer does not hold.
+    pub(crate) fn expert_extent_bytes(&self, id: usize) -> Option<usize> {
+        self.expert(id)
+            .and_then(|e| e.gate_up.len.checked_add(e.down.len))
+    }
+
     fn owner(&self) -> &Arc<dyn Any + Send + Sync> {
         &self.owner
     }
@@ -1413,6 +1420,14 @@ impl PanelSchedule {
     /// Sum of the experts' own extents over the sweep.
     pub(crate) fn extent_bytes(&self) -> u64 {
         self.extent_bytes
+    }
+
+    /// Own payload bytes of `layer`'s expert `id` (receipt touched bytes).
+    pub(crate) fn expert_extent_bytes(&self, layer: usize, id: usize) -> Option<usize> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .and_then(|l| l.sources.expert_extent_bytes(id))
     }
 
     pub(crate) fn layer_groups(&self, layer: usize) -> Option<&[ExpertGroupPlan]> {
