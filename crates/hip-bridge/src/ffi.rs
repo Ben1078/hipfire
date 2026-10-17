@@ -3628,10 +3628,12 @@ mod host_alloc_owner_tests {
     static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     /// The pointer whose fake free reports a HIP error.
     const FAILING: usize = 0x7000_0000;
+    /// The same, for the test that holds a real emu pinned-host charge on it.
+    const FAILING_CHARGED: usize = 0x7000_1000;
 
     unsafe extern "C" fn fake_free(ptr: *mut c_void) -> u32 {
         FREED.lock().unwrap_or_else(|e| e.into_inner()).push(ptr as usize);
-        if ptr as usize == FAILING {
+        if ptr as usize == FAILING || ptr as usize == FAILING_CHARGED {
             1
         } else {
             HIP_SUCCESS
@@ -3703,5 +3705,70 @@ mod host_alloc_owner_tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<HostAllocOwner>();
         assert_send_sync::<Arc<HostAllocOwner>>();
+    }
+
+    /// Committed pinned-host bytes of the process emu ledger.
+    fn committed_host_bytes(id: hipfire_config::emu_budget::BudgetId) -> u64 {
+        hipfire_config::emu_budget::snapshot(id).committed.host_bytes
+    }
+
+    #[test]
+    fn host_alloc_owner_token_release_happens_once_and_only_after_a_successful_free() {
+        use crate::emu_budget::{charged_alloc_keyed, release_keyed, Class, HOST_TOKENS};
+        use hipfire_config::emu_budget::{install, BudgetLimits};
+        let limits = BudgetLimits {
+            device_bytes: 1 << 40,
+            gtt_bytes: Some(1 << 40),
+            shared_host_bytes: None,
+            uma: false,
+        };
+        let id = install("0000:0f:00.0", limits).expect("the test ledger installs");
+        let process = crate::emu_budget::active().expect("a budget is installed");
+        let base = committed_host_bytes(id);
+
+        // Success: the pointer-keyed charge of the adopted allocation is released exactly
+        // once, by the last holder's free, and only after that free returned success.
+        let ok_ptr = 0x2000_0000usize;
+        charged_alloc_keyed(
+            &process,
+            &HOST_TOKENS,
+            Class::HostPinned,
+            4096,
+            |p: &usize| *p,
+            || Ok(ok_ptr),
+        )
+        .expect("the charge commits");
+        assert_eq!(committed_host_bytes(id), base + 4096, "the allocation is charged");
+        let registry = Arc::new(owner(ok_ptr));
+        let lease = Arc::clone(&registry);
+        drop(registry);
+        assert_eq!(committed_host_bytes(id), base + 4096, "a held lease keeps the charge");
+        assert_eq!(freed(ok_ptr), 0);
+        drop(lease);
+        assert_eq!(freed(ok_ptr), 1);
+        assert_eq!(committed_host_bytes(id), base, "released once by the successful free");
+
+        // Failure: the free reports an error, so the charge is retained (restored under its
+        // key), and a second drop path cannot release it.
+        charged_alloc_keyed(
+            &process,
+            &HOST_TOKENS,
+            Class::HostPinned,
+            8192,
+            |p: &usize| *p,
+            || Ok(FAILING_CHARGED),
+        )
+        .expect("the charge commits");
+        assert_eq!(committed_host_bytes(id), base + 8192);
+        drop(owner(FAILING_CHARGED));
+        assert_eq!(committed_host_bytes(id), base + 8192, "a failed free keeps the charge");
+        // The retained token is still keyed: a later successful release (a retry by
+        // whoever can free it) releases it exactly once.
+        release_keyed::<crate::emu_budget::Process>(&HOST_TOKENS, FAILING_CHARGED, || Ok(()))
+            .expect("the retry succeeds");
+        assert_eq!(committed_host_bytes(id), base);
+        release_keyed::<crate::emu_budget::Process>(&HOST_TOKENS, FAILING_CHARGED, || Ok(()))
+            .expect("a second release is a no-op");
+        assert_eq!(committed_host_bytes(id), base, "no double release");
     }
 }
