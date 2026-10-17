@@ -728,7 +728,10 @@ mod qwen4_route_tests {
         ];
         let declared_cold = [None, Some(1), Some(3), None, None, None];
         // `landed`: `None` is the shipped switch; `Some` is the pure decision for that state.
-        let route = |arch: &str, landed: Option<bool>, (gate_up, down): (DType, DType), cold: Option<u8>| {
+        let route = |arch: &str,
+                     landed: Option<bool>,
+                     (gate_up, down): (DType, DType),
+                     cold: Option<u8>| {
             let mut dtypes = canonical_dtypes();
             (dtypes.routed_gate_up, dtypes.routed_down) = (gate_up, down);
             let mut declared = policy(DType::MQ4G128V2);
@@ -736,7 +739,19 @@ mod qwen4_route_tests {
             declared.slab_cold_codec = cold;
             match landed {
                 None => select_grouped_route(
-                    &dtypes, 512, 10, 2560, 640, 640, 2560, 2560, 640, None, false, Some(declared), arch,
+                    &dtypes,
+                    512,
+                    10,
+                    2560,
+                    640,
+                    640,
+                    2560,
+                    2560,
+                    640,
+                    None,
+                    false,
+                    Some(declared),
+                    arch,
                 ),
                 Some(landed) => select_grouped_route_by(
                     &dtypes,
@@ -758,7 +773,10 @@ mod qwen4_route_tests {
         };
         let deltanet = cfg!(feature = "deltanet");
         // The shipped switch: gfx1151 E8P follows exactly it.
-        assert_eq!(route("gfx1151", None, pairs[2], Some(3)), deltanet && RECEIPTS);
+        assert_eq!(
+            route("gfx1151", None, pairs[2], Some(3)),
+            deltanet && RECEIPTS
+        );
         assert_eq!(route("gfx1151", None, pairs[1], Some(1)), deltanet);
         for landed in [false, true] {
             for (arch, admitted) in [
@@ -794,13 +812,20 @@ mod qwen4_route_tests {
             // W2 is refused everywhere, whatever it is declared as.
             for arch in ["gfx1201", "gfx1100", "gfx1151"] {
                 for cold in [None, Some(0), Some(1), Some(2), Some(3)] {
-                    assert!(!route(arch, Some(landed), pairs[4], cold), "{arch} {cold:?}");
+                    assert!(
+                        !route(arch, Some(landed), pairs[4], cold),
+                        "{arch} {cold:?}"
+                    );
                 }
             }
             // Cold codec = bucket 0, MQ4 = bucket 1.
             use crate::families::moe::{slab_bucket_of_pair, slab_bucket_of_pair_by};
             let bucket = |arch: &str, pair: (DType, DType)| {
-                slab_bucket_of_pair_by(&|codec| qwen4_slab_codec_admitted_with(arch, codec, landed), pair.0, pair.1)
+                slab_bucket_of_pair_by(
+                    &|codec| qwen4_slab_codec_admitted_with(arch, codec, landed),
+                    pair.0,
+                    pair.1,
+                )
             };
             for arch in ["gfx1201", "gfx1100"] {
                 assert_eq!(bucket(arch, pairs[0]), Some(1));
@@ -857,7 +882,19 @@ mod qwen4_route_tests {
             match landed {
                 // The shipped switch.
                 None => select_grouped_route(
-                    &dtypes, 512, 10, 2560, 640, 640, 2560, 2560, 640, Some(&tags), false, Some(declared), arch,
+                    &dtypes,
+                    512,
+                    10,
+                    2560,
+                    640,
+                    640,
+                    2560,
+                    2560,
+                    640,
+                    Some(&tags),
+                    false,
+                    Some(declared),
+                    arch,
                 ),
                 Some(landed) => select_grouped_route_by(
                     &dtypes,
@@ -873,7 +910,9 @@ mod qwen4_route_tests {
                     false,
                     Some(declared),
                     &|codec| {
-                        rdna_compute::slab_admission::qwen4_slab_codec_admitted_with(arch, codec, landed)
+                        rdna_compute::slab_admission::qwen4_slab_codec_admitted_with(
+                            arch, codec, landed,
+                        )
                     },
                 ),
             }
@@ -881,8 +920,14 @@ mod qwen4_route_tests {
         };
         let deltanet = cfg!(feature = "deltanet");
         // The shipped switch decides the shipped route; the pure form decides both states.
-        assert_eq!(route_with("gfx1151", None, MQ4, &[E8P], Some(3)), deltanet && RECEIPTS);
-        assert_eq!(route_with("gfx1151", None, E8P, &[MQ4], Some(3)), deltanet && RECEIPTS);
+        assert_eq!(
+            route_with("gfx1151", None, MQ4, &[E8P], Some(3)),
+            deltanet && RECEIPTS
+        );
+        assert_eq!(
+            route_with("gfx1151", None, E8P, &[MQ4], Some(3)),
+            deltanet && RECEIPTS
+        );
         assert_eq!(route_with("gfx1151", None, MQ4, &[W3], Some(1)), deltanet);
         assert_eq!(route_with("gfx1100", None, MQ4, &[E8P], Some(3)), deltanet);
         for landed in [false, true] {
@@ -911,15 +956,29 @@ mod qwen4_route_tests {
             assert_eq!(route("gfx1151", MQ4, &[W3], Some(1)), deltanet);
             assert_eq!(route("gfx1151", W3, &[MQ4], Some(1)), deltanet);
             for cold in [None, Some(1), Some(3)] {
-                assert!(!route("gfx1151", MQ4, &[W3, E8P], cold), "{landed} {cold:?}");
+                assert!(
+                    !route("gfx1151", MQ4, &[W3, E8P], cold),
+                    "{landed} {cold:?}"
+                );
                 assert!(!route("gfx1151", MQ4, &[W3, W2], cold), "{landed} {cold:?}");
-                assert!(!route("gfx1151", MQ4, &[E8P, W2], cold), "{landed} {cold:?}");
+                assert!(
+                    !route("gfx1151", MQ4, &[E8P, W2], cold),
+                    "{landed} {cold:?}"
+                );
             }
             assert!(!route("gfx1151", MQ4, &[W3], Some(3)));
             assert!(!route("gfx1151", MQ4, &[W3], None));
             // gfx1151 E8P: refused until the receipts land, then served exactly like gfx1100.
-            assert_eq!(route("gfx1151", MQ4, &[E8P], Some(3)), deltanet && landed, "{landed}");
-            assert_eq!(route("gfx1151", E8P, &[MQ4], Some(3)), deltanet && landed, "{landed}");
+            assert_eq!(
+                route("gfx1151", MQ4, &[E8P], Some(3)),
+                deltanet && landed,
+                "{landed}"
+            );
+            assert_eq!(
+                route("gfx1151", E8P, &[MQ4], Some(3)),
+                deltanet && landed,
+                "{landed}"
+            );
             assert!(!route("gfx1151", MQ4, &[E8P], Some(1)), "{landed}");
             assert!(!route("gfx1151", MQ4, &[E8P], None), "{landed}");
             for arch in ["gfx1200", "gfx942", "gfx1030"] {
