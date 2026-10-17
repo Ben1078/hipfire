@@ -539,6 +539,13 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         path.display(),
         gpu.arch
     );
+    let resolved_format = bundle.state_format();
+    eprintln!(
+        "[qwen4_cpu_split_parity] resolved kv_mode={:?} qsa_state={:?} gdn_state={:?}",
+        hipfire_runtime::config::get().kv_mode,
+        resolved_format.qsa,
+        resolved_format.gdn
+    );
     Ok(Model {
         gpu,
         bundle,
