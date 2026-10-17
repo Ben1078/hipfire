@@ -1719,6 +1719,7 @@ fn load_qwen4_rank_scoped(
     let mut native_mtp = shared.native_mtp;
     let hotset_policy = hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env()?;
     let placement_policy = hipfire_arch_qwen4::expert_hotset::PlacementPolicy::from_env()?;
+    let hotset_budget = hipfire_arch_qwen4::expert_hotset::HotsetBudget::from_env()?;
     if let Some(placement) = ep {
         if placement.ranks < 2 || placement.rank >= placement.ranks {
             return Err(format!(
@@ -2139,11 +2140,24 @@ fn load_qwen4_rank_scoped(
     // `whole-first` keeps the `hotset=0` whole-layer placement: the sidecar
     // is not consulted, so no tier plan, owner or route is ever built.
     let hotset_path = if whole_first == hotsets::WholeFirstDecision::Active {
+        if hotset_budget.is_fixed() {
+            return Err(format!(
+                "qwen4: {} requires an applicable ranked hotset, but {}=whole-first keeps whole-layer placement",
+                hotsets::HOT_BUDGET_MIB_ENV,
+                hotsets::PLACEMENT_POLICY_ENV,
+            ));
+        }
         None
     } else {
         match hotsets::preflight(&hotset_policy, model_path, &hotset_env) {
             Ok(path) => Some(path),
             Err(skip) => {
+                if hotset_budget.is_fixed() {
+                    return Err(format!(
+                        "qwen4: {} requires an applicable ranked hotset: {skip}",
+                        hotsets::HOT_BUDGET_MIB_ENV,
+                    ));
+                }
                 let path = hotset_policy.sidecar_path(model_path);
                 if let Some(line) = skip.log_line(&path) {
                     eprintln!("{line}");
@@ -2154,7 +2168,8 @@ fn load_qwen4_rank_scoped(
     };
     // All optional-sidecar decisions finish against the original manifest:
     // binding, source/manifest eligibility, host limits, plan and a fresh
-    // free-VRAM check. A refusal here leaves whole-layer placement untouched.
+    // free-VRAM check. A fixed budget fails closed; otherwise a refusal
+    // leaves whole-layer placement untouched.
     let mut hotset_host_bytes = 0;
     let (hotset, hotset_plan) = if let Some(path) =
         hotset_path.as_deref().filter(|_| band.is_none())
@@ -2180,12 +2195,12 @@ fn load_qwen4_rank_scoped(
             let total =
                 hotsets::require_budget(residency::expert_hotset_budget(free, non_expert, reserve))
                     .map_err(|skip| skip.to_string())?;
-            // Retain the existing fixed point: host-tier stage buffers can
-            // grow as a smaller budget moves more experts off device.
+            // Retain the automatic fixed point for stage buffers. Under a
+            // pin, reserve those buffers alongside the unchanged hot budget.
             let stage_enabled = residency::expert_stage_enabled(&ctx.gpu.arch);
             let mut stage = 0u64;
             let (plan, budget) = loop {
-                let budget = hotsets::require_budget(total.checked_sub(stage).ok_or_else(|| {
+                let available = hotsets::require_budget(total.checked_sub(stage).ok_or_else(|| {
                     format!(
                         "the {} MiB expert budget cannot hold the {} MiB of long-prefill stage buffers; free GPU memory or lower the expert placement",
                         total / MIB,
@@ -2193,6 +2208,7 @@ fn load_qwen4_rank_scoped(
                     )
                 }))
                 .map_err(|skip| skip.to_string())?;
+                let budget = hotset_budget.select(available)?;
                 let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
                     &slabs,
                     sidecar.rank(),
@@ -2227,8 +2243,8 @@ fn load_qwen4_rank_scoped(
             )?;
             residency::check_gtt_cap(host_bytes, residency::gtt_budget())?;
             // Re-query before either placement branch changes WeightEntries
-            // or tier conversion removes aggregate tensors. A shortfall can
-            // still take the ordinary whole-layer path without undoing work.
+            // or tier conversion removes aggregate tensors. A shortfall
+            // fails a fixed pin; auto can still take whole-layer placement.
             let (latest_free, _) = ctx
                 .gpu
                 .device_mem_info()
@@ -2243,6 +2259,9 @@ fn load_qwen4_rank_scoped(
                 ),
             )
             .map_err(|skip| skip.to_string())?;
+            // Check the entire requested ceiling, not just the rounded-down
+            // payload: a pinned budget must never silently lose headroom.
+            hotset_budget.select(latest_budget)?;
             if plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::Device)
                 > latest_budget
             {
@@ -2256,8 +2275,14 @@ fn load_qwen4_rank_scoped(
                 free / MIB, non_expert / MIB, reserve / MIB,
                 mtp_bytes.unwrap_or(0) / MIB, gather_bytes.unwrap_or(0) / MIB,
                 residency::EXPERT_TIER_TABLE_BYTES,
-                residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES / MIB, stage / MIB, budget / MIB,
+                residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES / MIB, stage / MIB, (total - stage) / MIB,
             );
+            if hotset_budget.is_fixed() {
+                eprintln!(
+                    "  qwen4 expert hot set fixed budget: {}={} MiB ({} bytes); ranked prefix independent of MTP mode",
+                    hotsets::HOT_BUDGET_MIB_ENV, budget / MIB, budget,
+                );
+            }
             Ok((sidecar, std::sync::Arc::new(plan), budget, host_bytes))
         };
         match prepare() {
@@ -2266,6 +2291,12 @@ fn load_qwen4_rank_scoped(
                 (Some(sidecar), Some((plan, budget)))
             }
             Err(reason) => {
+                if hotset_budget.is_fixed() {
+                    return Err(format!(
+                        "qwen4: {} could not be applied: {reason}",
+                        hotsets::HOT_BUDGET_MIB_ENV,
+                    ));
+                }
                 eprintln!(
                     "  qwen4 expert hot set: {} present, not applied ({reason}); whole-layer placement",
                     path.display(),

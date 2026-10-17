@@ -37,10 +37,11 @@
 //! [`HotsetPolicy`] reads `HIPFIRE_QWEN4_EXPERT_HOTSET`: unset = the
 //! `<model>.expert-hotset` file next to the model when it exists, `0` = off,
 //! an absolute path = that file. A relative or empty value is the only policy
-//! error ([`HotsetPolicy::parse`]). Every other reason the hotset cannot be
-//! used (arch, placement mode, artifact layout, bad or mismatched sidecar, no
-//! budget) is a [`HotsetSkip`]: never a load failure, the loader keeps
-//! whole-layer expert placement.
+//! error ([`HotsetPolicy::parse`]). Without a fixed [`HotsetBudget`], every
+//! other reason the hotset cannot be used (arch, placement mode, artifact
+//! layout, bad or mismatched sidecar, no budget) is a [`HotsetSkip`]: the
+//! loader keeps whole-layer expert placement. An explicit fixed budget
+//! requires the ranked hotset and fails the load instead of falling back.
 //!
 //! No GPU access; the only I/O is [`preflight`] statting one file,
 //! [`HotsetSidecar::load`] reading one file and [`HotsetBase::from_hfq`]
@@ -59,6 +60,8 @@ use crate::expert_residency::EXPERT_VRAM_LAYERS_ENV;
 /// Selects the sidecar. Unset: `<model>.expert-hotset` when it exists.
 /// `0`: off. Absolute path: that file. Anything else is a policy error.
 pub const HOTSET_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET";
+/// Developer-only fixed device-expert budget in MiB; unset keeps auto sizing.
+pub const HOT_BUDGET_MIB_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB";
 /// `kind` of a v1 sidecar.
 pub const SIDECAR_KIND: &str = "hipfire.qwen4.expert_hotset";
 /// `version` of the sidecar schema this module reads.
@@ -78,6 +81,61 @@ pub fn hotset_arch_admits(arch: &str, explicit_path: bool) -> bool {
 
 /// Log prefix of every hotset line.
 pub const LOG_PREFIX: &str = "  qwen4 expert hot set: ";
+/// Runtime hot-expert budget: automatic by default, or an exact byte ceiling
+/// for the ranked prefix, with the same meaning as lab `--hot-budget-mib`.
+/// The fixed ceiling does not include long-prefill staging buffers; those
+/// still have to fit alongside it in the loader's available budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotsetBudget {
+    fixed_bytes: Option<u64>,
+}
+
+impl HotsetBudget {
+    /// Parse positive unsigned decimal MiB with checked conversion to bytes.
+    /// Empty, zero, malformed and overflowing explicit values are errors.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = raw else {
+            return Ok(Self { fixed_bytes: None });
+        };
+        let invalid = || format!(
+            "{HOT_BUDGET_MIB_ENV}={raw:?}: expected positive unsigned decimal MiB \
+             that fit in u64 bytes; unset it for automatic sizing"
+        );
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let mib = raw.parse::<u64>().map_err(|_| invalid())?;
+        let bytes = mib.checked_mul(1 << 20).filter(|&bytes| bytes > 0).ok_or_else(invalid)?;
+        Ok(Self { fixed_bytes: Some(bytes) })
+    }
+
+    /// Read once from the process configuration snapshot, like [`HotsetPolicy`].
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(hipfire_config::developer_var(HOT_BUDGET_MIB_ENV).ok().as_deref())
+    }
+
+    /// Whether failure to apply the requested hotset must fail the load.
+    pub fn is_fixed(self) -> bool {
+        self.fixed_bytes.is_some()
+    }
+
+    /// Select the unchanged fixed ceiling only if it fits the available
+    /// bytes after all reserves, including long-prefill staging. Never clamp.
+    /// Automatic sizing retains the existing positive-budget requirement.
+    pub fn select(self, available: u64) -> Result<u64, String> {
+        match self.fixed_bytes {
+            Some(requested) if requested > available => Err(format!(
+                "{HOT_BUDGET_MIB_ENV} requests {requested} bytes ({} MiB), \
+                 but only {available} bytes ({} MiB) are available for hot experts \
+                 after reserves; refusing to shrink the fixed budget",
+                requested >> 20, available >> 20,
+            )),
+            Some(requested) => Ok(requested),
+            None => require_budget(Ok(available)).map_err(|skip| skip.to_string()),
+        }
+    }
+}
+
 
 /// `HIPFIRE_QWEN4_EXPERT_HOTSET`: where the sidecar comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1418,6 +1476,80 @@ mod tests {
         );
         assert_eq!(require_experts(7), Ok(7));
         assert_eq!(require_experts(0), Err(HotsetSkip::ZeroExperts));
+    }
+
+    #[test]
+    fn fixed_budget_parses_checked_mib() {
+        let auto = HotsetBudget::parse(None).unwrap();
+        assert!(!auto.is_fixed());
+        assert_eq!(auto.select(17).unwrap(), 17);
+        assert!(auto.select(0).is_err());
+        let fixed = HotsetBudget::parse(Some("1024")).unwrap();
+        assert!(fixed.is_fixed());
+        assert_eq!(fixed.select(2 << 30).unwrap(), 1 << 30);
+        let max_mib = u64::MAX >> 20;
+        let max_raw = max_mib.to_string();
+        assert_eq!(
+            HotsetBudget::parse(Some(&max_raw)).unwrap().select(u64::MAX).unwrap(),
+            max_mib << 20,
+        );
+    }
+
+    #[test]
+    fn invalid_or_unavailable_fixed_budget_fails_closed() {
+        for raw in ["", " ", "0", "-1", "+1", "1.5", "1MiB", "auto", " 1", "1 "] {
+            let error = HotsetBudget::parse(Some(raw)).unwrap_err();
+            assert!(error.contains(HOT_BUDGET_MIB_ENV), "{error}");
+        }
+        for raw in [(u64::MAX >> 20) + 1, u64::MAX] {
+            assert!(HotsetBudget::parse(Some(&raw.to_string())).is_err());
+        }
+        assert!(HotsetBudget::parse(Some("18446744073709551616")).is_err());
+        let fixed = HotsetBudget::parse(Some("2")).unwrap();
+        assert_eq!(fixed.select(2 << 20).unwrap(), 2 << 20);
+        for available in [0, (2 << 20) - 1] {
+            let error = fixed.select(available).unwrap_err();
+            assert!(error.contains(HOT_BUDGET_MIB_ENV), "{error}");
+            assert!(error.contains("refusing to shrink"), "{error}");
+        }
+    }
+
+    #[test]
+    fn fixed_budget_keeps_ranked_prefix_across_different_available_budgets() {
+        use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+        use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
+        use crate::expert_tier_plan::{plan_expert_tiers_from_slabs, Placement};
+
+        // Synthetic spans only: each expert occupies 512 KiB. A 2 MiB
+        // ceiling admits three, not four, because the owner also has tail pad.
+        let count = (EXPERTS_PER_LAYER as usize) * (TRUNK_LAYERS as usize);
+        let slabs: Vec<_> = (0..count)
+            .map(|id| ExpertSlab {
+                format: ExpertFormat::Mq4Xts,
+                gate_up: ExpertSlabSpan { offset: id * (1 << 19), len: 1 << 18 },
+                down: ExpertSlabSpan { offset: id * (1 << 19) + (1 << 18), len: 1 << 18 },
+            })
+            .collect();
+        let rank: Vec<u32> = (0..count as u32).rev().collect();
+        let fixed = HotsetBudget::parse(Some("2")).unwrap();
+        // Different auto headroom (e.g. AR versus MTP) and stage reserves
+        // cannot change the selected ceiling or the logical partition.
+        let ar = plan_expert_tiers_from_slabs(
+            &slabs, &rank, fixed.select(8 << 20).unwrap(),
+        ).unwrap();
+        let mtp = plan_expert_tiers_from_slabs(
+            &slabs, &rank, fixed.select(3 << 20).unwrap(),
+        ).unwrap();
+        assert_eq!(ar.device_experts(), 3);
+        assert_eq!(ar.logical_digest(), mtp.logical_digest());
+        assert_eq!(ar, mtp);
+        for (index, &id) in rank.iter().enumerate() {
+            assert_eq!(
+                ar.entry(id as usize / 512, id as usize % 512).unwrap().tier,
+                if index < 3 { Placement::Device } else { Placement::HostMapped },
+            );
+        }
+        assert!(fixed.select((2 << 20) - 1).is_err());
     }
 
     #[test]
