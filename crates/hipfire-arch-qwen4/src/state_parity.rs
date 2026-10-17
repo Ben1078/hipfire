@@ -2576,6 +2576,473 @@ pub fn run_mtp_fill_digest(
     Ok(value)
 }
 
+// ── S1 slow-link layer-major prefill: gate-facing state oracle ─────────
+//
+// Raw-byte SHA-256 digests of everything a prefill commits (GDN recurrent and
+// conv state per layer, the QSA arenas up to their active marks, the bounded
+// QSA buffers, PLE conv/history, HC feedback, positions and lengths), the
+// shared slab-capable range loader the S1 hardware gate and the parity CLI
+// use, and one bounded-row logit summary. Nothing here allocates N×vocab.
+
+/// Hex SHA-256 of `bytes`.
+fn slowlink_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The first `elements` elements of `tensor` as raw device bytes (empty reads
+/// nothing; an extent past the tensor is an error, never a clamp).
+fn slowlink_tensor_bytes(
+    gpu: &Gpu,
+    tensor: &GpuTensor,
+    elements: usize,
+) -> Result<Vec<u8>, String> {
+    if elements == 0 {
+        return Ok(Vec::new());
+    }
+    if elements > tensor.numel() {
+        return Err(format!(
+            "state extent {elements} exceeds tensor {}",
+            tensor.numel()
+        ));
+    }
+    let view = tensor.sub_offset(0, elements);
+    let mut bytes = vec![0u8; view.buf.size()];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &view.buf)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+/// Combine ordered `(name, hex digest)` parts into one digest. The names are
+/// part of the preimage, so a reordered or renamed part changes the result.
+fn slowlink_combine_digests(parts: &[(String, String)]) -> String {
+    let mut preimage = String::new();
+    for (name, digest) in parts {
+        preimage.push_str(name);
+        preimage.push('=');
+        preimage.push_str(digest);
+        preimage.push('\n');
+    }
+    slowlink_sha256(preimage.as_bytes())
+}
+
+/// Per-family raw-byte digests of the request state a prefill committed.
+/// Capacity-pinned QSA arenas are read up to their active marks only (beyond
+/// them the model never reads and `reset` zeroes); the bounded partial and
+/// selected buffers are read whole. `combined` covers every part in order.
+pub fn slowlink_state_digest(
+    gpu: &Gpu,
+    bundle: &crate::bundle::Qwen4Bundle,
+) -> Result<Value, String> {
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let config = &bundle.config;
+    let state = &bundle.state;
+    let raw_width = config
+        .indexer_kv_heads
+        .checked_mul(config.indexer_head_dim)
+        .ok_or("raw index width overflows")?;
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut gdn = Vec::with_capacity(state.gdn.len());
+    for (layer, layer_state) in state.gdn.iter().enumerate() {
+        let recurrent = slowlink_sha256(&slowlink_tensor_bytes(
+            gpu,
+            &layer_state.recurrent,
+            layer_state.recurrent.numel(),
+        )?);
+        let conv = slowlink_sha256(&slowlink_tensor_bytes(
+            gpu,
+            &layer_state.conv,
+            layer_state.conv.numel(),
+        )?);
+        parts.push((format!("gdn.{layer}.recurrent"), recurrent.clone()));
+        parts.push((format!("gdn.{layer}.conv"), conv.clone()));
+        gdn.push(json!({"layer": layer, "recurrent": recurrent, "conv": conv}));
+    }
+    let mut qsa = Vec::with_capacity(state.qsa.len());
+    for (layer, owner) in state.qsa.iter().enumerate() {
+        let active = [
+            ("full_keys", &owner.full_keys, owner.full_len, owner.full_row_units),
+            ("full_values", &owner.full_values, owner.full_len, owner.full_row_units),
+            ("raw_keys", &owner.raw_index_keys, owner.raw_len, raw_width),
+            ("pooled_keys", &owner.pooled_keys, owner.pooled_len, raw_width),
+        ];
+        let mut digests = Map::new();
+        for (name, tensor, rows, width) in active {
+            let elements = rows
+                .checked_mul(width)
+                .ok_or_else(|| format!("qsa.{layer}.{name} extent overflows"))?;
+            let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, elements)?);
+            parts.push((format!("qsa.{layer}.{name}"), digest.clone()));
+            digests.insert(name.to_string(), Value::String(digest));
+        }
+        for (name, tensor) in [
+            ("partial_keys", &owner.partial_keys),
+            ("partial_values", &owner.partial_values),
+            ("selected", &owner.selected_indices),
+        ] {
+            let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, tensor.numel())?);
+            parts.push((format!("qsa.{layer}.{name}"), digest.clone()));
+            digests.insert(name.to_string(), Value::String(digest));
+        }
+        let lengths = [
+            owner.full_len,
+            owner.raw_len,
+            owner.pooled_len,
+            owner.partial_len,
+            owner.selected_len,
+        ];
+        parts.push((format!("qsa.{layer}.lengths"), format!("{lengths:?}")));
+        qsa.push(json!({"layer": layer, "lengths": lengths, "digests": digests}));
+    }
+    let mut ple = Map::new();
+    if let Some(tensor) = &state.ple_conv {
+        let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, tensor.numel())?);
+        parts.push(("ple.conv".into(), digest.clone()));
+        ple.insert("conv".into(), Value::String(digest));
+    }
+    if let Some(tensor) = &state.hyper_feedback {
+        let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, tensor.numel())?);
+        parts.push(("ple.hyper_feedback".into(), digest.clone()));
+        ple.insert("hyper_feedback".into(), Value::String(digest));
+    }
+    let history = state.ple_history.previous();
+    parts.push(("ple.history".into(), format!("{history:?}")));
+    parts.push(("position".into(), state.position.to_string()));
+    Ok(json!({
+        "position": state.position,
+        "ple_history": history,
+        "gdn": gdn,
+        "qsa": qsa,
+        "ple": ple,
+        "combined": slowlink_combine_digests(&parts),
+        "parts": parts.len(),
+    }))
+}
+
+/// Indices and raw bits of the `k` largest finite entries, descending, ties
+/// broken by the lower index. Non-finite entries never rank.
+fn slowlink_top_k(values: &[f32], k: usize) -> Vec<(usize, u32)> {
+    let mut ranked: Vec<(usize, f32)> = values
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(k);
+    ranked
+        .into_iter()
+        .map(|(index, value)| (index, value.to_bits()))
+        .collect()
+}
+
+/// Bounded summary of `rows` consecutive logits rows of width `vocab` in
+/// `logits` (a view of exactly `rows * vocab` elements): per row the SHA-256
+/// of its bytes, finiteness, top-1 and the top-`top_k` (index, raw f32 bits).
+/// Callers keep `rows` small (the head view is never N×vocab).
+pub fn slowlink_logit_rows_summary(
+    gpu: &Gpu,
+    logits: &GpuTensor,
+    rows: usize,
+    vocab: usize,
+    top_k: usize,
+) -> Result<Value, String> {
+    let expected = rows
+        .checked_mul(vocab)
+        .ok_or("logit summary extent overflows")?;
+    if logits.numel() != expected {
+        return Err(format!(
+            "logit summary expects {rows}x{vocab}={expected} elements, tensor has {}",
+            logits.numel()
+        ));
+    }
+    let values = gpu
+        .download_f32(logits)
+        .map_err(|error| error.to_string())?;
+    let mut summary = Vec::with_capacity(rows);
+    let mut parts = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let slice = &values[row * vocab..(row + 1) * vocab];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) };
+        let digest = slowlink_sha256(bytes);
+        let finite = slice.iter().all(|value| value.is_finite());
+        let top = slowlink_top_k(slice, top_k);
+        parts.push((format!("row{row}"), digest.clone()));
+        summary.push(json!({
+            "row": row,
+            "sha256": digest,
+            "finite": finite,
+            "top1": top.first().map(|(index, _)| *index),
+            "top": top.iter().map(|(index, bits)| json!([index, bits])).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(json!({
+        "rows": rows,
+        "vocab": vocab,
+        "combined": slowlink_combine_digests(&parts),
+        "per_row": summary,
+    }))
+}
+
+/// What the shared slab-capable range loader built.
+pub struct SlowlinkLoaded {
+    pub bundle: crate::bundle::Qwen4Bundle,
+    pub vocab: usize,
+    pub eos_token: u32,
+    pub num_layers: usize,
+    /// Routed-expert tensors host-mapped by the placement (0 = all resident).
+    pub host_mapped_tensors: usize,
+    /// The fixed layer count applied, or `None` when the process placement
+    /// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, else all resident) decided.
+    pub expert_vram_layers: Option<usize>,
+    pub ple_format: String,
+}
+
+/// Load one real Qwen4 HFQM artifact the way `qwen4_greedy_ids` /
+/// `qwen4_kld` do: arena payloads, a fixed routed-expert layer placement
+/// with the host-mapped borrowed fallback, no MTP, no session cache, no PLE
+/// hot store. `expert_vram_layers = Some(n)` keeps layers `0..n` resident and
+/// host-maps the rest (a discrete card only); `None` defers to the process
+/// placement. The S1 selector, admission and arenas belong to the bundle's
+/// forward attach, not to this loader.
+pub fn slowlink_load_bundle(
+    gpu: &mut Gpu,
+    path: &Path,
+    max_seq: usize,
+    expert_vram_layers: Option<usize>,
+) -> Result<SlowlinkLoaded, String> {
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(path)
+        .map_err(|error| format!("open HFQM {}: {error}", path.display()))?;
+    let choice = hipfire_runtime::ple_sidecar::attach_validation_ple_rows(
+        &mut hfq,
+        path,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+    )
+    .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
+    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let trunk_overlay = crate::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
+        .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(
+        gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
+    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
+        .map_err(|error| format!("qwen4 mesh: {error}"))?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, gpu);
+    let npu_identity = crate::npu_trunk::model_index_identity(&hfq, &gpu.arch);
+    let use_ranges = gpu.is_uma();
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = match expert_vram_layers {
+        Some(layers) => {
+            if gpu.is_uma() {
+                return Err("host-mapped experts are only for discrete GPUs".to_string());
+            }
+            let mut weights = receipt.manifest.weights.clone();
+            crate::expert_residency::place_routed_experts(&mut weights, layers);
+            weights
+        }
+        None => oracle_expert_placement(gpu, &receipt.manifest.weights)?,
+    };
+    let host_mapped_tensors = weights
+        .iter()
+        .filter(|entry| entry.residency == WeightResidency::HostMapped)
+        .count();
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        gpu,
+        expected,
+        |entry| qwen4_oracle_payload(&source, &receipt.manifest.identity.recipe, entry, use_ranges),
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let vocab = receipt.config.vocab_size;
+    let eos_token = receipt.config.eos_token_id;
+    let num_layers = receipt.config.num_hidden_layers;
+    let state_format = crate::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        gpu,
+        &receipt.config,
+    )?;
+    let backend = Qwen4KvBackend::automatic(gpu);
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
+        receipt.config,
+        &receipt.manifest.identity.recipe,
+        transaction,
+        &receipt.placements,
+        gpu,
+        max_seq,
+        receipt.ple,
+        receipt.ple_rows,
+        state_format,
+        backend,
+        None,
+    )
+    .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
+    bundle.attach_npu_trunk_identity(npu_identity);
+    if let Some(overlay) = trunk_overlay {
+        bundle
+            .attach_trunk_overlay(overlay)
+            .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
+    }
+    bundle
+        .attach_forward(gpu, max_seq, scratch_mode)
+        .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+    Ok(SlowlinkLoaded {
+        bundle,
+        vocab,
+        eos_token,
+        num_layers,
+        host_mapped_tensors,
+        expert_vram_layers,
+        ple_format: choice.format.name().to_string(),
+    })
+}
+
+/// One whole-prompt production prefill per repeat from a fresh state
+/// (`prefill_final`: the selector's request path), each with its route
+/// receipt, fixed-state digest and final-row logit summary. The repeats must
+/// agree byte for byte (same-route determinism); the report says whether they
+/// did. The route is whatever `HIPFIRE_QWEN4_SLOWLINK_PREFILL` and the
+/// selector decide; run once per setting and compare the two reports.
+pub fn run_slowlink_prefill_state(
+    model_path: &Path,
+    prompt: &[u32],
+    expert_vram_layers: Option<usize>,
+    max_seq: usize,
+    repeats: usize,
+) -> Result<Value, String> {
+    if prompt.is_empty() {
+        return Err("slowlink state prompt is empty".to_string());
+    }
+    if repeats == 0 {
+        return Err("slowlink state repeats must be > 0".to_string());
+    }
+    if prompt.len() >= max_seq {
+        return Err(format!(
+            "slowlink state prompt of {} rows does not fit max_seq {max_seq}",
+            prompt.len()
+        ));
+    }
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let loaded = slowlink_load_bundle(&mut gpu, model_path, max_seq, expert_vram_layers)?;
+    let SlowlinkLoaded {
+        mut bundle,
+        vocab,
+        num_layers,
+        host_mapped_tensors,
+        ple_format,
+        ..
+    } = loaded;
+    let run = (|| -> Result<Value, String> {
+        let logits = gpu
+            .zeros(&[vocab], DType::F32)
+            .map_err(|error| error.to_string())?;
+        let mut runs = Vec::with_capacity(repeats);
+        let mut outcome = Ok(());
+        for repeat in 0..repeats {
+            let step = (|| -> Result<Value, String> {
+                bundle
+                    .prefill_final(&mut gpu, prompt, 0, &logits)
+                    .map_err(|error| format!("prefill {repeat}: {error}"))?;
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({
+                    "repeat": repeat,
+                    "receipt": bundle.slowlink_receipt(),
+                    "state": slowlink_state_digest(&gpu, &bundle)?,
+                    "final_logits": slowlink_logit_rows_summary(&gpu, &logits, 1, vocab, 16)?,
+                }))
+            })();
+            match step {
+                Ok(value) => runs.push(value),
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        let _ = gpu.free_tensor(logits);
+        outcome?;
+        let first = &runs[0];
+        let equal = runs.iter().all(|run| {
+            run["state"]["combined"] == first["state"]["combined"]
+                && run["final_logits"]["combined"] == first["final_logits"]["combined"]
+        });
+        Ok(json!({
+            "schema": "hipfire.qwen4.slowlink_prefill_state.v1",
+            "status": if equal { "pass" } else { "fail" },
+            "prompt_rows": prompt.len(),
+            "max_seq": max_seq,
+            "num_layers": num_layers,
+            "host_mapped_tensors": host_mapped_tensors,
+            "expert_vram_layers": expert_vram_layers,
+            "ple_format": ple_format,
+            "repeat_equal": equal,
+            "runs": runs,
+        }))
+    })();
+    let cleanup = bundle
+        .free_gpu(&mut gpu)
+        .err()
+        .map(|error| format!("qwen4 bundle teardown failed: {error}"));
+    let value = run?;
+    if let Some(error) = cleanup {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod slowlink_state_tests {
+    use super::*;
+
+    #[test]
+    fn slowlink_state_combined_digest_binds_names_and_order() {
+        let a = ("gdn.0.recurrent".to_string(), "aa".to_string());
+        let b = ("gdn.0.conv".to_string(), "bb".to_string());
+        let forward = slowlink_combine_digests(&[a.clone(), b.clone()]);
+        assert_eq!(forward, slowlink_combine_digests(&[a.clone(), b.clone()]));
+        assert_ne!(forward, slowlink_combine_digests(&[b.clone(), a.clone()]));
+        let renamed = ("gdn.1.recurrent".to_string(), "aa".to_string());
+        assert_ne!(forward, slowlink_combine_digests(&[renamed, b]));
+        assert_eq!(
+            slowlink_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn slowlink_state_top_k_is_descending_stable_and_skips_non_finite() {
+        let values = [1.0f32, f32::NAN, 3.0, 3.0, f32::INFINITY, -2.0];
+        let top = slowlink_top_k(&values, 3);
+        assert_eq!(
+            top,
+            vec![
+                (2, 3.0f32.to_bits()),
+                (3, 3.0f32.to_bits()),
+                (0, 1.0f32.to_bits())
+            ]
+        );
+        assert!(slowlink_top_k(&values, 0).is_empty());
+        assert_eq!(slowlink_top_k(&values, 99).len(), 4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
