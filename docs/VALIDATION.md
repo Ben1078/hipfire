@@ -353,8 +353,11 @@ unmeasured link never select the route, and a fast-link GPU result is never
 inferred from the XTX. H0's one-layer synthetic transfer evidence (copy-bound
 at ~99.9% of 7.09 GB/s) is a ceiling, and its 1,400+ tok/s pp16384 figure is a
 projection; only the fresh full-path receipts below can support a delivered
-number. 1,400 tok/s at pp16384 is the delivery target, 2,000 a measured
-stretch; never infer either from raw bandwidth.
+number. The 1,400 tok/s pp16384 figure was the original historical S1 gate
+floor and is not release acceptance. The release MQ4 target is 2,000 tok/s,
+and MQ2 must exceed MQ4 with decode at or above the MQ4 D2 decode; never infer
+either from raw bandwidth. Future D2 pair and MQ2 planning does not change the
+current S1 hold.
 
 Harness (CPU-testable parts run in `no-gpu` CI; GPU parts only inside a hipx
 fabric hold):
@@ -385,6 +388,28 @@ CPU commands (sequential, `ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1`):
 (schedule correctness, matched full-path A/B with the baseline code24 row,
 candidate code24 and regression closure); any missing cell is `incomplete`,
 not a pass, and a failed promotion leaves the route default OFF.
+
+Current status (claim-scoped; no pass is recorded). The last correctness hold
+(j1759) is **incomplete**: its primitive 80 s cap expired during the 82 s model
+load, so only `identity.manifest` passed and every other check was skipped.
+That hold supports no correctness, determinism, quality, memory or speed claim.
+Its cap covered the 80-110 s model load as well as the primitives; that was a
+harness budgeting error, not a finding about the route. The replacement hold is
+one correctness hold over all cases at the same 11 resident layers, route
+default OFF, with a 1,500 s maximum; no case, quality criterion or flag is
+narrowed or relaxed.
+
+Memory acceptance for that hold (product state cells): the minimum observed
+free VRAM over the whole run MUST be at least 512 MiB (536,870,912 B), taken
+from an independent 20 ms sysfs used/total sampler together with the existing
+in-process `hipMemGetInfo` `pre_load`, `post_load` and `end` points. Primitive
+identity, 7-case, load and teardown checks must pass; the memory census, the
+residual and the peak are informational only and are not driver attribution.
+The census is source-owned (11 admitted resident layers: owned core
+24,850,537,964 B plus nominal diagnostic 217,812,992 B = 25,068,350,956 B),
+not an actual driver figure; GPU-pool parked bytes are counted as used. This is
+a headroom product question and does not select a driver explanation. A
+missing cell is `incomplete`, not a pass.
 
 ### Flash-Next product-default receipts (perf claims)
 
