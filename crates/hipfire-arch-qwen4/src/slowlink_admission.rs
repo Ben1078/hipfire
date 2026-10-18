@@ -4691,12 +4691,15 @@ mod tests {
     #[test]
     fn slowlink_residency_j1778_granule_census_frontier_on_the_real_fixture() {
         use crate::expert_residency as residency;
-        // Granule slack of the 1,099 resident non-expert tensors of the real
-        // artifact (536 of them at least one granule), from its model-index.
+        // Granule slack of the 1,096 GPU-resident non-expert tensors of the
+        // real artifact (536 of them at least one granule), from its
+        // model-index; its 1,099 non-expert records also list 3 CPU-only PLE
+        // metadata arrays (24 + 128 + 128 = 280 B, all sub-granule, outside
+        // the 5,364,055,296 B GPU census), which add no slack.
         const J1778_WEIGHT_GRANULE_SLACK: u64 = 635_740_160;
         let granule = 2 * MIB;
         // The resident non-expert weights packed in ONE 256 B-aligned arena of
-        // the artifact (the model-index's 1,099 tensors; the worst internal
+        // the artifact (its 1,096 GPU tensors; the worst internal
         // alignment is below the arena's granule tail).
         const J1778_WEIGHT_PACKED_ROOT: u64 = 5_364_514_816;
         // The owners' own allocation lists at `tile`: forward scratch (owning
