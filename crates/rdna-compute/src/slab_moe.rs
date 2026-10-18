@@ -1893,7 +1893,9 @@ impl Gpu {
             || [slots, width, lo, hi]
                 .iter()
                 .any(|&v| i32::try_from(v).is_err())
-            || slots.checked_mul(width).is_none_or(|n| i32::try_from(n).is_err())
+            || slots
+                .checked_mul(width)
+                .is_none_or(|n| i32::try_from(n).is_err())
         {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -2146,7 +2148,12 @@ mod guarded_download_tests {
         // Enqueue failure AND join failure: the primary (enqueue) error is returned and the
         // buffer is leaked, never dropped while a copy may still target it.
         let log: Log = Rc::default();
-        let got = run(&log, Ok(()), Some(Err(err("second enqueue"))), Err(err("wait")));
+        let got = run(
+            &log,
+            Ok(()),
+            Some(Err(err("second enqueue"))),
+            Err(err("wait")),
+        );
         let e = got.err().unwrap();
         assert!(e.to_string().contains("second enqueue"), "{e}");
         assert_eq!(*log.borrow(), ["enqueue-1", "enqueue-2", "join"]);
@@ -3188,7 +3195,18 @@ pub mod slowlink_selftest {
                     at(300),
                     ne - 1,
                 ],
-                3 => [-1, ne, at(40), ne + 488, -7, at(3), i32::MIN, i32::MAX, at(17), at(17)],
+                3 => [
+                    -1,
+                    ne,
+                    at(40),
+                    ne + 488,
+                    -7,
+                    at(3),
+                    i32::MIN,
+                    i32::MAX,
+                    at(17),
+                    at(17),
+                ],
                 4 => [-1; K],
                 5 => {
                     let mut v = [if rng.below(2) == 0 { -1 } else { ne + 88 }; K];

@@ -6911,22 +6911,36 @@ mod tests {
         for arch in ["gfx1151", "gfx1201"] {
             let entry = lookup(arch, "tensor_ops", "").unwrap();
             assert!(entry.symbols.contains(&"gdn_q8ef_residual_zero"), "{arch}");
-            for symbol in entry.symbols.iter().filter(|s| {
-                s.starts_with("gdn_state_") || s.starts_with("gated_delta_step_")
-            }) {
+            for symbol in entry
+                .symbols
+                .iter()
+                .filter(|s| s.starts_with("gdn_state_") || s.starts_with("gated_delta_step_"))
+            {
                 if let Some(base) = symbol.strip_suffix("_q8") {
                     let twin = format!("{base}_q8ef");
                     assert!(entry.symbols.iter().any(|s| *s == twin), "{arch}: {twin}");
-                    assert!(entry.source().contains(&format!("void {twin}(")), "{arch}: {twin}");
+                    assert!(
+                        entry.source().contains(&format!("void {twin}(")),
+                        "{arch}: {twin}"
+                    );
                 }
             }
-            assert!(!entry.symbols.iter().any(|s| s.starts_with("gated_delta_rollback_layers_q8ef")));
+            assert!(!entry
+                .symbols
+                .iter()
+                .any(|s| s.starts_with("gated_delta_rollback_layers_q8ef")));
         }
         // The Q8Ef inline modules were removed until they have a GPU gate: no arch (gfx1151
         // included) inventories them.
         for arch in SUPPORTED_ARCHES {
-            assert!(lookup(arch, "gated_delta_chunk_q8ef_wmma", "").is_err(), "{arch}");
-            assert!(lookup(arch, "gated_delta_chunk_q8ef_wmma_arena", "").is_err(), "{arch}");
+            assert!(
+                lookup(arch, "gated_delta_chunk_q8ef_wmma", "").is_err(),
+                "{arch}"
+            );
+            assert!(
+                lookup(arch, "gated_delta_chunk_q8ef_wmma_arena", "").is_err(),
+                "{arch}"
+            );
         }
         let plain = lookup("gfx1151", "gated_delta_chunk_q8_wmma", "").unwrap();
         let plain_arena = lookup("gfx1151", "gated_delta_chunk_q8_wmma_arena", "").unwrap();

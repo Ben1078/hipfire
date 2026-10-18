@@ -2979,7 +2979,9 @@ pub(super) fn slowlink_admission(
             )
         })
     {
-        return refuse("the call declares neither the sealed expert-slab nor the aggregate QT44/QT53 route");
+        return refuse(
+            "the call declares neither the sealed expert-slab nor the aggregate QT44/QT53 route",
+        );
     }
     if !grouped_geometry(p) {
         return refuse("the declared grouped geometry is not admitted");
@@ -3022,11 +3024,7 @@ pub(super) fn slowlink_admission(
         // The F32 grouped arms of path 2: neither WMMA predicate holds and the unscatter
         // rotates the F32 rows itself (`unscatter_rotates`).  Anything else (path 1, a
         // half-enabled WMMA arm) is not one of the arms this lowering reproduces.
-        if use_path2
-            && !gateup_bf16(gpu, p)
-            && !down_wmma(gpu, p)
-            && unscatter_rotates(gpu, p)
-        {
+        if use_path2 && !gateup_bf16(gpu, p) && !down_wmma(gpu, p) && unscatter_rotates(gpu, p) {
             // The tile's own scratch must hold its F32 grouped arm: checked here, before any
             // launch, by the incumbent's own validation.
             validate_scratch(gpu, p, use_path2, p.m_total_max)?;

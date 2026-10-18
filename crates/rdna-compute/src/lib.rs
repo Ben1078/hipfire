@@ -24,6 +24,7 @@ pub mod e8p_moe_decode;
 pub mod embedding;
 pub mod emu;
 pub mod emu_validate;
+pub mod expert_capabilities;
 pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
@@ -52,7 +53,6 @@ pub mod lane_gdn;
 pub mod lane_rows_pm;
 mod loaded_code_check;
 pub mod moe;
-pub mod expert_capabilities;
 pub mod slab_admission;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,

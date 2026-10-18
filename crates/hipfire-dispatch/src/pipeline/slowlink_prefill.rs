@@ -567,7 +567,9 @@ fn decode_admission(
             MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
         )
     {
-        return refuse("the call declares neither the sealed expert-slab nor the aggregate QT44/QT53 route");
+        return refuse(
+            "the call declares neither the sealed expert-slab nor the aggregate QT44/QT53 route",
+        );
     }
     if slab && !super::slab_route::arch_supported(&gpu.arch) {
         return refuse("the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only");
@@ -604,7 +606,9 @@ fn decode_admission(
                 params.dtypes.routed_down,
             )
         {
-            return refuse("the aggregate one-row geometry or dtypes are not the sealed grouped route");
+            return refuse(
+                "the aggregate one-row geometry or dtypes are not the sealed grouped route",
+            );
         }
         return Ok(WindowRoute::Aggregate);
     }
@@ -1437,7 +1441,7 @@ pub fn finish_route_plan(
         // tile that produced a row).
         let x_norm = routes.f32_rows(layout.x_norm, 0, d.rows, d.hidden);
         routes.window_xq = Some(hip(
-            gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows),
+            gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows)
         )?);
         Gpu::moe_scatter_stable_top10_slab
     };
@@ -1456,9 +1460,8 @@ pub fn finish_route_plan(
     // The cohort (K1 / F32-tail / decode tiles): count its slots per expert on the device into
     // the layout's `cohort_counts` words (zeroed here), so the ONE barrier below reads both
     // count arrays and no token-route id ever reaches the host.
-    let cohort = (layout.dims.k1_rows + layout.dims.tail_rows > 0).then(|| {
-        routes.view(layout.cohort_counts, d.n_exp * I32_BYTES, DType::Raw)
-    });
+    let cohort = (layout.dims.k1_rows + layout.dims.tail_rows > 0)
+        .then(|| routes.view(layout.cohort_counts, d.n_exp * I32_BYTES, DType::Raw));
     if let Some(cohort_counts) = cohort.as_ref() {
         hip(gpu.slowlink_fill_bytes(cohort_counts, 0, d.n_exp * I32_BYTES))?;
         for tile in routes.tiles.iter().filter(|t| t.k1) {
@@ -1690,12 +1693,11 @@ impl<'a> PanelScratch<'a> {
     /// Register an aggregate F32-tail tile's call: its routed tail runs with its own operands
     /// against every binding.  Call once per [`TileKind::AggregateF32Tail`] tile of the layer,
     /// before the first panel.
-    pub fn add_tail_tile(
-        &mut self,
-        call: &'a PreparedChunkCall<'a>,
-    ) -> Result<(), DispatchError> {
+    pub fn add_tail_tile(&mut self, call: &'a PreparedChunkCall<'a>) -> Result<(), DispatchError> {
         if call.kind != TileKind::AggregateF32Tail {
-            return Err(bail("only an aggregate F32-tail tile registers tail operands"));
+            return Err(bail(
+                "only an aggregate F32-tail tile registers tail operands",
+            ));
         }
         if self.tails.iter().any(|t| t.row0 == call.row0) {
             return Err(bail("the F32 tail tile is already registered"));
@@ -1871,11 +1873,7 @@ pub fn execute_panel(
                     range.rows,
                     d.rows,
                 ))?;
-                let local = routes.view(
-                    layout.local_sorted,
-                    range.rows * I32_BYTES,
-                    DType::Raw,
-                );
+                let local = routes.view(layout.local_sorted, range.rows * I32_BYTES, DType::Raw);
                 hip(gpu.slowlink_remap_sorted(&sorted, &local, range.rows))?;
                 let x_down = hip(gpu.moe_unscatter_rotate128_f16(
                     params.y_gate_up_grouped,
@@ -4708,7 +4706,10 @@ mod slowlink_panel_tests {
                 l.total,
             ];
             assert!(fields.iter().all(|f| f % ALIGN == 0), "{rows}/{k1}/{tail}");
-            assert!(fields.windows(2).all(|w| w[0] <= w[1]), "{rows}/{k1}/{tail}");
+            assert!(
+                fields.windows(2).all(|w| w[0] <= w[1]),
+                "{rows}/{k1}/{tail}"
+            );
             // The F16 rows end where the next field starts.
             assert_eq!(l.local_sorted - l.x_f16, align_up(l.x_f16_bytes()).unwrap());
         }
@@ -4743,8 +4744,14 @@ mod slowlink_panel_tests {
         }
         assert_eq!(TileKind::SlabK2.route(), Some(WindowRoute::SlabIu4));
         assert_eq!(TileKind::SlabK1Tail.route(), Some(WindowRoute::SlabIu4));
-        assert_eq!(TileKind::AggregateWmma.route(), Some(WindowRoute::Aggregate));
-        assert_eq!(TileKind::AggregateF32Tail.route(), Some(WindowRoute::Aggregate));
+        assert_eq!(
+            TileKind::AggregateWmma.route(),
+            Some(WindowRoute::Aggregate)
+        );
+        assert_eq!(
+            TileKind::AggregateF32Tail.route(),
+            Some(WindowRoute::Aggregate)
+        );
         assert_eq!(TileKind::Decode.route(), None);
         assert_eq!(AGGREGATE_MIN_TILE_ROWS, 512);
     }
