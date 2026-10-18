@@ -69,10 +69,10 @@ fn pp_owner_required() -> BundleError {
 
 /// Architecture-private owner for the fulfilled manifest census.
 ///
-/// Assembly takes every resident handle into [`Qwen4Weights`], so rollback at
-/// unload releases no duplicate device allocations.  The transaction still
-/// owns the immutable projections, aliases, and external PLE descriptors and
-/// is drained only after the reader, mutable state, and resident weights.
+/// Assembly takes logical resident handles into [`Qwen4Weights`]. Arena
+/// allocations, when selected, remain owned by this transaction while those
+/// handles are borrowed views. Its immutable projections, aliases, external
+/// PLE descriptors and arena roots drain after state and resident handles.
 pub(crate) struct AttachedWeightStore {
     transaction: WeightLoadTransaction,
 }
@@ -972,6 +972,36 @@ impl Qwen4Bundle {
 
     pub fn attached_external_rows_len(&self) -> usize {
         self.weight_store.external_rows_len()
+    }
+
+    /// The single S1 load plan shared by admission and its real allocation
+    /// owners. `None` on an individually allocated incumbent load.
+    pub fn slowlink_weight_arena_plan(
+        &self,
+    ) -> Option<&std::sync::Arc<rdna_compute::byte_arena::ModelWeightArenaPlan>> {
+        self.weight_store.transaction.weight_arena_plan()
+    }
+
+    /// Actual live owning capacities, in the shared weight plan's root order.
+    /// These are allocation capacities, not the planned requests.
+    pub fn weight_arena_root_capacities(&self) -> Vec<usize> {
+        self.weight_store
+            .transaction
+            .weight_arena_root_capacities()
+    }
+
+    /// Actual live shadow-root capacities, in plan order. An unallocated
+    /// lazy root is `None`, never reported as an observed allocation.
+    pub fn f16_shadow_arena_root_capacities(&self, gpu: &Gpu) -> Vec<Option<usize>> {
+        match (
+            self.slowlink_weight_arena_plan(),
+            gpu.f16_shadow_arena_plan(),
+        ) {
+            (Some(weights), Some(shadows)) if std::sync::Arc::ptr_eq(weights, shadows) => {
+                gpu.f16_shadow_arena_root_capacities()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Attach cheap base-HFQ identity captured before the source was moved.

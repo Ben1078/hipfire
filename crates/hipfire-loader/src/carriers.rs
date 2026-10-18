@@ -2102,6 +2102,9 @@ fn load_qwen4_rank_scoped(
     // layers resident. Every other load keeps today's placement,
     // reserve and log byte for byte (zero S1 charge).
     let slowlink_mode = hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env();
+    // Construct one immutable plan only inside the selector's lazy facts
+    // closure. The same plan is charged below and handed to fulfillment.
+    let mut slowlink_weight_arenas = None;
     let slowlink_profile = {
         use hipfire_arch_qwen4::slowlink_admission as s1;
         let chunk_rows_env = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS").ok();
@@ -2137,7 +2140,7 @@ fn load_qwen4_rank_scoped(
             &shape,
             || hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu),
             || {
-                s1::single_device_facts(&s1::SingleDeviceLoad {
+                let load = s1::SingleDeviceLoad {
                     gpu: &*ctx.gpu,
                     config: &config,
                     weights: &manifest.weights,
@@ -2156,10 +2159,17 @@ fn load_qwen4_rank_scoped(
                     state_format,
                     scratch_mode,
                     purpose: s1::AdmissionPurpose::Product,
-                })
+                };
+                let arenas = s1::single_device_arena_plan(&load)?;
+                let facts = s1::single_device_facts_with_arenas(&load, &arenas)?;
+                slowlink_weight_arenas = Some(arenas);
+                Ok(facts)
             },
         )?
     };
+    if slowlink_profile.is_none() {
+        slowlink_weight_arenas = None;
+    }
     // The S1 profile sizes its placement from its own purpose tile (product:
     // 768 rows), never the incumbent chunk; every other load keeps the
     // incumbent placement chunk.
@@ -2842,27 +2852,46 @@ fn load_qwen4_rank_scoped(
     };
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
     let source = HfqModelSource::from_hfq(hfq);
-    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads_ep(
-        &manifest.weights,
-        &mesh,
-        config.num_hidden_layers,
-        ctx.gpu,
-        expected,
-        ep.map(|placement| hipfire_runtime::weight_store::EpFulfill {
-            rank: placement.rank,
-            ranks: placement.ranks,
-        }),
-        |entry| {
-            // A slab layer arena is one span of the container, not a tensor:
-            // the recipe resolves it before the by-name read.
-            crate::qwen4_slab::qwen4_fulfillment_payload(
-                &source,
-                &recipe,
-                entry,
-                qwen4_use_range_payload(use_ranges, entry.residency),
-            )
-        },
-    )
+    let payload_source = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+        // A slab layer arena is one span of the container, not a tensor:
+        // the recipe resolves it before the by-name read.
+        crate::qwen4_slab::qwen4_fulfillment_payload(
+            &source,
+            &recipe,
+            entry,
+            qwen4_use_range_payload(use_ranges, entry.residency),
+        )
+    };
+    let transaction = if slowlink_profile.is_some() {
+        if ep.is_some() {
+            return Err("qwen4: an S1 weight arena cannot use expert-parallel fulfillment".into());
+        }
+        let arenas = slowlink_weight_arenas.take().ok_or_else(|| {
+            "qwen4: admitted S1 profile has no charged weight arena plan".to_string()
+        })?;
+        hipfire_runtime::weight_store::fulfill_manifest_from_payloads_with_arenas(
+            &manifest.weights,
+            &mesh,
+            config.num_hidden_layers,
+            ctx.gpu,
+            expected,
+            arenas,
+            payload_source,
+        )
+    } else {
+        hipfire_runtime::weight_store::fulfill_manifest_from_payloads_ep(
+            &manifest.weights,
+            &mesh,
+            config.num_hidden_layers,
+            ctx.gpu,
+            expected,
+            ep.map(|placement| hipfire_runtime::weight_store::EpFulfill {
+                rank: placement.rank,
+                ranks: placement.ranks,
+            }),
+            payload_source,
+        )
+    }
     .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
     drop(weights_role);
     let scope = band

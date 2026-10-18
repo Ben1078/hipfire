@@ -214,6 +214,7 @@ fn load_inner(
     let routed_experts = !receipt.config.ffn.is_dense();
     let mut weights = receipt.manifest.weights.clone();
     let explicit = residency::expert_vram_layers_from_env()?;
+    let mut weight_arenas = None;
     let (resident_layers, placement, profile) = if !product_fallback
         && (unified || matches!(explicit, Some(residency::ExpertVramLayers::Layers(_))))
     {
@@ -266,7 +267,12 @@ fn load_inner(
             s1::SlowlinkMode::from_env(),
             &shape,
             || crate::host_link::host_link(load.gpu),
-            || s1::single_device_facts(&load),
+            || {
+                let arenas = s1::single_device_arena_plan(&load)?;
+                let facts = s1::single_device_facts_with_arenas(&load, &arenas)?;
+                weight_arenas = Some(arenas);
+                Ok(facts)
+            },
         )?;
         if profile.is_none() && !product_fallback {
             // Not selected: the caller keeps its own (baseline) loader and
@@ -309,18 +315,37 @@ fn load_inner(
         };
         (layers, placement, profile)
     };
+    if profile.is_none() {
+        weight_arenas = None;
+    }
     let host_mapped_tensors = weights
         .iter()
         .filter(|entry| entry.residency == WeightResidency::HostMapped)
         .count();
-    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        gpu,
-        expected,
-        |entry| payload(&source, &recipe, entry, unified),
-    )
+    let payload_source = |entry: &WeightEntry| payload(&source, &recipe, entry, unified);
+    let transaction = if profile.is_some() {
+        let arenas = weight_arenas.take().ok_or_else(|| {
+            "qwen4: admitted S1 profile has no charged weight arena plan".to_string()
+        })?;
+        hipfire_runtime::weight_store::fulfill_manifest_from_payloads_with_arenas(
+            &weights,
+            &mesh,
+            receipt.config.num_hidden_layers,
+            gpu,
+            expected,
+            arenas,
+            payload_source,
+        )
+    } else {
+        hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+            &weights,
+            &mesh,
+            receipt.config.num_hidden_layers,
+            gpu,
+            expected,
+            payload_source,
+        )
+    }
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let vocab = receipt.config.vocab_size;
     let eos_token = receipt.config.eos_token_id;
@@ -341,9 +366,13 @@ fn load_inner(
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     bundle.attach_npu_trunk_identity(npu_identity);
     if let Some(overlay) = trunk_overlay {
-        bundle
-            .attach_trunk_overlay(overlay)
-            .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
+        if let Err(error) = bundle.attach_trunk_overlay(overlay) {
+            let teardown = match bundle.free_gpu(gpu) {
+                Ok(()) => "bundle released to the device pool".to_string(),
+                Err(free) => format!("bundle teardown reported {free}"),
+            };
+            return Err(format!("qwen4 trunk overlay: {error}; {teardown}"));
+        }
     }
     let slowlink_profile = profile.is_some();
     // The admitted profile is attached before the forward is built: the
