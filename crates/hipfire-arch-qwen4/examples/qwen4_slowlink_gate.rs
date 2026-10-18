@@ -146,6 +146,19 @@ impl Mode {
     }
 }
 
+use hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose;
+
+/// The admission purpose of a mode's load. Only the primitive cell is the Hold 1
+/// self-test (its diagnostics are charged inside the admitted reserve); every
+/// state, product and perf cell is the product route and keeps the product's
+/// headroom rule. The one real load call below takes its purpose from here.
+fn load_purpose(mode: Mode) -> AdmissionPurpose {
+    match mode {
+        Mode::Primitives => AdmissionPurpose::PrimitiveSelftest,
+        Mode::State | Mode::Product | Mode::Perf => AdmissionPurpose::Product,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     model: PathBuf,
@@ -1729,7 +1742,13 @@ fn run(args: &Args) -> Result<bool, String> {
     if identity_problems.is_empty() {
         let mut fixture = fixture;
         let session_cache = (args.mode == Mode::State).then_some(fixture.session_cache_bytes);
-        let loaded = slowlink_load_bundle(&mut gpu, &args.model, fixture.max_seq, session_cache)?;
+        let loaded = slowlink_load_bundle(
+            &mut gpu,
+            &args.model,
+            fixture.max_seq,
+            session_cache,
+            load_purpose(args.mode),
+        )?;
         let vocab = loaded.vocab;
         out.insert(
             "load".into(),
@@ -1902,6 +1921,22 @@ fn main() {
 #[cfg(test)]
 mod slowlink_receipt_tests {
     use super::*;
+
+    #[test]
+    fn slowlink_receipt_load_purpose_is_selftest_only_for_primitives() {
+        assert_eq!(
+            load_purpose(Mode::Primitives),
+            AdmissionPurpose::PrimitiveSelftest
+        );
+        for mode in [Mode::State, Mode::Product, Mode::Perf] {
+            assert_eq!(
+                load_purpose(mode),
+                AdmissionPurpose::Product,
+                "{} is a product cell",
+                mode.name()
+            );
+        }
+    }
 
     fn receipt() -> Value {
         json!({
