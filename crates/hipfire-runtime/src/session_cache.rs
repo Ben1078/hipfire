@@ -1010,17 +1010,23 @@ struct HostMove<'a> {
     bytes: usize,
 }
 
-/// Queue every move on the gpu's active stream (the stream the live state's
-/// kernels run on, so each copy is ordered after, or before, the compute
-/// that produced or consumes the bytes) and wait for THAT stream only: other
-/// streams (an expert ring's) are neither drained nor retired. If the wait
-/// fails the blocks are flagged `undrained` and will never be freed.
-fn host_transfer(gpu: &mut Gpu, dir: Dir, moves: &[HostMove<'_>]) -> Result<(), String> {
-    if moves.is_empty() {
-        return Ok(());
-    }
-    gpu.bind_thread().map_err(|e| e.to_string())?;
+/// Queue every move of ONE capture, restore or park through `queue`, then
+/// take ONE `fence` for the whole operation (never one per part), before the
+/// caller publishes, applies metadata or returns. A fence is taken only if
+/// something was queued. If a move cannot be queued (or fails its bounds
+/// check) the moves already queued are still drained by that single fence
+/// before the error is returned; if the fence itself fails, EVERY host owner
+/// of the batch is flagged `undrained`, so none is ever freed (it
+/// quarantines on drop) while a copy may still be in flight. All the batch's
+/// owners are borrowed for the whole call, so a mixed-tier chain's sources
+/// outlive the one fence.
+fn run_transfer(
+    moves: &[HostMove<'_>],
+    mut queue: impl FnMut(&HostMove<'_>) -> Result<(), String>,
+    fence: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let mut result = Ok(());
+    let mut queued = false;
     for item in moves {
         let in_live = item
             .live_offset
@@ -1037,53 +1043,80 @@ fn host_transfer(gpu: &mut Gpu, dir: Dir, moves: &[HostMove<'_>]) -> Result<(), 
         if item.bytes == 0 {
             continue;
         }
-        let view = item.live.byte_view(item.live_offset, item.bytes);
-        let stream = gpu.active_stream.as_ref();
-        let queued = match dir {
-            Dir::ToStore => {
-                // SAFETY: `[host_offset, host_offset + bytes)` lies inside the
-                // live pinned allocation (checked above); the GPU is its only
-                // writer until the drain below, and the block outlives it.
-                let host = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        item.host.ptr().add(item.host_offset),
-                        item.bytes,
-                    )
-                };
-                gpu.hip.memcpy_dtoh_async(host, &view, stream)
-            }
-            Dir::ToLive => {
-                // SAFETY: as above; the host range is only read until the drain.
-                let host = unsafe {
-                    std::slice::from_raw_parts(
-                        item.host.ptr().add(item.host_offset),
-                        item.bytes,
-                    )
-                };
-                match stream {
-                    Some(stream) => gpu.hip.memcpy_htod_async(&view, host, stream),
-                    None => gpu.hip.memcpy_htod_async_default(&view, host),
-                }
-            }
-        };
-        if let Err(error) = queued {
-            result = Err(error.to_string());
+        if let Err(error) = queue(item) {
+            result = Err(error);
             break;
         }
+        queued = true;
     }
-    let drained = match gpu.active_stream.as_ref() {
-        Some(stream) => gpu.hip.stream_synchronize(stream),
-        None => gpu.hip.stream_synchronize_default(),
-    };
-    if let Err(error) = drained {
-        for item in moves {
-            item.host.mark_undrained();
+    if queued {
+        if let Err(error) = fence() {
+            for item in moves {
+                item.host.mark_undrained();
+            }
+            return Err(format!(
+                "session cache: host transfer could not be drained ({error}); its pinned memory is quarantined"
+            ));
         }
-        return Err(format!(
-            "session cache: host transfer could not be drained ({error}); its pinned memory is quarantined"
-        ));
     }
     result
+}
+
+/// Queue every move on the gpu's active stream (the stream the live state's
+/// kernels run on, so each copy is ordered after, or before, the compute
+/// that produced or consumes the bytes) and wait for THAT stream only, once
+/// ([`run_transfer`]): other streams (an expert ring's) are neither drained
+/// nor retired.
+fn host_transfer(gpu: &mut Gpu, dir: Dir, moves: &[HostMove<'_>]) -> Result<(), String> {
+    if moves.is_empty() {
+        return Ok(());
+    }
+    gpu.bind_thread().map_err(|e| e.to_string())?;
+    let gpu: &Gpu = gpu;
+    run_transfer(
+        moves,
+        |item| {
+            let view = item.live.byte_view(item.live_offset, item.bytes);
+            let stream = gpu.active_stream.as_ref();
+            let queued = match dir {
+                Dir::ToStore => {
+                    // SAFETY: `[host_offset, host_offset + bytes)` lies inside
+                    // the live pinned allocation (checked by `run_transfer`);
+                    // the GPU is its only writer until the fence, and the
+                    // block outlives it.
+                    let host = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            item.host.ptr().add(item.host_offset),
+                            item.bytes,
+                        )
+                    };
+                    gpu.hip.memcpy_dtoh_async(host, &view, stream)
+                }
+                Dir::ToLive => {
+                    // SAFETY: as above; the host range is only read until the
+                    // fence.
+                    let host = unsafe {
+                        std::slice::from_raw_parts(
+                            item.host.ptr().add(item.host_offset),
+                            item.bytes,
+                        )
+                    };
+                    match stream {
+                        Some(stream) => gpu.hip.memcpy_htod_async(&view, host, stream),
+                        None => gpu.hip.memcpy_htod_async_default(&view, host),
+                    }
+                }
+            };
+            queued.map_err(|e| e.to_string())
+        },
+        || {
+            let drained = match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.stream_synchronize(stream),
+                None => gpu.hip.stream_synchronize_default(),
+            };
+            drained.map_err(|e| e.to_string())
+        },
+    )
 }
 
 /// The live-state buffer of copy part `part` (fixed parts first, then row
@@ -7930,5 +7963,201 @@ mod tests {
         // keeps its old demotion rule.
         let plain = SessionCache::new(domain(), 1 << 20);
         assert!(plain.demotable(&child(Some(cut_key(&plain, &hist, 2)))));
+    }
+
+    /// `n` back-to-back moves of `bytes` between `live` and `host`.
+    fn moves_between<'a>(
+        live: &'a DeviceBuffer,
+        host: &'a HostBlock,
+        n: usize,
+        bytes: usize,
+    ) -> Vec<HostMove<'a>> {
+        (0..n)
+            .map(|i| HostMove {
+                live,
+                live_offset: i * bytes,
+                host,
+                host_offset: i * bytes,
+                bytes,
+            })
+            .collect()
+    }
+
+    fn quarantined_block(
+        bytes: usize,
+        drops: &Arc<AtomicUsize>,
+        quarantine: &Arc<Quarantine>,
+    ) -> HostBlock {
+        match quarantined_store(bytes, drops, quarantine) {
+            Store::Host(block) => block,
+            Store::Device(_) => unreachable!("a host store"),
+        }
+    }
+
+    #[test]
+    fn slowlink_session_cache_one_operation_takes_one_fence_for_every_part() {
+        // ~120 parts (fixed plus row streams) of one capture, restore or park.
+        let live = fake_buf(120 * 64);
+        let (drops, quarantine) = (counter(), Arc::new(Quarantine::default()));
+        let block = quarantined_block(120 * 64, &drops, &quarantine);
+        let moves = moves_between(&live, &block, 120, 64);
+        let queued = std::cell::Cell::new(0usize);
+        let fences = std::cell::Cell::new(0usize);
+        let result = run_transfer(
+            &moves,
+            |_| {
+                queued.set(queued.get() + 1);
+                Ok(())
+            },
+            || {
+                // The single fence follows every enqueue, never one per part.
+                assert_eq!(queued.get(), 120);
+                fences.set(fences.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!((queued.get(), fences.get()), (120, 1));
+        // A drained batch frees normally.
+        drop(block);
+        assert_eq!((released(&drops), quarantine.bytes()), (1, 0));
+
+        // Nothing to move, or nothing but empty parts: no fence at all.
+        let block = quarantined_block(64, &drops, &quarantine);
+        let none = |_: &HostMove<'_>| -> Result<(), String> { panic!("nothing to queue") };
+        let no_fence = || -> Result<(), String> { panic!("nothing to fence") };
+        assert_eq!(run_transfer(&[], none, no_fence), Ok(()));
+        let empty = moves_between(&live, &block, 3, 0);
+        assert_eq!(run_transfer(&empty, none, no_fence), Ok(()));
+    }
+
+    #[test]
+    fn slowlink_session_cache_partial_enqueue_failure_drains_once_and_keeps_owners_accounted() {
+        let live = fake_buf(120 * 64);
+        let (drops, quarantine) = (counter(), Arc::new(Quarantine::default()));
+        let block = quarantined_block(120 * 64, &drops, &quarantine);
+        let moves = moves_between(&live, &block, 120, 64);
+
+        // The 50th enqueue fails: the 49 already queued are drained by ONE
+        // fence, then the error is reported; the drained owner is not poisoned.
+        let queued = std::cell::Cell::new(0usize);
+        let fences = std::cell::Cell::new(0usize);
+        let result = run_transfer(
+            &moves,
+            |_| {
+                if queued.get() == 49 {
+                    return Err("queue refused".to_string());
+                }
+                queued.set(queued.get() + 1);
+                Ok(())
+            },
+            || {
+                assert_eq!(queued.get(), 49);
+                fences.set(fences.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("queue refused".to_string()));
+        assert_eq!((queued.get(), fences.get()), (49, 1));
+        drop(block);
+        assert_eq!((released(&drops), quarantine.bytes()), (1, 0));
+
+        // The same failure whose drain ALSO fails: every host owner of the
+        // batch (a mixed chain's two sources here) is flagged, and none is
+        // freed; both stay accounted in the quarantine.
+        let (first, second) = (
+            quarantined_block(256, &drops, &quarantine),
+            quarantined_block(512, &drops, &quarantine),
+        );
+        let live = fake_buf(768);
+        let mut moves = moves_between(&live, &first, 4, 64);
+        moves.extend((0..8).map(|i| HostMove {
+            live: &live,
+            live_offset: 256 + i * 64,
+            host: &second,
+            host_offset: i * 64,
+            bytes: 64,
+        }));
+        let fences = std::cell::Cell::new(0usize);
+        let sent = std::cell::Cell::new(0usize);
+        let result = run_transfer(
+            &moves,
+            |_| {
+                sent.set(sent.get() + 1);
+                if sent.get() == 6 {
+                    Err("queue refused".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                fences.set(fences.get() + 1);
+                Err("device lost".to_string())
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("quarantined") && error.contains("device lost"));
+        assert_eq!((sent.get(), fences.get()), (6, 1));
+        drop(moves);
+        let before = released(&drops);
+        drop(first);
+        drop(second);
+        assert_eq!(released(&drops), before, "outstanding DMA is never freed");
+        assert_eq!(quarantine.bytes(), 256 + 512);
+
+        // A later proven drain releases both.
+        assert_eq!(quarantine.release(), 2);
+        assert_eq!(released(&drops), before + 2);
+    }
+
+    #[test]
+    fn slowlink_session_cache_a_region_outside_its_buffer_fences_only_what_was_queued() {
+        let live = fake_buf(128);
+        let (drops, quarantine) = (counter(), Arc::new(Quarantine::default()));
+        let block = quarantined_block(128, &drops, &quarantine);
+        let fences = std::cell::Cell::new(0usize);
+        let fence = || {
+            fences.set(fences.get() + 1);
+            Ok(())
+        };
+        // The first region is outside the host block: nothing queued, no fence.
+        let bad = [HostMove {
+            live: &live,
+            live_offset: 0,
+            host: &block,
+            host_offset: 100,
+            bytes: 64,
+        }];
+        let never = |_: &HostMove<'_>| -> Result<(), String> { panic!("must not enqueue") };
+        assert!(run_transfer(&bad, never, fence).is_err());
+        assert_eq!(fences.get(), 0);
+        // A good region then a bad one: the queued copy is still fenced once.
+        let mixed = [
+            HostMove {
+                live: &live,
+                live_offset: 0,
+                host: &block,
+                host_offset: 0,
+                bytes: 64,
+            },
+            HostMove {
+                live: &live,
+                live_offset: 100,
+                host: &block,
+                host_offset: 64,
+                bytes: 64,
+            },
+        ];
+        let sent = std::cell::Cell::new(0usize);
+        let result = run_transfer(
+            &mixed,
+            |_| {
+                sent.set(sent.get() + 1);
+                Ok(())
+            },
+            fence,
+        );
+        assert!(result.is_err());
+        assert_eq!((sent.get(), fences.get()), (1, 1));
     }
 }
