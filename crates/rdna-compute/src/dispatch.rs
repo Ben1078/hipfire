@@ -8668,7 +8668,9 @@ impl Drop for Gpu {
             // Borrowed shadow views first, then a quiesced release of the roots; a
             // failed quiesce quarantines (leaks) them rather than freeing live memory.
             if let Err(err) = self.clear_f16_shadow_arena() {
-                eprintln!("[rdna-compute] failed to release the F16 shadow arena during Gpu drop: {err}");
+                eprintln!(
+                    "[rdna-compute] failed to release the F16 shadow arena during Gpu drop: {err}"
+                );
             }
         }
     }

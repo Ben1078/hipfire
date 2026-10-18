@@ -548,7 +548,10 @@ impl<R> ShadowRootSet<R> {
         if self.roots[root_index].is_none() {
             self.roots[root_index] = Some(exact_alloc(dev, request)?);
         }
-        Ok((self.roots[root_index].as_ref().expect("just ensured"), offset))
+        Ok((
+            self.roots[root_index].as_ref().expect("just ensured"),
+            offset,
+        ))
     }
 
     /// Unbind everything, then quiesce and release every root (live and
@@ -868,7 +871,10 @@ mod tests {
         let granule = 4096;
         let backing = p.backing_bytes(granule).unwrap();
         assert_eq!(backing, 2 * 4096);
-        assert_eq!(p.validate_capacities(&[600, 868], granule).unwrap(), backing);
+        assert_eq!(
+            p.validate_capacities(&[600, 868], granule).unwrap(),
+            backing
+        );
         // Oversized (e.g. a reused pool buffer) is rejected even if the granule
         // rounding would hide the difference.
         assert!(p.validate_capacities(&[601, 868], granule).is_err());
@@ -1008,21 +1014,30 @@ mod tests {
             roots.push(root);
         }
         let backing = weights.backing_bytes(granule).unwrap();
-        assert_eq!(weights.validate_capacities(&actual, granule).unwrap(), backing);
+        assert_eq!(
+            weights.validate_capacities(&actual, granule).unwrap(),
+            backing
+        );
         let per_root: u64 = roots
             .iter()
             .map(|r| round_up_to_granule(r.capacity, granule).unwrap())
             .sum();
         assert_eq!(per_root, backing);
         assert!(backing >= weights.logical_bytes().unwrap());
-        assert_eq!(dev.mallocs, weights.roots.len(), "one exact malloc per root");
+        assert_eq!(
+            dev.mallocs,
+            weights.roots.len(),
+            "one exact malloc per root"
+        );
     }
 
     #[test]
     fn oversized_allocator_capacity_is_rejected_and_released() {
         let mut dev = MockDevice::new();
         dev.oversize_granule = Some(1 << 20);
-        let err = exact_alloc(&mut dev, 600).err().expect("oversized rejected");
+        let err = exact_alloc(&mut dev, 600)
+            .err()
+            .expect("oversized rejected");
         match err {
             ExactAllocError::CapacityMismatch {
                 requested,
@@ -1099,7 +1114,10 @@ mod tests {
         set.ensure_member(&mut dev, a, 2048).unwrap();
         assert_eq!(dev.mallocs, 2);
         let (root, _) = set.ensure_member(&mut dev, m, 2048).unwrap();
-        assert_eq!(root.addr, addr, "pointer stays stable after the second root");
+        assert_eq!(
+            root.addr, addr,
+            "pointer stays stable after the second root"
+        );
         assert_eq!(dev.mallocs, 2);
         let caps: Vec<usize> = set
             .root_capacities(|r| r.capacity)
@@ -1369,7 +1387,10 @@ mod tests {
             .map(|c| c.expect("every root allocated"))
             .collect();
         assert_eq!(
-            model.f16_shadows.validate_capacities(&caps, granule).unwrap(),
+            model
+                .f16_shadows
+                .validate_capacities(&caps, granule)
+                .unwrap(),
             model.f16_shadows.backing_bytes(granule).unwrap()
         );
         assert_eq!(set.release(&mut dev).unwrap(), caps.len());
@@ -1426,9 +1447,15 @@ mod tests {
         let events = log.borrow().clone();
         assert_eq!(events.iter().filter(|e| *e == "quiesce").count(), 1);
         let quiesce = events.iter().position(|e| e == "quiesce").unwrap();
-        let forget = events.iter().position(|e| e == "forget value caches").unwrap();
+        let forget = events
+            .iter()
+            .position(|e| e == "forget value caches")
+            .unwrap();
         let drop_view = events.iter().position(|e| e == "drop view_c").unwrap();
-        assert!(quiesce < forget && quiesce < drop_view, "fence first: {events:?}");
+        assert!(
+            quiesce < forget && quiesce < drop_view,
+            "fence first: {events:?}"
+        );
         assert!(cache.is_empty());
         // Root, binding and pointer survive; nothing was allocated or freed.
         assert_eq!(set.lookup(0x2000), Some(c));
@@ -1464,7 +1491,10 @@ mod tests {
             assert!(removed.unwrap().is_some());
             assert!(cache.is_empty());
         }
-        assert!(seen.windows(2).all(|w| w[0] == w[1]), "pointer stable: {seen:?}");
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "pointer stable: {seen:?}"
+        );
         assert_eq!((dev.mallocs, dev.frees), (1, 0), "refills never allocate");
         // A refill that would overrun the reserved span is still refused.
         assert!(set.ensure_member(&mut dev, c, 2049).is_err());
@@ -1490,7 +1520,9 @@ mod tests {
         assert!(cache.contains_key(&0x2000), "view kept");
         let events = log.borrow().clone();
         assert!(
-            !events.iter().any(|e| e.starts_with("drop") || e == "forget value caches"),
+            !events
+                .iter()
+                .any(|e| e.starts_with("drop") || e == "forget value caches"),
             "no mutation behind a failed fence: {events:?}"
         );
         assert_eq!(set.lookup(0x2000), Some(c), "binding kept");
