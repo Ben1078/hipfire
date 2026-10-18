@@ -2179,6 +2179,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "slowlink_combine_panel",
                 "slowlink_fold_k1_counts",
                 "slowlink_mask_ids",
+                "slowlink_merge_rows",
+                "slowlink_remap_sorted",
             ]
         );
         add!(

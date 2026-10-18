@@ -28,6 +28,22 @@
 //! 5. [`finish_shared`], per tile: the saved shared activation restored and the shared down
 //!    folded into the tile's rows of the window accumulator.
 //!
+//! # Routes and tile kinds
+//!
+//! A window belongs to one [`WindowRoute`], fixed by the layer's declared route, and every
+//! tile to one [`TileKind`] (the arm the incumbent's own call for those rows takes):
+//!
+//! * `SlabIu4` (sealed expert-slab): K2 tiles run the grouped IU4 kernels over the window's A4
+//!   sidecars; `route_rows <= few_row_limit` tiles are the K1 lane-union GEMV cohort.
+//! * `Aggregate` (stacked-expert QT44 gate/up + QT53 down, no slab): K2 tiles
+//!   ([`TileKind::AggregateWmma`], `route_rows >= 512`) run the F16 WMMA grouped arm over the
+//!   window's rotated F16 activations with a panel-local unscatter + rotation and the BF16-row
+//!   WMMA down; tiles below 512 rows ([`TileKind::AggregateF32Tail`]) run the incumbent's own F32
+//!   routed tail per expert binding over their route ids masked to it (accumulating in place,
+//!   bindings ascending); a one-row tile is the decode GEMV cohort.  All three share one lease
+//!   and one sweep; a window need contain no WMMA tile.
+//!
+//! The shared combine is the same for the BF16-row K2 kinds: `slowlink_combine_panel`.
 //! The arithmetic of every kernel is the incumbent's: this module adds no GEMM algorithm.
 //! Nothing here records a stage-free event: retiring a panel's weights is the transport
 //! owner's job.  All CPU planning (layout, scheduling, ownership) is pure and tested without
@@ -48,6 +64,7 @@ const ALIGN: usize = 256;
 const F32_BYTES: usize = 4;
 const I32_BYTES: usize = 4;
 const BF16_BYTES: usize = 2;
+const F16_BYTES: usize = 2;
 /// Bytes of one `block_i4_128` record of the IU4 A4 sidecars.
 const A4_RECORD_BYTES: usize = 72;
 /// Width of the A4 sidecar block (`k / 128` records per row).
@@ -160,6 +177,63 @@ fn scoped<T>(
 
 // ───────────────────────────── layout ─────────────────────────────
 
+/// The routed lowering family of a window's layer, fixed by the layer's declared route (never
+/// by a dtype or a model name).  Every tile of a window belongs to it; the tile's own numerical
+/// class within it is its [`TileKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRoute {
+    /// Sealed expert-slab route: K2 tiles run the grouped IU4 kernels over the window's A4
+    /// sidecars, short tails the K1 lane-union GEMV cohort.
+    SlabIu4,
+    /// Aggregate stacked-expert QT44/QT53 route (no slab): K2 tiles (>= the WMMA row
+    /// threshold) run the F16 WMMA grouped arm over the window's rotated F16 activations,
+    /// tiles below it the incumbent's F32 grouped/indexed arm as a per-binding cohort, and a
+    /// one-row tile the decode GEMV cohort.
+    Aggregate,
+}
+
+/// The numerical class of one tile of a window: which of the incumbent's lowerings its rows run.
+/// A window may mix kinds of one [`WindowRoute`]; the K2 kinds ([`TileKind::SlabK2`],
+/// [`TileKind::AggregateWmma`]) run window-wide grouped panels, every other kind is a cohort
+/// run per expert binding against the same lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileKind {
+    /// Slab K2 (grouped IU4), `route_rows > few_row_limit`.
+    SlabK2,
+    /// Slab K1 short tail (lane-union GEMV), `route_rows <= few_row_limit`.
+    SlabK1Tail,
+    /// Aggregate F16 WMMA grouped arm (`route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`).
+    AggregateWmma,
+    /// Aggregate F32 grouped (or few-row indexed-down) arm below the WMMA threshold, 2.. rows.
+    AggregateF32Tail,
+    /// The incumbent's one-row DECODE call.
+    Decode,
+}
+
+impl TileKind {
+    /// Whether the tile's rows join the window-wide grouped K2 panels.
+    pub fn is_k2(self) -> bool {
+        matches!(self, Self::SlabK2 | Self::AggregateWmma)
+    }
+
+    /// The window route the kind belongs to.
+    pub fn route(self) -> Option<WindowRoute> {
+        match self {
+            Self::SlabK2 | Self::SlabK1Tail => Some(WindowRoute::SlabIu4),
+            Self::AggregateWmma | Self::AggregateF32Tail => Some(WindowRoute::Aggregate),
+            Self::Decode => None,
+        }
+    }
+}
+
+/// Grouped rows the aggregate route's panel-local slot map holds: the S1 panel bound.
+pub const AGGREGATE_PANEL_ROWS: usize = PanelLimits::S1.max_grouped_rows;
+
+/// Rows from which an aggregate tile takes the F16 WMMA grouped arm (the incumbent's own
+/// [`rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]); tiles below it are
+/// [`TileKind::AggregateF32Tail`].
+pub const AGGREGATE_MIN_TILE_ROWS: usize = rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS;
+
 /// Window geometry the route storage is sized from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptRouteDims {
@@ -172,8 +246,14 @@ pub struct PromptRouteDims {
     pub mi: usize,
     /// Intermediate width of the shared expert, 0 when the layer has none.
     pub shared_intermediate: usize,
-    /// Upper bound of the window rows lowered to the K1 short-tail cohort, 0 when none.
+    /// Upper bound of the window rows lowered to the K1 cohort (slab short tails and one-row
+    /// decode tiles), 0 when none.
     pub k1_rows: usize,
+    /// Upper bound of the window rows of aggregate F32-tail tiles, 0 when none (and always 0
+    /// on the slab route).
+    pub tail_rows: usize,
+    /// The routed lowering of the window's layer.
+    pub route: WindowRoute,
 }
 
 /// Byte offsets of every field of the route storage (one region, 256-aligned fields).
@@ -196,29 +276,37 @@ pub struct PromptRouteLayout {
     k1_y0: usize,
     k1_ids: usize,
     k1_shared: usize,
+    tail_ids: usize,
+    x_f16: usize,
+    local_sorted: usize,
+    k1_tmp: usize,
+    cohort_counts: usize,
     total: usize,
 }
 
 impl PromptRouteLayout {
     pub fn new(dims: &PromptRouteDims) -> Result<Self, DispatchError> {
         let d = *dims;
-        if d.rows == 0 || d.hidden == 0 || d.n_exp == 0 || d.mi == 0 || d.k1_rows > d.rows {
+        let cohort_rows = d.k1_rows.checked_add(d.tail_rows);
+        if d.rows == 0
+            || d.hidden == 0
+            || d.n_exp == 0
+            || d.mi == 0
+            || cohort_rows.is_none_or(|n| n > d.rows)
+            || (d.tail_rows > 0 && d.route != WindowRoute::Aggregate)
+        {
             return Err(bail(format!("degenerate route storage dimensions {d:?}")));
         }
         if d.hidden % 8 != 0 || i32::try_from(d.rows).is_err() || d.n_exp > 1024 {
             return Err(bail(format!("unsupported route storage dimensions {d:?}")));
         }
-        // The single count readback packs the K2 padded count (< 2^20) and the K1 slot count
-        // (< 2^11, bits 20..30) of an expert into one non-negative i32 word.
-        if d.rows * K_TOP + (MOE_GROUPED_BLOCK_M - 1) >= 1 << COUNT_BITS
-            || d.k1_rows * K_TOP >= 1 << (31 - COUNT_BITS)
-        {
+        // The count barrier reads the K2 padded counts (i32, one word an expert) and, beside
+        // them, the cohort's slot count of every expert (one word an expert, no packing), so
+        // neither is bounded by the other.
+        if i32::try_from(d.rows * K_TOP + (MOE_GROUPED_BLOCK_M - 1)).is_err() {
             return Err(bail(format!(
-                "the window exceeds the packed count fields (rows {} <= {}, K1 rows {} <= {})",
-                d.rows,
-                ((1usize << COUNT_BITS) - MOE_GROUPED_BLOCK_M) / K_TOP,
-                d.k1_rows,
-                ((1usize << (31 - COUNT_BITS)) - 1) / K_TOP
+                "the window's padded slot count exceeds an i32 word (rows {})",
+                d.rows
             )));
         }
         let slots = mul(d.rows, K_TOP)?;
@@ -251,6 +339,34 @@ impl PromptRouteLayout {
             mul(mul(d.k1_rows, 2)?, d.shared_intermediate)?,
             F32_BYTES,
         )?)?;
+        // The aggregate route's own fields (empty for the slab route, whose region is
+        // unchanged): the F32-tail tiles' masked-id scratch, the window's rotated F16
+        // activations and the panel-local slot map (only when some row takes the WMMA arm), and
+        // the decode cohort's per-binding scratch rows (one decode tile's `[10, hidden]`).
+        let aggregate = d.route == WindowRoute::Aggregate;
+        let wmma = aggregate && d.rows > d.k1_rows + d.tail_rows;
+        let tail_ids = field(mul(mul(d.tail_rows, K_TOP)?, I32_BYTES)?)?;
+        let x_f16 = field(if wmma {
+            mul(mul(d.rows, d.hidden)?, F16_BYTES)?
+        } else {
+            0
+        })?;
+        let local_sorted = field(if wmma {
+            mul(AGGREGATE_PANEL_ROWS, I32_BYTES)?
+        } else {
+            0
+        })?;
+        let k1_tmp = field(if aggregate && d.k1_rows > 0 {
+            mul(mul(K_TOP, d.hidden)?, F32_BYTES)?
+        } else {
+            0
+        })?;
+        // The cohort's per-expert slot counts (read back with the K2 counts at the one barrier).
+        let cohort_counts = field(if d.k1_rows + d.tail_rows > 0 {
+            mul(d.n_exp, I32_BYTES)?
+        } else {
+            0
+        })?;
         Ok(Self {
             dims: d,
             grouped_rows,
@@ -269,6 +385,11 @@ impl PromptRouteLayout {
             k1_y0,
             k1_ids,
             k1_shared,
+            tail_ids,
+            x_f16,
+            local_sorted,
+            k1_tmp,
+            cohort_counts,
             total: next,
         })
     }
@@ -285,12 +406,50 @@ impl PromptRouteLayout {
 
     /// Bytes of the two IU4 A4 sidecars at window rows (`int4_mmq_x_scratch` of the gate/up
     /// activation and `qwen4_moe_down_i4_scratch` of the down activation): what the producer
-    /// kernels reserve when the window's rows quantize.
+    /// kernels reserve when the window's rows quantize.  Zero on the aggregate route, which
+    /// quantizes nothing: its window activations are the region's `x_f16` field
+    /// ([`Self::x_f16_bytes`]) and its panel-local F16 down input fits the F16 X scratch the
+    /// tile's own rotation already reserves.
     pub fn a4_sidecar_bytes(&self) -> usize {
         let d = &self.dims;
+        if d.route == WindowRoute::Aggregate {
+            return 0;
+        }
         let gate_up = (d.hidden / A4_BLOCK_K) * d.rows * A4_RECORD_BYTES;
         let down = (d.mi / A4_BLOCK_K) * d.rows * K_TOP * A4_RECORD_BYTES;
         gate_up + down
+    }
+
+    /// The window's routed lowering.
+    pub fn route(&self) -> WindowRoute {
+        self.dims.route
+    }
+
+    /// Aggregate route: the window's rotated F16 activations `[rows, hidden]` (inside the
+    /// region, counted by [`Self::total_bytes`]); 0 on the slab route and for an aggregate
+    /// window with no WMMA-arm rows (`rows == k1_rows + tail_rows`).
+    pub fn x_f16_bytes(&self) -> usize {
+        let d = &self.dims;
+        if d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows {
+            d.rows * d.hidden * F16_BYTES
+        } else {
+            0
+        }
+    }
+
+    /// Bytes of the aggregate F32-tail tiles' masked-id scratch (`tail_rows * 10` I32).
+    pub fn tail_ids_bytes(&self) -> usize {
+        self.dims.tail_rows * K_TOP * I32_BYTES
+    }
+
+    /// Bytes of the cohort's per-expert slot count words (one I32 an expert, read back with the
+    /// K2 padded counts at the one barrier); 0 for a window with no cohort rows.
+    pub fn cohort_counts_bytes(&self) -> usize {
+        if self.dims.k1_rows + self.dims.tail_rows > 0 {
+            self.dims.n_exp * I32_BYTES
+        } else {
+            0
+        }
     }
 
     /// Bytes of the grouped-scatter Gpu scratch at FULL window size: exactly what
@@ -369,6 +528,8 @@ pub struct PreparedChunkCall<'a> {
     row0: usize,
     position: usize,
     k2: bool,
+    kind: TileKind,
+    route: WindowRoute,
     decode: bool,
     use_path2: bool,
     hidden: usize,
@@ -379,27 +540,36 @@ pub struct PreparedChunkCall<'a> {
 }
 
 /// Pre-mutation admission of a one-row sealed DECODE call as a K1 tile of the window: the
-/// plain sealed expert-slab decode over a uniform MQ4 layer (GPU top-k with the fused
-/// router/shared gate-side, the K1 lane-union GEMV, the canonical top-10 combine, then the
-/// shared down after it), no EP, CPU split/splice, ninepath, deferred combine, fused
-/// down-last combine or routed-out partial.
+/// plain sealed grouped decode (GPU top-k with the fused router/shared gate-side, the K1
+/// lane-union GEMV, the canonical top-10 combine, then the shared down after it), no EP, CPU
+/// split/splice, ninepath, deferred combine, fused down-last combine or routed-out partial,
+/// over either a uniform MQ4 expert-slab layer or the aggregate stacked-expert QT44/QT53 route
+/// (no per-expert tags; its indexed GEMVs write a row for every slot, so its cohort merges
+/// per binding).  Returns the window route the tile belongs to.
 fn decode_admission(
     gpu: &Gpu,
     params: &crate::families::moe::MoeParams<'_>,
-) -> Result<(), DispatchError> {
+) -> Result<WindowRoute, DispatchError> {
+    use crate::families::moe::MoeRouteCapability;
     use rdna_compute::slab_moe::SlabBuckets;
     let refuse = |why: &str| {
         Err(bail(format!(
             "{why}; the one-row decode tile stays on the incumbent route"
         )))
     };
-    if !params
-        .route_policy
-        .is_some_and(|policy| policy.capability.is_slab())
+    let Some(policy) = params.route_policy.as_ref() else {
+        return refuse("the call declares no grouped route");
+    };
+    let slab = policy.capability.is_slab();
+    if !slab
+        && !matches!(
+            policy.capability,
+            MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
+        )
     {
-        return refuse("not the sealed expert-slab route");
+        return refuse("the call declares neither the sealed expert-slab nor the aggregate QT44/QT53 route");
     }
-    if !super::slab_route::arch_supported(&gpu.arch) {
+    if slab && !super::slab_route::arch_supported(&gpu.arch) {
         return refuse("the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only");
     }
     if params.batch_size != 1
@@ -411,13 +581,32 @@ fn decode_admission(
         || params.routed_down_m % 64 != 0
         || params.routed_down_k % 128 != 0
     {
-        return refuse("the one-row geometry is not the sealed slab geometry");
+        return refuse("the one-row geometry is not the sealed grouped geometry");
     }
     if !params.recipe.bf16_round_trip() || !params.recipe.shared_after_combine() {
         return refuse("the recipe is not the BF16-row combine with the shared down after it");
     }
     if params.shared.is_none() || params.skip_shared || params.routed_out.is_some() {
         return refuse("the call carries no plain shared expert");
+    }
+    if !slab {
+        if params.expert_dtype_tags.is_some()
+            || !crate::families::moe::grouped_route_geometry_supported(
+                policy,
+                params.n_exp,
+                params.k,
+                params.hidden,
+                params.mi,
+                params.routed_gate_up_k,
+                params.routed_down_m,
+                params.routed_down_k,
+                params.dtypes.routed_gate_up,
+                params.dtypes.routed_down,
+            )
+        {
+            return refuse("the aggregate one-row geometry or dtypes are not the sealed grouped route");
+        }
+        return Ok(WindowRoute::Aggregate);
     }
     let layer = super::slab_route::layer(
         &gpu.arch,
@@ -426,7 +615,7 @@ fn decode_admission(
         params.expert_dtype_tags,
     )?;
     match layer.buckets {
-        SlabBuckets::Uniform(bucket) if bucket != 0 => Ok(()),
+        SlabBuckets::Uniform(bucket) if bucket != 0 => Ok(WindowRoute::SlabIu4),
         _ => refuse("the layer is not uniform MQ4"),
     }
 }
@@ -443,7 +632,7 @@ impl<'a> PreparedChunkCall<'a> {
     ) -> Result<Self, DispatchError> {
         if let Some(params) = call.decode_params() {
             // `seal_moe_for_layer` seals a decode call when `route_rows == 1`.
-            decode_admission(gpu, params)?;
+            let route = decode_admission(gpu, params)?;
             let selection = match call.kernel_selection() {
                 super::moe_program::MoeKernelSelection::Decode(selection) => selection,
                 super::moe_program::MoeKernelSelection::Prefill(_) => {
@@ -475,6 +664,8 @@ impl<'a> PreparedChunkCall<'a> {
                 row0,
                 position,
                 k2: false,
+                kind: TileKind::Decode,
+                route,
                 decode: true,
                 use_path2: false,
                 hidden: params.hidden,
@@ -487,11 +678,26 @@ impl<'a> PreparedChunkCall<'a> {
         let params = call
             .prefill_params()
             .ok_or_else(|| bail("the call carries no operands"))?;
-        let k2 = super::qt44_qt53_prefill::slowlink_admission(gpu, params)?;
         let selection = match call.kernel_selection() {
             super::moe_program::MoeKernelSelection::Prefill(selection) => selection,
             super::moe_program::MoeKernelSelection::Decode(_) => {
                 return Err(bail("the call carries a decode selection"))
+            }
+        };
+        let use_path2 = selection.uses_grouped_rows();
+        let tile = super::qt44_qt53_prefill::slowlink_admission(gpu, params, use_path2)?;
+        let (k2, kind, route) = match tile {
+            super::qt44_qt53_prefill::SlowlinkTile::SlabK2 => {
+                (true, TileKind::SlabK2, WindowRoute::SlabIu4)
+            }
+            super::qt44_qt53_prefill::SlowlinkTile::SlabK1 => {
+                (false, TileKind::SlabK1Tail, WindowRoute::SlabIu4)
+            }
+            super::qt44_qt53_prefill::SlowlinkTile::AggregateWmma => {
+                (true, TileKind::AggregateWmma, WindowRoute::Aggregate)
+            }
+            super::qt44_qt53_prefill::SlowlinkTile::AggregateF32Tail => {
+                (false, TileKind::AggregateF32Tail, WindowRoute::Aggregate)
             }
         };
         if selection.cpu_split || selection.cpu_deferred_experts {
@@ -499,7 +705,6 @@ impl<'a> PreparedChunkCall<'a> {
                 "a CPU-split or CPU-deferred call is not a layer-major tile",
             ));
         }
-        let use_path2 = selection.uses_grouped_rows();
         let shared_intermediate = params.prelude.shared.as_ref().map_or(0, |s| s.intermediate);
         Ok(Self {
             call,
@@ -508,6 +713,8 @@ impl<'a> PreparedChunkCall<'a> {
             row0,
             position,
             k2,
+            kind,
+            route,
             decode: false,
             use_path2,
             hidden: params.gate_up_k,
@@ -538,6 +745,16 @@ impl<'a> PreparedChunkCall<'a> {
     /// routed K1 and shared down are the decode stages).
     pub fn is_decode(&self) -> bool {
         self.decode
+    }
+    /// The routed lowering of the window this tile belongs to: [`PromptRouteDims::route`] of
+    /// the window's storage must equal it for every tile.
+    pub fn window_route(&self) -> WindowRoute {
+        self.route
+    }
+
+    /// The tile's numerical class (the arm the incumbent's own call for these rows takes).
+    pub fn tile_kind(&self) -> TileKind {
+        self.kind
     }
 
     /// The prefill operands of a prefill tile.
@@ -601,6 +818,9 @@ struct TileRec {
     decode: bool,
     /// First K1 row of this tile in the K1 y0 / masked-id scratch.
     k1_row0: usize,
+    /// An aggregate F32-tail tile (`k1` is set too: it is a per-binding cohort tile).  Its
+    /// `k1_row0` indexes the tail masked-id scratch, not the K1 y0 rows.
+    tail: bool,
 }
 
 /// The window's per-layer route state, one region reused by every layer.
@@ -611,6 +831,7 @@ pub struct PromptRouteStorage {
     combined: GpuTensor,
     filled: usize,
     k1_used: usize,
+    tail_used: usize,
     /// The first tile's signature and K2-ness: the geometry reference for every tile and
     /// the K2 arm reference for the K2 tiles.
     first_arm: Option<([usize; 6], bool)>,
@@ -618,6 +839,8 @@ pub struct PromptRouteStorage {
     k2_arm: Option<usize>,
     tiles: Vec<TileRec>,
     window_xq: Option<Int4MmqPrepared>,
+    /// The window's stable grouping has run (set by [`finish_route_plan`], per layer).
+    planned: bool,
 }
 
 impl PromptRouteStorage {
@@ -658,10 +881,12 @@ impl PromptRouteStorage {
             combined,
             filled: 0,
             k1_used: 0,
+            tail_used: 0,
             first_arm: None,
             k2_arm: None,
             tiles: Vec::new(),
             window_xq: None,
+            planned: false,
         })
     }
 
@@ -676,10 +901,12 @@ impl PromptRouteStorage {
     pub fn reset_for_layer(&mut self) {
         self.filled = 0;
         self.k1_used = 0;
+        self.tail_used = 0;
         self.first_arm = None;
         self.k2_arm = None;
         self.tiles.clear();
         self.window_xq = None;
+        self.planned = false;
     }
 
     pub fn rows(&self) -> usize {
@@ -770,6 +997,12 @@ pub fn prepare_routes(
     if call.rows == 0 || call.row0 + call.rows > d.rows {
         return Err(bail("the tile exceeds the window"));
     }
+    if call.route != d.route {
+        return Err(bail(format!(
+            "the tile's routed lowering {:?} differs from the window's {:?}",
+            call.route, d.route
+        )));
+    }
     if call.hidden != d.hidden
         || call.n_exp != d.n_exp
         || call.mi != d.mi
@@ -794,12 +1027,25 @@ pub fn prepare_routes(
         }
     }
     let k1 = !call.k2;
-    if k1 && dst.k1_used + call.rows > d.k1_rows {
+    let tail = call.kind == TileKind::AggregateF32Tail;
+    if tail {
+        if dst.tail_used + call.rows > d.tail_rows {
+            return Err(bail("the F32 tail cohort exceeds its reserved rows"));
+        }
+    } else if k1 && dst.k1_used + call.rows > d.k1_rows {
         return Err(bail("the K1 short-tail cohort exceeds its reserved rows"));
     }
     let slots = call.rows * K_TOP;
     // The incumbent's own prepare stages, for this tile's own call.
     execute_sealed_prepare(gpu, call.call)?;
+    if call.kind == TileKind::AggregateF32Tail {
+        // The activation the tile's fused unscatter would fold in: produced here, once.
+        super::qt44_qt53_prefill::slowlink_tail_shared_activation(
+            gpu,
+            call.params(),
+            call.use_path2,
+        )?;
+    }
     // Append the tile's state to the window.
     let copy = |gpu: &Gpu, dst_off: usize, src: &GpuTensor, bytes: usize| {
         hip(gpu.memcpy_dtod_at_ordered_async(&dst.region.buf, dst_off, &src.buf, 0, bytes))
@@ -856,12 +1102,27 @@ pub fn prepare_routes(
         hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
     } else {
         let params = *call.params();
-        copy(
-            gpu,
-            layout.x_norm + call.row0 * d.hidden * F32_BYTES,
-            params.x_norm_batch,
-            call.rows * d.hidden * F32_BYTES,
-        )?;
+        if call.kind == TileKind::AggregateWmma {
+            // The aggregate K2 arm reads the rotated F16 activations, the bytes the incumbent's
+            // own gate/up rotation produces (`rotate_x_mq_batched_f16` is the F32 rotation
+            // rounded to F16 row by row, whatever the tile's row count): rotate the tile once
+            // into the shared F16 X scratch and append it to the window's `x_f16` at once, as
+            // the scratch is valid only until the next F16 conversion.  No F32 copy is saved.
+            let x16 = hip(gpu.rotate_x_mq_batched_f16(params.x_norm_batch, d.hidden, call.rows))?;
+            copy(
+                gpu,
+                layout.x_f16 + call.row0 * d.hidden * F16_BYTES,
+                &x16,
+                call.rows * d.hidden * F16_BYTES,
+            )?;
+        } else {
+            copy(
+                gpu,
+                layout.x_norm + call.row0 * d.hidden * F32_BYTES,
+                params.x_norm_batch,
+                call.rows * d.hidden * F32_BYTES,
+            )?;
+        }
         copy(
             gpu,
             layout.topk_ids + call.row0 * K_TOP * I32_BYTES,
@@ -875,8 +1136,12 @@ pub fn prepare_routes(
             slots * F32_BYTES,
         )?;
         if k1 {
-            // The K1 cohort stays out of the K2 grouping: unrouted ids for the scatter/combine.
-            hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
+            // The cohort stays out of the K2 grouping: unrouted ids for the scatter/combine.  An
+            // F32-tail tile accumulates in place per binding with the incumbent's own combine
+            // (no trailing products), so its rows also carry the marker that skips the layer's
+            // terminal products (`slowlink_combine_pad`).
+            let fill = if tail { 0x80 } else { 0xFF };
+            hip(gpu.slowlink_fill_bytes(&route_ids, fill, slots * I32_BYTES))?;
         } else {
             copy(
                 gpu,
@@ -905,9 +1170,12 @@ pub fn prepare_routes(
         rows: call.rows,
         k1,
         decode: call.decode,
-        k1_row0: dst.k1_used,
+        k1_row0: if tail { dst.tail_used } else { dst.k1_used },
+        tail,
     });
-    if k1 {
+    if tail {
+        dst.tail_used += call.rows;
+    } else if k1 {
         dst.k1_used += call.rows;
     }
     if dst.first_arm.is_none() {
@@ -1148,7 +1416,6 @@ pub fn finish_route_plan(
         )));
     }
     let slots = d.rows * K_TOP;
-    let x_norm = routes.f32_rows(layout.x_norm, 0, d.rows, d.hidden);
     let route_ids = routes.ids_view(layout.route_ids, 0, d.rows);
     let sorted = routes.view(layout.sorted, layout.grouped_rows * I32_BYTES, DType::Raw);
     let tiles = routes.view(
@@ -1159,12 +1426,23 @@ pub fn finish_route_plan(
     let inverse = routes.ids_view(layout.inverse, 0, d.rows);
     let counts = routes.view(layout.counts, d.n_exp * I32_BYTES, DType::Raw);
     let offsets = routes.view(layout.offsets, (d.n_exp + 1) * I32_BYTES, DType::Raw);
-    // The window's activations quantize once per layer (row-wise, so independent of the tile
-    // that produced a row).
-    routes.window_xq = Some(hip(
-        gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows)
-    )?);
-    hip(gpu.moe_scatter_stable_top10_slab(
+    let aggregate = d.route == WindowRoute::Aggregate;
+    let scatter = if aggregate {
+        // The incumbent's own stable grouping of the aggregate F16 WMMA route (the arch gate
+        // admits gfx1100, gfx1151 and gfx1201 here, not the slab entry).  The window's F16
+        // activations were rotated tile by tile in `prepare_routes`.
+        Gpu::moe_scatter_stable_top10
+    } else {
+        // The window's activations quantize once per layer (row-wise, so independent of the
+        // tile that produced a row).
+        let x_norm = routes.f32_rows(layout.x_norm, 0, d.rows, d.hidden);
+        routes.window_xq = Some(hip(
+            gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows),
+        )?);
+        Gpu::moe_scatter_stable_top10_slab
+    };
+    hip(scatter(
+        gpu,
         &route_ids,
         &counts,
         &offsets,
@@ -1175,46 +1453,60 @@ pub fn finish_route_plan(
         d.n_exp,
         layout.grouped_rows,
     ))?;
-    // K1 short-tail cohort: fold its per-expert slot counts into the same count words on the
-    // device (K2 padded count in the low 20 bits, K1 slot count above), so the ONE readback of
-    // `n_exp` words carries both and no token-route id ever reaches the host.
-    for tile in routes.tiles.iter().filter(|t| t.k1) {
-        let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
-        hip(gpu.slowlink_fold_k1_counts(&ids, &counts, tile.rows * K_TOP, d.n_exp))?;
+    // The cohort (K1 / F32-tail / decode tiles): count its slots per expert on the device into
+    // the layout's `cohort_counts` words (zeroed here), so the ONE barrier below reads both
+    // count arrays and no token-route id ever reaches the host.
+    let cohort = (layout.dims.k1_rows + layout.dims.tail_rows > 0).then(|| {
+        routes.view(layout.cohort_counts, d.n_exp * I32_BYTES, DType::Raw)
+    });
+    if let Some(cohort_counts) = cohort.as_ref() {
+        hip(gpu.slowlink_fill_bytes(cohort_counts, 0, d.n_exp * I32_BYTES))?;
+        for tile in routes.tiles.iter().filter(|t| t.k1) {
+            let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
+            hip(gpu.slowlink_fold_k1_counts(&ids, cohort_counts, tile.rows * K_TOP, d.n_exp))?;
+        }
     }
-    // The one count barrier: one stream-ordered D2H on the compute stream, one stream wait.
+    // The one count barrier: stream-ordered D2H of both count arrays on the compute stream,
+    // one stream wait.
     let started = Instant::now();
-    let packed = hip(gpu.slowlink_sync_download_i32(&counts, d.n_exp))?;
+    let (counts_host, cohort_host) = match cohort.as_ref() {
+        Some(cohort_counts) => {
+            hip(gpu.slowlink_sync_download_i32_pair(&counts, cohort_counts, d.n_exp))?
+        }
+        None => (
+            hip(gpu.slowlink_sync_download_i32(&counts, d.n_exp))?,
+            vec![0; d.n_exp],
+        ),
+    };
     let barrier = BarrierCost {
         sync_ms: started.elapsed().as_secs_f64() * 1e3,
-        bytes_downloaded: d.n_exp * I32_BYTES,
+        bytes_downloaded: d.n_exp * I32_BYTES * if cohort.is_some() { 2 } else { 1 },
     };
-    let (counts_host, k1_experts) = unpack_counts(&packed)?;
-    let plan = LayerRoutePlan::from_counts(&counts_host, k1_experts, barrier)?;
+    let cohort_experts = cohort_experts(&counts_host, &cohort_host)?;
+    let plan = LayerRoutePlan::from_counts(&counts_host, cohort_experts, barrier)?;
     if plan.total_rows > layout.grouped_rows {
         return Err(bail("the stable grouping exceeds its row bound"));
     }
+    routes.planned = true;
     Ok(plan)
 }
 
-/// Bits of a packed count word holding the K2 padded count; the K1 slot count sits above.
-const COUNT_BITS: u32 = 20;
-
-/// Split the packed count words into the K2 padded counts and the experts the K1 cohort
-/// routes to (`word >> 20 > 0`).
-fn unpack_counts(packed: &[i32]) -> Result<(Vec<i32>, Vec<usize>), DispatchError> {
-    let mut counts = Vec::with_capacity(packed.len());
-    let mut k1 = Vec::new();
-    for (e, &word) in packed.iter().enumerate() {
-        if word < 0 {
-            return Err(bail(format!("the packed count of expert {e} is negative")));
+/// Validate the K2 padded counts and return the experts the cohort routes to (non-zero
+/// cohort slot count), ascending.
+fn cohort_experts(counts: &[i32], cohort: &[i32]) -> Result<Vec<usize>, DispatchError> {
+    if counts.len() != cohort.len() {
+        return Err(bail("the two count arrays differ in length"));
+    }
+    let mut experts = Vec::new();
+    for (e, (&k2, &k1)) in counts.iter().zip(cohort).enumerate() {
+        if k2 < 0 || k1 < 0 {
+            return Err(bail(format!("a count of expert {e} is negative")));
         }
-        counts.push(word & ((1 << COUNT_BITS) - 1));
-        if word >> COUNT_BITS != 0 {
-            k1.push(e);
+        if k1 > 0 {
+            experts.push(e);
         }
     }
-    Ok((counts, k1))
+    Ok(experts)
 }
 
 // ───────────────────────────── weights and panels ─────────────────────────────
@@ -1321,10 +1613,19 @@ struct DecodeTile<'a> {
     input: &'a GpuTensor,
 }
 
+/// An aggregate F32-tail tile registered with the scratch: the tile's own call operands (its
+/// row count, flags and scratch decide every kernel its routed tail runs).
+struct TailTile<'a> {
+    row0: usize,
+    params: MoePrefillParams<'a>,
+    use_path2: bool,
+}
+
 /// The BF16 panel scratches and the tile calls the K1 cohort borrows its scratch from.
 pub struct PanelScratch<'a> {
     params: MoePrefillParams<'a>,
     decode: Vec<DecodeTile<'a>>,
+    tails: Vec<TailTile<'a>>,
     limits: PanelLimits,
 }
 
@@ -1356,6 +1657,7 @@ impl<'a> PanelScratch<'a> {
         Ok(Self {
             params,
             decode: Vec::new(),
+            tails: Vec::new(),
             limits,
         })
     }
@@ -1381,6 +1683,27 @@ impl<'a> PanelScratch<'a> {
             resolution: selection.resolution,
             route: selection.route,
             input,
+        });
+        Ok(())
+    }
+
+    /// Register an aggregate F32-tail tile's call: its routed tail runs with its own operands
+    /// against every binding.  Call once per [`TileKind::AggregateF32Tail`] tile of the layer,
+    /// before the first panel.
+    pub fn add_tail_tile(
+        &mut self,
+        call: &'a PreparedChunkCall<'a>,
+    ) -> Result<(), DispatchError> {
+        if call.kind != TileKind::AggregateF32Tail {
+            return Err(bail("only an aggregate F32-tail tile registers tail operands"));
+        }
+        if self.tails.iter().any(|t| t.row0 == call.row0) {
+            return Err(bail("the F32 tail tile is already registered"));
+        }
+        self.tails.push(TailTile {
+            row0: call.row0,
+            params: *call.params(),
+            use_path2: call.use_path2,
         });
         Ok(())
     }
@@ -1472,10 +1795,6 @@ pub fn execute_panel(
     let params = scratch.params;
     let slots = d.rows * K_TOP;
     if range.rows > 0 {
-        let xq = routes
-            .window_xq
-            .as_ref()
-            .ok_or_else(|| bail("the window's route plan has not run"))?;
         let tile0 = range.row_base / MOE_GROUPED_BLOCK_M;
         let tiles = routes.view(
             layout.tiles + tile0 * I32_BYTES,
@@ -1487,39 +1806,97 @@ pub fn execute_panel(
             range.rows * I32_BYTES,
             DType::Raw,
         );
-        hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-            weights.gate_up_table,
-            &tiles,
-            &sorted,
-            xq,
-            params.y_gate_up_grouped,
-            2 * d.mi,
-            d.hidden,
-            K_TOP,
-            range.rows,
-            d.rows,
-            false,
-        ))?;
-        let xdown = hip(gpu.qwen4_moe_rotate128_i4_slab(
-            params.y_gate_up_grouped,
-            &sorted,
-            d.mi,
-            range.rows,
-            slots,
-        ))?;
-        hip(gpu.gemm_qwen4_moe_down_iu4_sym(
-            weights.down_table,
-            &tiles,
-            &sorted,
-            &xdown,
-            params.y_down_grouped,
-            d.hidden,
-            d.mi,
-            1,
-            range.rows,
-            slots,
-            false,
-        ))?;
+        match d.route {
+            WindowRoute::SlabIu4 => {
+                let xq = routes
+                    .window_xq
+                    .as_ref()
+                    .ok_or_else(|| bail("the window's route plan has not run"))?;
+                hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+                    weights.gate_up_table,
+                    &tiles,
+                    &sorted,
+                    xq,
+                    params.y_gate_up_grouped,
+                    2 * d.mi,
+                    d.hidden,
+                    K_TOP,
+                    range.rows,
+                    d.rows,
+                    false,
+                ))?;
+                let xdown = hip(gpu.qwen4_moe_rotate128_i4_slab(
+                    params.y_gate_up_grouped,
+                    &sorted,
+                    d.mi,
+                    range.rows,
+                    slots,
+                ))?;
+                hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+                    weights.down_table,
+                    &tiles,
+                    &sorted,
+                    &xdown,
+                    params.y_down_grouped,
+                    d.hidden,
+                    d.mi,
+                    1,
+                    range.rows,
+                    slots,
+                    false,
+                ))?;
+            }
+            WindowRoute::Aggregate => {
+                if !routes.planned || range.rows > AGGREGATE_PANEL_ROWS {
+                    return Err(bail(
+                        "the window's route plan has not run or the panel exceeds the aggregate \
+                         panel bound",
+                    ));
+                }
+                // The incumbent's F16 WMMA grouped route over this panel's tiles: SwiGLU in the
+                // gate/up epilogue (BF16 rows), the down's own unscatter + 128-wide rotation to
+                // F16, the BF16-row WMMA down.  The window's rotated activations are the region's
+                // `x_f16` (indexed by the window slot / 10); the down's F16 input is panel-local
+                // through a compact slot map, so the F16 X scratch holds only the panel's rows.
+                let x_f16 = routes.view(layout.x_f16, routes.layout.x_f16_bytes(), DType::F16);
+                hip(gpu.gemm_mq4g256v2_moe_grouped_top10_silu_bf16out(
+                    weights.gate_up_table,
+                    &tiles,
+                    &sorted,
+                    &x_f16,
+                    params.y_gate_up_grouped,
+                    2 * d.mi,
+                    d.hidden,
+                    K_TOP,
+                    range.rows,
+                    d.rows,
+                ))?;
+                let local = routes.view(
+                    layout.local_sorted,
+                    range.rows * I32_BYTES,
+                    DType::Raw,
+                );
+                hip(gpu.slowlink_remap_sorted(&sorted, &local, range.rows))?;
+                let x_down = hip(gpu.moe_unscatter_rotate128_f16(
+                    params.y_gate_up_grouped,
+                    &local,
+                    d.mi,
+                    range.rows,
+                    range.rows,
+                ))?;
+                hip(gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
+                    weights.down_table,
+                    &tiles,
+                    &local,
+                    &x_down,
+                    params.y_down_grouped,
+                    d.hidden,
+                    d.mi,
+                    range.rows,
+                    true,
+                ))?;
+            }
+        }
     }
     // The ordered combine; a zero-row panel still applies its ownership range.
     let route_ids = routes.ids_view(layout.route_ids, 0, d.rows);
@@ -1541,19 +1918,31 @@ pub fn execute_panel(
         range.own_hi,
     ))?;
     if range.k1 {
-        run_k1_cohort(gpu, &params, &scratch.decode, routes, &weights, range, hook)?;
+        run_k1_cohort(
+            gpu,
+            &params,
+            &scratch.decode,
+            &scratch.tails,
+            routes,
+            &weights,
+            range,
+            hook,
+        )?;
     }
     combine.panels_done += 1;
     combine.next_row_base = range.row_base + range.rows;
     Ok(())
 }
 
-/// The K1 cohort of every short-tail tile against one binding: the incumbent's K1 arithmetic
-/// over the tile's route ids masked to the binding.
+/// The cohort tiles of every kind against one binding: the incumbent's K1 arithmetic of a slab
+/// short tail or a one-row decode tile, or the incumbent's own F32 routed tail of an aggregate
+/// tile below the WMMA threshold, each over the tile's route ids masked to the binding.
+#[allow(clippy::too_many_arguments)]
 fn run_k1_cohort(
     gpu: &mut Gpu,
     params: &MoePrefillParams<'_>,
     decode_tiles: &[DecodeTile<'_>],
+    tail_tiles: &[TailTile<'_>],
     routes: &PromptRouteStorage,
     weights: &ExpertPanelBinding<'_>,
     range: &PanelRange,
@@ -1562,6 +1951,54 @@ fn run_k1_cohort(
     let layout = &routes.layout;
     let d = layout.dims;
     for tile in routes.tiles.iter().filter(|t| t.k1) {
+        if tile.tail {
+            // The aggregate F32-tail tile: restore its prepared input and route weights into
+            // the model's scratch the tile's own call names, mask its ids to the binding, and
+            // run the incumbent's routed tail stages for these rows.  Its combine accumulates
+            // in place into the tile's rows of the window accumulator (zero at the layer
+            // start); bindings run in ascending expert order, which is the canonical one.
+            let tt = tail_tiles
+                .iter()
+                .find(|t| t.row0 == tile.row0)
+                .ok_or_else(|| bail("an F32 tail tile was not registered with the scratch"))?;
+            let slots = tile.rows * K_TOP;
+            let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
+            let masked = routes.view(
+                layout.tail_ids + tile.k1_row0 * K_TOP * I32_BYTES,
+                slots * I32_BYTES,
+                DType::Raw,
+            );
+            let target = routes
+                .combined
+                .sub_offset(tile.row0 * d.hidden, tile.rows * d.hidden);
+            scoped(gpu, hook, tile.row0, |gpu| {
+                hip(gpu.memcpy_dtod_at_ordered_async(
+                    &tt.params.x_norm_batch.buf,
+                    0,
+                    &routes.region.buf,
+                    layout.x_norm + tile.row0 * d.hidden * F32_BYTES,
+                    tile.rows * d.hidden * F32_BYTES,
+                ))?;
+                hip(gpu.memcpy_dtod_at_ordered_async(
+                    &tt.params.topk_weights.buf,
+                    0,
+                    &routes.region.buf,
+                    layout.topk_weights + tile.row0 * K_TOP * F32_BYTES,
+                    slots * F32_BYTES,
+                ))?;
+                hip(gpu.slowlink_mask_ids(&ids, &masked, slots, range.bind_lo, range.bind_hi))?;
+                super::qt44_qt53_prefill::slowlink_f32_tail_panel(
+                    gpu,
+                    &tt.params,
+                    tt.use_path2,
+                    &masked,
+                    weights.gate_up_table,
+                    weights.down_table,
+                    &target,
+                )
+            })?;
+            continue;
+        }
         let slots = tile.rows * K_TOP;
         let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
         let masked = routes.view(
@@ -1593,7 +2030,14 @@ fn run_k1_cohort(
                 view.expert_gate_up_ptrs = weights.gate_up_table;
                 view.expert_down_ptrs = weights.down_table;
                 view.skip_shared = true;
-                view.down_expanded = &y0;
+                // The slab K1 kernels leave the rows of unheld (-1) slots untouched, so they
+                // write the persistent rows directly.  The aggregate indexed GEMVs write EVERY
+                // slot (zero for an id outside the binding): each binding's launch goes to the
+                // tile's scratch rows and only its own slots' rows are merged.
+                let aggregate = d.route == WindowRoute::Aggregate;
+                let tmp = aggregate
+                    .then(|| routes.view(layout.k1_tmp, slots * d.hidden * F32_BYTES, DType::F32));
+                view.down_expanded = tmp.as_ref().unwrap_or(&y0);
                 super::decode_gate_up_stage(gpu, &view, dt.resolution, dt.input, false, dt.route)?;
                 super::decode_activation_stage(gpu, &view, dt.resolution, dt.route, None)?;
                 super::decode_down_stage(
@@ -1607,7 +2051,19 @@ fn run_k1_cohort(
                     false,
                     false,
                     dt.route,
-                )
+                )?;
+                if let Some(tmp) = tmp.as_ref() {
+                    hip(gpu.slowlink_merge_rows(
+                        tmp,
+                        &y0,
+                        &ids,
+                        slots,
+                        d.hidden,
+                        range.bind_lo,
+                        range.bind_hi,
+                    ))?;
+                }
+                Ok(())
             })?;
             continue;
         }
@@ -1667,7 +2123,8 @@ pub fn finish_combine(
     let route_ids = routes.ids_view(layout.route_ids, 0, d.rows);
     // K1 rows carry no routed id here, so the pad leaves their (+0) accumulator unchanged.
     hip(gpu.slowlink_combine_pad(&route_ids, &routes.combined, d.hidden, d.rows, d.n_exp))?;
-    for tile in routes.tiles.iter().filter(|t| t.k1) {
+    // An F32-tail tile already combined in place, binding by binding, in `run_k1_cohort`.
+    for tile in routes.tiles.iter().filter(|t| t.k1 && !t.tail) {
         let slots = tile.rows * K_TOP;
         let y0 = routes.f32_rows(layout.k1_y0, tile.k1_row0 * K_TOP, slots, d.hidden);
         let ids = routes.ids_view(layout.topk_ids, tile.row0, tile.rows);
@@ -2099,6 +2556,7 @@ pub mod selftest {
                 k1: tile.k1,
                 decode: false,
                 k1_row0: k1_used,
+                tail: false,
             });
             if tile.k1 {
                 k1_used += rows;
@@ -2106,6 +2564,28 @@ pub mod selftest {
             row0 += rows;
         }
         routes.filled = row0;
+        if d.route == WindowRoute::Aggregate {
+            // The aggregate K2 arm reads the window's rotated F16 activations, which
+            // `prepare_routes` produces tile by tile; the synthetic tiles' F32 activations are
+            // rotated the same way (all K2: the aggregate route has no prefill K1 tile).
+            if tiles.iter().any(|t| t.k1) {
+                return Err(bail("the aggregate route has no prefill K1 tile"));
+            }
+            // In pieces of the aggregate route's minimum tile (512 rows, whose F16 X scratch
+            // every real tile already reserves), so the diagnostic grows no Gpu scratch.
+            for lo in (0..row0).step_by(AGGREGATE_MIN_TILE_ROWS) {
+                let n = AGGREGATE_MIN_TILE_ROWS.min(row0 - lo);
+                let x = routes.f32_rows(layout.x_norm, lo, n, d.hidden);
+                let x16 = hip(gpu.rotate_x_mq_batched_f16(&x, d.hidden, n))?;
+                hip(gpu.memcpy_dtod_at_ordered_async(
+                    &routes.region.buf,
+                    layout.x_f16 + lo * d.hidden * F16_BYTES,
+                    &x16.buf,
+                    0,
+                    n * d.hidden * F16_BYTES,
+                ))?;
+            }
+        }
         routes.k1_used = k1_used;
         routes.first_arm = Some((call.arm_signature(), call.k2));
         routes.k2_arm = call.k2.then(|| call.arm_signature()[5]);
@@ -2126,7 +2606,11 @@ pub mod selftest {
         let panels = plan.schedule(&ranges, limits)?;
         let mut scratch = PanelScratch::new(call, limits)?;
         if let Some(decode_call) = decode {
-            scratch.add_decode_tile(decode_call)?;
+            if decode_call.decode {
+                scratch.add_decode_tile(decode_call)?;
+            } else {
+                scratch.add_tail_tile(decode_call)?;
+            }
         }
         let (y_gu, y_dn) = (
             scratch.params.y_gate_up_grouped,
@@ -2206,22 +2690,27 @@ pub mod selftest {
         canaries: bool,
         decode: Option<&PreparedChunkCall<'_>>,
     ) -> Result<Window, DispatchError> {
-        let decode_rows = decode.map_or(0, |d| d.rows);
-        let rows: usize = tiles.iter().map(SynthTile::rows).sum::<usize>() + decode_rows;
+        // The real cohort call (a one-row decode tile or an aggregate F32-tail tile) prepares
+        // through the production `prepare_routes`; it saves its shared gate/up and selector
+        // (decode) or its activated shared rows (tail).
+        let real_rows = decode.map_or(0, |d| d.rows);
+        let real_tail = decode.is_some_and(|d| d.kind == TileKind::AggregateF32Tail);
+        let rows: usize = tiles.iter().map(SynthTile::rows).sum::<usize>() + real_rows;
         let k1_rows: usize = tiles
             .iter()
             .filter(|t| t.k1)
             .map(SynthTile::rows)
             .sum::<usize>()
-            + decode_rows;
+            + if real_tail { 0 } else { real_rows };
         let layout = PromptRouteLayout::new(&PromptRouteDims {
             rows,
             hidden: call.hidden,
             n_exp: call.n_exp,
             mi: call.mi,
-            // A real decode tile saves its shared gate/up and selector.
             shared_intermediate: decode.map_or(0, |d| d.shared_intermediate),
             k1_rows,
+            tail_rows: if real_tail { real_rows } else { 0 },
+            route: call.route,
         })?;
         let mut routes = PromptRouteStorage::alloc(gpu, &layout)?;
         match run_window_inner(
@@ -2333,11 +2822,17 @@ pub mod selftest {
         pub mi: usize,
         /// Experts of the supplied binding (`expert_hi - expert_lo`).
         pub binding_experts: usize,
-        /// K1 tile rows (`3.min(few_row_limit)`; the diagnostics use at most 3).
+        /// K1 tile rows (`3.min(few_row_limit)`; the diagnostics use at most 3).  On the
+        /// aggregate route: the rows of the real row-0 F32-tail call `k1_tail_cohort` runs.
         pub k1_rows: usize,
         /// Intermediate width of the shared expert of the real decode call
-        /// (`DecodeTailCohort` only; the other diagnostics seed no shared expert).
+        /// (`DecodeTailCohort`; on the aggregate route also `K1TailCohort`'s real tail call;
+        /// the other diagnostics seed no shared expert).
         pub shared_intermediate: usize,
+        /// The routed lowering of the call the diagnostics run over
+        /// ([`PreparedChunkCall::window_route`]): it decides the window's region layout and
+        /// which Gpu scratch slots a window grows.
+        pub route: WindowRoute,
     }
 
     /// Unique-owner peak bytes of one diagnostic EXTRA to the model's own tensors: the panel
@@ -2456,13 +2951,15 @@ pub mod selftest {
 
     /// Bytes of one synthetic window run by `run_window` (route region, grouped-scatter and A4
     /// scratch on the device; seeded tiles, assembled rows, accumulator and inverse map on the
-    /// host) with `rows` tokens of which `k1_rows` are the K1 cohort, and at most `grouped`
-    /// padded K2 rows.
+    /// host) with `rows` tokens of which `k1_rows` are the K1 cohort and `tail_rows` the
+    /// aggregate F32-tail cohort, and at most `grouped` padded K2 rows.
+    #[allow(clippy::too_many_arguments)]
     fn window_bytes(
         g: &DiagGeometry,
         limits: PanelLimits,
         rows: usize,
         k1_rows: usize,
+        tail_rows: usize,
         shared: usize,
         grouped: usize,
         dev: &mut Vec<(&'static str, usize)>,
@@ -2475,6 +2972,8 @@ pub mod selftest {
             mi: g.mi,
             shared_intermediate: shared,
             k1_rows,
+            tail_rows,
+            route: g.route,
         })?;
         let slots = rows * K_TOP;
         dev.push(("route_region", layout.total_bytes()));
@@ -2574,7 +3073,7 @@ pub mod selftest {
                 let grouped = upper(rows * K_TOP);
                 let mut dev = Vec::new();
                 let mut host = Vec::new();
-                window_bytes(g, limits, rows, 0, 0, grouped, &mut dev, &mut host)?;
+                window_bytes(g, limits, rows, 0, 0, 0, grouped, &mut dev, &mut host)?;
                 let (mono_dev, mono_host) = monolithic_bytes(g, rows, grouped);
                 // Device: the window stays alive while the monolithic reference runs.
                 dev.push(("monolithic_reference", mono_dev));
@@ -2590,13 +3089,37 @@ pub mod selftest {
                 out.device_parts = dev;
                 out.host_parts = host;
             }
+            DiagCase::K1TailCohort if g.route == WindowRoute::Aggregate => {
+                // The aggregate route's cohort primitive: one real F32-tail call (`k1_rows`
+                // rows, shared expert of `shared_intermediate`) is the whole window; its
+                // reference is the incumbent's unmasked routed tail into a zero target.
+                let rows = g.k1_rows;
+                let mut dev = Vec::new();
+                let mut host = Vec::new();
+                window_bytes(
+                    g,
+                    limits,
+                    rows,
+                    0,
+                    rows,
+                    g.shared_intermediate,
+                    0,
+                    &mut dev,
+                    &mut host,
+                )?;
+                dev.push(("tail_reference_target_f32", rows * g.hidden * F32_BYTES));
+                host.push(("tail_reference_readback", rows * g.hidden * F32_BYTES));
+                host.push(("accumulator_readback", rows * g.hidden * F32_BYTES));
+                out.device_parts = dev;
+                out.host_parts = host;
+            }
             DiagCase::K1TailCohort => {
                 let k1 = g.k1_rows;
                 let rows = 64 + k1;
                 let grouped = upper(64 * K_TOP);
                 let mut dev = Vec::new();
                 let mut host = Vec::new();
-                window_bytes(g, limits, rows, k1, 0, grouped, &mut dev, &mut host)?;
+                window_bytes(g, limits, rows, k1, 0, 0, grouped, &mut dev, &mut host)?;
                 dev.push((
                     "k1_reference_y0_and_accumulator",
                     k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
@@ -2614,9 +3137,13 @@ pub mod selftest {
                 // the larger of the two is the peak.
                 let k1 = g.k1_rows;
                 let (mut dev_a, mut host_a) = (Vec::new(), Vec::new());
-                window_bytes(g, limits, 40, 0, 0, 0, &mut dev_a, &mut host_a)?;
+                window_bytes(g, limits, 40, 0, 0, 0, 0, &mut dev_a, &mut host_a)?;
                 let (mut dev_b, mut host_b) = (Vec::new(), Vec::new());
-                window_bytes(g, limits, k1, k1, 0, 0, &mut dev_b, &mut host_b)?;
+                // The aggregate route has no synthetic K1-only window (its cohort windows hold
+                // a real tail/decode call, run by the K1/decode primitives).
+                if g.route == WindowRoute::SlabIu4 {
+                    window_bytes(g, limits, k1, k1, 0, 0, 0, &mut dev_b, &mut host_b)?;
+                }
                 dev_b.push((
                     "k1_reference_y0_and_accumulator",
                     k1 * K_TOP * g.hidden * F32_BYTES + k1 * g.hidden * F32_BYTES,
@@ -2646,6 +3173,7 @@ pub mod selftest {
                     limits,
                     rows,
                     k1,
+                    0,
                     g.shared_intermediate,
                     grouped,
                     &mut dev,
@@ -2681,8 +3209,16 @@ pub mod selftest {
     /// The three Gpu grow-only scratch needs of a window of `rows` tokens.
     fn window_scratch(g: &DiagGeometry, rows: usize) -> ScratchSlots {
         ScratchSlots {
-            a4_gate_up: (g.hidden / A4_BLOCK_K) * rows * A4_RECORD_BYTES,
-            a4_down: (g.mi / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES,
+            a4_gate_up: if g.route == WindowRoute::Aggregate {
+                0
+            } else {
+                (g.hidden / A4_BLOCK_K) * rows * A4_RECORD_BYTES
+            },
+            a4_down: if g.route == WindowRoute::Aggregate {
+                0
+            } else {
+                (g.mi / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES
+            },
             group_scatter: rdna_compute::scratch::qwen4_moe_group_layout(rows * K_TOP, g.n_exp)
                 .bytes,
         }
@@ -2698,7 +3234,11 @@ pub mod selftest {
         Ok(match case {
             DiagCase::CanonicalCombine => ScratchSlots::default(),
             DiagCase::WithinExpertCanary => window_scratch(g, limits.max_grouped_rows),
+            DiagCase::K1TailCohort if g.route == WindowRoute::Aggregate => {
+                window_scratch(g, g.k1_rows)
+            }
             DiagCase::K1TailCohort => window_scratch(g, 64 + g.k1_rows),
+            DiagCase::ZeroRowPanel if g.route == WindowRoute::Aggregate => window_scratch(g, 40),
             DiagCase::ZeroRowPanel => {
                 window_scratch(g, 40).max_with(&window_scratch(g, g.k1_rows.max(1)))
             }
@@ -3048,8 +3588,114 @@ pub mod selftest {
         Ok(())
     }
 
-    /// `k1_tail_cohort`: a short-tail tile beside a K2 tile, cohort run per binding against
-    /// masked ids, equals the incumbent K1 arithmetic; the K2 rows are unaffected.
+    /// The aggregate F32-tail scenario: the incumbent's REAL tail call (built by the caller as the
+    /// model builds it, `row0 == 0`, its input state, scratch and weights in place) is the whole
+    /// window, run through the production prepare, route plan, panels and ordered combine over
+    /// a binding split in two halves, so its routed tail runs once per half on ids masked to
+    /// it and accumulates in place; the rows must equal, bitwise, the incumbent's own routed
+    /// tail (the same stage functions, unmasked ids, the whole binding, one launch chain) over
+    /// the SAME restored input and route weights.  The binding MUST hold every expert the call's
+    /// router selects (the resident all-expert binding).
+    fn f32_tail_scenario(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        rep: &mut PrimitiveReport,
+    ) -> Result<(), DispatchError> {
+        let (lo, hi) = (binding.expert_lo, binding.expert_hi);
+        if hi - lo < 2
+            || hi > call.n_exp
+            || call.row0 != 0
+            || call.kind != TileKind::AggregateF32Tail
+        {
+            return Err(bail(
+                "the F32 tail scenario needs a row-0 aggregate F32-tail call and a binding of at \
+                 least two experts",
+            ));
+        }
+        let mid = lo + (hi - lo) / 2;
+        let halves = [
+            ExpertPanelBinding {
+                expert_hi: mid,
+                ..binding
+            },
+            ExpertPanelBinding {
+                expert_lo: mid,
+                ..binding
+            },
+        ];
+        let window = run_window(gpu, call, &halves, limits, &[], true, Some(call))?;
+        rep.check(
+            "cohort_only_window_has_only_zero_row_panels",
+            window.plan.total_rows == 0 && window.panels.iter().all(|p| p.rows == 0),
+            format!(
+                "{} rows, {} panels",
+                window.plan.total_rows,
+                window.panels.len()
+            ),
+        );
+        let layout = window.routes.layout.clone();
+        let d = layout.dims;
+        let params = *call.params();
+        hip(gpu.memcpy_dtod_at_ordered_async(
+            &params.x_norm_batch.buf,
+            0,
+            &window.routes.region.buf,
+            layout.x_norm,
+            call.rows * d.hidden * F32_BYTES,
+        ))?;
+        hip(gpu.memcpy_dtod_at_ordered_async(
+            &params.topk_weights.buf,
+            0,
+            &window.routes.region.buf,
+            layout.topk_weights,
+            call.rows * K_TOP * F32_BYTES,
+        ))?;
+        let ids = window.routes.ids_view(layout.topk_ids, 0, call.rows);
+        let reference = hip(gpu.zeros(&[call.rows * d.hidden], DType::F32))?;
+        let run = (|| -> Result<Vec<f32>, DispatchError> {
+            super::super::qt44_qt53_prefill::slowlink_f32_tail_panel(
+                gpu,
+                &params,
+                call.use_path2,
+                &ids,
+                binding.gate_up_table,
+                binding.down_table,
+                &reference,
+            )?;
+            sync(gpu)?;
+            hip(gpu.download_f32(&reference))
+        })();
+        let _ = gpu.free_tensor(reference);
+        let reference = run?;
+        let got = &window.acc[..call.rows * d.hidden];
+        rep.check(
+            "f32_tail_rows_equal_the_incumbent_routed_tail",
+            diffs(got, &reference) == 0,
+            format!(
+                "{} mismatching elements over {} rows",
+                diffs(got, &reference),
+                call.rows
+            ),
+        );
+        rep.check(
+            "scratch_guard_canaries_intact",
+            window.canary_violations == 0,
+            format!(
+                "{} of {} guard bytes overwritten",
+                window.canary_violations, window.canary_checks
+            ),
+        );
+        window.routes.release(gpu);
+        Ok(())
+    }
+
+    /// `k1_tail_cohort`: the route's short-tail cohort.  Slab route: a K1 tile beside a K2 tile,
+    /// cohort run per binding against masked ids, equals the incumbent K1 arithmetic; the K2
+    /// rows are unaffected.  Aggregate route: `call` is a real row-0
+    /// [`TileKind::AggregateF32Tail`] call and the cohort is its F32 routed tail
+    /// ([`f32_tail_scenario`]).
     pub fn k1_tail_cohort(
         gpu: &mut Gpu,
         call: &PreparedChunkCall<'_>,
@@ -3070,7 +3716,10 @@ pub mod selftest {
         seed: u64,
     ) -> Result<PrimitiveReport, DispatchError> {
         let mut rep = PrimitiveReport::new("k1_tail_cohort");
-        k1_scenario(gpu, call, binding, limits, seed, true, &mut rep)?;
+        match call.route {
+            WindowRoute::SlabIu4 => k1_scenario(gpu, call, binding, limits, seed, true, &mut rep)?,
+            WindowRoute::Aggregate => f32_tail_scenario(gpu, call, binding, limits, &mut rep)?,
+        }
         Ok(rep)
     }
 
@@ -3374,7 +4023,9 @@ pub mod selftest {
             ),
         );
         window.routes.release(gpu);
-        k1_scenario(gpu, call, binding, limits, seed ^ 0x5a5a, false, &mut rep)?;
+        if call.route == WindowRoute::SlabIu4 {
+            k1_scenario(gpu, call, binding, limits, seed ^ 0x5a5a, false, &mut rep)?;
+        }
         Ok(rep)
     }
 }
@@ -3407,6 +4058,8 @@ mod slowlink_panel_tests {
             mi: 640,
             shared_intermediate: 640,
             k1_rows: rows.min(16),
+            tail_rows: 0,
+            route: WindowRoute::SlabIu4,
         }
     }
 
@@ -3655,6 +4308,7 @@ mod slowlink_panel_tests {
             binding_experts: 32,
             k1_rows: 3,
             shared_intermediate: 640,
+            route: WindowRoute::SlabIu4,
         }
     }
 
@@ -3705,6 +4359,8 @@ mod slowlink_panel_tests {
             mi: 640,
             shared_intermediate: 640,
             k1_rows: 48,
+            tail_rows: 0,
+            route: WindowRoute::SlabIu4,
         })
         .unwrap();
         let admitted = ScratchSlots {
@@ -3725,6 +4381,8 @@ mod slowlink_panel_tests {
             mi: 640,
             shared_intermediate: 640,
             k1_rows: 48,
+            tail_rows: 0,
+            route: WindowRoute::SlabIu4,
         })
         .unwrap();
         let tile_slots = ScratchSlots {
@@ -3758,6 +4416,62 @@ mod slowlink_panel_tests {
     }
 
     #[test]
+    fn slowlink_panel_aggregate_suite_ledger_has_no_a4_scratch_and_runs_a_real_tail_window() {
+        use super::selftest::diagnostic_bytes;
+        let slab = real_identity();
+        let agg = DiagGeometry {
+            route: WindowRoute::Aggregate,
+            ..slab
+        };
+        let s = suite_diagnostic_bytes(&DEFAULT_SUITE, &slab, PanelLimits::S1).unwrap();
+        let a = suite_diagnostic_bytes(&DEFAULT_SUITE, &agg, PanelLimits::S1).unwrap();
+        // The slab windows grow the two A4 sidecar slots; the aggregate ones never do.
+        assert!(s.persistent.a4_gate_up > 0 && s.persistent.a4_down > 0);
+        assert_eq!((a.persistent.a4_gate_up, a.persistent.a4_down), (0, 0));
+        assert_eq!(a.persistent.group_scatter, s.persistent.group_scatter);
+        // Its cohort primitive is one real F32-tail call (3 rows) as the whole window, with a
+        // zero-target reference: the region carries the tail rows' masked-id scratch, no x_f16.
+        let tail = diagnostic_bytes(DiagCase::K1TailCohort, &agg, PanelLimits::S1).unwrap();
+        assert!(tail
+            .device_parts
+            .iter()
+            .any(|p| p.0 == "tail_reference_target_f32" && p.1 == 3 * 2560 * 4));
+        let region = PromptRouteLayout::new(&PromptRouteDims {
+            rows: 3,
+            hidden: 2560,
+            n_exp: 512,
+            mi: 640,
+            shared_intermediate: 640,
+            k1_rows: 0,
+            tail_rows: 3,
+            route: WindowRoute::Aggregate,
+        })
+        .unwrap();
+        assert_eq!(region.x_f16_bytes(), 0);
+        assert!(tail
+            .device_parts
+            .iter()
+            .any(|p| p.0 == "route_region" && p.1 == region.total_bytes()));
+        // The aggregate ZeroRowPanel has no synthetic K1-only window: only the 40-row window.
+        let zero = diagnostic_bytes(DiagCase::ZeroRowPanel, &agg, PanelLimits::S1).unwrap();
+        let region40 = PromptRouteLayout::new(&PromptRouteDims {
+            rows: 40,
+            hidden: 2560,
+            n_exp: 512,
+            mi: 640,
+            shared_intermediate: 0,
+            k1_rows: 0,
+            tail_rows: 0,
+            route: WindowRoute::Aggregate,
+        })
+        .unwrap();
+        assert!(zero
+            .device_parts
+            .iter()
+            .any(|p| p.0 == "route_region" && p.1 == region40.total_bytes()));
+    }
+
+    #[test]
     fn slowlink_panel_decode_tail_diag_ledger_is_pinned_and_within_the_canary_peak() {
         use super::selftest::{diagnostic_bytes, DiagCase, DiagGeometry};
         // The real MQ4 layer identity with the RESIDENT all-expert binding, a 64-token K2
@@ -3769,6 +4483,7 @@ mod slowlink_panel_tests {
             binding_experts: 512,
             k1_rows: 1,
             shared_intermediate: 640,
+            route: WindowRoute::SlabIu4,
         };
         let limits = PanelLimits::S1;
         let decode = diagnostic_bytes(DiagCase::DecodeTailCohort, &g, limits).unwrap();
@@ -3826,14 +4541,14 @@ mod slowlink_panel_tests {
         let mut d = dims(16_384);
         d.k1_rows = 48;
         let l = PromptRouteLayout::new(&d).unwrap();
-        assert_eq!(l.total_bytes(), 386_070_784);
+        assert_eq!(l.total_bytes(), 386_072_832);
         assert_eq!(l.a4_sidecar_bytes(), 82_575_360);
         assert_eq!(l.group_scatter_bytes(), 3_278_848);
         assert_eq!(
             l.group_scatter_bytes(),
             rdna_compute::scratch::qwen4_moe_group_layout(163_840, 512).bytes
         );
-        assert_eq!(l.charged_bytes(), 471_924_992);
+        assert_eq!(l.charged_bytes(), 471_927_040);
         // The 1536-row tile's scratch is a strict subset of the full-window size.
         let tile = PromptRouteLayout::new(&dims(1536)).unwrap();
         assert_eq!(tile.group_scatter_bytes(), 309_248);
@@ -3871,9 +4586,10 @@ mod slowlink_panel_tests {
                 + layout.accumulator_bytes()
                 + layout.shared_hidden_bytes()
                 + layout.shared_scalar_bytes()
-                + layout.k1_bytes();
+                + layout.k1_bytes()
+                + layout.cohort_counts_bytes();
             assert!(layout.total_bytes() >= named);
-            assert!(layout.total_bytes() - named <= 14 * ALIGN, "rows {rows}");
+            assert!(layout.total_bytes() - named <= 16 * ALIGN, "rows {rows}");
         }
         let l = PromptRouteLayout::new(&dims(16384)).unwrap();
         assert_eq!(l.a4_sidecar_bytes(), 20 * 16384 * 72 + 5 * 16384 * 10 * 72);
@@ -3898,6 +4614,139 @@ mod slowlink_panel_tests {
         assert_eq!(with.shared_hidden_bytes(), 1536 * 640 * 4);
         assert_eq!(with.shared_scalar_bytes(), 1536 * 4);
         assert!(with.total_bytes() > without.total_bytes());
+    }
+
+    fn aggregate_dims(rows: usize, k1_rows: usize, tail_rows: usize) -> PromptRouteDims {
+        PromptRouteDims {
+            rows,
+            hidden: 2560,
+            n_exp: N_EXP,
+            mi: 640,
+            shared_intermediate: 640,
+            k1_rows,
+            tail_rows,
+            route: WindowRoute::Aggregate,
+        }
+    }
+
+    #[test]
+    fn slowlink_panel_aggregate_layout_swaps_the_a4_sidecars_for_the_f16_window_activations() {
+        // The real split artifact's identity: H2560, mi 640, E512, shared I640, 16384 rows.
+        let mut slab = dims(16_384);
+        slab.k1_rows = 48;
+        let s = PromptRouteLayout::new(&slab).unwrap();
+        let a = PromptRouteLayout::new(&aggregate_dims(16_384, 48, 0)).unwrap();
+        assert_eq!(a.route(), WindowRoute::Aggregate);
+        assert_eq!(a.a4_sidecar_bytes(), 0);
+        assert_eq!(a.x_f16_bytes(), 16_384 * 2560 * 2);
+        assert_eq!(a.x_f16_bytes(), 83_886_080);
+        // Region: the slab's fields unchanged, then the F16 window rows, the 2048-row slot
+        // map and one decode tile's `[10, hidden]` F32 scratch.
+        assert_eq!(
+            a.total_bytes() - s.total_bytes(),
+            83_886_080 + 2048 * 4 + 10 * 2560 * 4
+        );
+        assert_eq!(a.total_bytes(), 470_069_504);
+        assert_eq!(a.group_scatter_bytes(), s.group_scatter_bytes());
+        assert_eq!(a.charged_bytes(), a.total_bytes() + a.group_scatter_bytes());
+        assert_eq!(a.charged_bytes(), 473_348_352);
+        // The slab route pays the A4 sidecars instead: the two routes' charges are within a
+        // few MiB of each other.
+        assert!(a.charged_bytes().abs_diff(s.charged_bytes()) < 2 << 20);
+    }
+
+    #[test]
+    fn slowlink_panel_aggregate_window_without_wmma_rows_carries_no_f16_activations() {
+        // Only F32-tail rows (and a decode row): nothing takes the WMMA arm.
+        let only_tails = PromptRouteLayout::new(&aggregate_dims(512, 1, 511)).unwrap();
+        assert_eq!(only_tails.x_f16_bytes(), 0);
+        assert_eq!(only_tails.tail_ids_bytes(), 511 * 10 * 4);
+        let decode_only = PromptRouteLayout::new(&aggregate_dims(1, 1, 0)).unwrap();
+        assert_eq!(decode_only.x_f16_bytes(), 0);
+        // One more row is a WMMA row: the window now carries its F16 activations.
+        let mixed = PromptRouteLayout::new(&aggregate_dims(513, 1, 511)).unwrap();
+        assert_eq!(mixed.x_f16_bytes(), 513 * 2560 * 2);
+        assert!(mixed.total_bytes() > only_tails.total_bytes() + 513 * 2560 * 2 - 1);
+        // The slab route has neither F16 rows nor tail scratch.
+        let slab = PromptRouteLayout::new(&dims(513)).unwrap();
+        assert_eq!(slab.x_f16_bytes(), 0);
+        assert_eq!(slab.tail_ids_bytes(), 0);
+    }
+
+    #[test]
+    fn slowlink_panel_aggregate_layout_fields_are_aligned_and_disjoint() {
+        for (rows, k1, tail) in [
+            (1usize, 1usize, 0usize),
+            (3, 0, 3),
+            (512, 1, 511),
+            (1537, 1, 8),
+            (16384, 1, 511),
+        ] {
+            let l = PromptRouteLayout::new(&aggregate_dims(rows, k1, tail)).unwrap();
+            assert_eq!(l.total_bytes() % ALIGN, 0, "{rows}/{k1}/{tail}");
+            let fields = [
+                l.x_norm,
+                l.route_ids,
+                l.topk_ids,
+                l.topk_weights,
+                l.sorted,
+                l.tiles,
+                l.inverse,
+                l.counts,
+                l.offsets,
+                l.accumulator,
+                l.shared_hidden,
+                l.shared_scalar,
+                l.k1_y0,
+                l.k1_ids,
+                l.k1_shared,
+                l.tail_ids,
+                l.x_f16,
+                l.local_sorted,
+                l.k1_tmp,
+                l.cohort_counts,
+                l.total,
+            ];
+            assert!(fields.iter().all(|f| f % ALIGN == 0), "{rows}/{k1}/{tail}");
+            assert!(fields.windows(2).all(|w| w[0] <= w[1]), "{rows}/{k1}/{tail}");
+            // The F16 rows end where the next field starts.
+            assert_eq!(l.local_sorted - l.x_f16, align_up(l.x_f16_bytes()).unwrap());
+        }
+    }
+
+    #[test]
+    fn slowlink_panel_cohort_row_bounds_follow_the_route() {
+        // Tail rows exist only on the aggregate route and, with the K1 rows, fit the window.
+        let mut slab = dims(4096);
+        slab.tail_rows = 1;
+        assert!(PromptRouteLayout::new(&slab).is_err());
+        assert!(PromptRouteLayout::new(&aggregate_dims(8, 4, 5)).is_err());
+        assert!(PromptRouteLayout::new(&aggregate_dims(8, 4, 4)).is_ok());
+        // Cohort slot counts are one word an expert beside the K2 counts (no packing bound).
+        assert!(PromptRouteLayout::new(&aggregate_dims(4096, 1, 2047)).is_ok());
+        let mut k1 = dims(4096);
+        k1.k1_rows = 204;
+        assert!(PromptRouteLayout::new(&k1).is_ok());
+        k1.k1_rows = 205;
+        assert!(PromptRouteLayout::new(&k1).is_err());
+    }
+
+    #[test]
+    fn slowlink_panel_tile_kinds_name_their_numerical_class_and_route() {
+        assert!(TileKind::SlabK2.is_k2() && TileKind::AggregateWmma.is_k2());
+        for cohort in [
+            TileKind::SlabK1Tail,
+            TileKind::AggregateF32Tail,
+            TileKind::Decode,
+        ] {
+            assert!(!cohort.is_k2(), "{cohort:?}");
+        }
+        assert_eq!(TileKind::SlabK2.route(), Some(WindowRoute::SlabIu4));
+        assert_eq!(TileKind::SlabK1Tail.route(), Some(WindowRoute::SlabIu4));
+        assert_eq!(TileKind::AggregateWmma.route(), Some(WindowRoute::Aggregate));
+        assert_eq!(TileKind::AggregateF32Tail.route(), Some(WindowRoute::Aggregate));
+        assert_eq!(TileKind::Decode.route(), None);
+        assert_eq!(AGGREGATE_MIN_TILE_ROWS, 512);
     }
 
     #[test]
@@ -4169,45 +5018,41 @@ mod slowlink_panel_tests {
     }
 
     #[test]
-    fn slowlink_panel_packed_counts_carry_k2_padding_and_k1_touch_in_one_word() {
-        // Device words: K2 padded count in the low 20 bits, K1 slot count above.
-        let packed = [
-            0,
-            32,
-            (3 << COUNT_BITS) | 48,
-            1 << COUNT_BITS,
-            16,
-            (480 << COUNT_BITS) | ((1 << COUNT_BITS) - 16),
-        ];
-        let (counts, k1) = unpack_counts(&packed).unwrap();
-        assert_eq!(counts, vec![0, 32, 48, 0, 16, (1 << COUNT_BITS) - 16]);
-        assert_eq!(k1, vec![2, 3, 5]);
-        assert!(unpack_counts(&[-1]).is_err());
-        // The unpacked counts are exactly what the plan consumes.
+    fn slowlink_panel_count_arrays_carry_k2_padding_and_cohort_touch_separately() {
+        // Two device arrays, one word an expert: the K2 padded counts and the cohort slot counts.
+        let k2 = [0, 32, 48, 0, 16, (1 << 20) - 16];
+        let cohort = [0, 0, 3, 1, 0, 480];
+        let experts = cohort_experts(&k2, &cohort).unwrap();
+        assert_eq!(experts, vec![2, 3, 5]);
+        assert!(cohort_experts(&[-1], &[0]).is_err());
+        assert!(cohort_experts(&[0], &[-1]).is_err());
+        assert!(cohort_experts(&[0, 0], &[0]).is_err());
+        // The counts are exactly what the plan consumes.
         let plan =
-            LayerRoutePlan::from_counts(&counts[..5], k1[..2].to_vec(), BarrierCost::default())
+            LayerRoutePlan::from_counts(&k2[..5], experts[..2].to_vec(), BarrierCost::default())
                 .unwrap();
         assert_eq!(plan.total_rows, 96);
         assert_eq!(plan.k1_experts, vec![2, 3]);
     }
 
     #[test]
-    fn slowlink_panel_packed_count_fields_are_bounded_before_any_mutation() {
-        // The largest window the K2 field holds: rows*10 + 15 < 2^20.
-        let mut d = dims(104_856);
-        d.k1_rows = 48;
-        assert!(PromptRouteLayout::new(&d).is_ok());
-        assert!(PromptRouteLayout::new(&dims(104_858)).is_err());
-        // K1 slot counts per expert fill the 11 bits above the K2 field (bits 20..30, the sign
-        // bit stays clear so the packed i32 word is never negative): below 2^11 = 2048 slots,
-        // so at most 204 K1 rows.
+    fn slowlink_panel_cohort_counts_are_not_bounded_by_the_k2_count_word() {
+        // No packing: a worst-case aggregate window (every F32-tail segment of a window plus
+        // the decode rows) and a large slab K1 cohort are admitted, and only a window whose
+        // padded slot count cannot be an i32 word is refused before any mutation.
+        assert!(PromptRouteLayout::new(&aggregate_dims(16_384, 48, 3066)).is_ok());
         let mut d = dims(16_384);
-        d.k1_rows = 204;
+        d.k1_rows = 1000;
         assert!(PromptRouteLayout::new(&d).is_ok());
-        d.k1_rows = 205;
-        assert!(PromptRouteLayout::new(&d).is_err());
-        // The worst packed word (K1 field full, K2 field full) is still a positive i32.
-        let worst = (2047i64 << COUNT_BITS) | ((1i64 << COUNT_BITS) - 1);
-        assert!(worst <= i64::from(i32::MAX));
+        assert!(PromptRouteLayout::new(&dims(214_748_364)).is_err());
+        // Each cohort window reserves one count word per expert beside the K2 counts.
+        let none = PromptRouteLayout::new(&{
+            let mut d = dims(1536);
+            d.k1_rows = 0;
+            d
+        })
+        .unwrap();
+        let some = PromptRouteLayout::new(&dims(1536)).unwrap();
+        assert!(some.total_bytes() >= none.total_bytes() + 512 * 4);
     }
 }

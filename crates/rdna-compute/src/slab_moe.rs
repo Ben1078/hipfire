@@ -1733,9 +1733,9 @@ impl Gpu {
         }
     }
 
-    /// Fold the K1 cohort's route ids into the stable grouping's count words: `counts[id] +=
-    /// 1 << 20` per valid id of `ids` (`n` I32).  The caller guarantees the padded K2 counts
-    /// stay below `1 << 20` and each expert's K1 slots below `1 << 11` (bits 20..30).
+    /// Count the cohort's route ids per expert: `counts[id] += 1` per valid id (in
+    /// `[0, n_experts)`) of `ids` (`n` I32); `counts` is a separate word array the caller zeroed
+    /// (one i32 an expert, no packing with the K2 padded counts).
     pub fn slowlink_fold_k1_counts(
         &mut self,
         ids: &GpuTensor,
@@ -1829,6 +1829,114 @@ impl Gpu {
         )
     }
 
+    /// `local[i] = i` when `sorted[i] >= 0`, else `-1`, for the `rows` I32 slots of one panel
+    /// (the compact local slot space of the aggregate route's panel unscatter and down GEMM).
+    pub fn slowlink_remap_sorted(
+        &mut self,
+        sorted: &GpuTensor,
+        local: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if rows == 0 || i32::try_from(rows).is_err() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_remap_sorted: need rows > 0 and an i32 extent",
+            ));
+        }
+        crate::moe::require_span(sorted, &[rows, 4], "slowlink_remap_sorted sorted")?;
+        crate::moe::require_span(local, &[rows, 4], "slowlink_remap_sorted local")?;
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const FUNC: &str = "slowlink_remap_sorted";
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let (sp, lp) = (sorted.buf.as_ptr(), local.buf.as_ptr());
+        let rv = rows as i32;
+        let mut params = [
+            &sp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(rows as u32).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(lp);
+                b.push_i32(rv);
+                b
+            },
+        )
+    }
+
+    /// Copy the F32 rows (`width` wide) of the `slots` slots whose id in `ids` lies in
+    /// `[lo, hi)` from `src` to `dst`; every other row of `dst` is left untouched (the
+    /// aggregate K1 cohort's per-binding merge).
+    #[allow(clippy::too_many_arguments)]
+    pub fn slowlink_merge_rows(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        ids: &GpuTensor,
+        slots: usize,
+        width: usize,
+        lo: usize,
+        hi: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if slots == 0
+            || width == 0
+            || lo > hi
+            || [slots, width, lo, hi]
+                .iter()
+                .any(|&v| i32::try_from(v).is_err())
+            || slots.checked_mul(width).is_none_or(|n| i32::try_from(n).is_err())
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_merge_rows: need slots > 0, width > 0, lo <= hi and i32 extents",
+            ));
+        }
+        crate::moe::require_span(src, &[slots, width, 4], "slowlink_merge_rows src")?;
+        crate::moe::require_span(dst, &[slots, width, 4], "slowlink_merge_rows dst")?;
+        crate::moe::require_span(ids, &[slots, 4], "slowlink_merge_rows ids")?;
+        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const FUNC: &str = "slowlink_merge_rows";
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        let (sp, dp, ip) = (src.buf.as_ptr(), dst.buf.as_ptr(), ids.buf.as_ptr());
+        let (sv, wv, lv, hv) = (slots as i32, width as i32, lo as i32, hi as i32);
+        let mut params = [
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+            &wv as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [slots as u32, (width as u32).div_ceil(256), 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_ptr(ip);
+                b.push_i32(sv);
+                b.push_i32(wv);
+                b.push_i32(lv);
+                b.push_i32(hv);
+                b
+            },
+        )
+    }
+
     /// The one S1 count barrier: a stream-ordered D2H of the first `words` i32 of `tensor` on
     /// the ACTIVE compute stream, then one wait on that stream alone (never the transport
     /// owner's copy stream, never the legacy/null stream, never a device-wide sync).  Needs an
@@ -1864,6 +1972,46 @@ impl Gpu {
         self.hip.stream_synchronize(stream)?;
         self.take_device_wait_error()?;
         Ok(host)
+    }
+
+    /// [`Gpu::slowlink_sync_download_i32`] of the first `words` i32 of TWO tensors at the same
+    /// barrier: two stream-ordered D2H copies on the active compute stream, then one wait on
+    /// that stream alone.  Needs an active stream.
+    pub fn slowlink_sync_download_i32_pair(
+        &mut self,
+        first: &GpuTensor,
+        second: &GpuTensor,
+        words: usize,
+    ) -> HipResult<(Vec<i32>, Vec<i32>)> {
+        self.bind_thread()?;
+        let bytes_len = words.checked_mul(4);
+        if bytes_len.is_none_or(|bytes| bytes > first.buf.size() || bytes > second.buf.size()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_sync_download_i32_pair: the span exceeds a tensor",
+            ));
+        }
+        let Some(stream) = self.active_stream.as_ref() else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slowlink_sync_download_i32_pair: the S1 count barrier needs the active compute stream",
+            ));
+        };
+        let mut a = vec![0i32; words];
+        let mut b = vec![0i32; words];
+        // SAFETY: each `Vec` owns `words * 4` initialized bytes, i32 has no padding, and the
+        // slices are used only for these copies, which complete at the stream wait below.
+        let (ab, bb) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a.as_mut_ptr() as *mut u8, words * 4),
+                std::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut u8, words * 4),
+            )
+        };
+        self.hip.memcpy_dtoh_async(ab, &first.buf, Some(stream))?;
+        self.hip.memcpy_dtoh_async(bb, &second.buf, Some(stream))?;
+        self.hip.stream_synchronize(stream)?;
+        self.take_device_wait_error()?;
+        Ok((a, b))
     }
 }
 
@@ -2734,9 +2882,12 @@ pub mod slowlink_selftest {
     use super::slowlink_panel_owns;
 
     const K: usize = 10;
-    const EXPERTS: usize = 512;
+    /// Dimensions of the default fixture ([`make_case`]); every model function reads the
+    /// case's own `h` and `n_exp`, so [`make_case_dims`] drives it at any hidden width and
+    /// expert count (the real artifact's 2560 / 512 included).
+    const DEFAULT_EXPERTS: usize = 512;
     const CLASSES: usize = 12;
-    const HIDDEN: usize = 24;
+    const DEFAULT_HIDDEN: usize = 24;
 
     pub struct Rng(pub u64);
     impl Rng {
@@ -2824,11 +2975,11 @@ pub mod slowlink_selftest {
         }
     }
 
-    fn distinct(rng: &mut Rng) -> [i32; K] {
+    fn distinct(rng: &mut Rng, n_exp: usize) -> [i32; K] {
         let mut ids = [0i32; K];
         let mut n = 0;
         while n < K {
-            let c = rng.below(EXPERTS) as i32;
+            let c = rng.below(n_exp) as i32;
             if !ids[..n].contains(&c) {
                 ids[n] = c;
                 n += 1;
@@ -2837,9 +2988,19 @@ pub mod slowlink_selftest {
         ids
     }
 
-    /// Every adversarial class, grouped the way the stable scatter groups (`(expert, slot)`
-    /// order, each expert padded to 16), with some valid ids whose grouped row is invalid.
+    /// [`make_case_dims`] at the default dimensions (24 columns, 512 experts).
     pub fn make_case(seed: u64, tokens_per_class: usize) -> Case {
+        make_case_dims(seed, tokens_per_class, DEFAULT_HIDDEN, DEFAULT_EXPERTS)
+    }
+
+    /// Every adversarial class, grouped the way the stable scatter groups (`(expert, slot)`
+    /// order, each expert padded to 16), with some valid ids whose grouped row is invalid, over
+    /// `hidden` columns and `n_exp >= K` experts.  The fixed ids of the classes are taken modulo
+    /// `n_exp` (identical at 512) and the out-of-range ones are relative to it.
+    pub fn make_case_dims(seed: u64, tokens_per_class: usize, hidden: usize, n_exp: usize) -> Case {
+        assert!(n_exp >= K && hidden > 0, "the fixture needs >= 10 experts");
+        let ne = n_exp as i32;
+        let at = |e: usize| (e % n_exp) as i32;
         let mut rng = Rng(seed | 1);
         let tokens = CLASSES * tokens_per_class;
         let mut topk = vec![0i32; tokens * K];
@@ -2849,18 +3010,29 @@ pub mod slowlink_selftest {
             let c = tok % CLASSES;
             class_of[tok] = c;
             let ids: [i32; K] = match c {
-                1 => [7; K],
-                2 => [5, 5, 9, 9, 9, 1, 1, 300, 300, 511],
-                3 => [-1, 512, 40, 1000, -7, 3, i32::MIN, i32::MAX, 17, 17],
+                1 => [at(7); K],
+                2 => [
+                    at(5),
+                    at(5),
+                    at(9),
+                    at(9),
+                    at(9),
+                    at(1),
+                    at(1),
+                    at(300),
+                    at(300),
+                    ne - 1,
+                ],
+                3 => [-1, ne, at(40), ne + 488, -7, at(3), i32::MIN, i32::MAX, at(17), at(17)],
                 4 => [-1; K],
                 5 => {
-                    let mut v = [if rng.below(2) == 0 { -1 } else { 600 }; K];
-                    v[rng.below(K)] = rng.below(EXPERTS) as i32;
+                    let mut v = [if rng.below(2) == 0 { -1 } else { ne + 88 }; K];
+                    v[rng.below(K)] = rng.below(n_exp) as i32;
                     v
                 }
-                8 => [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-                9 => [4, 4, 4, 100, 100, 200, 200, 200, 511, 0],
-                _ => distinct(&mut rng),
+                8 => [2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|e| at(e)),
+                9 => [4, 4, 4, 100, 100, 200, 200, 200, 511, 0].map(|e| at(e)),
+                _ => distinct(&mut rng, n_exp),
             };
             for r in 0..K {
                 topk[tok * K + r] = ids[r];
@@ -2868,31 +3040,31 @@ pub mod slowlink_selftest {
             }
         }
         // Stable grouping: (expert, flat slot), pad16 per expert.
-        let mut count = vec![0usize; EXPERTS];
+        let mut count = vec![0usize; n_exp];
         for &id in &topk {
-            if (0..EXPERTS as i32).contains(&id) {
+            if (0..ne).contains(&id) {
                 count[id as usize] += 1;
             }
         }
-        let mut start = vec![0usize; EXPERTS + 1];
-        for e in 0..EXPERTS {
+        let mut start = vec![0usize; n_exp + 1];
+        for e in 0..n_exp {
             start[e + 1] = start[e] + count[e].div_ceil(16) * 16;
         }
-        let g = start[EXPERTS].max(16);
-        let mut fill = vec![0usize; EXPERTS];
+        let g = start[n_exp].max(16);
+        let mut fill = vec![0usize; n_exp];
         let mut inv = vec![-1i32; tokens * K];
-        let mut down = vec![0u16; g * HIDDEN];
+        let mut down = vec![0u16; g * hidden];
         for slot in 0..tokens * K {
             let id = topk[slot];
-            if !(0..EXPERTS as i32).contains(&id) {
+            if !(0..ne).contains(&id) {
                 continue;
             }
             let e = id as usize;
             let row = start[e] + fill[e];
             fill[e] += 1;
             let c = class_of[slot / K];
-            for col in 0..HIDDEN {
-                down[row * HIDDEN + col] = palette(c, &mut rng);
+            for col in 0..hidden {
+                down[row * hidden + col] = palette(c, &mut rng);
             }
             // Class 10: most slots lose their grouped row but keep their (valid) id.
             inv[slot] = if c == 10 && rng.below(3) != 0 {
@@ -2901,7 +3073,7 @@ pub mod slowlink_selftest {
                 row as i32
             };
         }
-        let init = (0..tokens * HIDDEN)
+        let init = (0..tokens * hidden)
             .map(|i| match i % 5 {
                 0 => 0.0,
                 1 => -0.0,
@@ -2912,8 +3084,8 @@ pub mod slowlink_selftest {
             .collect();
         Case {
             tokens,
-            h: HIDDEN,
-            n_exp: EXPERTS,
+            h: hidden,
+            n_exp,
             g,
             start,
             down,
@@ -2991,7 +3163,7 @@ pub mod slowlink_selftest {
                     slowlink_panel_owns(
                         c.topk[base + r],
                         c.inv[base + r],
-                        EXPERTS,
+                        c.n_exp,
                         c.g,
                         row_base,
                         rows,
@@ -3005,13 +3177,13 @@ pub mod slowlink_selftest {
             for (_, r) in ents {
                 let row = c.inv[base + r];
                 let wt = rbf(c.w[base + r]);
-                for col in 0..HIDDEN {
+                for col in 0..c.h {
                     let y = if row >= 0 && (row as usize) < c.g {
-                        wd(c.down[row as usize * HIDDEN + col])
+                        wd(c.down[row as usize * c.h + col])
                     } else {
                         0.0
                     };
-                    let a = &mut acc[tok * HIDDEN + col];
+                    let a = &mut acc[tok * c.h + col];
                     *a = rbf(*a + rbf(rbf(y) * wt));
                 }
             }
@@ -3022,10 +3194,10 @@ pub mod slowlink_selftest {
     fn apply_pad(c: &Case, acc: &mut [f32]) {
         for tok in 0..c.tokens {
             let valid = (0..K)
-                .filter(|&r| (0..EXPERTS as i32).contains(&c.topk[tok * K + r]))
+                .filter(|&r| (0..c.n_exp as i32).contains(&c.topk[tok * K + r]))
                 .count();
-            for col in 0..HIDDEN {
-                let a = &mut acc[tok * HIDDEN + col];
+            for col in 0..c.h {
+                let a = &mut acc[tok * c.h + col];
                 for _ in valid..K {
                     *a = rbf(*a + rbf(0.0 * 0.0));
                 }
@@ -3039,7 +3211,7 @@ pub mod slowlink_selftest {
 
     /// Panels `[cuts[k], cuts[k+1])` of the window's rows with the ownership partition the
     /// scheduler builds: the last expert of each panel closes its range, the last panel
-    /// closes at `EXPERTS`.
+    /// closes at the case's expert count.
     fn panels(c: &Case, cuts: &[usize]) -> Vec<(usize, usize, (usize, usize))> {
         let mut out = Vec::new();
         let mut prev_hi = 0;
@@ -3047,7 +3219,7 @@ pub mod slowlink_selftest {
             let (lo, hi) = (win[0], win[1]);
             let last = k + 2 == cuts.len();
             let own_hi = if last {
-                EXPERTS
+                c.n_exp
             } else if hi > lo {
                 (expert_of_row(c, hi - 1) + 1).max(prev_hi)
             } else {
@@ -3104,7 +3276,7 @@ pub mod slowlink_selftest {
             out.push(cuts);
         }
         // Cuts exactly inside the heavy experts (7: all ten ranks x tokens; 5/9/300).
-        for e in [7usize, 5, 9, 300, 511] {
+        for e in [7usize, 5, 9, 300, 511].map(|e| e % c.n_exp) {
             let mid = (c.start[e] + c.start[e + 1]) / 2;
             let mut cuts = vec![0, c.start[e], mid, c.start[e + 1], c.g];
             cuts.sort();
@@ -3134,14 +3306,14 @@ pub mod slowlink_selftest {
             let mut rng = Rng(seed ^ 0x77);
             for cuts in partitions(&case, &mut rng) {
                 let ps = panels(&case, &cuts);
-                // The ownership ranges partition [0, EXPERTS) in panel order.
+                // The ownership ranges partition [0, n_exp) in panel order.
                 let mut next = 0;
                 for &(_, _, (lo, hi)) in &ps {
                     assert_eq!(lo, next, "ownership gap/overlap, cuts {cuts:?}");
                     assert!(hi >= lo);
                     next = hi;
                 }
-                assert_eq!(next, EXPERTS);
+                assert_eq!(next, case.n_exp);
                 for slot in 0..case.tokens * K {
                     let id = case.topk[slot];
                     let owners = ps
@@ -3150,7 +3322,7 @@ pub mod slowlink_selftest {
                             slowlink_panel_owns(
                                 id,
                                 case.inv[slot],
-                                EXPERTS,
+                                case.n_exp,
                                 case.g,
                                 base,
                                 rows,
@@ -3159,7 +3331,7 @@ pub mod slowlink_selftest {
                             )
                         })
                         .count();
-                    let valid = (0..EXPERTS as i32).contains(&id);
+                    let valid = (0..case.n_exp as i32).contains(&id);
                     assert_eq!(
                         owners,
                         usize::from(valid),
@@ -3219,8 +3391,8 @@ pub mod slowlink_selftest {
         case.w[4] = -1.0;
         let row = case.start[3];
         case.inv[4] = row as i32;
-        for col in 0..HIDDEN {
-            case.down[row * HIDDEN + col] = 0;
+        for col in 0..case.h {
+            case.down[row * case.h + col] = 0;
             case.init[col] = -0.0;
         }
         let want = canonical(&case);
@@ -3231,8 +3403,50 @@ pub mod slowlink_selftest {
             (0..=case.g / 16).map(|i| i * 16).collect(),
         ] {
             let got = run(&case, &cuts, true, true);
-            assert_eq!(diffs(&got[..HIDDEN], &want[..HIDDEN]), 0, "cuts {cuts:?}");
-            assert!(got[..HIDDEN].iter().all(|v| v.to_bits() == 0));
+            assert_eq!(diffs(&got[..case.h], &want[..case.h]), 0, "cuts {cuts:?}");
+            assert!(got[..case.h].iter().all(|v| v.to_bits() == 0));
+        }
+    }
+
+    /// The model reads each case's own hidden width and expert count: the canonical equality
+    /// and exactly-once ownership hold at a tiny shape, an odd expert count and the real
+    /// artifact's 2560 x 512 (a CPU model proof only; no GEMM or GPU claim).
+    #[test]
+    fn slowlink_combine_model_is_generic_over_hidden_width_and_expert_count() {
+        for (hidden, n_exp, per_class) in [(8usize, 16usize, 6usize), (64, 40, 5), (2560, 512, 2)] {
+            let case = make_case_dims(0xD1A5 ^ hidden as u64, per_class, hidden, n_exp);
+            assert_eq!((case.h, case.n_exp), (hidden, n_exp));
+            assert_eq!(case.down.len(), case.g * hidden);
+            assert_eq!(case.start.len(), n_exp + 1);
+            assert_eq!(case.init.len(), case.tokens * hidden);
+            let want = canonical(&case);
+            let mut rng = Rng(0x77 ^ hidden as u64);
+            for cuts in partitions(&case, &mut rng) {
+                let got = run(&case, &cuts, true, true);
+                assert_eq!(diffs(&got, &want), 0, "{hidden}x{n_exp}, cuts {cuts:?}");
+                let ps = panels(&case, &cuts);
+                assert_eq!(ps.last().map(|p| (p.2).1), Some(n_exp));
+                for slot in 0..case.tokens * K {
+                    let id = case.topk[slot];
+                    let owners = ps
+                        .iter()
+                        .filter(|&&(base, rows, (lo, hi))| {
+                            slowlink_panel_owns(
+                                id,
+                                case.inv[slot],
+                                case.n_exp,
+                                case.g,
+                                base,
+                                rows,
+                                lo,
+                                hi,
+                            )
+                        })
+                        .count();
+                    let valid = (0..n_exp as i32).contains(&id);
+                    assert_eq!(owners, usize::from(valid), "{hidden}x{n_exp} slot {slot}");
+                }
+            }
         }
     }
 

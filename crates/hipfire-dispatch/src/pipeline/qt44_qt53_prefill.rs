@@ -2919,29 +2919,67 @@ fn fp8_combine(
 
 // ───────────── S1 slow-link layer-major prefill hooks (`slowlink_prefill`) ─────────────
 
-/// Pre-mutation admission of one tile call into the S1 layer-major window: the sealed
-/// expert-slab route over a uniform MQ4 layer, the plain grouped tail (no EP, CPU
-/// split/splice, stage tables, routed-out partial or FP8), BF16-row combine arithmetic
-/// and a shared down after the combine.  Returns whether the tile runs the K2 grouped
-/// kernels (`true`) or is a K1 short-tail tile (`route_rows <= few_row_limit`, the
-/// lane-union GEMV arithmetic of the incumbent, run per expert binding by
-/// [`slowlink_k1_panel`]).  `Err` means the caller must stay on the incumbent route; nothing
-/// has been launched or written.
+/// Which lowering of the incumbent a tile call takes inside the S1 window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SlowlinkTile {
+    /// Sealed expert-slab K2: the grouped IU4 kernels (`route_rows > few_row_limit`).
+    SlabK2,
+    /// Sealed expert-slab K1 short tail: the lane-union GEMV, run per expert binding by
+    /// [`slowlink_k1_panel`].
+    SlabK1,
+    /// Aggregate stacked-expert QT44 gate/up + QT53 down (no slab) on the F16 WMMA grouped
+    /// route end to end: SwiGLU in the gate/up epilogue, BF16 grouped rows, the down's own
+    /// unscatter + 128-wide rotation, the BF16-input combine ([`wmma_tile_route`]).
+    AggregateWmma,
+    /// The same aggregate route below the WMMA row threshold: the incumbent's F32 grouped
+    /// (or, up to `few_row_limit` rows, F32-grouped gate/up + indexed down) arm.  Run per
+    /// expert binding by [`slowlink_f32_tail_panel`], through the incumbent's own stage
+    /// functions over the tile's route ids masked to the binding.
+    AggregateF32Tail,
+}
+
+/// Pre-mutation admission of one tile call into the S1 layer-major window: the plain grouped
+/// tail (no EP, CPU split/splice, stage tables, routed-out partial or FP8), BF16-row combine
+/// arithmetic and a shared down after the combine, over either
+///
+/// * the sealed expert-slab route on a uniform MQ4 layer ([`SlowlinkTile::SlabK2`] /
+///   [`SlowlinkTile::SlabK1`], the latter the incumbent's lane-union GEMV arithmetic for
+///   `route_rows <= few_row_limit`), or
+/// * the aggregate stacked-expert QT44/QT53 route (no slab declaration; the declared capability
+///   is `Qt44Qt53Grouped`/`Qt44Qt53GroupedSymmetric`, uniform dtypes, no per-expert tags) whose
+///   tile takes the F16 WMMA grouped arm ([`SlowlinkTile::AggregateWmma`]) or, below the WMMA row
+///   threshold, the F32 grouped arm ([`SlowlinkTile::AggregateF32Tail`]).  The symmetric IU4
+///   arm and path 1 have no panel lowering and are refused here.
+///
+/// `use_path2` is the call's own grouped-rows selection.  `Err` means the caller must stay on
+/// the incumbent route; nothing has been launched or written.
 pub(super) fn slowlink_admission(
     gpu: &Gpu,
     p: &MoePrefillParams<'_>,
-) -> Result<bool, DispatchError> {
+    use_path2: bool,
+) -> Result<SlowlinkTile, DispatchError> {
     use rdna_compute::slab_moe::SlabBuckets;
     let refuse = |why: &str| {
         Err(DispatchError::Hip(format!(
             "slowlink layer-major prefill: {why}; staying on the incumbent route"
         )))
     };
-    if is_fp8(p) || !is_slab(p) {
-        return refuse("not the sealed expert-slab route");
+    let slab = is_slab(p);
+    if is_fp8(p) {
+        return refuse("the FP8 grouped route has no panel lowering");
     }
-    if !super::slab_route::arch_supported(&gpu.arch) {
+    if slab && !super::slab_route::arch_supported(&gpu.arch) {
         return refuse("the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only");
+    }
+    if !slab
+        && !p.route_policy.is_some_and(|policy| {
+            matches!(
+                policy.capability,
+                MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
+            )
+        })
+    {
+        return refuse("the call declares neither the sealed expert-slab nor the aggregate QT44/QT53 route");
     }
     if !grouped_geometry(p) {
         return refuse("the declared grouped geometry is not admitted");
@@ -2969,7 +3007,32 @@ pub(super) fn slowlink_admission(
         || p.down_k % 128 != 0
         || (gpu.arch == "gfx1100" && p.down_k != 640)
     {
-        return refuse("the projection geometry is not the sealed slab geometry");
+        return refuse("the projection geometry is not the sealed grouped geometry");
+    }
+    if !slab {
+        if p.expert_dtype_tags.is_some() {
+            return refuse("the aggregate layer carries per-expert dtype tags");
+        }
+        if sym_iu4(gpu, p, use_path2) {
+            return refuse("the symmetric IU4 arm of the aggregate route has no panel lowering");
+        }
+        if wmma_tile_route(gpu, p, use_path2) {
+            return Ok(SlowlinkTile::AggregateWmma);
+        }
+        // The F32 grouped arms of path 2: neither WMMA predicate holds and the unscatter
+        // rotates the F32 rows itself (`unscatter_rotates`).  Anything else (path 1, a
+        // half-enabled WMMA arm) is not one of the arms this lowering reproduces.
+        if use_path2
+            && !gateup_bf16(gpu, p)
+            && !down_wmma(gpu, p)
+            && unscatter_rotates(gpu, p)
+        {
+            // The tile's own scratch must hold its F32 grouped arm: checked here, before any
+            // launch, by the incumbent's own validation.
+            validate_scratch(gpu, p, use_path2, p.m_total_max)?;
+            return Ok(SlowlinkTile::AggregateF32Tail);
+        }
+        return refuse("the aggregate tile takes an arm that has no panel lowering");
     }
     let layer = super::slab_route::layer(
         &gpu.arch,
@@ -2983,7 +3046,11 @@ pub(super) fn slowlink_admission(
     }
     // The recipe/dtype/geometry predicates of `slab_k2` hold, so it differs from a K1 call
     // only in the route rows.
-    Ok(slab_k2(gpu, p))
+    Ok(if slab_k2(gpu, p) {
+        SlowlinkTile::SlabK2
+    } else {
+        SlowlinkTile::SlabK1
+    })
 }
 
 /// One expert binding of the K1 short-tail cohort of one tile: the incumbent's K1 path (rotate,
@@ -3036,6 +3103,79 @@ pub(super) fn slowlink_k1_panel(
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))?;
     let rot = f32_view(p.rot_batch, 0, active);
     super::slab_route::k1_down(gpu, layer, ids, down_table, &rot, y0, p.batch_size)
+}
+
+/// The shared expert's activation of an aggregate F32-tail tile, run by the window's prepare
+/// step.  On the incumbent's F32 grouped arm the activation rides in the routed unscatter launch
+/// ([`shared_in_unscatter`]) and the prepare stage skips it; the window's routed tail runs the
+/// unscatter per expert binding on the tile's route ids masked to the binding, with no shared
+/// expert in it, so the activation is produced here, once, by the very launch the fused path
+/// folds in (`shared_expert_activation_bf16_f32`), exactly as [`shared_activation`] runs it when
+/// it is not fused.  Nothing to do when the prepare stage already produced it.
+pub(super) fn slowlink_tail_shared_activation(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
+    if !(use_path2 && shared_in_unscatter(gpu, p)) || shared_gu_pm(gpu, p, use_path2) {
+        return Ok(());
+    }
+    let shared = p
+        .prelude
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
+    let live = p.batch_size * shared.intermediate;
+    let (gate, up, rotated) = (
+        f32_view(shared.gate_out, 0, live),
+        f32_view(shared.up_out, 0, live),
+        f32_view(shared.rotated, 0, live),
+    );
+    hip(gpu.shared_expert_activation_bf16_f32(&gate, &up, &rotated, shared.scalar, p.batch_size))
+}
+
+/// One expert binding of an aggregate F32-tail tile: the incumbent's own routed tail for the
+/// tile (its stable-or-fused scatter, F32 grouped gate/up, unscatter + 128-wide rotation,
+/// down arm and combine, each the incumbent's own stage function over the tile's own call, so
+/// every kernel choice is the tile's) over the tile's route ids masked to the binding
+/// (`ids`, `-1` for an expert the binding does not hold: the scatter leaves such slots
+/// unrouted, the combine skips them) and the binding's GLOBAL-id pointer tables.  The combine
+/// accumulates in place into `target` (the tile's rows of the window accumulator); bindings run
+/// in ascending expert order, and both F32 combines pick ranks by ascending expert id and add no
+/// trailing zero products, so the in-place chain over bindings is the one-launch combine.  `p`
+/// is the tile's call with `x_norm_batch` and `topk_weights` restored by the caller; the shared
+/// expert is not part of it (its activation ran in [`slowlink_tail_shared_activation`], its down
+/// runs after, in the window's shared stage).
+pub(super) fn slowlink_f32_tail_panel(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    ids: &GpuTensor,
+    gate_up_table: &GpuTensor,
+    down_table: &GpuTensor,
+    target: &GpuTensor,
+) -> Result<(), DispatchError> {
+    if !use_path2 || wmma_tile_route(gpu, p, use_path2) || !unscatter_rotates(gpu, p) {
+        return Err(DispatchError::Hip(
+            "slowlink layer-major prefill: the F32 tail cohort tile is not an F32 grouped call"
+                .into(),
+        ));
+    }
+    let mut view: MoePrefillParams<'_> = *p;
+    view.topk_indices = ids;
+    view.expert_gate_up_ptrs = gate_up_table;
+    view.expert_down_ptrs = down_table;
+    view.x_batch = target;
+    view.routed_out = None;
+    view.prelude.shared = None;
+    let grouped_rows = p.m_total_max;
+    input_basis(gpu, &view, use_path2)?;
+    scatter(gpu, &view, grouped_rows)?;
+    gate_up(gpu, &view, use_path2, grouped_rows)?;
+    unscatter(gpu, &view, grouped_rows)?;
+    activation(gpu, &view, use_path2)?;
+    down(gpu, &view, use_path2, grouped_rows)?;
+    combine(gpu, &view, use_path2, grouped_rows, false)
 }
 
 /// The shared down of one tile, accumulating into `target` (the tile's rows of the

@@ -305,12 +305,16 @@ extern "C" __global__ __launch_bounds__(64) void slowlink_combine_panel(
 // The canonical kernel's terminal products, once per layer: every token adds
 // (10 - valid) +0 products (bf16(bf16(+0) * bf16(+0)) = +0) after its last
 // valid rank.  Only a -0 accumulator changes.  Same grid as the panel kernel.
+// A row whose first route id is SLOWLINK_ROW_DONE is a cohort row whose incumbent combine
+// (which adds no trailing products) already ran in place, per expert binding: it is skipped.
+#define SLOWLINK_ROW_DONE ((int)0x80808080)
 extern "C" __global__ __launch_bounds__(64) void slowlink_combine_pad(
     const int* __restrict__ topk, float* __restrict__ acc, int hidden, int tokens,
     int n_experts) {
     const int token = blockIdx.y;
     if (token >= tokens) return;
     const size_t rb = (size_t)token * 10;
+    if (topk[rb] == SLOWLINK_ROW_DONE) return;  // uniform per block
     int valid = 0;
 #pragma unroll
     for (int r = 0; r < 10; ++r) {
@@ -348,14 +352,41 @@ extern "C" __global__ __launch_bounds__(256) void slowlink_mask_ids(
     out[i] = (v >= lo && v < hi) ? v : -1;
 }
 
-// S1 single count barrier: fold the K1 short-tail cohort's per-expert slot counts into the
-// stable grouping's padded-count words (K2 padded count < 2^20 in the low bits, K1 slot
-// count in bits 20..30), so one 512-word readback carries both.  Integer atomic adds are
-// order-independent; ids outside [0, n_exp) are unrouted and add nothing.
+// S1 single count barrier: count the cohort (K1 short-tail / F32-tail / decode tiles) slots
+// per expert into the layout's cohort count words, read back beside the stable grouping's
+// padded counts at the one barrier.  Integer atomic adds are order-independent; ids outside
+// [0, n_exp) are unrouted and add nothing.
 extern "C" __global__ __launch_bounds__(256) void slowlink_fold_k1_counts(
     const int* __restrict__ ids, int* __restrict__ counts, int n, int n_exp) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int v = ids[i];
-    if (v >= 0 && v < n_exp) atomicAdd(&counts[v], 1 << 20);
+    if (v >= 0 && v < n_exp) atomicAdd(&counts[v], 1);
+}
+
+// S1 aggregate-route panel support: re-index one panel's grouped rows to a compact local slot
+// space, `local[i] = i` for a real row and -1 for a pad row, so the panel's unscatter/rotation
+// and down GEMM address a panel-sized F16 activation instead of one row per window slot.
+extern "C" __global__ __launch_bounds__(256) void slowlink_remap_sorted(
+    const int* __restrict__ sorted, int* __restrict__ local, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    local[i] = sorted[i] >= 0 ? i : -1;
+}
+
+// S1 aggregate-route K1 cohort: the aggregate lane-union GEMVs write EVERY slot's row (zero
+// for an id outside the launch's binding), so one binding's launch cannot own the shared
+// output.  Copy the rows of the slots whose id lies in [lo, hi) from the binding's scratch
+// `src` to the persistent `dst`; every other slot's row of `dst` is left untouched.
+// Grid (slots, ceil(width / 256)), block 256.
+extern "C" __global__ __launch_bounds__(256) void slowlink_merge_rows(
+    const float* __restrict__ src, float* __restrict__ dst, const int* __restrict__ ids,
+    int slots, int width, int lo, int hi) {
+    const int s = blockIdx.x;
+    if (s >= slots) return;
+    const int id = ids[s];
+    if (id < lo || id >= hi) return;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= width) return;
+    dst[(long long)s * width + j] = src[(long long)s * width + j];
 }
