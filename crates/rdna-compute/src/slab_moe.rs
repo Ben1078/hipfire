@@ -2181,9 +2181,14 @@ mod guarded_download_tests {
         let got = run(&log, Ok(()), None, Err(err("wait")));
         assert!(got.is_err());
         assert_eq!(*log.borrow(), ["enqueue-1", "join"]);
+        // Confirmed join: the buffer is handed to the caller (alive until the caller drops it),
+        // freed only afterwards.
         let log: Log = Rc::default();
-        assert!(run(&log, Ok(()), None, Ok(())).is_ok());
+        let ok = run(&log, Ok(()), None, Ok(()));
+        assert!(ok.is_ok());
         assert_eq!(*log.borrow(), ["enqueue-1", "join"]);
+        drop(ok);
+        assert_eq!(*log.borrow(), ["enqueue-1", "join", "drop"]);
     }
 }
 
