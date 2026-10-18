@@ -377,8 +377,7 @@ fn sym_iu4_rule(out: &mut Effective, unset: bool, ctx: &ArchCtx) {
         if unset {
             out.value = ConfigValue::Bool(false);
             out.by_arch_rule = true;
-            out.reason =
-                Some("unset: off on gfx1100 (default-OFF aggregate route; =1 opts in)".into());
+            out.reason = Some("unset: off on gfx1100".into());
         }
         return;
     }
@@ -866,7 +865,7 @@ mod tests {
         assert!(e.by_arch_rule);
         assert_eq!(
             e.reason.as_deref(),
-            Some("unset: off on gfx1100 (default-OFF aggregate route; =1 opts in)")
+            Some("unset: off on gfx1100")
         );
         assert_eq!(e.applies, Applies::ServeRestart);
         for arch in ["gfx1030", "gfx1101", "gfx942"] {
