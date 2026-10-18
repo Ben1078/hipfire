@@ -831,10 +831,8 @@ fn resolve_sources(
     if sources.is_empty() {
         return Err(Unusable::Arm);
     }
-    let mut codecs: Vec<(DType, DType)> = sources
-        .iter()
-        .flat_map(|source| source.codecs())
-        .collect();
+    let mut codecs: Vec<(DType, DType)> =
+        sources.iter().flat_map(|source| source.codecs()).collect();
     codecs.sort_unstable();
     codecs.dedup();
     Ok((sources, codecs))

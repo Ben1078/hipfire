@@ -279,9 +279,7 @@ pub(super) fn plan_entries(
 /// E8P bytes, an MQ4 slot the MQ4 bytes. The figure comes from the slot's plan
 /// format (the table the GPU views are built from), never from the CPU span
 /// ranges, the CPU quant, the arena allocation or one constant for the layer.
-pub(super) fn gpu_read_bytes(
-    plan: &crate::expert_arena::ExpertArenaLayer,
-) -> Vec<Option<u64>> {
+pub(super) fn gpu_read_bytes(plan: &crate::expert_arena::ExpertArenaLayer) -> Vec<Option<u64>> {
     plan.experts
         .iter()
         .map(|entry| {

@@ -767,10 +767,7 @@ impl ColdLayerSource {
     /// gate/up plus down bytes, resolved independently of its CPU codec and
     /// span lengths. `None` for a device-resident, absent or out-of-range expert or a
     /// codec with no CPU executor.
-    pub(crate) fn cold_probe(
-        &self,
-        expert: usize,
-    ) -> Option<crate::d2_default::ProbeExpert<'_>> {
+    pub(crate) fn cold_probe(&self, expert: usize) -> Option<crate::d2_default::ProbeExpert<'_>> {
         match (&self.codecs, &self.owner) {
             (ColdCodecs::Uniform(gate_up, down), owner) => owner
                 .payload(expert, *gate_up, *down)
