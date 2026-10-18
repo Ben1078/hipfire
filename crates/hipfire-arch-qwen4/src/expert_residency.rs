@@ -1974,7 +1974,7 @@ impl AutoReserve {
     /// byte for byte. An admitted S1 load reads the bottom-up census alone
     /// ([`Self::census_total`]): the historical floor is a stale measured
     /// formula (5,517,207,808 B at the 1,536-row tile against a 2,237,111,724 B
-    /// census) that would put the ten-layer floor out of reach, and the S1
+    /// census) that would put even the preferred ten resident layers out of reach, and the S1
     /// profile adds its own explicit terms and the safety margin on top
     /// ([`PlacementCharges`]); the Hold 1 gate verifies the measured peak
     /// against census + safety + allowance.
@@ -2017,7 +2017,10 @@ impl AutoReserve {
 }
 
 /// The largest trunk-layer count whose routed experts fit in `free_vram`
-/// after the non-expert weights and `reserve` ([`auto_vram_reserve`]).
+/// after the non-expert weights and `reserve` ([`auto_vram_reserve`]). The S1
+/// admission's [`crate::slowlink_admission::PlacementBudget::largest_fitting_layers`]
+/// calls it (once the base budget fits) so there is one largest-fit
+/// arithmetic; it has no layer floor, and zero is a valid answer.
 pub fn auto_vram_layers(
     free_vram: u64,
     non_expert_bytes: u64,
