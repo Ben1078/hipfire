@@ -89,6 +89,14 @@ pub const PANEL_MAX_GROUPED_ROWS: usize = 2048;
 /// entry snapshot is the incumbent's own). A request with more session cuts is a bypass.
 pub const S1_MAX_BOUNDARY_SNAPSHOTS: usize = 4;
 
+/// Generic occupancy budget charged on every admitted S1 profile before the
+/// 512 MiB safety margin: the UNATTRIBUTED load/runtime device occupancy the
+/// loaded model showed beyond every modelled census term (j1761: 847,209,812 B
+/// incremental after the pre-load baseline, 887,055,700 B in total). It is a
+/// conservative reservation, not a driver measurement and not an allocation:
+/// nothing allocates it, and no arch, card or host name selects it.
+pub const S1_RUNTIME_OVERHEAD_BYTES: u64 = 1 << 30;
+
 /// Byte alignment of every arena span and page region.
 pub const S1_ALIGN: u64 = 256;
 
@@ -754,6 +762,71 @@ pub fn group_scatter_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64,
     })
 }
 
+/// What an admitted S1 profile is for. The product charges nothing for
+/// diagnostics; the Hold 1 primitive self-tests charge their own peak INSIDE
+/// the admitted reserve ([`diagnostic_budget_bytes`]), so they are never
+/// allocated beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionPurpose {
+    Product,
+    PrimitiveSelftest,
+}
+
+/// Device bytes the primitive self-tests allocate beyond the tile call's own
+/// tensors, from the authoritative helpers (no copied constants): the
+/// transport's [`PanelPoolSpec::selftest_reserve`] total and the dispatch
+/// crate's per-case diagnostic peaks
+/// (`slowlink_prefill::selftest::diagnostic_bytes`) at the real geometry over
+/// an all-expert binding. The primitives run one at a time and each releases
+/// before the next begins (the transport's buffers are `hip.malloc`/`free`,
+/// not pool-resident), so the budget is the largest single primitive, never
+/// the sum. 0 for [`AdmissionPurpose::Product`].
+///
+/// [`PanelPoolSpec::selftest_reserve`]: crate::gpu_forward::panel_stage::PanelPoolSpec::selftest_reserve
+pub fn diagnostic_budget_bytes(
+    geometry: &ModelGeometry,
+    purpose: AdmissionPurpose,
+    gate_up_layer_bytes: u64,
+    down_layer_bytes: u64,
+) -> Result<u64, String> {
+    use hipfire_dispatch::pipeline::slowlink_prefill::selftest::{
+        diagnostic_bytes, DiagCase, DiagGeometry,
+    };
+    use hipfire_dispatch::pipeline::slowlink_prefill::PanelLimits;
+    if purpose == AdmissionPurpose::Product {
+        return Ok(0);
+    }
+    let pages = PanelPageLayout::new(geometry.num_experts, gate_up_layer_bytes, down_layer_bytes)?;
+    let transport = pages
+        .pool_spec()?
+        .selftest_reserve()
+        .ok_or_else(|| "slow-link prefill selftest reserve overflows".to_string())?;
+    let mut peak = u64::try_from(transport.total_device_bytes)
+        .map_err(|_| "slow-link prefill selftest reserve overflows".to_string())?;
+    let diag_geometry = DiagGeometry {
+        hidden: geometry.hidden,
+        n_exp: geometry.num_experts,
+        mi: geometry.moe_intermediate,
+        binding_experts: geometry.num_experts,
+        k1_rows: 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
+        shared_intermediate: geometry.shared_intermediate,
+    };
+    for case in [
+        DiagCase::CanonicalCombine,
+        DiagCase::WithinExpertCanary,
+        DiagCase::K1TailCohort,
+        DiagCase::ZeroRowPanel,
+        DiagCase::DecodeTailCohort,
+    ] {
+        let bytes = diagnostic_bytes(case, &diag_geometry, PanelLimits::S1)
+            .map_err(|error| error.to_string())?;
+        let device = u64::try_from(bytes.device_peak)
+            .map_err(|_| "slow-link prefill diagnostic bytes overflow".to_string())?;
+        peak = peak.max(device);
+    }
+    Ok(peak)
+}
+
 /// Everything the S1 profile costs beyond the incumbent's 1,536-row reserve,
 /// term by term. [`Self::total`] is the one number placement charges
 /// ([`crate::expert_residency::PlacementCharges::slowlink`]).
@@ -782,11 +855,30 @@ pub struct SlowlinkCensus {
     /// hidden copy. The entry snapshot is the incumbent's own snapshot arena,
     /// already in the base reserve, and is never charged again.
     pub boundary_state: u64,
+    /// BUDGET, not an allocation: [`S1_RUNTIME_OVERHEAD_BYTES`], the generic
+    /// unattributed load/runtime occupancy the S1 load observed beyond every
+    /// modelled term. Charged before the 512 MiB safety margin.
+    pub runtime_overhead: u64,
+    /// BUDGET: the Hold 1 primitive self-tests' own peak
+    /// ([`diagnostic_budget_bytes`]); 0 for the product purpose.
+    pub diagnostic: u64,
 }
 
 impl SlowlinkCensus {
-    /// Every term, named, in log order.
-    pub fn terms(&self) -> [(&'static str, u64); 7] {
+    /// Every term, named, in log order: the seven OWNED allocations, then the
+    /// two BUDGET terms ([`Self::owned_terms`], [`Self::budget_terms`]).
+    pub fn terms(&self) -> [(&'static str, u64); 9] {
+        let owned = self.owned_terms();
+        let budget = self.budget_terms();
+        [
+            owned[0], owned[1], owned[2], owned[3], owned[4], owned[5], owned[6], budget[0],
+            budget[1],
+        ]
+    }
+
+    /// The seven terms S1 itself allocates, each from the layout that is also
+    /// its allocation.
+    pub fn owned_terms(&self) -> [(&'static str, u64); 7] {
         [
             ("expert ring", self.ring),
             ("expert lookahead", self.lookahead),
@@ -798,15 +890,31 @@ impl SlowlinkCensus {
         ]
     }
 
-    /// Sum of every term, checked.
+    /// The two budget (reservation) terms: not allocations S1 makes, but
+    /// occupancy the placement must leave free.
+    pub fn budget_terms(&self) -> [(&'static str, u64); 2] {
+        [
+            ("runtime overhead budget", self.runtime_overhead),
+            ("diagnostic budget", self.diagnostic),
+        ]
+    }
+
+    fn sum(terms: &[(&'static str, u64)]) -> Result<u64, String> {
+        terms.iter().try_fold(0u64, |total, (name, bytes)| {
+            total
+                .checked_add(*bytes)
+                .ok_or_else(|| format!("slow-link prefill census overflows at '{name}'"))
+        })
+    }
+
+    /// Sum of the seven owned terms, checked.
+    pub fn owned_total(&self) -> Result<u64, String> {
+        Self::sum(&self.owned_terms())
+    }
+
+    /// Sum of every term, checked: the one number placement charges.
     pub fn total(&self) -> Result<u64, String> {
-        self.terms()
-            .into_iter()
-            .try_fold(0u64, |total, (name, bytes)| {
-                total
-                    .checked_add(bytes)
-                    .ok_or_else(|| format!("slow-link prefill census overflows at '{name}'"))
-            })
+        Self::sum(&self.terms())
     }
 
     /// `name MiB, ...` for the placement log.
@@ -847,6 +955,9 @@ pub struct AdmissionInputs {
     pub fixed_state_bytes: u64,
     /// Entry `pending` hidden copy of a native-MTP request (0 for AR).
     pub pending_save_bytes: u64,
+    /// The Hold 1 primitive self-tests' own peak device bytes
+    /// ([`diagnostic_budget_bytes`]); 0 for the product purpose.
+    pub diagnostic_bytes: u64,
     /// The incumbent's requested prefill chunk resolved at load: the non-S1
     /// checkpoint cadence (8192 on the narrow target). NEVER used for
     /// placement or scratch; those stay on the 1,536-row tile.
@@ -962,6 +1073,8 @@ pub fn census_of(
             "boundary state",
         )
         .and_then(|stages| checked_add(stages, inputs.pending_save_bytes, "boundary state"))?,
+        runtime_overhead: S1_RUNTIME_OVERHEAD_BYTES,
+        diagnostic: inputs.diagnostic_bytes,
     };
     Ok((pages, arena, census))
 }
@@ -1039,6 +1152,8 @@ pub struct LoadFacts<'a> {
     pub config: &'a Qwen4Config,
     pub weights: &'a [hipfire_runtime::weight_manifest::WeightEntry],
     pub bytes_of: &'a dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    /// What the admitted profile is for ([`AdmissionPurpose`]).
+    pub purpose: AdmissionPurpose,
     /// Free device bytes the placement is sized from.
     pub free: u64,
     /// [`crate::expert_residency::AutoReserve::census_total`] at
@@ -1114,6 +1229,15 @@ pub fn load_admission_inputs(
     } else {
         0
     };
+    // The Hold 1 primitive self-tests' own peak (0 for the product), from the
+    // authoritative transport and dispatch helpers.
+    let diagnostic_bytes = diagnostic_budget_bytes(
+        &geometry,
+        facts.purpose,
+        gate_up_layer_bytes,
+        down_layer_bytes,
+    )
+    .map_err(SlowlinkDecline::Geometry)?;
     Ok(AdmissionInputs {
         geometry,
         free: facts.free,
@@ -1126,6 +1250,7 @@ pub fn load_admission_inputs(
         baseline_layers,
         fixed_state_bytes,
         pending_save_bytes,
+        diagnostic_bytes,
         checkpoint_stride_rows: facts.checkpoint_stride_rows,
         window_rows: facts.window_rows,
         link_gbps,
@@ -1267,6 +1392,10 @@ pub struct SingleDeviceLoad<'a> {
     pub max_k: usize,
     pub state_format: crate::Qwen4StateFormat,
     pub scratch_mode: crate::gpu_forward::Qwen4ForwardScratchMode,
+    /// What the admitted profile is for: the product, or the Hold 1 primitive
+    /// self-tests (which charge their own diagnostic reserve inside the
+    /// admission, never beside it).
+    pub purpose: AdmissionPurpose,
 }
 
 /// Exact [`LoadFacts`] of a single-device discrete load: free device memory,
@@ -1302,6 +1431,7 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
     // Beta's single incumbent helper (probes the host link once, cached).
     let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
     Ok(LoadFacts {
+        purpose: load.purpose,
         config: load.config,
         weights: load.weights,
         bytes_of: load.bytes_of,
@@ -1459,6 +1589,7 @@ mod tests {
             baseline_layers: 10,
             fixed_state_bytes: 64 * MIB,
             pending_save_bytes: 4 * 2560 * 4,
+            diagnostic_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -1515,6 +1646,8 @@ mod tests {
             + arena.total_bytes
             + S1_MAX_BOUNDARY_SNAPSHOTS as u64 * inputs.fixed_state_bytes
             + inputs.pending_save_bytes
+            + S1_RUNTIME_OVERHEAD_BYTES
+            + inputs.diagnostic_bytes
     }
 
     /// Free VRAM that keeps exactly `layers` layers beside the S1 charge.
@@ -1931,7 +2064,7 @@ mod tests {
         let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
         let inputs = |base_reserve: u64| AdmissionInputs {
             geometry: ModelGeometry::from_config(&config).unwrap(),
-            free: 24 * GIB - 3 * GIB / 2,
+            free: 25_713_180_672,
             non_expert: 5_364_055_296,
             layer_expert_bytes: 1_336_934_400,
             gate_up_layer_bytes: GATE_UP_LAYER,
@@ -1941,6 +2074,7 @@ mod tests {
             baseline_layers: 0,
             fixed_state_bytes: stage,
             pending_save_bytes: 0,
+            diagnostic_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -1948,7 +2082,7 @@ mod tests {
         assert_eq!(GATE_UP_LAYER + DOWN_LAYER, 1_336_934_400);
         // The S1 extras on the real fixture (no MTP) and the safety margin.
         let (_, _, extras) = census_of(&inputs(0)).unwrap();
-        assert_eq!(extras.total().unwrap(), 2_543_092_544);
+        assert_eq!(extras.owned_total().unwrap(), 2_543_092_544);
         assert_eq!(
             crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
             536_870_912
@@ -1967,6 +2101,138 @@ mod tests {
             }
             other => panic!("the historical floor must be a deficit, got {other:?}"),
         }
+    }
+
+    /// The j1761 proof of the admission fix, on the measured inputs. The XTX
+    /// reported 25,713,180,672 B free before the load and 2,558,525,440 B after
+    /// it: the load used 887,055,700 B beyond the source weights and the tile
+    /// (847,209,812 B incremental to the 39,845,888 B pre-load baseline), which
+    /// no census term models. With `runtime_overhead` charged the admission
+    /// keeps exactly ten layers at tile 1,536 with 18 pages and the projected
+    /// free after the load, the S1 allocations and the self-test peak is at
+    /// least the 512 MiB safety margin; without it the same inputs admit
+    /// eleven layers and the projection is negative (the observed OOM).
+    #[test]
+    fn slowlink_residency_j1761_admission_keeps_ten_layers_and_projects_the_margin() {
+        use crate::expert_residency::{auto_vram_layers, AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        use rdna_compute::tensor_ops::QsaKvFormat;
+        const FREE_PRELOAD: u64 = 25_713_180_672;
+        const NON_EXPERT: u64 = 5_364_055_296;
+        const LAYER: u64 = 1_336_934_400;
+        const TILE_CENSUS: u64 = 2_237_111_724;
+        const LOAD_GAP_TOTAL: u64 = 887_055_700;
+        const LOAD_GAP_INCREMENTAL: u64 = 847_209_812;
+        const PRELOAD_USED: u64 = 39_845_888;
+        const MARGIN: u64 = 536_870_912;
+        assert_eq!(LOAD_GAP_TOTAL - PRELOAD_USED, LOAD_GAP_INCREMENTAL);
+        // The generic budget covers the whole unattributed load occupancy.
+        assert!(S1_RUNTIME_OVERHEAD_BYTES >= LOAD_GAP_TOTAL);
+        assert_eq!(
+            crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+            MARGIN
+        );
+
+        let config = crate::config::compact_test_config();
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+        workspace[0].1 = 47_559_944;
+        let reserve = AutoReserve::new(
+            Some(5_517_207_808),
+            ReserveCensus {
+                qsa_context: 281_149_440,
+                state: 68_514_080,
+                forward: 1_839_888_260,
+                f16_shadows: 0,
+                workspace,
+                qsa_selector: 0,
+                mtp: 0,
+                gather: 0,
+                runtime: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(reserve.census_total, TILE_CENSUS);
+        let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
+        let inputs = |diagnostic_bytes: u64| AdmissionInputs {
+            geometry: ModelGeometry::from_config(&config).unwrap(),
+            free: FREE_PRELOAD,
+            non_expert: NON_EXPERT,
+            layer_expert_bytes: LAYER,
+            gate_up_layer_bytes: GATE_UP_LAYER,
+            down_layer_bytes: DOWN_LAYER,
+            trunk_layers: config.num_hidden_layers,
+            base_reserve: reserve.placement_bytes(true),
+            baseline_layers: 0,
+            fixed_state_bytes: stage,
+            pending_save_bytes: 0,
+            diagnostic_bytes,
+            checkpoint_stride_rows: 8192,
+            window_rows: S1_WINDOW_ROWS,
+            link_gbps: 7.09,
+        };
+
+        // The self-test peak is the authoritative transport/dispatch figure.
+        let selftest = diagnostic_budget_bytes(
+            &ModelGeometry::from_config(&config).unwrap(),
+            AdmissionPurpose::PrimitiveSelftest,
+            GATE_UP_LAYER,
+            DOWN_LAYER,
+        )
+        .unwrap();
+        assert!(selftest >= 217_821_184, "at least the transport reserve");
+        assert_eq!(
+            diagnostic_budget_bytes(
+                &ModelGeometry::from_config(&config).unwrap(),
+                AdmissionPurpose::Product,
+                GATE_UP_LAYER,
+                DOWN_LAYER,
+            ),
+            Ok(0)
+        );
+
+        for (label, diagnostic) in [("product", 0u64), ("primitive selftest", selftest)] {
+            let profile = admit(&inputs(diagnostic))
+                .unwrap_or_else(|decline| panic!("{label} must admit: {decline}"));
+            assert_eq!(profile.resident_layers, 10, "{label}");
+            assert_eq!(profile.tile_rows, 1536, "{label}");
+            assert_eq!(profile.pages.total_pages(), 18, "{label}");
+            let owned = profile.census.owned_total().unwrap();
+            assert_eq!(owned, 2_543_092_544, "{label}");
+            assert_eq!(profile.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
+            assert_eq!(profile.census.diagnostic, diagnostic);
+            // Projected free after the load (weights, tile census and the whole
+            // observed unattributed gap), the S1 allocations and the self-test
+            // peak: at least the safety margin.
+            let resident = profile.resident_layers as u64 * LAYER;
+            let used = NON_EXPERT + resident + TILE_CENSUS + LOAD_GAP_TOTAL + owned + diagnostic;
+            let projected = FREE_PRELOAD.checked_sub(used).expect("fits the card");
+            assert!(
+                projected >= MARGIN,
+                "{label}: projected free {projected} B is below the {MARGIN} B margin"
+            );
+        }
+
+        // Without the generic budget the same inputs admit eleven layers and
+        // the projection is negative: the j1761 OOM, reproduced on the CPU.
+        let (_, _, census) = census_of(&inputs(0)).unwrap();
+        let without_budget = census.owned_total().unwrap();
+        let reserve_without = TILE_CENSUS + without_budget + MARGIN;
+        let layers_without = auto_vram_layers(FREE_PRELOAD, NON_EXPERT, LAYER, 48, reserve_without);
+        assert_eq!(layers_without, 11);
+        let used_without = NON_EXPERT
+            + layers_without as u64 * LAYER
+            + TILE_CENSUS
+            + LOAD_GAP_TOTAL
+            + without_budget;
+        assert!(
+            used_without > FREE_PRELOAD,
+            "eleven layers beside the observed gap exceed the card"
+        );
     }
 
     /// Every non-S1 load (the incumbent, fast links, unified memory, every
@@ -2075,12 +2341,13 @@ mod tests {
             baseline_layers: 0,
             fixed_state_bytes: stage,
             pending_save_bytes: 0,
+            diagnostic_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
         };
         let (pages, arena, census) = census_of(&inputs).unwrap();
-        let s1_total = census.total().unwrap();
+        let s1_total = census.owned_total().unwrap();
         // Route storage includes D's `k1_shared` (245,760 B): 386,070,784 B,
         // charged with A4 and the grouped-scatter scratch at 471,924,992 B.
         assert_eq!(s1_total, 2_543_092_544, "S1 layout, no MTP");
@@ -2093,7 +2360,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            mtp_census.total().unwrap(),
+            mtp_census.owned_total().unwrap(),
             2_543_133_504,
             "S1 layout, native MTP"
         );
@@ -2270,7 +2537,7 @@ mod tests {
         assert_eq!(profile.tile_rows, 1536);
         assert!(profile.tile_rows <= 1536);
         assert_eq!(profile.window_rows, 16384);
-        // Seven charged terms, every one itemised in log order.
+        // Seven owned terms then two budget terms, every one itemised in log order.
         let names: Vec<&str> = profile
             .census
             .terms()
@@ -2287,6 +2554,8 @@ mod tests {
                 "group scatter",
                 "HC arena",
                 "boundary state",
+                "runtime overhead budget",
+                "diagnostic budget",
             ]
         );
         assert!(profile.describe().contains("10 resident layers"));
