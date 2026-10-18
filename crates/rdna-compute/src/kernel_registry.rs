@@ -6971,7 +6971,7 @@ mod tests {
     /// (gfx1100, gfx1151), `__GFX12__` (gfx1201), `__gfx942__`, and the
     /// `QSA_HAS_*` capability macros the source defines from them. Covers the
     /// plain `extern "C" __global__` kernels and the QSA kernel macros.
-    fn tensor_ops_source_exports(arch: &str) -> std::collections::BTreeSet<String> {
+    fn source_exports(src: &str, arch: &str) -> std::collections::BTreeSet<String> {
         let mut defined: HashSet<String> = HashSet::new();
         match arch {
             "gfx1100" | "gfx1151" => {
@@ -6999,7 +6999,7 @@ mod tests {
                 defined.contains(name.trim()) != negate
             })
         };
-        let lines: Vec<&str> = crate::tensor_ops::TENSOR_OPS_SRC.lines().collect();
+        let lines: Vec<&str> = src.lines().collect();
         // (this branch is live, some branch of the group was taken)
         let mut stack: Vec<(bool, bool)> = Vec::new();
         let mut active_text = String::new();
@@ -7097,6 +7097,41 @@ mod tests {
             }
         }
         names
+    }
+
+    fn tensor_ops_source_exports(arch: &str) -> std::collections::BTreeSet<String> {
+        source_exports(crate::tensor_ops::TENSOR_OPS_SRC, arch)
+    }
+
+    /// S1 slow-link layer-major kernels (the panel/mask/combine wrappers of
+    /// `slab_moe.rs`, all in `moe_down_combine_grouped_top10.hip`) take the
+    /// same registry path as every other module: the module's index is the
+    /// source's export set on every qwen4 arch, and every kernel a
+    /// `slowlink_*` wrapper requests (read from the wrappers' own `FUNC`
+    /// constants, no allowlist here) is in it, so the official pack of each
+    /// arch carries them with no arch-specific gate. (S1 stays default-off;
+    /// the Flash-Next walked plans are open, so these load lazily from the
+    /// same index.)
+    #[test]
+    fn s1_d_kernels_are_in_the_packaged_index_of_every_qwen4_arch() {
+        use std::collections::BTreeSet;
+        let wrappers: BTreeSet<&str> = include_str!("slab_moe.rs")
+            .lines()
+            .filter_map(|line| {
+                line.trim().strip_prefix("const FUNC: &str = \"slowlink_")?.strip_suffix("\";")
+            })
+            .collect();
+        assert!(wrappers.len() >= 6, "{wrappers:?}");
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let entry = lookup(arch, "moe_down_combine_grouped_top10", "").unwrap();
+            let registered: BTreeSet<String> =
+                entry.symbols.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(registered, source_exports(entry.source(), arch), "{arch}");
+            for name in &wrappers {
+                let symbol = format!("slowlink_{name}");
+                assert!(registered.contains(&symbol), "{arch}: {symbol}");
+            }
+        }
     }
 
     const SEALED_J1778_GFX1100: &str =
