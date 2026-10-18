@@ -35,7 +35,7 @@ pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
 
 pub(crate) const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
-const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
+pub(crate) const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
@@ -44,10 +44,12 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` (on unless `0`) routes QSA prefill
 /// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
 /// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
-/// the F32 and q8 states, gfx1201 on the fp8 state.  Not bit-exact against the hg4
+/// the F32 and q8 states, gfx1201 on the fp8 state, gfx1100 on the q8 state of
+/// 24/2-head layers only and opt-in (`HIPFIRE_FN_QSA_GATHER_GFX1100=1`).  Not
+/// bit-exact against the hg4
 /// kernel; admitted because its error against an f64 reference is no worse
 /// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
-/// route.  Read once.
+/// route on every arch (hard kill).  Read once.
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
@@ -61,8 +63,9 @@ static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> =
 /// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
 /// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
 /// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
-/// JIT source, on every gathered-route arch (gfx1151, gfx1201).  `0` keeps the
-/// hipcc kernels.  Read once.
+/// JIT source, on every gathered-route arch (gfx1151, gfx1201; gfx1100 runs the
+/// PM attention only, behind the hipcc Q8 converter).  `0` keeps the hipcc
+/// kernels.  Read once.
 static QWEN4_QSA_PM: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true));
 /// Persistent per-QSA-layer F16 K/V for exact gfx1151 F32-state prefill.
@@ -8342,6 +8345,9 @@ pub fn indexed_attention_attention_batch_exact(
 
 /// The gathered route's launches for `p` on the hipcc kernels or, with `pm`,
 /// the builder module (`HIPFIRE_QWEN4_QSA_PM`), whatever the route flags say.
+/// On gfx1100 (certified attention only) `pm` runs the PM attention behind the
+/// hipcc Q8 converter, `!pm` the hipcc attention (its byte oracle); any
+/// non-Q8 format errors there.
 /// Byte-equality and timing harness only (`examples/qsa_pm_check.rs`).
 #[cfg(any(test, feature = "lab"))]
 #[doc(hidden)]
@@ -9702,16 +9708,31 @@ const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 
 /// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` (read
 /// first, so with it `0` nothing else is consulted), the Qwen4 F16 route not opted
 /// out, and an arch with a kernel for the state format (gfx1151: F32 and
-/// q8, gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
+/// q8, gfx1201: fp8, gfx1100: q8 only and opt-in via
+/// `HIPFIRE_FN_QSA_GATHER_GFX1100`, see [`qsa_gathered_format_enabled`]).
+/// Loaders use it to reserve and account the route's scratch.
 pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
     *QWEN4_QSA_WMMA_GATHER
         && *crate::gemm::QWEN4_F16_WMMA
-        && match format {
-            QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
-            QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
-            QsaKvFormat::Q8 => gpu.arch_caps.is_gfx1151(),
-            QsaKvFormat::Fp8Fnuz => false,
+        && qsa_gathered_format_enabled(&gpu.arch_caps, &gpu.flags, format)
+}
+
+/// The capability/flag half of [`qsa_gathered_wmma_enabled`]: no process
+/// statics, so it is testable without a device.
+fn qsa_gathered_format_enabled(
+    caps: &crate::arch_caps::ArchCaps,
+    flags: &crate::feature_flags::FeatureFlags,
+    format: QsaKvFormat,
+) -> bool {
+    match format {
+        QsaKvFormat::F32 => caps.is_gfx1151(),
+        QsaKvFormat::Fp8 => caps.is_gfx1201(),
+        QsaKvFormat::Q8 => {
+            caps.is_gfx1151()
+                || (caps.has_qsa_gather_q8_attend_pm() && flags.fn_qsa_gather_gfx1100_enabled())
         }
+        QsaKvFormat::Fp8Fnuz => false,
+    }
 }
 
 /// Bytes of the gathered route's F16 workspace a forward ending at `tokens`
@@ -9801,7 +9822,8 @@ pub fn reserve_qsa_gathered_wmma_scratch(
 /// Whether the gathered F16 WMMA attention applies (checked after the dense
 /// route): the route is enabled for the state format
 /// ([`qsa_gathered_wmma_enabled`]), >= QWEN4_F16_WMMA_MIN_TOKENS rows, no
-/// recorder or capture, head_dim 256 with at most 16 query heads per KV head,
+/// recorder or capture, head_dim 256 with at most 16 query heads per KV head
+/// (gfx1100: exactly the Q8 24/2-head shape, [`qsa_gathered_gfx1100_shape`]),
 /// and a token list that fits the LDS budget.  With
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every launch is the incumbent's.
 fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
@@ -9811,8 +9833,23 @@ fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) 
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
         && p.n_heads / p.n_kv_heads <= 16
+        && (!gpu.arch_caps.has_qsa_gather_q8_attend_pm()
+            || (qsa_gathered_gfx1100_shape(p.format, p.head_dim, p.n_heads, p.n_kv_heads)
+                && qsa_gathered_pm_fits(p)))
         && p.capacity.div_ceil(128) * 128 * 4 + QSA_GATHERED_STATIC_LDS_BYTES
             <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+}
+
+/// The one shape the certified gfx1100 gathered attention covers: Q8 cache,
+/// head dimension 256, 24 query / 2 KV heads (group 12). Anything else keeps
+/// the incumbent (the module has no other format or group size).
+fn qsa_gathered_gfx1100_shape(
+    format: QsaKvFormat,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+) -> bool {
+    format == QsaKvFormat::Q8 && head_dim == 256 && n_heads == 24 && n_kv_heads == 2
 }
 
 /// QSA attention over each row's selection in F16 WMMA
@@ -9877,10 +9914,25 @@ fn qsa_gathered_wmma_launch_with(
     const GFX1151: &str = "indexed_attention_gathered_wmma";
     const GFX1201: &str = "indexed_attention_gathered_wmma_gfx1201";
     const PM_GFX1151: &str = "qsa_gather_pm_gfx1151";
+    const PM_GFX1100: &str = "qsa_gather_pm_gfx1100";
     const PM_GFX1201: &str = "qsa_gather_pm_gfx1201";
     let hip = |module, src, kernel| -> Code { (module, Ok(src), kernel) };
     let built = |module, image, kernel| -> Code { (module, Err(image), kernel) };
-    let attend_gfx1151 = if pm {
+    // The attend is chosen once, by capability. gfx1100 carries the certified
+    // PeaceMaker attention only (no PM converter exists for any format, and the
+    // gfx1151 image must never run there): Q8 with the hipcc converter. `!pm`
+    // keeps the hipcc gfx1151-source attend (the PM/hipcc oracle relationship).
+    let pm_gfx1100 = gpu.arch_caps.has_qsa_gather_q8_attend_pm();
+    if pm_gfx1100 && p.format != QsaKvFormat::Q8 {
+        return Err(HipError::new(0, "gfx1100 QSA gathered route requires a Q8 cache"));
+    }
+    let attend = if pm && pm_gfx1100 {
+        built(
+            PM_GFX1100,
+            crate::kernels::QSA_GATHER_PM_GFX1100,
+            "indexed_attention_gathered_wmma_f16_pm_gfx1100",
+        )
+    } else if pm {
         built(
             PM_GFX1151,
             crate::kernels::QSA_GATHER_PM_GFX1151,
@@ -9900,7 +9952,7 @@ fn qsa_gathered_wmma_launch_with(
                 INDEXED_ATTENTION_GATHERED_WMMA_SRC,
                 "indexed_attention_kv_f16vb",
             ),
-            attend_gfx1151,
+            attend,
         ),
         (QsaKvFormat::F32, true) => (
             built(
@@ -9908,7 +9960,7 @@ fn qsa_gathered_wmma_launch_with(
                 crate::kernels::QSA_GATHER_PM_GFX1151,
                 "indexed_attention_kv_f16vb_pm_gfx1151",
             ),
-            attend_gfx1151,
+            attend,
         ),
         (QsaKvFormat::Q8, _) => (
             hip(
@@ -9916,7 +9968,7 @@ fn qsa_gathered_wmma_launch_with(
                 INDEXED_ATTENTION_GATHERED_WMMA_SRC,
                 "indexed_attention_kv_f16vb_q8",
             ),
-            attend_gfx1151,
+            attend,
         ),
         (QsaKvFormat::Fp8, false) => (
             hip(
@@ -10559,6 +10611,60 @@ mod tests {
             qsa_decode_attention_policy_with(&flags, &caps, QsaKvFormat::F32, 256, 24, 2, usize::MAX / 4, true),
             per_head
         );
+    }
+
+    /// The gfx1100 Q8 gathered attention is opt-in: off by default, on with
+    /// the flag, off with `=0`; F32/Fp8 never. gfx1151/gfx1201 are unchanged
+    /// and ignore the gfx1100 flag.
+    #[test]
+    fn qsa_gathered_format_gate_gfx1100_is_opt_in_q8_only() {
+        let enabled = |arch: &str, flag: Option<bool>, format| {
+            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+            flags.fn_qsa_gather_gfx1100 = flag;
+            let flags = std::sync::Arc::new(flags);
+            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+            qsa_gathered_format_enabled(&caps, &flags, format)
+        };
+        use QsaKvFormat::{Fp8, Fp8Fnuz, Q8, F32};
+        assert_eq!(
+            enabled("gfx1100", None, Q8),
+            crate::feature_flags::FN_QSA_GATHER_GFX1100_DEFAULT
+        );
+        assert!(!enabled("gfx1100", None, Q8));
+        assert!(enabled("gfx1100", Some(true), Q8));
+        assert!(!enabled("gfx1100", Some(false), Q8));
+        for format in [F32, Fp8, Fp8Fnuz] {
+            for flag in [None, Some(true), Some(false)] {
+                assert!(!enabled("gfx1100", flag, format), "{format:?} {flag:?}");
+            }
+        }
+        // The other gathered archs ignore the gfx1100 flag.
+        for flag in [None, Some(true), Some(false)] {
+            assert!(enabled("gfx1151", flag, F32));
+            assert!(enabled("gfx1151", flag, Q8));
+            assert!(!enabled("gfx1151", flag, Fp8));
+            assert!(enabled("gfx1201", flag, Fp8));
+            assert!(!enabled("gfx1201", flag, Q8));
+            assert!(!enabled("gfx1201", flag, F32));
+            assert!(!enabled("gfx1101", flag, Q8));
+            assert!(!enabled("gfx1151", flag, Fp8Fnuz));
+        }
+    }
+
+    #[test]
+    fn qsa_gathered_gfx1100_shape_is_q8_24_2_256_only() {
+        use QsaKvFormat::{Fp8, Q8, F32};
+        assert!(qsa_gathered_gfx1100_shape(Q8, 256, 24, 2));
+        assert!(!qsa_gathered_gfx1100_shape(Q8, 256, 24, 4));
+        assert!(!qsa_gathered_gfx1100_shape(Q8, 256, 32, 2));
+        assert!(!qsa_gathered_gfx1100_shape(Q8, 256, 16, 2));
+        assert!(!qsa_gathered_gfx1100_shape(Q8, 128, 24, 2));
+        assert!(!qsa_gathered_gfx1100_shape(F32, 256, 24, 2));
+        assert!(!qsa_gathered_gfx1100_shape(Fp8, 256, 24, 2));
+        // PM descriptor bound: 24/2 at a sane capacity fits, an offset past
+        // the 32-bit raw-buffer range does not.
+        assert!(qsa_gathered_pm_shape_fits(1 << 20, 2, 24));
+        assert!(!qsa_gathered_pm_shape_fits(3_000_000, 2, 24));
     }
 
     #[test]

@@ -69,6 +69,7 @@ pub struct ArchCaps {
     has_hfq3_mmq: bool,
     has_hfq4_mmq: bool,
     has_cdna3_lds_gemv: bool,
+    has_qsa_gather_q8_attend_pm: bool,
 
     // ── Env-overridable tuning parameters ─────────────────────────
     gemv_dp4a: bool,
@@ -159,6 +160,7 @@ impl ArchCaps {
         let has_hfq3_mmq = flags.hfq3_mmq.unwrap_or(true) && has_hfq3_sdot4;
         let has_hfq4_mmq = flags.hfq4_mmq_rdna2.unwrap_or(true) && has_hfq3_sdot4;
         let has_cdna3_lds_gemv = flags.gfx942_lds_gemv.unwrap_or(false);
+        let has_qsa_gather_q8_attend_pm = is_gfx1100;
 
         // Tuning parameters
         let gemv_dp4a = flags.gemv_dp4a.unwrap_or(is_gfx906);
@@ -217,6 +219,7 @@ impl ArchCaps {
             has_hfq3_mmq,
             has_hfq4_mmq,
             has_cdna3_lds_gemv,
+            has_qsa_gather_q8_attend_pm,
             gemv_dp4a,
             gemv_prefetch,
             gemv_rows_default,
@@ -500,6 +503,14 @@ impl ArchCaps {
     pub fn has_cdna3_lds_gemv(&self) -> bool {
         self.has_cdna3_lds_gemv
     }
+    /// The certified PeaceMaker gathered QSA module of this architecture
+    /// (`kernels::QSA_GATHER_PM_GFX1100`) carries the attention only; the Q8 cache
+    /// converter stays the hipcc `indexed_attention_kv_f16vb_q8`. Hardware/module
+    /// capability (exact gfx1100) and independent of any env override; the
+    /// opt-in is `FeatureFlags::fn_qsa_gather_gfx1100_enabled`.
+    pub fn has_qsa_gather_q8_attend_pm(&self) -> bool {
+        self.has_qsa_gather_q8_attend_pm
+    }
     pub fn gemv_dp4a_enabled(&self) -> bool {
         self.gemv_dp4a
     }
@@ -734,6 +745,21 @@ mod tests {
         }
         assert!(!make_caps("gfx906").has_dot2_f32_f16());
         assert!(!make_caps("gfx1010").has_dot2_f32_f16());
+    }
+
+    #[test]
+    fn qsa_gather_q8_attend_pm_is_exact_gfx1100() {
+        for arch in [
+            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201", "gfx940", "gfx941", "gfx942",
+        ] {
+            assert_eq!(
+                make_caps(arch).has_qsa_gather_q8_attend_pm(),
+                arch == "gfx1100",
+                "{arch}"
+            );
+        }
     }
 
     #[test]

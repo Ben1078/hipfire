@@ -3,10 +3,21 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder-emitted QSA gathered F16 WMMA prefill attention (the gfx1151 /
-//! gfx1201 default `HIPFIRE_QWEN4_QSA_WMMA_GATHER` route), default on
-//! (`HIPFIRE_QWEN4_QSA_PM=0` opts out). Two symbols per arch, with the ABI, grid,
-//! block, LDS layout and output bytes of the hipcc twins in
-//! `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`:
+//! gfx1201 default `HIPFIRE_QWEN4_QSA_WMMA_GATHER` route, default on;
+//! `HIPFIRE_QWEN4_QSA_PM=0` opts out), and the gfx1100 production opt-in
+//! attention (Q8 cache, 24/2 heads; `HIPFIRE_FN_QSA_GATHER_GFX1100=1`, default
+//! off while qualified). Two symbols per gfx1151 / gfx1201 module, the
+//! attention alone in the gfx1100 module, with the ABI, grid, block, LDS layout
+//! and output bytes of the hipcc twins in
+//! `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`
+//! (the gfx1100 module is checked against that same source compiled for gfx1100):
+//!
+//! gfx1100 is the gfx11 attention of gfx1151 on the typed `Gfx1100` target: the
+//! same builder program, with gfx1100's VALU TRANS-use hazard waits inserted by
+//! the builder and ELF machine `gfx1100`. Its F16 K/V producer is NOT emitted: the
+//! Q8 converter stays the
+//! hipcc `indexed_attention_kv_f16vb_q8`, whose F16 K / block-transposed V
+//! layout this attention consumes.
 //!
 //! - convert (`indexed_attention_kv_f16vb[_fp8]`): grid `[tokens, kv_heads]`,
 //!   block 256; cache row `tok` as F16 K `[tok][kv_heads*256]` and
@@ -44,13 +55,14 @@
 //! probabilities and sums retired).
 use super::common::{add64, lit, mem, op, s, s_add_i32, s_add_u32, s_addc_u32, smem, sop, sr, srd_tail, v, vr};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, insn::{Instruction, MemoryClass}, ledger::Counter, reg::{Live, RegRef}};
-use peacemaker_author::{End, Gfx1151, Gfx1201, LdsRegion, Free, Published, Target, Wave, WgUniform, Scc, Workgroup, ready, retire};
+use peacemaker_author::{End, Gfx1100, Gfx1151, Gfx1201, LdsRegion, Free, Published, Target, Wave, WgUniform, Scc, Workgroup, ready, retire};
 
 type Wg<'b, T> = Workgroup<'b, T, Builder>;
 
 macro_rules! on_target {
     ($arch:expr, $b:expr, $body:ident($($arg:expr),*)) => {
         match $arch {
+            Arch::Gfx1100 => $body(&mut Workgroup::<Gfx1100, Builder>::new($b)?, $($arg),*),
             Arch::Gfx1151 => $body(&mut Workgroup::<Gfx1151, Builder>::new($b)?, $($arg),*),
             Arch::Gfx1201 => $body(&mut Workgroup::<Gfx1201, Builder>::new($b)?, $($arg),*),
             a => Err(format!("qsa_gather: no typed target for {}", a.name())),
@@ -79,6 +91,10 @@ pub const MAX_BYTES: u64 = 1 << 31;
 pub enum Kind { Convert, Attend }
 impl Kind {
     pub const ALL: [Kind; 2] = [Kind::Convert, Kind::Attend];
+    /// The symbols a module of `arch` carries: gfx1100 the attention only.
+    pub fn for_arch(arch: Arch) -> &'static [Kind] {
+        if arch == Arch::Gfx1100 { &[Kind::Attend] } else { &Self::ALL }
+    }
     pub fn tag(self) -> &'static str { match self { Self::Convert => "convert", Self::Attend => "attend" } }
 }
 
@@ -94,7 +110,11 @@ impl Spec {
     }
     pub fn module(arch: Arch) -> String { format!("qsa_gather_pm_{}", arch.name()) }
     pub fn validate(self) -> Result<(), String> {
-        if matches!(self.arch, Arch::Gfx1151 | Arch::Gfx1201) { Ok(()) } else { Err("qsa_gather: built for gfx1151 and gfx1201 only".into()) }
+        match (self.arch, self.kind) {
+            (Arch::Gfx1151 | Arch::Gfx1201, _) | (Arch::Gfx1100, Kind::Attend) => Ok(()),
+            (Arch::Gfx1100, Kind::Convert) => Err("qsa_gather: gfx1100 builds the attention only; its Q8 K/V converter is the hipcc indexed_attention_kv_f16vb_fp8 kernel".into()),
+            (arch, _) => Err(format!("qsa_gather: built for gfx1100 (attention), gfx1151 and gfx1201 only, not {}", arch.name())),
+        }
     }
     pub fn kernargs(self) -> KernargLayout {
         match self.kind {
@@ -130,9 +150,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     b.finish()
 }
 
-/// Both symbols of `arch` as one module.
+/// Every symbol of `arch` (`Kind::for_arch`) as one module.
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = Kind::ALL.into_iter().map(|kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
+    let emitted = Kind::for_arch(arch).iter().map(|&kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
     Ok((emitted, text, proof))
 }

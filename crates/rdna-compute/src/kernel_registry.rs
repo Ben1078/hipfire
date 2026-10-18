@@ -393,6 +393,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
             ["kv_cache_write_asym3_q8_pair_gfx1100"]
         );
+        // gfx1100 gathered QSA attention (opt-in HIPFIRE_FN_QSA_GATHER_GFX1100): the hipcc
+        // Q8 converter and the hipcc oracle attend (HIPFIRE_QWEN4_QSA_PM=0) that
+        // tensor_ops.rs qsa_gathered_wmma_launch_with ensures by this module name and
+        // source. The certified PM attend is embedded in the binary (no pack entry).
+        add!(
+            "indexed_attention_gathered_wmma",
+            crate::tensor_ops::INDEXED_ATTENTION_GATHERED_WMMA_SRC,
+            [
+                "indexed_attention_kv_f16vb_q8",
+                "indexed_attention_gathered_wmma_f16"
+            ]
+        );
     }
     if matches!(arch, "gfx906" | "gfx942") {
         add!(
