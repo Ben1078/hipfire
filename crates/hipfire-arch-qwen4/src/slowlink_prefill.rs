@@ -5318,17 +5318,27 @@ mod slowlink_prompt {
                 [vec![768; 21], vec![256]].concat(),
                 "{route:?}: 21 native 768-row tiles then the final 256-row tile"
             );
-            assert_eq!(plan.windows.len(), 1, "{route:?}: one full 16,384-row window");
+            assert_eq!(
+                plan.windows.len(),
+                1,
+                "{route:?}: one full 16,384-row window"
+            );
             assert_eq!(plan.windows[0].rows, 16384);
             // 768 rows is at or above the WMMA minimum: BF16 streams, K2.
             for tile in &plan.tiles[..21] {
                 assert!(tile.routing.bf16_streams, "{route:?}");
-                assert_eq!(tile_cohort(route, tile.routing.route_rows, 8), TileCohort::K2);
+                assert_eq!(
+                    tile_cohort(route, tile.routing.route_rows, 8),
+                    TileCohort::K2
+                );
             }
             // 256 rows is below it: an F32-stream tile.
             let last = plan.tiles.last().unwrap();
             assert_eq!(last.rows, 256);
-            assert!(!last.routing.bf16_streams, "{route:?}: the final tile is F32");
+            assert!(
+                !last.routing.bf16_streams,
+                "{route:?}: the final tile is F32"
+            );
             let window = &plan.windows[0];
             match route {
                 dsp::WindowRoute::Aggregate => {
@@ -5388,8 +5398,14 @@ mod slowlink_prompt {
             assert!(product.arena.total_bytes < counterfactual.arena.total_bytes);
             // Window-sized owners do not depend on the tile.
             for actual in [&product, &primitive] {
-                assert_eq!(actual.census.route_storage, counterfactual.census.route_storage);
-                assert_eq!(actual.census.group_scatter, counterfactual.census.group_scatter);
+                assert_eq!(
+                    actual.census.route_storage,
+                    counterfactual.census.route_storage
+                );
+                assert_eq!(
+                    actual.census.group_scatter,
+                    counterfactual.census.group_scatter
+                );
                 assert_eq!(actual.census.a4_sidecars, counterfactual.census.a4_sidecars);
                 assert_eq!(actual.window_rows, counterfactual.window_rows);
             }
@@ -5407,7 +5423,11 @@ mod slowlink_prompt {
                     .unwrap()
                     .expect("the mandatory boundary request plans");
                 assert_chronology(&plan);
-                assert_eq!(plan.windows.len(), 2, "{route:?}: the fifth cut ends window one");
+                assert_eq!(
+                    plan.windows.len(),
+                    2,
+                    "{route:?}: the fifth cut ends window one"
+                );
                 assert_eq!(plan.windows[0].end_position(), 8192);
                 assert_eq!(plan.windows[0].cuts, vec![3, 4, 1536, 1537]);
                 assert_eq!(plan.windows[1].position, 8192);

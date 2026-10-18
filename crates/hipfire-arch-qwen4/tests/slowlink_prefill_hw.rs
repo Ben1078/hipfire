@@ -128,14 +128,7 @@ fn load(purpose: Purpose) -> Hw {
         resident_layers,
         placement,
         ..
-    } = slowlink_load_bundle(
-        &mut gpu,
-        &model,
-        MAX_SEQ,
-        None,
-        purpose,
-    )
-    .expect("load");
+    } = slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, None, purpose).expect("load");
     assert!(
         slowlink_profile && resident_layers >= MIN_RESIDENT_LAYERS as usize,
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
@@ -146,7 +139,10 @@ fn load(purpose: Purpose) -> Hw {
         let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
         (profile.purpose, profile.tile_rows as u64)
     };
-    assert_eq!(admitted_purpose, purpose, "the load admitted another purpose");
+    assert_eq!(
+        admitted_purpose, purpose,
+        "the load admitted another purpose"
+    );
     assert_eq!(
         tile,
         hipfire_arch_qwen4::slowlink_admission::purpose_tile_rows(purpose) as u64,

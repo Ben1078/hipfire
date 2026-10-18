@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::code_object::CodeObjectRegistry;
 use std::process::Command;
-use std::thread;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 struct PreparedModule {
     name: String,
@@ -165,8 +165,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn valid_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,7 +522,13 @@ fn probe_device_compiler() -> DeviceCompilerProbe {
                 .to_string()
         })
         .unwrap_or_default();
-    DeviceCompilerProbe { hipcc_bin, rocm_env_root, has_hipcc, toolchain_id, disabled }
+    DeviceCompilerProbe {
+        hipcc_bin,
+        rocm_env_root,
+        has_hipcc,
+        toolchain_id,
+        disabled,
+    }
 }
 
 impl KernelCompiler {
@@ -623,7 +628,13 @@ impl KernelCompiler {
                  pre-compiled blobs will be used verbatim"
             );
         }
-        let DeviceCompilerProbe { hipcc_bin, rocm_env_root, has_hipcc, toolchain_id, .. } = probe;
+        let DeviceCompilerProbe {
+            hipcc_bin,
+            rocm_env_root,
+            has_hipcc,
+            toolchain_id,
+            ..
+        } = probe;
 
         let gfx1151_cumode_modules = if arch == "gfx1151" {
             hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
@@ -786,8 +797,16 @@ impl KernelCompiler {
         assembler_identity: &str,
     ) -> String {
         Self::hash_parts(
-            source, arch, "", &[], "", SchedulerProfile::Default,
-            "custom-isa", builder_version, kernel_id_variant, assembler_identity,
+            source,
+            arch,
+            "",
+            &[],
+            "",
+            SchedulerProfile::Default,
+            "custom-isa",
+            builder_version,
+            kernel_id_variant,
+            assembler_identity,
         )
     }
 
@@ -851,12 +870,8 @@ impl KernelCompiler {
             .and_then(|value| SchedulerProfile::parse(&value));
         let scheduler_profile = sched_profile_override
             .unwrap_or_else(|| crate::kernels::scheduler_profile_for_module(arch, name));
-        let module_flags = Self::module_flags_with_profile(
-            arch,
-            name,
-            &gfx1151_cumode_modules,
-            scheduler_profile,
-        );
+        let module_flags =
+            Self::module_flags_with_profile(arch, name, &gfx1151_cumode_modules, scheduler_profile);
         Self::hash_parts(
             source,
             arch,
@@ -890,7 +905,9 @@ impl KernelCompiler {
             .unwrap_or_else(|| crate::kernels::scheduler_profile_for_module(arch, module));
         let mut flags = core_hipcc_flags(arch);
         flags.extend(extra_flags.iter().cloned());
-        flags.extend(Self::module_flags_with_profile(arch, module, &selected, profile));
+        flags.extend(Self::module_flags_with_profile(
+            arch, module, &selected, profile,
+        ));
         CompileRecipe {
             arch: arch.to_owned(),
             flags,
@@ -905,7 +922,10 @@ impl KernelCompiler {
         source: &str,
         extra_flags: &str,
     ) -> CompileRecipe {
-        let extra = extra_flags.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let extra = extra_flags
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let mut recipe = Self::recipe_for(arch, module, &extra);
         recipe.flags.extend(Self::per_kernel_flags(source));
         recipe
@@ -927,7 +947,10 @@ impl KernelCompiler {
         symbols: Vec<String>,
         object: &Path,
     ) -> Result<PackIndex, String> {
-        if !valid_identifier(module) || symbols.is_empty() || !symbols.iter().all(|s| valid_identifier(s)) {
+        if !valid_identifier(module)
+            || symbols.is_empty()
+            || !symbols.iter().all(|s| valid_identifier(s))
+        {
             return Err(format!("invalid module/symbol for package: {module}"));
         }
         if self.toolchain_id.is_empty() {
@@ -993,7 +1016,10 @@ impl KernelCompiler {
         let index_path = dir.join(format!("{module}.index.json"));
         if !index_path.exists() {
             if dir.join(format!("{module}.hsaco")).exists() {
-                return Err(format!("{}: index missing for installed object", index_path.display()));
+                return Err(format!(
+                    "{}: index missing for installed object",
+                    index_path.display()
+                ));
             }
             return Ok(None);
         }
@@ -1006,7 +1032,10 @@ impl KernelCompiler {
         // by name instead of as a blanket identity mismatch.
         let mut failed: Vec<String> = Vec::new();
         if index.version != PACK_INDEX_VERSION {
-            failed.push(format!("index version {} (expected {PACK_INDEX_VERSION})", index.version));
+            failed.push(format!(
+                "index version {} (expected {PACK_INDEX_VERSION})",
+                index.version
+            ));
         }
         if index.module != module {
             failed.push(format!("module `{}` (requested `{module}`)", index.module));
@@ -1020,7 +1049,10 @@ impl KernelCompiler {
             .filter(|symbol| !index.symbols.iter().any(|entry| entry == symbol))
             .collect();
         if !unindexed.is_empty() {
-            failed.push(format!("symbol not in the module index: {}", unindexed.join(", ")));
+            failed.push(format!(
+                "symbol not in the module index: {}",
+                unindexed.join(", ")
+            ));
         }
         if index.source_sha256 != sha256_hex(source.as_bytes()) {
             failed.push("source sha256 differs".to_owned());
@@ -1032,7 +1064,10 @@ impl KernelCompiler {
             failed.push("scheduler profile differs".to_owned());
         }
         if index.cache_abi != KERNEL_CACHE_ABI {
-            failed.push(format!("cache ABI {} (expected {KERNEL_CACHE_ABI})", index.cache_abi));
+            failed.push(format!(
+                "cache ABI {} (expected {KERNEL_CACHE_ABI})",
+                index.cache_abi
+            ));
         }
         if index.packaging_key != packaging_key {
             failed.push("packaging key differs".to_owned());
@@ -1052,7 +1087,11 @@ impl KernelCompiler {
             return Err(fail(&format!("index mismatch: {}", failed.join("; "))));
         }
         let object = dir.join(format!("{module}.hsaco"));
-        if !pair_valid(&object, &dir.join(format!("{module}.hash")), &index.packaging_key) {
+        if !pair_valid(
+            &object,
+            &dir.join(format!("{module}.hash")),
+            &index.packaging_key,
+        ) {
             return Err(fail("object/hash pair missing or stale"));
         }
         let bytes = std::fs::read(&object).map_err(|e| fail(&e.to_string()))?;
@@ -1073,8 +1112,17 @@ impl KernelCompiler {
             .map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    fn writeback_package(&self, module: &str, source: &str, symbol: &str, object: &Path, force: bool) {
-        let Some(dir) = self.writeback_dir() else { return };
+    fn writeback_package(
+        &self,
+        module: &str,
+        source: &str,
+        symbol: &str,
+        object: &Path,
+        force: bool,
+    ) {
+        let Some(dir) = self.writeback_dir() else {
+            return;
+        };
         let key = self.packaging_hash(module, source);
         let index_path = dir.join(format!("{module}.index.json"));
         let cold_object = dir.join(format!("{module}.hsaco"));
@@ -1086,7 +1134,8 @@ impl KernelCompiler {
                 return;
             }
         };
-        let existing = std::fs::read(&index_path).ok()
+        let existing = std::fs::read(&index_path)
+            .ok()
             .and_then(|bytes| serde_json::from_slice::<PackIndex>(&bytes).ok());
         let same_bytes = existing.as_ref().is_some_and(|prior| {
             prior.version == index.version
@@ -1102,7 +1151,13 @@ impl KernelCompiler {
                 && prior.toolchain_sha256 == index.toolchain_sha256
         });
         if same_bytes && pair_valid(&cold_object, &cold_hash, &key) {
-            index.symbols.extend(existing.unwrap().symbols.into_iter().filter(|s| s != symbol));
+            index.symbols.extend(
+                existing
+                    .unwrap()
+                    .symbols
+                    .into_iter()
+                    .filter(|s| s != symbol),
+            );
             // Even if the old index says its digest matches, check the actual
             // cold bytes; a corrupted blob must be repaired from the hot object.
             if std::fs::read(&cold_object)
@@ -1127,11 +1182,22 @@ impl KernelCompiler {
     }
 
     /// Build or retrieve one object, publishing a verified install package.
-    pub fn pack_to(&mut self, module: &str, source: &str, symbols: &[String], dir: &Path) -> HipResult<PathBuf> {
+    pub fn pack_to(
+        &mut self,
+        module: &str,
+        source: &str,
+        symbols: &[String],
+        dir: &Path,
+    ) -> HipResult<PathBuf> {
         if symbols.is_empty() || !self.has_hipcc {
-            return Err(self.compiler_unavailable_error(module, "packaging requires hipcc and at least one symbol"));
+            return Err(self.compiler_unavailable_error(
+                module,
+                "packaging requires hipcc and at least one symbol",
+            ));
         }
-        let object = self.compile_for_symbol(module, source, &symbols[0])?.to_path_buf();
+        let object = self
+            .compile_for_symbol(module, source, &symbols[0])?
+            .to_path_buf();
         self.publish_package(module, source, symbols, &object, dir)
             .map_err(|e| hip_bridge::HipError::new(0, &e))
     }
@@ -1175,10 +1241,26 @@ impl KernelCompiler {
 
     /// The complete hipcc invocation (compiler path first) the JIT runs for
     /// `module`, with `src_path`/`obj_path` in place of its cache paths.
-    pub fn jit_argv(&self, module: &str, source: &str, src_path: &Path, obj_path: &Path) -> Vec<String> {
-        let passthrough = Self::hipcc_passthrough(module, source, &self.extra_flags, &self.module_flags(module));
+    pub fn jit_argv(
+        &self,
+        module: &str,
+        source: &str,
+        src_path: &Path,
+        obj_path: &Path,
+    ) -> Vec<String> {
+        let passthrough = Self::hipcc_passthrough(
+            module,
+            source,
+            &self.extra_flags,
+            &self.module_flags(module),
+        );
         std::iter::once(self.hipcc_bin.display().to_string())
-            .chain(Self::direct_hipcc_args(&self.arch, src_path, obj_path, passthrough))
+            .chain(Self::direct_hipcc_args(
+                &self.arch,
+                src_path,
+                obj_path,
+                passthrough,
+            ))
             .collect()
     }
 
@@ -1191,7 +1273,13 @@ impl KernelCompiler {
     /// `src_path` and the object to `obj_path` instead of the unique cache
     /// temporaries. hipcc names the `__hip_cuid_*` marker after the input
     /// path and argv, so a fixed pair makes the bytes repeatable on one host.
-    pub fn compile_to_paths(&self, module: &str, source: &str, src_path: &Path, obj_path: &Path) -> HipResult<()> {
+    pub fn compile_to_paths(
+        &self,
+        module: &str,
+        source: &str,
+        src_path: &Path,
+        obj_path: &Path,
+    ) -> HipResult<()> {
         if !self.has_hipcc {
             return Err(self.compiler_unavailable_error(module, "an offline compile was requested"));
         }
@@ -1313,9 +1401,17 @@ impl KernelCompiler {
     }
 
     /// Check the exact exported symbol before a packaged object reaches HIP.
-    pub fn compile_for_symbol(&mut self, name: &str, source: &str, symbol: &str) -> HipResult<&Path> {
+    pub fn compile_for_symbol(
+        &mut self,
+        name: &str,
+        source: &str,
+        symbol: &str,
+    ) -> HipResult<&Path> {
         if !valid_identifier(name) || !valid_identifier(symbol) {
-            return Err(hip_bridge::HipError::new(0, "invalid kernel module or symbol"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "invalid kernel module or symbol",
+            ));
         }
         if let Some(dir) = &self.cold_dir {
             match self.indexed_object(dir, name, source, symbol) {
@@ -1331,7 +1427,9 @@ impl KernelCompiler {
                         self.arch
                     )));
                 }
-                Err(error) => eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT"),
+                Err(error) => {
+                    eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT")
+                }
             }
         }
 
@@ -1378,13 +1476,12 @@ impl KernelCompiler {
         let legacy_obj = self.cache_dir.join(format!("{name}.hsaco"));
         let legacy_hash = self.cache_dir.join(format!("{name}.hash"));
         if pair_valid(&legacy_obj, &legacy_hash, &src_hash) {
-            let hit_path = if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true)
-                .is_ok()
-            {
-                obj_path
-            } else {
-                legacy_obj
-            };
+            let hit_path =
+                if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true).is_ok() {
+                    obj_path
+                } else {
+                    legacy_obj
+                };
             self.writeback_package(name, source, symbol, &hit_path, false);
             self.ensure_radiowave_certification(name, &hit_path);
             self.compiled.insert(name.to_string(), hit_path);
@@ -1397,7 +1494,9 @@ impl KernelCompiler {
             }
             return Err(match unverified_object {
                 Some(found) => self.unverified_object_error(name, &src_hash, &found),
-                None => self.compiler_unavailable_error(name, "no usable cached kernel image exists"),
+                None => {
+                    self.compiler_unavailable_error(name, "no usable cached kernel image exists")
+                }
             });
         }
 
@@ -1432,7 +1531,12 @@ impl KernelCompiler {
     /// dirs are aliased). Bypasses all lookup and invokes transactional hipcc
     /// publication directly. Cold is force-synced only after success. A failed
     /// hipcc leaves prior durable pairs intact.
-    pub(crate) fn recompile(&mut self, name: &str, source: &str, symbol: &str) -> HipResult<PathBuf> {
+    pub(crate) fn recompile(
+        &mut self,
+        name: &str,
+        source: &str,
+        symbol: &str,
+    ) -> HipResult<PathBuf> {
         if !self.has_hipcc {
             return Err(self.compiler_unavailable_error(
                 name,
@@ -1801,7 +1905,10 @@ impl KernelCompiler {
     /// Compile multiple kernels in parallel. Returns paths to .hsaco files.
     /// Kernels already compiled or cached are skipped.
     pub fn compile_batch(&mut self, kernels: &[(&str, &str)]) -> HipResult<()> {
-        let with_symbols = kernels.iter().map(|&(name, source)| (name, source, name)).collect::<Vec<_>>();
+        let with_symbols = kernels
+            .iter()
+            .map(|&(name, source)| (name, source, name))
+            .collect::<Vec<_>>();
         self.compile_batch_for_symbols(&with_symbols)
     }
 
@@ -1813,42 +1920,80 @@ impl KernelCompiler {
     }
 
     /// Freeze a registry plan and start only its missing CPU compilation work.
-    pub fn begin_batch(&mut self, kernels: Vec<crate::kernel_registry::KernelEntry>, jobs: usize)
-        -> HipResult<KernelBatch>
-    {
+    pub fn begin_batch(
+        &mut self,
+        kernels: Vec<crate::kernel_registry::KernelEntry>,
+        jobs: usize,
+    ) -> HipResult<KernelBatch> {
         for entry in &kernels {
-            let recipe = Self::recipe_for_source(&self.arch, entry.module, entry.source(), &self.extra_flags);
-            if entry.arch != self.arch || entry.flags != recipe.flags
-                || entry.scheduler_profile != recipe.scheduler_profile || entry.symbols.is_empty()
+            let recipe = Self::recipe_for_source(
+                &self.arch,
+                entry.module,
+                entry.source(),
+                &self.extra_flags,
+            );
+            if entry.arch != self.arch
+                || entry.flags != recipe.flags
+                || entry.scheduler_profile != recipe.scheduler_profile
+                || entry.symbols.is_empty()
             {
-                return Err(hip_bridge::HipError::new(0, &format!("{}: batch recipe mismatch", entry.module)));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{}: batch recipe mismatch", entry.module),
+                ));
             }
         }
-        let requests = kernels.iter().flat_map(|entry| entry.symbols.iter()
-            .map(move |symbol| (entry.module, entry.source(), *symbol))).collect::<Vec<_>>();
+        let requests = kernels
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .symbols
+                    .iter()
+                    .map(move |symbol| (entry.module, entry.source(), *symbol))
+            })
+            .collect::<Vec<_>>();
         self.prepare_batch(&requests, jobs)
     }
 
-    fn prepare_batch(&mut self, kernels: &[(&str, &str, &str)], jobs: usize) -> HipResult<KernelBatch> {
+    fn prepare_batch(
+        &mut self,
+        kernels: &[(&str, &str, &str)],
+        jobs: usize,
+    ) -> HipResult<KernelBatch> {
         if jobs == 0 {
-            return Err(hip_bridge::HipError::new(0, "JIT batch jobs must be positive"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "JIT batch jobs must be positive",
+            ));
         }
         // Refuse conflicting module identities before any lookup/publication.
         let mut identities = HashMap::new();
         for &(name, source, symbol) in kernels {
             if !valid_identifier(name) || !valid_identifier(symbol) {
-                return Err(hip_bridge::HipError::new(0, "invalid kernel module or symbol"));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "invalid kernel module or symbol",
+                ));
             }
             let hash = self.cache_hash(name, source);
-            if identities.insert(name, hash.clone()).is_some_and(|prior| prior != hash) {
-                return Err(hip_bridge::HipError::new(0, &format!("{name}: conflicting batch recipes")));
+            if identities
+                .insert(name, hash.clone())
+                .is_some_and(|prior| prior != hash)
+            {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{name}: conflicting batch recipes"),
+                ));
             }
         }
         let mut to_compile: Vec<PreparedJob> = Vec::new();
 
         for &(name, source, symbol) in kernels {
             if !valid_identifier(name) || !valid_identifier(symbol) {
-                return Err(hip_bridge::HipError::new(0, "invalid kernel module or symbol"));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "invalid kernel module or symbol",
+                ));
             }
             if let Some(dir) = &self.cold_dir {
                 match self.indexed_object(dir, name, source, symbol) {
@@ -1864,7 +2009,9 @@ impl KernelCompiler {
                             self.arch
                         )));
                     }
-                    Err(error) => eprintln!("  {name}: packaged object rejected ({error}); falling back to JIT"),
+                    Err(error) => eprintln!(
+                        "  {name}: packaged object rejected ({error}); falling back to JIT"
+                    ),
                 }
             }
 
@@ -1913,25 +2060,34 @@ impl KernelCompiler {
                 }
                 return Err(match unverified_object {
                     Some(found) => self.unverified_object_error(name, &src_hash, &found),
-                    None => self.compiler_unavailable_error(name, "no usable cached kernel image exists"),
+                    None => self
+                        .compiler_unavailable_error(name, "no usable cached kernel image exists"),
                 });
             }
 
-            if let Some(job) = to_compile.iter_mut().find(|job| job.modules[0].hash == src_hash) {
+            if let Some(job) = to_compile
+                .iter_mut()
+                .find(|job| job.modules[0].hash == src_hash)
+            {
                 if let Some(module) = job.modules.iter_mut().find(|module| module.name == name) {
                     if !module.symbols.iter().any(|s| s == symbol) {
                         module.symbols.push(symbol.to_owned());
                     }
                 } else {
                     job.modules.push(PreparedModule {
-                        name: name.to_owned(), hash: src_hash, symbols: vec![symbol.to_owned()],
+                        name: name.to_owned(),
+                        hash: src_hash,
+                        symbols: vec![symbol.to_owned()],
                     });
                 }
             } else {
                 to_compile.push(PreparedJob {
-                    source: source.to_owned(), module_flags,
+                    source: source.to_owned(),
+                    module_flags,
                     modules: vec![PreparedModule {
-                        name: name.to_owned(), hash: src_hash, symbols: vec![symbol.to_owned()],
+                        name: name.to_owned(),
+                        hash: src_hash,
+                        symbols: vec![symbol.to_owned()],
                     }],
                 });
             }
@@ -1939,7 +2095,9 @@ impl KernelCompiler {
 
         let workers = jobs.min(to_compile.len());
         let queue = Arc::new(Mutex::new(to_compile.into_iter()));
-        let mut batch = KernelBatch { handles: Vec::with_capacity(workers) };
+        let mut batch = KernelBatch {
+            handles: Vec::with_capacity(workers),
+        };
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let arch = self.arch.clone();
@@ -1947,27 +2105,46 @@ impl KernelCompiler {
             let hipcc_bin = self.hipcc_bin.clone();
             let rocm_env_root = self.rocm_env_root.clone();
             let extra_flags = self.extra_flags.clone();
-            let handle = thread::Builder::new().name("hipfire-jit".to_owned()).spawn(move || {
-                let mut completed = Vec::new();
-                loop {
-                    let job = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
-                    let Some(job) = job else { break; };
-                    let module = &job.modules[0];
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::hipcc_compile_publish(&hipcc_bin, rocm_env_root.as_deref(),
-                            &arch, &cache_dir, &module.name, &job.source, &module.hash,
-                            &extra_flags, &job.module_flags, true)
-                    })).unwrap_or_else(|panic| {
-                        let reason = panic.downcast_ref::<&str>().copied()
-                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("unknown panic");
-                        Err(hip_bridge::HipError::new(0,
-                            &format!("{}: JIT worker panicked: {reason}", module.name)))
-                    });
-                    completed.push(CompletedJob { job, result });
-                }
-                completed
-            }).map_err(|e| hip_bridge::HipError::new(0, &format!("starting JIT worker: {e}")))?;
+            let handle = thread::Builder::new()
+                .name("hipfire-jit".to_owned())
+                .spawn(move || {
+                    let mut completed = Vec::new();
+                    loop {
+                        let job = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                        let Some(job) = job else {
+                            break;
+                        };
+                        let module = &job.modules[0];
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            Self::hipcc_compile_publish(
+                                &hipcc_bin,
+                                rocm_env_root.as_deref(),
+                                &arch,
+                                &cache_dir,
+                                &module.name,
+                                &job.source,
+                                &module.hash,
+                                &extra_flags,
+                                &job.module_flags,
+                                true,
+                            )
+                        }))
+                        .unwrap_or_else(|panic| {
+                            let reason = panic
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                .unwrap_or("unknown panic");
+                            Err(hip_bridge::HipError::new(
+                                0,
+                                &format!("{}: JIT worker panicked: {reason}", module.name),
+                            ))
+                        });
+                        completed.push(CompletedJob { job, result });
+                    }
+                    completed
+                })
+                .map_err(|e| hip_bridge::HipError::new(0, &format!("starting JIT worker: {e}")))?;
             batch.handles.push(handle);
         }
         Ok(batch)
@@ -1978,39 +2155,72 @@ impl KernelCompiler {
         let mut error = None;
         for handle in batch.handles.drain(..) {
             match handle.join() {
-                Ok(completed) => for CompletedJob { job, result } in completed {
-                    if let Err(e) = result {
-                        if error.is_none() { error = Some(e); }
-                        continue;
-                    }
-                    let first = &job.modules[0];
-                    let artifact = self.cache_dir.join(hot_object_name(&first.name, &first.hash));
-                    for module in job.modules {
-                        let object = self.cache_dir.join(hot_object_name(&module.name, &module.hash));
-                        if object != artifact {
-                            if let Err(e) = publish_pair(&self.cache_dir,
-                                &hot_stem(&module.name, &module.hash), &artifact, &module.hash, false)
-                            {
-                                if error.is_none() {
-                                    error = Some(hip_bridge::HipError::new(0, &format!("{}: alias publication: {e}", module.name)));
+                Ok(completed) => {
+                    for CompletedJob { job, result } in completed {
+                        if let Err(e) = result {
+                            if error.is_none() {
+                                error = Some(e);
+                            }
+                            continue;
+                        }
+                        let first = &job.modules[0];
+                        let artifact = self
+                            .cache_dir
+                            .join(hot_object_name(&first.name, &first.hash));
+                        for module in job.modules {
+                            let object = self
+                                .cache_dir
+                                .join(hot_object_name(&module.name, &module.hash));
+                            if object != artifact {
+                                if let Err(e) = publish_pair(
+                                    &self.cache_dir,
+                                    &hot_stem(&module.name, &module.hash),
+                                    &artifact,
+                                    &module.hash,
+                                    false,
+                                ) {
+                                    if error.is_none() {
+                                        error = Some(hip_bridge::HipError::new(
+                                            0,
+                                            &format!("{}: alias publication: {e}", module.name),
+                                        ));
+                                    }
+                                    continue;
                                 }
-                                continue;
+                                // Certification needs the source next to each artifact alias.
+                                if let Err(e) =
+                                    std::fs::write(object.with_extension("hip"), &job.source)
+                                {
+                                    if error.is_none() {
+                                        error = Some(hip_bridge::HipError::new(
+                                            0,
+                                            &format!("{}: alias source: {e}", module.name),
+                                        ));
+                                    }
+                                    continue;
+                                }
                             }
-                            // Certification needs the source next to each artifact alias.
-                            if let Err(e) = std::fs::write(object.with_extension("hip"), &job.source) {
-                                if error.is_none() { error = Some(hip_bridge::HipError::new(0, &format!("{}: alias source: {e}", module.name))); }
-                                continue;
+                            self.ensure_radiowave_certification(&module.name, &object);
+                            for symbol in module.symbols {
+                                self.writeback_package(
+                                    &module.name,
+                                    &job.source,
+                                    &symbol,
+                                    &object,
+                                    false,
+                                );
                             }
+                            self.compiled.insert(module.name, object);
                         }
-                        self.ensure_radiowave_certification(&module.name, &object);
-                        for symbol in module.symbols {
-                            self.writeback_package(&module.name, &job.source, &symbol, &object, false);
-                        }
-                        self.compiled.insert(module.name, object);
                     }
-                },
+                }
                 Err(_) => {
-                    if error.is_none() { error = Some(hip_bridge::HipError::new(0, "JIT worker panicked outside compilation")); }
+                    if error.is_none() {
+                        error = Some(hip_bridge::HipError::new(
+                            0,
+                            "JIT worker panicked outside compilation",
+                        ));
+                    }
                 }
             }
         }
@@ -2043,15 +2253,31 @@ mod tests {
     #[test]
     fn custom_arm_cache_key_cannot_alias_hipcc() {
         let baseline = KernelCompiler::hash_parts(
-            "source", "gfx1201", "", &[], "llvm", SchedulerProfile::Default,
-            "hipcc", "", "", "",
+            "source",
+            "gfx1201",
+            "",
+            &[],
+            "llvm",
+            SchedulerProfile::Default,
+            "hipcc",
+            "",
+            "",
+            "",
         );
         let custom = KernelCompiler::custom_isa_hash_for(
-            "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=0", "llvm-mc 23",
+            "source",
+            "gfx1201",
+            "0.1.0",
+            "iu4_k1:cacc2=0",
+            "llvm-mc 23",
         );
         assert_ne!(baseline, custom);
         let other_variant = KernelCompiler::custom_isa_hash_for(
-            "source", "gfx1201", "0.1.0", "iu4_k1:cacc2=1", "llvm-mc 23",
+            "source",
+            "gfx1201",
+            "0.1.0",
+            "iu4_k1:cacc2=1",
+            "llvm-mc 23",
         );
         assert_ne!(custom, other_variant);
     }
@@ -2545,7 +2771,10 @@ mod tests {
                 &[],
                 "hipcc 7.2",
                 SchedulerProfile::Default,
-                "hipcc", "", "", "",
+                "hipcc",
+                "",
+                "",
+                "",
             )
         );
         assert_eq!(
@@ -2557,7 +2786,10 @@ mod tests {
                 &[],
                 "hipcc 7.2",
                 SchedulerProfile::Default,
-                "hipcc", "", "", "",
+                "hipcc",
+                "",
+                "",
+                "",
             )
         );
     }
@@ -2983,7 +3215,8 @@ mod tests {
                     c.has_hipcc = true;
                     c.hipcc_bin = hipcc;
                     start.wait();
-                    c.compile("k", "__global__ void k() {}").map(Path::to_path_buf)
+                    c.compile("k", "__global__ void k() {}")
+                        .map(Path::to_path_buf)
                 })
             })
             .collect::<Vec<_>>()
@@ -2991,11 +3224,17 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>();
         for result in &results {
-            let path = result.as_ref().expect("every concurrent compile must succeed");
+            let path = result
+                .as_ref()
+                .expect("every concurrent compile must succeed");
             assert_eq!(std::fs::read(path).unwrap(), b"COMPILED");
         }
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
-        assert!(leftover_temps(&hot).is_empty(), "{:?}", leftover_temps(&hot));
+        assert!(
+            leftover_temps(&hot).is_empty(),
+            "{:?}",
+            leftover_temps(&hot)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3004,7 +3243,6 @@ mod tests {
         let name = "packaged_kernel";
         let source = "__global__ void packaged_kernel() {}";
         let arch = "gfx1201";
-
 
         // Builder has a real toolchain, but packaging must use empty id.
         let mut builder = test_compiler("", "hipcc 7.2");
@@ -3050,7 +3288,6 @@ mod tests {
         compiler
     }
 
-
     #[test]
     fn prebuilt_gate_missing_or_wrong_hash_rejected() {
         for hash in [None, Some("wrong-key")] {
@@ -3063,8 +3300,12 @@ mod tests {
             let single = prebuilt_gate_compiler(&root, false);
             let hash_path = cold.join("gate.hash");
             match hash {
-                None => { std::fs::remove_file(&hash_path).unwrap(); }
-                Some(bad) => { std::fs::write(&hash_path, bad).unwrap(); }
+                None => {
+                    std::fs::remove_file(&hash_path).unwrap();
+                }
+                Some(bad) => {
+                    std::fs::write(&hash_path, bad).unwrap();
+                }
             }
             for (batch, mut compiler) in [single, prebuilt_gate_compiler(&root, false)]
                 .into_iter()
@@ -3089,7 +3330,11 @@ mod tests {
             let name = "gate";
             let source = "__global__ void gate() {}";
             let single = prebuilt_gate_compiler(&root, false);
-            let dir = if legacy { root.join("hot") } else { root.join("cold") };
+            let dir = if legacy {
+                root.join("hot")
+            } else {
+                root.join("cold")
+            };
             let object = dir.join("gate.hsaco");
             std::fs::write(&object, b"PREBUILT").unwrap();
             if legacy {
@@ -3134,7 +3379,10 @@ mod tests {
             assert_eq!(compiler.compiled[name], hot);
             assert_eq!(std::fs::read(&hot).unwrap(), b"FRESH");
             assert_eq!(std::fs::read(&old).unwrap(), b"FRESH");
-            assert_eq!(std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(), compiler.packaging_hash(name, source));
+            assert_eq!(
+                std::fs::read_to_string(root.join("cold/gate.hash")).unwrap(),
+                compiler.packaging_hash(name, source)
+            );
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -3173,11 +3421,19 @@ mod tests {
         let hot_key = producer.cache_hash(name, source);
         let portable_key = producer.packaging_hash(name, source);
         assert_ne!(hot_key, portable_key);
-        producer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap();
+        producer
+            .compile_batch_for_symbols(&[(name, source, symbol)])
+            .unwrap();
         let cold = root.join("cold");
         let object = cold.join("rmsnorm.hsaco");
-        assert!(pair_valid(&object, &cold.join("rmsnorm.hash"), &portable_key));
-        let index: PackIndex = serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap()).unwrap();
+        assert!(pair_valid(
+            &object,
+            &cold.join("rmsnorm.hash"),
+            &portable_key
+        ));
+        let index: PackIndex =
+            serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap())
+                .unwrap();
         assert_eq!(index.toolchain_id, "hipcc 7.2");
         assert_eq!(index.object_sha256, sha256_hex(b"FRESH"));
         assert_eq!(index.symbols, [symbol]);
@@ -3185,10 +3441,15 @@ mod tests {
         for batch in [false, true] {
             let mut consumer = prebuilt_gate_compiler(&root, false);
             if batch {
-                consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap();
+                consumer
+                    .compile_batch_for_symbols(&[(name, source, symbol)])
+                    .unwrap();
                 assert_eq!(consumer.compiled[name], object);
             } else {
-                assert_eq!(consumer.compile_for_symbol(name, source, symbol).unwrap(), object);
+                assert_eq!(
+                    consumer.compile_for_symbol(name, source, symbol).unwrap(),
+                    object
+                );
             }
         }
         let _ = std::fs::remove_dir_all(root);
@@ -3212,24 +3473,37 @@ mod tests {
         let root = temp_root("residual_mmq_fallback");
         for arch in ["gfx1100", "gfx1151"] {
             let extra_flags = "-DIU4_A4_CANDIDATES=2";
-            let entry = crate::kernel_registry::lookup(
-                arch, "gemm_mq4g256v2_residual_mmq", extra_flags,
-            ).unwrap();
+            let entry =
+                crate::kernel_registry::lookup(arch, "gemm_mq4g256v2_residual_mmq", extra_flags)
+                    .unwrap();
             let compiler = test_compiler(extra_flags, "hipcc 7.16");
             let dir = root.join(arch);
             std::fs::create_dir_all(&dir).unwrap();
             let object = dir.join(format!("{}.hsaco", entry.module));
             std::fs::write(&object, b"INDEX ADMISSION TEST").unwrap();
-            let symbols = entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect();
+            let symbols = entry
+                .symbols
+                .iter()
+                .map(|symbol| (*symbol).to_owned())
+                .collect();
             let mut compiler = compiler;
             compiler.arch = arch.to_owned();
-            let index = compiler.pack_index(entry.module, entry.source(), symbols, &object).unwrap();
-            std::fs::write(dir.join(format!("{}.hash", entry.module)), &index.packaging_key).unwrap();
+            let index = compiler
+                .pack_index(entry.module, entry.source(), symbols, &object)
+                .unwrap();
+            std::fs::write(
+                dir.join(format!("{}.hash", entry.module)),
+                &index.packaging_key,
+            )
+            .unwrap();
             publish_index(&dir, &index).unwrap();
             for symbol in entry.symbols {
                 assert_eq!(
-                    compiler.indexed_object(&dir, entry.module, entry.source(), symbol).unwrap(),
-                    Some(object.clone()), "{arch}: {symbol}",
+                    compiler
+                        .indexed_object(&dir, entry.module, entry.source(), symbol)
+                        .unwrap(),
+                    Some(object.clone()),
+                    "{arch}: {symbol}",
                 );
             }
         }
@@ -3254,16 +3528,27 @@ mod tests {
             "indexed_attention_cache_append_q8_batched",
             "indexed_attention_decode_prologue_q8",
         ];
-        let sealed: std::collections::BTreeSet<&str> =
-            SEALED.lines().filter_map(|line| line.strip_prefix("index ")).collect();
+        let sealed: std::collections::BTreeSet<&str> = SEALED
+            .lines()
+            .filter_map(|line| line.strip_prefix("index "))
+            .collect();
         let root = temp_root("sealed_index_closure");
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let entry = crate::kernel_registry::lookup(arch, "tensor_ops", "").unwrap();
-            let old: Vec<&str> =
-                entry.symbols.iter().copied().filter(|s| !REPAIRED.contains(s)).collect();
+            let old: Vec<&str> = entry
+                .symbols
+                .iter()
+                .copied()
+                .filter(|s| !REPAIRED.contains(s))
+                .collect();
             if arch == "gfx1100" {
                 // The pre-repair registry is exactly the sealed index.
-                assert_eq!(old.iter().copied().collect::<std::collections::BTreeSet<_>>(), sealed);
+                assert_eq!(
+                    old.iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    sealed
+                );
             }
             let mut compiler = test_compiler("", "hipcc 7.16");
             compiler.arch = arch.to_owned();
@@ -3273,26 +3558,43 @@ mod tests {
             std::fs::write(&object, b"INDEX CLOSURE TEST").unwrap();
             let publish = |symbols: &[&str]| {
                 let symbols = symbols.iter().map(|s| (*s).to_owned()).collect();
-                let index = compiler.pack_index(entry.module, entry.source(), symbols, &object).unwrap();
+                let index = compiler
+                    .pack_index(entry.module, entry.source(), symbols, &object)
+                    .unwrap();
                 std::fs::write(dir.join("tensor_ops.hash"), &index.packaging_key).unwrap();
                 publish_index(&dir, &index).unwrap();
             };
-            let load = |symbol: &str| compiler.indexed_object(&dir, entry.module, entry.source(), symbol);
+            let load =
+                |symbol: &str| compiler.indexed_object(&dir, entry.module, entry.source(), symbol);
 
             publish(&old);
             for symbol in &old {
-                assert_eq!(load(symbol).unwrap(), Some(object.clone()), "{arch}: {symbol}");
+                assert_eq!(
+                    load(symbol).unwrap(),
+                    Some(object.clone()),
+                    "{arch}: {symbol}"
+                );
             }
             for symbol in REPAIRED {
                 let error = load(symbol).unwrap_err();
-                assert!(error.contains("symbol not in the module index"), "{arch}: {error}");
+                assert!(
+                    error.contains("symbol not in the module index"),
+                    "{arch}: {error}"
+                );
                 assert!(error.contains(symbol), "{arch}: {error}");
-                assert!(!error.contains("source sha256") && !error.contains("flags differ"), "{arch}: {error}");
+                assert!(
+                    !error.contains("source sha256") && !error.contains("flags differ"),
+                    "{arch}: {error}"
+                );
             }
 
             publish(entry.symbols);
             for symbol in entry.symbols {
-                assert_eq!(load(symbol).unwrap(), Some(object.clone()), "{arch}: {symbol}");
+                assert_eq!(
+                    load(symbol).unwrap(),
+                    Some(object.clone()),
+                    "{arch}: {symbol}"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(root);
@@ -3312,8 +3614,18 @@ mod tests {
         let original = std::fs::read(&index_path).unwrap();
 
         for field in [
-            "version", "module", "symbols", "arch", "source_sha256", "flags", "scheduler_profile",
-            "cache_abi", "packaging_key", "object_sha256", "toolchain_id", "toolchain_sha256",
+            "version",
+            "module",
+            "symbols",
+            "arch",
+            "source_sha256",
+            "flags",
+            "scheduler_profile",
+            "cache_abi",
+            "packaging_key",
+            "object_sha256",
+            "toolchain_id",
+            "toolchain_sha256",
         ] {
             let mut mutated: serde_json::Value = serde_json::from_slice(&original).unwrap();
             mutated[field] = match field {
@@ -3325,16 +3637,29 @@ mod tests {
             };
             std::fs::write(&index_path, serde_json::to_vec(&mutated).unwrap()).unwrap();
             let mut consumer = prebuilt_gate_compiler(&root, false);
-            let err = consumer.compile_for_symbol(name, source, symbol).unwrap_err();
-            assert!(err.to_string().contains("packaged object rejected"), "{field}: {err}");
+            let err = consumer
+                .compile_for_symbol(name, source, symbol)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("packaged object rejected"),
+                "{field}: {err}"
+            );
         }
         std::fs::write(&index_path, &original).unwrap();
         let mut consumer = prebuilt_gate_compiler(&root, false);
-        assert!(consumer.compile_for_symbol(name, source, "other_symbol").is_err());
-        assert!(consumer.compile_for_symbol(name, "__global__ void changed() {}", symbol).is_err());
+        assert!(consumer
+            .compile_for_symbol(name, source, "other_symbol")
+            .is_err());
+        assert!(consumer
+            .compile_for_symbol(name, "__global__ void changed() {}", symbol)
+            .is_err());
         std::fs::write(&object, b"CORRUPTED").unwrap();
         let mut consumer = prebuilt_gate_compiler(&root, false);
-        assert!(consumer.compile_batch_for_symbols(&[(name, source, symbol)]).unwrap_err().to_string().contains("SHA-256"));
+        assert!(consumer
+            .compile_batch_for_symbols(&[(name, source, symbol)])
+            .unwrap_err()
+            .to_string()
+            .contains("SHA-256"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3352,11 +3677,15 @@ mod tests {
         let mut consumer = prebuilt_gate_compiler(&root, true);
         consumer.toolchain_id = "hipcc 9.9".to_owned();
         consumer.hipcc_bin = install_fake_hipcc(&root.join("local-bin"), b"LOCAL", false);
-        let loaded = consumer.compile_for_symbol(name, source, symbol).unwrap().to_path_buf();
+        let loaded = consumer
+            .compile_for_symbol(name, source, symbol)
+            .unwrap()
+            .to_path_buf();
         assert_eq!(std::fs::read(&loaded).unwrap(), b"LOCAL");
         assert_ne!(loaded, cold.join("rmsnorm.hsaco"));
         let index: PackIndex =
-            serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(cold.join("rmsnorm.index.json")).unwrap())
+                .unwrap();
         assert_eq!(index.toolchain_id, "hipcc 9.9");
         assert_eq!(std::fs::read(cold.join("rmsnorm.hsaco")).unwrap(), b"LOCAL");
         let _ = std::fs::remove_dir_all(root);
@@ -3391,8 +3720,14 @@ mod tests {
         ];
         let pack = root.join("pack").join("gfx1201");
         for entry in &entries {
-            let symbols = entry.symbols.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-            producer.pack_to(entry.module, entry.source(), &symbols, &pack).unwrap();
+            let symbols = entry
+                .symbols
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>();
+            producer
+                .pack_to(entry.module, entry.source(), &symbols, &pack)
+                .unwrap();
         }
         let verify = |local: Option<&str>| {
             crate::kernel_pack::verify_entries(&entries, "gfx1201", "", &pack, local)
@@ -3403,7 +3738,9 @@ mod tests {
         assert_eq!(verified.code_object_version, 6);
         assert!(verify(Some("hipcc 7.2")).is_ok());
         // A different local compiler would reject every object at load time.
-        assert!(verify(Some("hipcc 9.9")).unwrap_err().contains("toolchain mismatch"));
+        assert!(verify(Some("hipcc 9.9"))
+            .unwrap_err()
+            .contains("toolchain mismatch"));
 
         // An unindexed pair would be seeded into the hot cache unchecked.
         std::fs::write(pack.join("stray.hsaco"), &elf).unwrap();
@@ -3424,99 +3761,135 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_root("bounded_batch");
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
-        let mut expected = None;
-        for jobs in [1, 3] {
-            let arm = root.join(format!("{arch}-jobs{jobs}"));
-            let mut compiler = prebuilt_gate_compiler(&arm, true);
-            compiler.arch = arch.to_owned();
-            let inner = std::env::var_os("HIPFIRE_TEST_REAL_HIPCC")
-                .map(PathBuf::from).unwrap_or_else(|| compiler.hipcc_bin.clone());
-            let log = arm.join("events");
-            let wrapper = arm.join("timed-hipcc");
-            std::fs::write(&wrapper, format!(
+            let mut expected = None;
+            for jobs in [1, 3] {
+                let arm = root.join(format!("{arch}-jobs{jobs}"));
+                let mut compiler = prebuilt_gate_compiler(&arm, true);
+                compiler.arch = arch.to_owned();
+                let inner = std::env::var_os("HIPFIRE_TEST_REAL_HIPCC")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| compiler.hipcc_bin.clone());
+                let log = arm.join("events");
+                let wrapper = arm.join("timed-hipcc");
+                std::fs::write(&wrapper, format!(
                 "#!/bin/sh\ncase \" $* \" in *' -o '*) ;; *) exec '{}' \"$@\" ;; esac\nprintf 'start %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\n'{}' \"$@\"\nstatus=$?\nprintf 'end %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\nexit \"$status\"\n",
                 inner.display(), log.display(), inner.display(), log.display())).unwrap();
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-            compiler.hipcc_bin = wrapper;
-            let sources = [
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                compiler.hipcc_bin = wrapper;
+                let sources = [
                 "extern \"C\" __global__ void first() {} extern \"C\" __global__ void second() {}",
                 "extern \"C\" __global__ void third() {}",
                 "extern \"C\" __global__ void fourth() {}",
             ];
-            let requests = [
-                ("alpha", sources[0], "first"), ("alpha", sources[0], "second"),
-                ("alpha", sources[0], "first"), ("alias", sources[0], "second"),
-                ("beta", sources[1], "third"), ("gamma", sources[2], "fourth"),
-            ];
-            // Exercise the public registry contract as well as tuple preparation.
-            let recipe = KernelCompiler::recipe_for_source(arch, "alpha", sources[0], "");
-            let entry = crate::kernel_registry::KernelEntry {
-                arch, module: "alpha", symbols: &["first", "second"],
-                source: std::borrow::Cow::Borrowed(sources[0]),
-                flags: recipe.flags, scheduler_profile: recipe.scheduler_profile,
-            };
-            let empty = compiler.begin_batch(vec![entry], 0);
-            assert!(empty.is_err());
-            let entries = [
-                ("alpha", sources[0], &["first", "second", "first"][..]),
-                ("alias", sources[0], &["second"][..]),
-                ("beta", sources[1], &["third"][..]),
-                ("gamma", sources[2], &["fourth"][..]),
-            ].into_iter().map(|(module, source, symbols)| {
-                let recipe = KernelCompiler::recipe_for_source(arch, module, source, "");
-                crate::kernel_registry::KernelEntry {
-                    arch, module, symbols, source: std::borrow::Cow::Borrowed(source),
-                    flags: recipe.flags, scheduler_profile: recipe.scheduler_profile,
+                let requests = [
+                    ("alpha", sources[0], "first"),
+                    ("alpha", sources[0], "second"),
+                    ("alpha", sources[0], "first"),
+                    ("alias", sources[0], "second"),
+                    ("beta", sources[1], "third"),
+                    ("gamma", sources[2], "fourth"),
+                ];
+                // Exercise the public registry contract as well as tuple preparation.
+                let recipe = KernelCompiler::recipe_for_source(arch, "alpha", sources[0], "");
+                let entry = crate::kernel_registry::KernelEntry {
+                    arch,
+                    module: "alpha",
+                    symbols: &["first", "second"],
+                    source: std::borrow::Cow::Borrowed(sources[0]),
+                    flags: recipe.flags,
+                    scheduler_profile: recipe.scheduler_profile,
+                };
+                let empty = compiler.begin_batch(vec![entry], 0);
+                assert!(empty.is_err());
+                let entries = [
+                    ("alpha", sources[0], &["first", "second", "first"][..]),
+                    ("alias", sources[0], &["second"][..]),
+                    ("beta", sources[1], &["third"][..]),
+                    ("gamma", sources[2], &["fourth"][..]),
+                ]
+                .into_iter()
+                .map(|(module, source, symbols)| {
+                    let recipe = KernelCompiler::recipe_for_source(arch, module, source, "");
+                    crate::kernel_registry::KernelEntry {
+                        arch,
+                        module,
+                        symbols,
+                        source: std::borrow::Cow::Borrowed(source),
+                        flags: recipe.flags,
+                        scheduler_profile: recipe.scheduler_profile,
+                    }
+                })
+                .collect();
+                let batch = compiler.begin_batch(entries, jobs).unwrap();
+                assert_eq!(batch.handles.len(), jobs);
+                compiler.finish_batch(batch).unwrap();
+                let mut events = std::fs::read_to_string(&log)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let parts = line.split_whitespace().collect::<Vec<_>>();
+                        (parts[1].parse::<u64>().unwrap(), parts[0] == "start")
+                    })
+                    .collect::<Vec<_>>();
+                events.sort_by_key(|event| event.0);
+                assert_eq!(events.iter().filter(|event| event.1).count(), 3);
+                let mut active = 0;
+                for (_, start) in events {
+                    if start {
+                        active += 1;
+                    } else {
+                        active -= 1;
+                    }
+                    assert!(active <= jobs);
                 }
-            }).collect();
-            let batch = compiler.begin_batch(entries, jobs).unwrap();
-            assert_eq!(batch.handles.len(), jobs);
-            compiler.finish_batch(batch).unwrap();
-            let mut events = std::fs::read_to_string(&log).unwrap().lines().map(|line| {
-                let parts = line.split_whitespace().collect::<Vec<_>>();
-                (parts[1].parse::<u64>().unwrap(), parts[0] == "start")
-            }).collect::<Vec<_>>();
-            events.sort_by_key(|event| event.0);
-            assert_eq!(events.iter().filter(|event| event.1).count(), 3);
-            let mut active = 0;
-            for (_, start) in events {
-                if start { active += 1; } else { active -= 1; }
-                assert!(active <= jobs);
-            }
-            assert_eq!(active, 0);
-            let mut identities = Vec::new();
-            for module in ["alpha", "alias", "beta", "gamma"] {
-                for extension in ["hsaco", "hash", "index.json"] {
-                    identities.push(std::fs::read(arm.join("cold").join(format!("{module}.{extension}"))).unwrap());
+                assert_eq!(active, 0);
+                let mut identities = Vec::new();
+                for module in ["alpha", "alias", "beta", "gamma"] {
+                    for extension in ["hsaco", "hash", "index.json"] {
+                        identities.push(
+                            std::fs::read(arm.join("cold").join(format!("{module}.{extension}")))
+                                .unwrap(),
+                        );
+                    }
                 }
-            }
-            if let Some(expected) = &expected { assert_eq!(&identities, expected); }
-            else { expected = Some(identities); }
-            let index: PackIndex = serde_json::from_slice(
-                &std::fs::read(arm.join("cold/alpha.index.json")).unwrap()).unwrap();
-            assert!(index.symbols.contains(&"first".to_owned()));
-            assert!(index.symbols.contains(&"second".to_owned()));
-            if std::env::var_os("HIPFIRE_TEST_REAL_HIPCC").is_some() {
-                for &(module, _, symbol) in &requests {
-                    let object = &compiler.compiled[module];
-                    let code = std::fs::read(object).unwrap();
-                    let manifest = std::fs::read_to_string(object.with_extension("radiowave.json")).unwrap();
-                    let certification = CodeObjectCertification::from_json(&code, &manifest).unwrap();
-                    assert!(certification.kernel(symbol).is_some(), "missing export {symbol}");
+                if let Some(expected) = &expected {
+                    assert_eq!(&identities, expected);
+                } else {
+                    expected = Some(identities);
                 }
+                let index: PackIndex = serde_json::from_slice(
+                    &std::fs::read(arm.join("cold/alpha.index.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(index.symbols.contains(&"first".to_owned()));
+                assert!(index.symbols.contains(&"second".to_owned()));
+                if std::env::var_os("HIPFIRE_TEST_REAL_HIPCC").is_some() {
+                    for &(module, _, symbol) in &requests {
+                        let object = &compiler.compiled[module];
+                        let code = std::fs::read(object).unwrap();
+                        let manifest =
+                            std::fs::read_to_string(object.with_extension("radiowave.json"))
+                                .unwrap();
+                        let certification =
+                            CodeObjectCertification::from_json(&code, &manifest).unwrap();
+                        assert!(
+                            certification.kernel(symbol).is_some(),
+                            "missing export {symbol}"
+                        );
+                    }
+                }
+                let before = std::fs::read(&log).unwrap();
+                let batch = compiler.prepare_batch(&requests, jobs).unwrap();
+                assert!(batch.handles.is_empty());
+                compiler.finish_batch(batch).unwrap();
+                assert_eq!(std::fs::read(&log).unwrap(), before);
+                compiler.cold_dir = None;
+                let batch = compiler.prepare_batch(&requests, jobs).unwrap();
+                assert!(batch.handles.is_empty());
+                compiler.finish_batch(batch).unwrap();
+                assert_eq!(std::fs::read(&log).unwrap(), before);
+                eprintln!("{arch}: jobs={jobs}, compiler starts=3, aliases=4, objects/hash/index identical, installed/hot starts=0");
             }
-            let before = std::fs::read(&log).unwrap();
-            let batch = compiler.prepare_batch(&requests, jobs).unwrap();
-            assert!(batch.handles.is_empty());
-            compiler.finish_batch(batch).unwrap();
-            assert_eq!(std::fs::read(&log).unwrap(), before);
-            compiler.cold_dir = None;
-            let batch = compiler.prepare_batch(&requests, jobs).unwrap();
-            assert!(batch.handles.is_empty());
-            compiler.finish_batch(batch).unwrap();
-            assert_eq!(std::fs::read(&log).unwrap(), before);
-            eprintln!("{arch}: jobs={jobs}, compiler starts=3, aliases=4, objects/hash/index identical, installed/hot starts=0");
-        }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3526,14 +3899,20 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for finish in [false, true] {
             let joined = Arc::new(AtomicUsize::new(0));
-            let mut handles = vec![thread::spawn(|| -> Vec<CompletedJob> { panic!("test worker"); })];
+            let mut handles = vec![thread::spawn(|| -> Vec<CompletedJob> {
+                panic!("test worker");
+            })];
             for _ in 0..3 {
                 let joined = Arc::clone(&joined);
                 handles.push(thread::spawn(move || {
                     thread::sleep(std::time::Duration::from_millis(20));
                     joined.fetch_add(1, Ordering::SeqCst);
                     vec![CompletedJob {
-                        job: PreparedJob { source: String::new(), module_flags: vec![], modules: vec![] },
+                        job: PreparedJob {
+                            source: String::new(),
+                            module_flags: vec![],
+                            modules: vec![],
+                        },
                         result: Err(hip_bridge::HipError::new(0, "test compile failure")),
                     }]
                 }));
@@ -3541,7 +3920,9 @@ mod tests {
             let batch = KernelBatch { handles };
             if finish {
                 assert!(test_compiler("", "").finish_batch(batch).is_err());
-            } else { drop(batch); }
+            } else {
+                drop(batch);
+            }
             assert_eq!(joined.load(Ordering::SeqCst), 3);
         }
     }
@@ -3550,7 +3931,9 @@ mod tests {
     fn batch_refuses_zero_jobs_and_conflicting_recipes() {
         let mut compiler = test_compiler("", "");
         assert!(compiler.prepare_batch(&[], 0).is_err());
-        assert!(compiler.prepare_batch(&[("one", "first", "one"), ("one", "second", "two")], 2).is_err());
+        assert!(compiler
+            .prepare_batch(&[("one", "first", "one"), ("one", "second", "two")], 2)
+            .is_err());
         assert!(compiler.compiled.is_empty());
     }
 }

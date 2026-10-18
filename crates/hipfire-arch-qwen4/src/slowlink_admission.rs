@@ -1618,8 +1618,7 @@ pub fn select_profile(
                     tile: Some(profile.tile_rows),
                 }),
                 _ => Ok(profile),
-            })
-        {
+            }) {
             Ok(profile) => {
                 eprintln!("  qwen4 {}", profile.describe());
                 return Ok(Some(profile));

@@ -3903,18 +3903,23 @@ mod tests {
                         // opt-in; rows reach 512 raw or through gfx1151's scope.
                         let capable = matches!(arch, "gfx1100" | "gfx1101" | "gfx1151")
                             || (arch == "gfx1201" && optin);
-                        let scoped =
-                            arch == "gfx1151" && (pm_invariant || (append && chunk >= 48));
+                        let scoped = arch == "gfx1151" && (pm_invariant || (append && chunk >= 48));
                         let reaches = chunk >= 512 || scoped;
                         let label = format!(
                             "{arch} optin {optin} chunk {chunk} append {append} pm {pm_invariant}"
                         );
-                        assert_eq!(charge, if capable && reaches { bound } else { 0 }, "{label}");
+                        assert_eq!(
+                            charge,
+                            if capable && reaches { bound } else { 0 },
+                            "{label}"
+                        );
                         // The runtime predicate over the shadowed owners' K
                         // values agrees: it holds for some owner iff the census
                         // charges.
                         let runtime = [2560usize, 640, 10240].into_iter().any(|k| {
-                            qwen4_f16_wmma_applies_for(&caps, optin, true, route_rows, k, true, true)
+                            qwen4_f16_wmma_applies_for(
+                                &caps, optin, true, route_rows, k, true, true,
+                            )
                         });
                         assert_eq!(runtime, charge > 0, "{label}");
                     }
@@ -3928,12 +3933,24 @@ mod tests {
             "gfx1100",
             std::sync::Arc::new(FeatureFlags::for_test("gfx1100")),
         );
-        assert!(qwen4_f16_wmma_applies_for(&caps, true, true, 512, 640, true, true));
-        assert!(!qwen4_f16_wmma_applies_for(&caps, true, false, 512, 640, true, true));
-        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 512, 8, true, true));
-        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 511, 640, true, true));
-        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 512, 640, false, true));
-        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 512, 640, true, false));
+        assert!(qwen4_f16_wmma_applies_for(
+            &caps, true, true, 512, 640, true, true
+        ));
+        assert!(!qwen4_f16_wmma_applies_for(
+            &caps, true, false, 512, 640, true, true
+        ));
+        assert!(!qwen4_f16_wmma_applies_for(
+            &caps, true, true, 512, 8, true, true
+        ));
+        assert!(!qwen4_f16_wmma_applies_for(
+            &caps, true, true, 511, 640, true, true
+        ));
+        assert!(!qwen4_f16_wmma_applies_for(
+            &caps, true, true, 512, 640, false, true
+        ));
+        assert!(!qwen4_f16_wmma_applies_for(
+            &caps, true, true, 512, 640, true, false
+        ));
     }
 
     /// The shadows are physical owners DUPLICATING the original BF16 weights:

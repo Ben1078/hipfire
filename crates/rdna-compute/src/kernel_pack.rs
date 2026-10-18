@@ -93,7 +93,11 @@ pub fn verify_dir(
 
 /// Every indexed symbol of every registry module must be exported by the
 /// module's object. All offenders are reported, not the first.
-pub(crate) fn verify_exports(entries: &[KernelEntry], arch: &str, dir: &Path) -> Result<(), String> {
+pub(crate) fn verify_exports(
+    entries: &[KernelEntry],
+    arch: &str,
+    dir: &Path,
+) -> Result<(), String> {
     let mut unexported = Vec::new();
     for entry in entries {
         let object = dir.join(format!("{}.hsaco", entry.module));
@@ -417,7 +421,10 @@ pub fn code_object_exports(object: &[u8], arch: &str) -> Result<BTreeSet<String>
             .checked_add(len)
             .and_then(|end| elf.get(at..end))
             .ok_or("truncated ELF code object")?;
-        Ok(bytes.iter().rev().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
+        Ok(bytes
+            .iter()
+            .rev()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
     };
     let offset = |at: usize, len: usize| -> Result<usize, String> {
         usize::try_from(field(at, len)?).map_err(|_| "ELF offset overflow".to_owned())
@@ -646,7 +653,9 @@ mod tests {
         // Retype the dynsym section header (section 1) so no `.dynsym` remains.
         let sections_at = u64::from_le_bytes(no_symbols[0x28..0x30].try_into().unwrap()) as usize;
         no_symbols[sections_at + 64 + 4] = 1;
-        assert!(code_object_exports(&no_symbols, "gfx1100").unwrap_err().contains(".dynsym"));
+        assert!(code_object_exports(&no_symbols, "gfx1100")
+            .unwrap_err()
+            .contains(".dynsym"));
     }
 
     /// An uncompressed clang offload bundle of `(triple, payload)` entries.
@@ -695,7 +704,9 @@ mod tests {
         assert!(error.contains("truncated offload bundle entry"), "{error}");
         // An empty target image is an error for that arch; other arches are unaffected.
         let empty = offload_bundle(&[host, (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &[])]);
-        assert!(code_object_exports(&empty, "gfx1100").unwrap_err().contains("is empty"));
+        assert!(code_object_exports(&empty, "gfx1100")
+            .unwrap_err()
+            .contains("is empty"));
         // Compressed bundles are refused by name, never read as ELF.
         let error = code_object_exports(b"CCOB\x03\x00\x00\x00 compressed", "gfx1100").unwrap_err();
         assert!(error.contains("compressed offload bundle"), "{error}");
@@ -726,8 +737,13 @@ mod tests {
         assert_eq!(measured.len(), 83);
         assert_eq!(code_object_exports(bundle, "gfx1100").unwrap(), measured);
         // The gfx1100 ELF at its bundle offset (4096) is the same image.
-        assert_eq!(code_object_exports(&bundle[4096..], "gfx1100").unwrap(), measured);
-        assert!(code_object_exports(bundle, "gfx1151").unwrap_err().contains("no amdgcn image"));
+        assert_eq!(
+            code_object_exports(&bundle[4096..], "gfx1100").unwrap(),
+            measured
+        );
+        assert!(code_object_exports(bundle, "gfx1151")
+            .unwrap_err()
+            .contains("no amdgcn image"));
         assert!(code_object_exports(&bundle[..bundle.len() - 4096], "gfx1100").is_err());
     }
 
@@ -749,8 +765,11 @@ mod tests {
                 "packaging_key": "", "object_sha256": "", "toolchain_id": "t",
                 "toolchain_sha256": "",
             });
-            std::fs::write(root.join("alpha.index.json"), serde_json::to_vec(&index).unwrap())
-                .unwrap();
+            std::fs::write(
+                root.join("alpha.index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
         };
         std::fs::write(
             root.join("alpha.hsaco"),
@@ -763,7 +782,10 @@ mod tests {
         write_index(&["alpha_a", "alpha_b", "alpha_c", "alpha_d"]);
         let error = verify_exports(&entries, "gfx1100", &root).unwrap_err();
         assert!(error.contains("2 indexed symbol(s)"), "{error}");
-        assert!(error.contains("alpha:alpha_c") && error.contains("alpha:alpha_d"), "{error}");
+        assert!(
+            error.contains("alpha:alpha_c") && error.contains("alpha:alpha_d"),
+            "{error}"
+        );
         assert!(!error.contains("alpha:alpha_a"), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }

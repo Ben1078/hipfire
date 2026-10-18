@@ -2063,8 +2063,7 @@ pub fn profile_shape_problems(manifest: &Value) -> Vec<String> {
         }
         bad.extend(profile_terms_problems(manifest, profile, true));
         bad.extend(profile_terms_problems(manifest, profile, false));
-        if get(manifest, &profile_path(profile, "purpose")).and_then(Value::as_str)
-            != Some(profile)
+        if get(manifest, &profile_path(profile, "purpose")).and_then(Value::as_str) != Some(profile)
         {
             bad.push(format!(
                 "manifest {} is not {profile:?}",
@@ -2161,14 +2160,19 @@ pub fn profile_terms_problems(manifest: &Value, profile: &str, census: bool) -> 
     };
     let path = profile_path(profile, terms_key);
     let Some(array) = get(manifest, &path).and_then(Value::as_array) else {
-        return vec![format!("manifest {path} is not an array of {{name, bytes}} terms")];
+        return vec![format!(
+            "manifest {path} is not an array of {{name, bytes}} terms"
+        )];
     };
     let mut bad = Vec::new();
     let mut names: Vec<&str> = Vec::new();
     let mut sum = Some(0u64);
     let mut cold: Vec<u64> = Vec::new();
     for (index, term) in array.iter().enumerate() {
-        let name = term.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
+        let name = term
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
         let bytes = term.get("bytes").and_then(Value::as_u64);
         let (Some(name), Some(bytes)) = (name, bytes) else {
             bad.push(format!(
@@ -2201,7 +2205,10 @@ pub fn profile_terms_problems(manifest: &Value, profile: &str, census: bool) -> 
         ));
     }
     if census {
-        let stated = get(manifest, &profile_path(profile, "f16_shadow_cold_bound_bytes"));
+        let stated = get(
+            manifest,
+            &profile_path(profile, "f16_shadow_cold_bound_bytes"),
+        );
         if let Some(stated) = stated.filter(|v| !v.is_null()) {
             if cold.len() != 1 || stated.as_u64() != Some(cold[0]) {
                 bad.push(format!(

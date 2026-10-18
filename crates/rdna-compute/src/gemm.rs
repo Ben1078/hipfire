@@ -48227,7 +48227,10 @@ static SLAB_K2_GFX1100_E8P: SlabK2 = SlabK2 {
 static SLAB_K2_GFX1151_E8P: SlabK2 = SlabK2 {
     module: "qwen4_moe_iu4_sym_e8p_pm_gfx1151",
     image: kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151,
-    entries: ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"],
+    entries: [
+        "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151",
+        "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151",
+    ],
     code_bits: 2,
 };
 
@@ -48271,7 +48274,10 @@ pub(crate) fn slab_k2_raw(arch: &str, codec: u8) -> Option<(&'static str, [&'sta
         )),
         ("gfx1151", 1) => Some((
             QWEN4_MOE_SYM_W3_NT4_PM_MODULE_GFX1151,
-            [QWEN4_MOE_SYM_W3_NT4_GATE_UP_GFX1151, QWEN4_MOE_SYM_W3_NT4_DOWN_GFX1151[0]],
+            [
+                QWEN4_MOE_SYM_W3_NT4_GATE_UP_GFX1151,
+                QWEN4_MOE_SYM_W3_NT4_DOWN_GFX1151[0],
+            ],
         )),
         _ => None,
     }
@@ -52101,7 +52107,10 @@ mod route_selector_tests {
         assert_eq!(gfx1151_e8p.module, "qwen4_moe_iu4_sym_e8p_pm_gfx1151");
         assert_eq!(
             gfx1151_e8p.entries,
-            ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"]
+            [
+                "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151",
+                "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"
+            ]
         );
         assert_eq!(gfx1151_e8p.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151);
         assert_eq!(gfx1151_e8p.code_bits, 2);
@@ -52138,7 +52147,10 @@ mod route_selector_tests {
         }
         // gfx1151 E8P has a table row (`slab_k2_metadata`) and serves exactly when the shared
         // admission matrix admits it.
-        assert_eq!(slab_k2_entry("gfx1151", 3).is_some(), crate::qwen4_slab_codec_admitted("gfx1151", 3));
+        assert_eq!(
+            slab_k2_entry("gfx1151", 3).is_some(),
+            crate::qwen4_slab_codec_admitted("gfx1151", 3)
+        );
     }
 
     /// `(group_segment_fixed_size, private_segment_fixed_size, kernarg_segment_size)` of the
@@ -52258,18 +52270,37 @@ mod route_selector_tests {
         for (name, contract) in [
             (
                 k2.entries[0],
-                include_str!("../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.gate_up_e8p.contract.json"),
+                include_str!(
+                    "../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.gate_up_e8p.contract.json"
+                ),
             ),
             (
                 k2.entries[1],
-                include_str!("../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.down_e8p.contract.json"),
+                include_str!(
+                    "../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.down_e8p.contract.json"
+                ),
             ),
         ] {
-            assert!(contract.contains(&format!("\"symbol\": \"{name}\"")), "{name}: contract symbol");
-            assert!(contract.contains("\"launch_dynamic_lds_bytes\": 0"), "{name}: dynamic LDS");
-            assert!(contract.contains("\"group_segment_fixed_bytes\": 1536"), "{name}: static LDS");
-            assert!(contract.contains("\"require_wave32\": true"), "{name}: wave32");
-            assert!(contract.contains("\"require_zero_private\": true"), "{name}: private segment");
+            assert!(
+                contract.contains(&format!("\"symbol\": \"{name}\"")),
+                "{name}: contract symbol"
+            );
+            assert!(
+                contract.contains("\"launch_dynamic_lds_bytes\": 0"),
+                "{name}: dynamic LDS"
+            );
+            assert!(
+                contract.contains("\"group_segment_fixed_bytes\": 1536"),
+                "{name}: static LDS"
+            );
+            assert!(
+                contract.contains("\"require_wave32\": true"),
+                "{name}: wave32"
+            );
+            assert!(
+                contract.contains("\"require_zero_private\": true"),
+                "{name}: private segment"
+            );
             assert_eq!(
                 kernel_descriptor(k2.image, name),
                 Some((1536, 0, 64)),
@@ -52278,7 +52309,11 @@ mod route_selector_tests {
         }
         // The never-served `_acc` twins share the kernarg ABI.
         for name in k2.entries {
-            assert_eq!(kernel_descriptor(k2.image, &format!("{name}_acc")), Some((1536, 0, 64)), "{name}_acc");
+            assert_eq!(
+                kernel_descriptor(k2.image, &format!("{name}_acc")),
+                Some((1536, 0, 64)),
+                "{name}_acc"
+            );
         }
     }
 
@@ -52288,17 +52323,31 @@ mod route_selector_tests {
     #[test]
     fn qwen4_moe_sym_slab_k2_inventory_is_not_permission_and_gfx1151_is_the_gfx1100_arm() {
         let mut tabled = Vec::new();
-        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942", "gfx906", "gfx1101", ""] {
+        for arch in [
+            "gfx1100", "gfx1151", "gfx1201", "gfx942", "gfx906", "gfx1101", "",
+        ] {
             for codec in 0u8..=255 {
                 if slab_k2_metadata(arch, codec).is_some() {
                     tabled.push((arch, codec));
                 }
             }
         }
-        assert_eq!(tabled, [("gfx1100", 0), ("gfx1100", 3), ("gfx1151", 3), ("gfx1201", 3)]);
+        assert_eq!(
+            tabled,
+            [
+                ("gfx1100", 0),
+                ("gfx1100", 3),
+                ("gfx1151", 3),
+                ("gfx1201", 3)
+            ]
+        );
         for (arch, codec) in tabled {
             let served = slab_k2_entry(arch, codec);
-            assert_eq!(served.is_some(), crate::qwen4_slab_codec_admitted(arch, codec), "{arch} {codec}");
+            assert_eq!(
+                served.is_some(),
+                crate::qwen4_slab_codec_admitted(arch, codec),
+                "{arch} {codec}"
+            );
             if let Some(served) = served {
                 assert!(std::ptr::eq(served, slab_k2_metadata(arch, codec).unwrap()));
             }
@@ -52309,25 +52358,46 @@ mod route_selector_tests {
         assert_eq!(halo.module, xtx.module.replace("gfx1100", "gfx1151"));
         assert_eq!(
             halo.entries,
-            ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"]
+            [
+                "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151",
+                "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"
+            ]
         );
         for (halo_name, xtx_name) in halo.entries.iter().zip(xtx.entries) {
             assert_eq!(*halo_name, xtx_name.replace("gfx1100", "gfx1151"));
         }
         assert_eq!(halo.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151);
         assert!(!std::ptr::eq(halo.image, xtx.image));
-        assert!(!std::ptr::eq(halo.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1201));
+        assert!(!std::ptr::eq(
+            halo.image,
+            kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1201
+        ));
         assert_eq!(halo.code_bits, xtx.code_bits);
         for name in halo.entries {
-            assert!(!name.ends_with("_acc"), "{name}: the qualification twin must not be served");
-            assert!(contains_bytes(halo.image, format!("{name}.kd").as_bytes()), "{name}.kd missing");
+            assert!(
+                !name.ends_with("_acc"),
+                "{name}: the qualification twin must not be served"
+            );
+            assert!(
+                contains_bytes(halo.image, format!("{name}.kd").as_bytes()),
+                "{name}.kd missing"
+            );
             // The gfx1151 image names no gfx1100 or gfx1201 symbol.
-            assert!(!contains_bytes(halo.image, name.replace("gfx1151", "gfx1100").as_bytes()), "{name} (gfx1100 spelling)");
-            assert!(!contains_bytes(halo.image, name.replace("gfx1151", "gfx1201").as_bytes()), "{name} (gfx1201 spelling)");
+            assert!(
+                !contains_bytes(halo.image, name.replace("gfx1151", "gfx1100").as_bytes()),
+                "{name} (gfx1100 spelling)"
+            );
+            assert!(
+                !contains_bytes(halo.image, name.replace("gfx1151", "gfx1201").as_bytes()),
+                "{name} (gfx1201 spelling)"
+            );
         }
         // W2 / W3 / MQ4 stay unserved on gfx1151 here (W3 keeps its own launcher, MQ4 the hipcc one).
         for codec in [0u8, 1, 2, 255] {
-            assert!(slab_k2_metadata("gfx1151", codec).is_none() && slab_k2_entry("gfx1151", codec).is_none());
+            assert!(
+                slab_k2_metadata("gfx1151", codec).is_none()
+                    && slab_k2_entry("gfx1151", codec).is_none()
+            );
         }
     }
 }

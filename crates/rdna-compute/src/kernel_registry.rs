@@ -7146,24 +7146,46 @@ mod tests {
         let loads = |needle: &str| slab.lines().filter(|l| l.contains(needle)).count();
         assert_eq!(loads("kernels::SLOWLINK_PREFILL_SRC"), wrappers.len());
         assert_eq!(loads("MOE_DOWN_COMBINE_GROUPED_TOP10_SRC"), 0);
-        assert_eq!(loads(&format!("const MODULE: &str = \"{NEW}\";")), wrappers.len());
+        assert_eq!(
+            loads(&format!("const MODULE: &str = \"{NEW}\";")),
+            wrappers.len()
+        );
         assert_eq!(loads(&format!("\"{OLD}\"")), 0);
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let old = lookup(arch, OLD, "").unwrap();
-            assert_eq!(format!("{:x}", Sha256::digest(old.source().as_bytes())), OLD_SHA, "{arch}");
+            assert_eq!(
+                format!("{:x}", Sha256::digest(old.source().as_bytes())),
+                OLD_SHA,
+                "{arch}"
+            );
             let new = lookup(arch, NEW, "").unwrap();
             let index = |entry: &KernelEntry| -> BTreeSet<String> {
                 entry.symbols.iter().map(|s| (*s).to_owned()).collect()
             };
-            assert_eq!(index(&old), source_exports(old.source(), arch), "{arch} {OLD}");
-            assert_eq!(index(&new), source_exports(new.source(), arch), "{arch} {NEW}");
-            assert!(index(&old).iter().all(|s| !s.starts_with("slowlink_")), "{arch}");
+            assert_eq!(
+                index(&old),
+                source_exports(old.source(), arch),
+                "{arch} {OLD}"
+            );
+            assert_eq!(
+                index(&new),
+                source_exports(new.source(), arch),
+                "{arch} {NEW}"
+            );
+            assert!(
+                index(&old).iter().all(|s| !s.starts_with("slowlink_")),
+                "{arch}"
+            );
             assert!(index(&old).is_disjoint(&index(&new)), "{arch}");
             for name in &wrappers {
                 let symbol = format!("slowlink_{name}");
                 assert!(index(&new).contains(&symbol), "{arch}: {symbol}");
             }
-            assert_eq!(index(&new).len(), wrappers.len(), "{arch}: unrequested export");
+            assert_eq!(
+                index(&new).len(),
+                wrappers.len(),
+                "{arch}: unrequested export"
+            );
         }
         // The walked plans still name the legacy module at its recorded identity.
         let old = lookup("gfx1201", OLD, "").unwrap();

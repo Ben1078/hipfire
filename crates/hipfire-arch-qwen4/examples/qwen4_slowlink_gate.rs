@@ -2168,11 +2168,11 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     progress.record(
         "plan",
         json!({"mode": args.mode.name(), "route": args.route.name(), "required": required,
-               "admitted_purpose": purpose_name(load_purpose(args.mode)),
-               "manifest_profiles": {
-                   "product_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRODUCT),
-                   "primitive_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRIMITIVE),
-               }}),
+        "admitted_purpose": purpose_name(load_purpose(args.mode)),
+        "manifest_profiles": {
+            "product_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRODUCT),
+            "primitive_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRIMITIVE),
+        }}),
     );
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     // Baseline sample: after the HIP context exists, before any model allocation.
@@ -3787,7 +3787,9 @@ mod slowlink_receipt_tests {
         // A sum that overflows u64 refuses rather than wrapping.
         let mut m = manifest.clone();
         m["memory_ledger"]["profiles"][profile]["device_weights_bytes"] = json!(u64::MAX);
-        assert!(memory_ledger(&m, profile).unwrap_err().contains("overflows"));
+        assert!(memory_ledger(&m, profile)
+            .unwrap_err()
+            .contains("overflows"));
         let mut m = manifest;
         m["memory_ledger"]["census_basis"] = json!("  ");
         assert!(memory_ledger(&m, profile).is_err());
@@ -4474,8 +4476,7 @@ mod slowlink_receipt_tests {
         let mut roomy = product_receipt(768);
         roomy["retained_scratch_rows"] = json!(1536);
         assert!(
-            !call_problems(Expect::LayerMajor, product, Some(&roomy), 16384, true, true)
-                .is_empty()
+            !call_problems(Expect::LayerMajor, product, Some(&roomy), 16384, true, true).is_empty()
         );
         // The generic historical validator is unchanged: no expected tile, 1,536 passes.
         let generic = Limits {
@@ -4527,7 +4528,14 @@ mod slowlink_receipt_tests {
             bypass["bypass_reason"] = json!("request at most one tile");
         }
         // A call longer than the bypass bound must run layer-major, whatever the tile.
-        let bad = call_problems(Expect::LayerMajor, 768, Some(&incumbent()), 1537, false, false);
+        let bad = call_problems(
+            Expect::LayerMajor,
+            768,
+            Some(&incumbent()),
+            1537,
+            false,
+            false,
+        );
         assert!(!bad.is_empty());
     }
 
@@ -4663,7 +4671,9 @@ mod slowlink_receipt_tests {
         assert_eq!(ledger.owned_device_bytes, primitive);
         assert_eq!(ledger.decomposition.sequential_diag, GIB);
         assert_eq!(
-            memory_ledger(&with_root, PROFILE_PRODUCT).unwrap_err().contains("sequential_diag_bytes"),
+            memory_ledger(&with_root, PROFILE_PRODUCT)
+                .unwrap_err()
+                .contains("sequential_diag_bytes"),
             true,
             "the product profile has no diagnostic bytes to decompose"
         );
@@ -4692,7 +4702,10 @@ mod slowlink_receipt_tests {
                 array[last]["bytes"] = json!(bytes + 1);
                 m["memory_ledger"]["profiles"][profile][key] = json!(array);
                 let bad = profile_terms_problems(&m, profile, census);
-                assert!(bad.iter().any(|p| p.contains("sums to")), "{profile} {key}: {bad:?}");
+                assert!(
+                    bad.iter().any(|p| p.contains("sums to")),
+                    "{profile} {key}: {bad:?}"
+                );
                 assert!(!manifest_problems(&m, &observed()).is_empty());
             }
             // The cold F16 term must appear exactly once in the census terms.
@@ -4707,12 +4720,22 @@ mod slowlink_receipt_tests {
                 .any(|p| p.contains("expected exactly 1")));
             let mut twice = manifest();
             let mut array = terms(&mut twice, profile, "s1_tile_census_terms");
-            let cold = array.iter().find(|t| t["name"] == COLD_F16_TERM).unwrap().clone();
+            let cold = array
+                .iter()
+                .find(|t| t["name"] == COLD_F16_TERM)
+                .unwrap()
+                .clone();
             array.push(cold);
             twice["memory_ledger"]["profiles"][profile]["s1_tile_census_terms"] = json!(array);
             let bad = profile_terms_problems(&twice, profile, true);
-            assert!(bad.iter().any(|p| p.contains("repeats the term name")), "{bad:?}");
-            assert!(bad.iter().any(|p| p.contains("expected exactly 1")), "{bad:?}");
+            assert!(
+                bad.iter().any(|p| p.contains("repeats the term name")),
+                "{bad:?}"
+            );
+            assert!(
+                bad.iter().any(|p| p.contains("expected exactly 1")),
+                "{bad:?}"
+            );
             // ...and never in the extras (no duplicate physical charge).
             let mut extra = manifest();
             let mut array = terms(&mut extra, profile, "s1_extras_terms");
@@ -4786,9 +4809,11 @@ mod slowlink_receipt_tests {
             ("product", Some(768), Some(16384), Some(11)),
             ("product", None, None, None),
         ] {
-            let bad =
-                profile_load_problems(&m, PROFILE_PRODUCT, purpose, tile, window, resident);
-            assert!(!bad.is_empty(), "{purpose} {tile:?} {window:?} {resident:?}");
+            let bad = profile_load_problems(&m, PROFILE_PRODUCT, purpose, tile, window, resident);
+            assert!(
+                !bad.is_empty(),
+                "{purpose} {tile:?} {window:?} {resident:?}"
+            );
         }
     }
 
