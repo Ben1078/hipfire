@@ -276,38 +276,26 @@ fn load_inner(
         let layers = match &profile {
             Some(p) => p.resident_layers,
             None => {
-                // The incumbent's automatic placement at its own chunk.
-                let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, max_seq);
-                let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
-                    gpu: load.gpu,
-                    config: load.config,
-                    weights: load.weights,
-                    bytes_of: load.bytes_of,
+                // The product's automatic placement at its own chunk (the
+                // shared incumbent resolver; `None`: fully resident).
+                let dedicated_stage = residency::dedicated_slab_stage(
+                    residency::expert_stage_placement_enabled(&gpu.arch),
+                    matches!(recipe, crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }),
+                    false,
+                );
+                residency::incumbent_auto_resident_layers(
+                    load.gpu,
+                    load.config,
+                    load.weights,
+                    load.bytes_of,
                     backend,
-                    use_ranges: false,
                     max_seq,
                     vmm_granularity,
-                    mtp_kept: false,
-                    max_k: 0,
-                    routed_experts,
                     state_format,
                     scratch_mode,
-                    ranks: 1,
-                    chunk_rows: chunk,
-                })?;
-                let (free, _) = load
-                    .gpu
-                    .device_mem_info()
-                    .map_err(|error| format!("qwen4: device memory query: {error}"))?;
-                let charges = residency::PlacementCharges::new(inputs.layer_experts, false)?;
-                residency::auto_placement_layers(
-                    free as u64,
-                    inputs.non_expert,
-                    inputs.layer_experts,
-                    load.config.num_hidden_layers,
-                    inputs.reserve.bytes(),
-                    &charges,
+                    dedicated_stage,
                 )?
+                .unwrap_or(load.config.num_hidden_layers)
             }
         };
         residency::place_routed_experts(&mut weights, layers);
