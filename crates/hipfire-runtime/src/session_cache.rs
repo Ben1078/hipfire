@@ -1660,7 +1660,11 @@ impl SessionCache {
     /// Evict device snapshots until `bytes` more fit the budget (counting
     /// pending snapshots) and the memory guard (counting `growth`).
     fn make_room(&mut self, gpu: &mut Gpu, bytes: u64, growth: u64) -> Result<(), &'static str> {
-        let pending_bytes: u64 = self.pending.iter().map(|entry| device_bytes(&entry.1)).sum();
+        let pending_bytes: u64 = self
+            .pending
+            .iter()
+            .map(|entry| device_bytes(&entry.1))
+            .sum();
         loop {
             let over_budget = self
                 .pool
@@ -1765,10 +1769,15 @@ impl SessionCache {
     /// plus at most `granule - 1` of padding per snapshot (it cannot be
     /// iterated), an upper bound.
     fn device_backing(&self, granule: u64) -> u64 {
-        let round = |bytes: u64| if bytes == 0 { 0 } else { backing(bytes, granule) };
-        let resident = |slot: &Option<Resident>| {
-            slot.as_ref().map_or(0, |r| round(r.buf.device_bytes()))
+        let round = |bytes: u64| {
+            if bytes == 0 {
+                0
+            } else {
+                backing(bytes, granule)
+            }
         };
+        let resident =
+            |slot: &Option<Resident>| slot.as_ref().map_or(0, |r| round(r.buf.device_bytes()));
         let pool = self
             .pool
             .total_bytes()
@@ -1783,7 +1792,11 @@ impl SessionCache {
         saturating_total(
             [pool, parked]
                 .into_iter()
-                .chain(self.pending.iter().map(|entry| round(device_bytes(&entry.1))))
+                .chain(
+                    self.pending
+                        .iter()
+                        .map(|entry| round(device_bytes(&entry.1))),
+                )
                 .chain(self.release.iter().map(|s| round(device_bytes(s))))
                 .chain(self.release_bufs.iter().map(|s| round(s.device_bytes())))
                 .chain([
@@ -1818,7 +1831,11 @@ impl SessionCache {
     /// Whether the device pool's own budget holds `need` more bytes beside
     /// its published and pending snapshots, evicting nothing.
     fn pool_room(&self, need: u64) -> bool {
-        let pending: u64 = self.pending.iter().map(|entry| device_bytes(&entry.1)).sum();
+        let pending: u64 = self
+            .pending
+            .iter()
+            .map(|entry| device_bytes(&entry.1))
+            .sum();
         self.pool
             .total_bytes()
             .saturating_add(pending)
@@ -2295,7 +2312,12 @@ impl SessionCache {
                 Some(snapshot) => snapshot.parent.clone(),
                 None => match self.host_pool.get(&key.0, key.1, key.2) {
                     Some(snapshot) => snapshot.parent.clone(),
-                    None => self.disk.as_mut().and_then(|disk| disk.get(key))?.parent.clone(),
+                    None => self
+                        .disk
+                        .as_mut()
+                        .and_then(|disk| disk.get(key))?
+                        .parent
+                        .clone(),
                 },
             };
             match parent {
@@ -2477,8 +2499,11 @@ impl SessionCache {
         let chain = self.chain_sources(keys, temps, missing)?;
         let leaf = chain.last().expect("non-empty chain").0;
         let dst = state.restore_parts(gpu, route, &leaf.meta)?;
-        let fixed: Vec<(usize, usize)> =
-            dst.fixed.iter().map(|part| (part.offset, part.bytes)).collect();
+        let fixed: Vec<(usize, usize)> = dst
+            .fixed
+            .iter()
+            .map(|part| (part.offset, part.bytes))
+            .collect();
         let rows: Vec<(usize, usize)> = dst
             .rows
             .iter()
@@ -2776,11 +2801,9 @@ impl SessionCache {
             None => self.make_room(gpu, bytes, growth).map(|()| Tier::Device),
             Some(_) => self.place(gpu, bytes, growth, true),
         };
-        let dst = placed
-            .and_then(|tier| {
-                alloc_store(gpu, tier, plan.total, self.quarantine.as_ref())
-                    .map_err(|_| "allocation")
-            });
+        let dst = placed.and_then(|tier| {
+            alloc_store(gpu, tier, plan.total, self.quarantine.as_ref()).map_err(|_| "allocation")
+        });
         let dst = match dst {
             Ok(dst) => dst,
             Err(reason) => {
@@ -2912,11 +2935,12 @@ impl SessionCache {
                 skip(self, reason);
                 return Ok(());
             }
-            ResidentPlan::Reuse => self
-                .pending_slot(lineage)
-                .take()
-                .expect("reuse is planned over a pending buffer")
-                .buf,
+            ResidentPlan::Reuse => {
+                self.pending_slot(lineage)
+                    .take()
+                    .expect("reuse is planned over a pending buffer")
+                    .buf
+            }
             ResidentPlan::Allocate(tier) if self.pressure.is_none() => {
                 debug_assert_eq!(tier, Tier::Device);
                 if let Some(previous) = self.pending_slot(lineage).take() {
@@ -3334,12 +3358,9 @@ impl SessionCache {
                 Some(_) => self.place(gpu, plan.total as u64, growth, false),
             }
         };
-        let buf = match placed
-            .and_then(|tier| {
-                alloc_store(gpu, tier, plan.total, self.quarantine.as_ref())
-                    .map_err(|_| "allocation")
-            })
-        {
+        let buf = match placed.and_then(|tier| {
+            alloc_store(gpu, tier, plan.total, self.quarantine.as_ref()).map_err(|_| "allocation")
+        }) {
             Ok(buf) => buf,
             Err(reason) => {
                 if self.pressure.is_some() {
@@ -7234,7 +7255,10 @@ mod tests {
             device_budget_bytes: 2 * 35_651_584 + GRANULE,
         });
         assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(Tier::Device));
-        assert_eq!(cache.pick_tier(GRANULE + 1, true, || Some(true)), Ok(Tier::Host));
+        assert_eq!(
+            cache.pick_tier(GRANULE + 1, true, || Some(true)),
+            Ok(Tier::Host)
+        );
         // A published pool snapshot is bounded above by payload plus one
         // granule of padding, never below its true backing.
         cache.pending.clear();
@@ -7320,7 +7344,10 @@ mod tests {
         // Everything but the evictable published pool (100) is pinned: 328
         // bytes, so exactly 672 more fit and 673 do not.
         assert_eq!(cache.pick_tier(672, true, || Some(false)), Ok(Tier::Host));
-        assert_eq!(cache.pick_tier(673, true, || Some(false)), Err("host budget"));
+        assert_eq!(
+            cache.pick_tier(673, true, || Some(false)),
+            Err("host budget")
+        );
         // The device budget is 0: even a passing guard cannot place it there.
         assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(Tier::Host));
     }
@@ -7522,11 +7549,14 @@ mod tests {
             let capture = capture_domain(&domain, true);
             let keys = cache.chain_keys(&capture, &hist[..leaf]).unwrap();
             assert_eq!(keys.len(), 5);
-            assert_eq!(keys[..3], [
-                cut_key(&cache, &main, 3),
-                cut_key(&cache, &main, 4),
-                cut_key(&cache, &main, 1536)
-            ]);
+            assert_eq!(
+                keys[..3],
+                [
+                    cut_key(&cache, &main, 3),
+                    cut_key(&cache, &main, 4),
+                    cut_key(&cache, &main, 1536)
+                ]
+            );
             let chain = cache.chain_sources(&keys, &[], "gone").unwrap();
             let tiers: Vec<&str> = chain
                 .iter()
@@ -7564,7 +7594,10 @@ mod tests {
 
         // A chain that does not tile the destination is refused, not guessed.
         let main_keys = cache
-            .chain_keys(&capture_domain(&cache.domain.scoped("scope"), true), &main[..8192])
+            .chain_keys(
+                &capture_domain(&cache.domain.scoped("scope"), true),
+                &main[..8192],
+            )
             .unwrap();
         let chain = cache.chain_sources(&main_keys, &[], "gone").unwrap();
         let mut links: Vec<&StoredSnapshot> = chain.iter().map(|(s, _)| *s).collect();
@@ -7781,22 +7814,29 @@ mod tests {
             )
             .unwrap();
         }
-        let (k1536, k4096) = (
-            cut_key(&cache, &hist, 1536),
-            cut_key(&cache, &hist, 4096),
-        );
+        let (k1536, k4096) = (cut_key(&cache, &hist, 1536), cut_key(&cache, &hist, 4096));
         let leaf = cache.entry(&k4096).unwrap();
         assert_eq!(leaf.parent, Some(k1536.clone()));
         assert_eq!(leaf.fixed_bytes, mtp_fixed);
         // The draft head's rows are delta streams like the rest.
-        assert_eq!(leaf.segments.last().map(|s| (s.from, s.to)), Some((1536, 4096)));
+        assert_eq!(
+            leaf.segments.last().map(|s| (s.from, s.to)),
+            Some((1536, 4096))
+        );
 
         let keys = cache
-            .chain_keys(&capture_domain(&cache.domain.scoped("scope"), true), &hist[..4096])
+            .chain_keys(
+                &capture_domain(&cache.domain.scoped("scope"), true),
+                &hist[..4096],
+            )
             .unwrap();
         let chain = cache.chain_sources(&keys, &[], "gone").unwrap();
         let links: Vec<&StoredSnapshot> = chain.iter().map(|(s, _)| *s).collect();
-        let dst_fixed = [(0usize, QSA_FIXED), (QSA_FIXED, 4096), (QSA_FIXED + 4096, 512)];
+        let dst_fixed = [
+            (0usize, QSA_FIXED),
+            (QSA_FIXED, 4096),
+            (QSA_FIXED + 4096, 512),
+        ];
         let copies = plan_chain_restore(&links, &dst_fixed, &mtp_rows(4096)).unwrap();
         // Every extra fixed part comes from the leaf, whole; the draft rows
         // tile [0, 4096).
@@ -7821,11 +7861,8 @@ mod tests {
         assert!(plan_chain_restore(&links, &dst_fixed, &mtp_rows(1536)).is_err());
         // A capture after a rollback below the parent's rows ignores that
         // parent and takes its rows from 0 instead of a negative delta.
-        let (parent, plan) = cache.plan_capture(
-            vec![k1536.clone()],
-            mtp_fixed.clone(),
-            &mtp_rows(1000),
-        );
+        let (parent, plan) =
+            cache.plan_capture(vec![k1536.clone()], mtp_fixed.clone(), &mtp_rows(1000));
         assert!(parent.is_none());
         assert!(plan.segments.iter().all(|s| s.from == 0));
         // ...while at the parent's own rows it deltas against it.
@@ -7845,7 +7882,10 @@ mod tests {
         assert_eq!(snapshot.bytes_len(), 64);
         let store = snapshot.into_store().expect("a host snapshot owns memory");
         assert!(store.is_host());
-        assert_eq!((store.size(), store.host_bytes(), store.device_bytes()), (64, 64, 0));
+        assert_eq!(
+            (store.size(), store.host_bytes(), store.device_bytes()),
+            (64, 64, 0)
+        );
         assert_eq!(released(&drops), 0);
         drop(store);
         assert_eq!(released(&drops), 1);
@@ -7872,7 +7912,11 @@ mod tests {
             block.mark_undrained();
         }
         drop(quarantined);
-        assert_eq!(released(&drops), 1, "an undrained block is leaked, not freed");
+        assert_eq!(
+            released(&drops),
+            1,
+            "an undrained block is leaked, not freed"
+        );
         // The drained sibling frees exactly once.
         drop(host_store(32, &drops));
         assert_eq!(released(&drops), 2);
@@ -7885,11 +7929,17 @@ mod tests {
         assert_eq!(cache.device_floor(), 0);
         // The plain guard headroom is untouched; the policy floor only raises it.
         assert_eq!(guard_headroom(VRAM_HEADROOM, 0), VRAM_HEADROOM);
-        assert_eq!(guard_headroom(VRAM_HEADROOM, POLICY_DEVICE_SAFETY), POLICY_DEVICE_SAFETY);
+        assert_eq!(
+            guard_headroom(VRAM_HEADROOM, POLICY_DEVICE_SAFETY),
+            POLICY_DEVICE_SAFETY
+        );
         assert_eq!(POLICY_DEVICE_SAFETY, 512 << 20);
         assert_eq!(guard_headroom(4 * GIB, POLICY_DEVICE_SAFETY), 4 * GIB);
         // No tier choice, no host owner, no host budget.
-        assert_eq!(cache.pick_tier(1, true, || Some(true)), Err("no pressure policy"));
+        assert_eq!(
+            cache.pick_tier(1, true, || Some(true)),
+            Err("no pressure policy")
+        );
         let usage = cache.usage();
         assert_eq!((usage.host_budget_bytes, usage.host_total_bytes()), (0, 0));
         assert!(cache.host_pool.is_empty());
@@ -8058,8 +8108,7 @@ mod tests {
         let drops = counter();
         let hist = prompt(1, 8);
         let mut cache = policy_cache(HUGE, HUGE);
-        let (host_parent, device_parent) =
-            (cut_key(&cache, &hist, 2), cut_key(&cache, &hist, 3));
+        let (host_parent, device_parent) = (cut_key(&cache, &hist, 2), cut_key(&cache, &hist, 3));
         cache
             .pending
             .push((host_parent.clone(), host_snapshot(100, None, &drops)));
@@ -8068,8 +8117,12 @@ mod tests {
             .pending
             .push((device_parent.clone(), fake_snapshot(3)));
         cache.commit();
-        assert!(cache.host_pool.contains(&host_parent.0, host_parent.1, host_parent.2));
-        assert!(cache.pool.contains(&device_parent.0, device_parent.1, device_parent.2));
+        assert!(cache
+            .host_pool
+            .contains(&host_parent.0, host_parent.1, host_parent.2));
+        assert!(cache
+            .pool
+            .contains(&device_parent.0, device_parent.1, device_parent.2));
 
         // The disk tier's parent invariant names the device and disk only, so
         // a device child whose parent lives on the host is dropped on
@@ -8285,7 +8338,12 @@ mod tests {
 
     /// Publish `snapshot` at cut `p` (linking its parent first, as capture
     /// does) through the production `commit`.
-    fn publish_cut(cache: &mut SessionCache, hist: &[u32], p: usize, snapshot: StoredSnapshot) -> Key {
+    fn publish_cut(
+        cache: &mut SessionCache,
+        hist: &[u32],
+        p: usize,
+        snapshot: StoredSnapshot,
+    ) -> Key {
         let key = cut_key(cache, hist, p);
         if let Some(parent) = snapshot.parent.clone() {
             cache.link(&parent);
@@ -8301,11 +8359,21 @@ mod tests {
         let hist = prompt(1, 8);
         let mut cache = policy_cache(HUGE, HUGE);
         let device = publish_cut(&mut cache, &hist, 2, fake_snapshot(2));
-        let child = publish_cut(&mut cache, &hist, 3, host_snapshot(100, Some(device.clone()), &drops));
+        let child = publish_cut(
+            &mut cache,
+            &hist,
+            3,
+            host_snapshot(100, Some(device.clone()), &drops),
+        );
         // Unrelated host entries: a standalone one and a host-only chain.
         let lone = publish_cut(&mut cache, &hist, 5, host_snapshot(10, None, &drops));
         let root = publish_cut(&mut cache, &hist, 6, host_snapshot(20, None, &drops));
-        let leaf = publish_cut(&mut cache, &hist, 7, host_snapshot(30, Some(root.clone()), &drops));
+        let leaf = publish_cut(
+            &mut cache,
+            &hist,
+            7,
+            host_snapshot(30, Some(root.clone()), &drops),
+        );
 
         // The device pool has nothing evictable: the host child pins its parent.
         assert!(cache.pool.is_pinned(&device.0, device.1, device.2));
@@ -8344,19 +8412,36 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_session_cache_growth_unwinds_a_multi_host_chain_leaf_first_and_stops_at_host_only() {
+    fn slowlink_session_cache_growth_unwinds_a_multi_host_chain_leaf_first_and_stops_at_host_only()
+    {
         let drops = counter();
         let hist = prompt(1, 8);
         let mut cache = policy_cache(HUGE, HUGE);
         let device = publish_cut(&mut cache, &hist, 2, fake_snapshot(2));
-        let h1 = publish_cut(&mut cache, &hist, 3, host_snapshot(10, Some(device.clone()), &drops));
-        let h2 = publish_cut(&mut cache, &hist, 4, host_snapshot(20, Some(h1.clone()), &drops));
+        let h1 = publish_cut(
+            &mut cache,
+            &hist,
+            3,
+            host_snapshot(10, Some(device.clone()), &drops),
+        );
+        let h2 = publish_cut(
+            &mut cache,
+            &hist,
+            4,
+            host_snapshot(20, Some(h1.clone()), &drops),
+        );
         let other = publish_cut(&mut cache, &hist, 5, host_snapshot(40, None, &drops));
 
         // Only the unpinned leaf is a victim; its host parent is pinned by it.
-        assert_eq!(cache.plan_device_blocker(), Some(HostVictim::Pool(h2.clone())));
+        assert_eq!(
+            cache.plan_device_blocker(),
+            Some(HostVictim::Pool(h2.clone()))
+        );
         drop(cache.take_device_blocker());
-        assert_eq!(cache.plan_device_blocker(), Some(HostVictim::Pool(h1.clone())));
+        assert_eq!(
+            cache.plan_device_blocker(),
+            Some(HostVictim::Pool(h1.clone()))
+        );
         drop(cache.take_device_blocker());
         assert_eq!(released(&drops), 2);
         assert_eq!(cache.usage().host_evictions_total, 2);
