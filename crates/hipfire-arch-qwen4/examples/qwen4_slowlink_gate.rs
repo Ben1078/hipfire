@@ -162,7 +162,7 @@ impl Mode {
     }
 }
 
-use hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose;
+use hipfire_arch_qwen4::slowlink_admission::{purpose_tile_rows, AdmissionPurpose};
 
 /// The admission purpose of a mode's load. Only the primitive cell is the Hold 1
 /// self-test (its diagnostics are charged inside the admitted reserve); every
@@ -173,6 +173,32 @@ fn load_purpose(mode: Mode) -> AdmissionPurpose {
         Mode::Primitives => AdmissionPurpose::PrimitiveSelftest,
         Mode::State | Mode::Product | Mode::Perf => AdmissionPurpose::Product,
     }
+}
+
+/// The manifest `s1_profiles` key of a purpose.
+fn purpose_name(purpose: AdmissionPurpose) -> &'static str {
+    match purpose {
+        AdmissionPurpose::Product => PROFILE_PRODUCT,
+        AdmissionPurpose::PrimitiveSelftest => PROFILE_PRIMITIVE,
+    }
+}
+
+/// What this cell's profile is, and is not, evidence of. The primitive cell
+/// runs at the primitive purpose's tile and is kernel correctness only; every
+/// other cell is a product-shape claim at the product tile.
+fn s1_profile_evidence(purpose: AdmissionPurpose, manifest: &Value) -> Value {
+    let primitive = purpose == AdmissionPurpose::PrimitiveSelftest;
+    json!({
+        "admitted_purpose": purpose_name(purpose),
+        "admitted_tile_rows": purpose_tile_rows(purpose),
+        "manifest_product_tile_rows": manifest_profile_tile(manifest, PROFILE_PRODUCT),
+        "manifest_primitive_tile_rows": manifest_profile_tile(manifest, PROFILE_PRIMITIVE),
+        "qualification": if primitive {
+            "kernel correctness only, at the primitive purpose's tile; not a product-shape qualification"
+        } else {
+            "product-shape claim at the product purpose's tile"
+        },
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -466,6 +492,10 @@ struct Ctx {
     eos: u32,
     fixture: Fixture,
     route: Expect,
+    /// The admitted purpose profile's tile (sealed manifest, equal to the
+    /// binary's `purpose_tile_rows`): the exact tile every layer-major
+    /// receipt of this load must name.
+    expected_tile: u64,
     /// Labeled phase memory samples ([`mem_sample`]).
     mem: Vec<Value>,
     /// The durable progress sidecar.
@@ -502,9 +532,8 @@ impl Ctx {
         Some(receipt)
     }
 
-    /// Receipt problems for one request call of `call_rows` rows. A forced
-    /// layer-major call longer than one tile must run layer-major; a shorter
-    /// one may be an explicit, named selector bypass.
+    /// Receipt problems for one request call of `call_rows` rows, bound to this
+    /// load's admitted profile tile ([`call_problems`]).
     fn validate(
         &self,
         receipt: Option<&Value>,
@@ -512,18 +541,43 @@ impl Ctx {
         single_window: bool,
         overlap: bool,
     ) -> Vec<String> {
-        let limits = Limits {
-            require_single_window: single_window,
-            require_overlap: overlap && self.route == Expect::LayerMajor,
-            ..Limits::default()
-        };
-        match self.route {
-            Expect::Incumbent => validate(receipt, Expect::Incumbent, &limits),
-            Expect::LayerMajor if call_rows as u64 > MAX_TILE_ROWS => {
-                validate(receipt, Expect::LayerMajor, &limits)
-            }
-            Expect::LayerMajor => validate_forced_short(receipt, &limits),
+        call_problems(
+            self.route,
+            self.expected_tile,
+            receipt,
+            call_rows,
+            single_window,
+            overlap,
+        )
+    }
+}
+
+/// Receipt problems for one request call of `call_rows` rows. A forced
+/// layer-major call longer than one historical tile (`MAX_TILE_ROWS`, the
+/// approved named-incumbent-bypass bound) must run layer-major; a shorter one
+/// may be an explicit, named selector bypass. Every layer-major receipt must
+/// name exactly `expected_tile` rows (the admitted purpose profile): being
+/// within the generic 1,536 upper bound is not enough.
+fn call_problems(
+    route: Expect,
+    expected_tile: u64,
+    receipt: Option<&Value>,
+    call_rows: usize,
+    single_window: bool,
+    overlap: bool,
+) -> Vec<String> {
+    let limits = Limits {
+        require_single_window: single_window,
+        require_overlap: overlap && route == Expect::LayerMajor,
+        expected_tile_rows: Some(expected_tile),
+        ..Limits::default()
+    };
+    match route {
+        Expect::Incumbent => validate(receipt, Expect::Incumbent, &limits),
+        Expect::LayerMajor if call_rows as u64 > MAX_TILE_ROWS => {
+            validate(receipt, Expect::LayerMajor, &limits)
         }
+        Expect::LayerMajor => validate_forced_short(receipt, &limits),
     }
 }
 
@@ -1787,12 +1841,7 @@ fn state_required(fixture: &Fixture, route: Expect) -> Vec<String> {
 
 /// One named stage of the state cell with its start/end and check rows
 /// persisted around it.
-fn stage(
-    ctx: &mut Ctx,
-    checks: &mut Checks,
-    name: &str,
-    body: impl FnOnce(&mut Ctx, &mut Checks),
-) {
+fn stage(ctx: &mut Ctx, checks: &mut Checks, name: &str, body: impl FnOnce(&mut Ctx, &mut Checks)) {
     ctx.progress.record(
         "stage_start",
         json!({"stage": name, "cache_usage": ctx.cache_usage()}),
@@ -1821,9 +1870,14 @@ fn run_state(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<Strin
     // so a partial log shows which one was in flight; `evidence.restore`
     // stays one array.
     let mut restore = Vec::new();
-    stage(ctx, checks, "state.restore.marker_boundary", |ctx, checks| {
-        marker_boundary_checks(ctx, checks, &mut restore);
-    });
+    stage(
+        ctx,
+        checks,
+        "state.restore.marker_boundary",
+        |ctx, checks| {
+            marker_boundary_checks(ctx, checks, &mut restore);
+        },
+    );
     stage(ctx, checks, "state.restore.boundary16k", |ctx, checks| {
         boundary16k_checks(ctx, checks, &mut restore);
     });
@@ -2113,7 +2167,12 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     let mut checks = Checks::new(&required_refs);
     progress.record(
         "plan",
-        json!({"mode": args.mode.name(), "route": args.route.name(), "required": required}),
+        json!({"mode": args.mode.name(), "route": args.route.name(), "required": required,
+               "admitted_purpose": purpose_name(load_purpose(args.mode)),
+               "manifest_profiles": {
+                   "product_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRODUCT),
+                   "primitive_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRIMITIVE),
+               }}),
     );
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     // Baseline sample: after the HIP context exists, before any model allocation.
@@ -2125,7 +2184,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     persist_memory(progress, "pre_load", &pre_load, None);
     let mut mem_samples = vec![pre_load];
     let sampler = heavy_memory.then(ProcSampler::start);
-    let identity_problems = manifest_problems(
+    let mut identity_problems = manifest_problems(
         &manifest,
         &Observed {
             binary_sha256: observed_binary.clone(),
@@ -2133,6 +2192,11 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             gpu_arch: gpu.arch.clone(),
         },
     );
+    identity_problems.extend(profile_admission_problems(
+        &manifest,
+        purpose_tile_rows(AdmissionPurpose::Product) as u64,
+        purpose_tile_rows(AdmissionPurpose::PrimitiveSelftest) as u64,
+    ));
     checks.push(
         "identity.manifest",
         identity_problems.clone(),
@@ -2142,6 +2206,14 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     progress.checks(&checks);
     let mut out = serde_json::Map::new();
     if identity_problems.is_empty() {
+        // The sealed profile of this cell's purpose is the tile every layer-major
+        // receipt must name; the identity check above already proved it equals
+        // what this binary's loader admits for that purpose.
+        let purpose = load_purpose(args.mode);
+        let profile = purpose_name(purpose);
+        let expected_tile = manifest_profile_tile(&manifest, profile).unwrap_or(0);
+        out.insert("s1_profile".into(), s1_profile_evidence(purpose, &manifest));
+        progress.record("profile", out["s1_profile"].clone());
         let mut fixture = fixture;
         let session_cache = (args.mode == Mode::State).then_some(fixture.session_cache_bytes);
         progress.record(
@@ -2181,6 +2253,8 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         // the S1 admission's joint placement (>= 10 resident layers); the
         // incumbent arm must not carry a profile.
         let mut placement_problems = Vec::new();
+        let profile_now = loaded.bundle.slowlink_profile();
+        let admitted_tile = profile_now.map(|p| p.tile_rows as u64);
         match args.route {
             Expect::LayerMajor => {
                 if !loaded.slowlink_profile || loaded.placement != "slowlink-profile" {
@@ -2189,6 +2263,16 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                         loaded.placement
                     ));
                 }
+                // The actual admitted profile against the sealed ledger of this
+                // cell's purpose: purpose, tile, window and resident layers.
+                placement_problems.extend(profile_load_problems(
+                    &manifest,
+                    profile,
+                    profile_now.map_or("none", |p| purpose_name(p.purpose)),
+                    admitted_tile,
+                    profile_now.map(|p| p.window_rows as u64),
+                    profile_now.map(|p| p.resident_layers as u64),
+                ));
                 if (loaded.resident_layers as u64) < MIN_RESIDENT_LAYERS {
                     placement_problems.push(format!(
                         "resident layers {} < {MIN_RESIDENT_LAYERS}",
@@ -2206,7 +2290,9 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             "load.placement",
             placement_problems,
             json!({"placement": loaded.placement, "resident_layers": loaded.resident_layers,
-                   "host_mapped_tensors": loaded.host_mapped_tensors, "slowlink_profile": loaded.slowlink_profile}),
+                   "host_mapped_tensors": loaded.host_mapped_tensors, "slowlink_profile": loaded.slowlink_profile,
+                   "admitted_purpose": purpose_name(purpose), "admitted_tile_rows": admitted_tile,
+                   "expected_tile_rows": expected_tile}),
         );
         progress.checks(&checks);
         // A failure from here on still owns the GPU: its point sample is
@@ -2250,6 +2336,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             eos: loaded.eos_token,
             fixture,
             route: args.route,
+            expected_tile,
             mem: mem_samples,
             progress: progress.clone(),
         };
@@ -2279,7 +2366,10 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             samples.push(sampler.finish());
             out.insert(
                 "memory_observations".into(),
-                memory_diagnostic(&samples, memory_ledger(&manifest)),
+                memory_diagnostic(
+                    &samples,
+                    memory_ledger(&manifest, purpose_name(load_purpose(args.mode))),
+                ),
             );
         } else {
             // Every other cell (state, product, timed perf): no sampler thread,
@@ -2294,10 +2384,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                 json!({"required": false, "samples": samples}),
             );
         }
-        progress.record(
-            "cache",
-            json!({"phase": "end", "usage": ctx.cache_usage()}),
-        );
+        progress.record("cache", json!({"phase": "end", "usage": ctx.cache_usage()}));
         let peak = ctx
             .gpu
             .hip
@@ -2769,6 +2856,23 @@ mod slowlink_receipt_tests {
         assert_eq!(checks.status(), "fail");
     }
 
+    /// One sealed purpose-profile ledger: core = weights + tile census + extras,
+    /// owned = core + sequential diag.
+    fn profile_ledger(purpose: &str, tile: u64, census: u64, diag: u64) -> Value {
+        let (weights, extras) = (20 * GIB, 2 * GIB);
+        let core = weights + census + extras;
+        json!({
+            "purpose": purpose, "tile_rows": tile, "resident_expert_layers": 10,
+            "window_rows": 16384, "page_count": 18,
+            "device_weights_bytes": weights,
+            "s1_tile_census_bytes": census, "s1_tile_census_terms": {"tile": census},
+            "s1_extras_bytes": extras, "s1_extras_terms": {"extras": extras},
+            "device_core_bytes": core, "sequential_diag_bytes": diag,
+            "device_owned_bytes": core + diag, "runtime_budget_bytes": 24 * GIB,
+            "safety_margin_bytes": GIB / 2,
+        })
+    }
+
     fn manifest() -> Value {
         json!({
             "source": {"base": "d8865a16b5d0e01eff712df85d2754122f6edaee", "tip": "a".repeat(40)},
@@ -2779,7 +2883,14 @@ mod slowlink_receipt_tests {
             "host": {"hostname": "hipx", "topology": "walk"},
             "device": {"uuid": "GPU-43390a851e296ee5", "arch": "gfx1100"},
             "link": {"gbps": 7.09, "topology_walk": "x4"},
-            "memory_ledger": {"device_gib": 23.0, "host_unreclaimable_gib": 90.0},
+            "memory_ledger": {
+                "device_gib": 23.0, "host_unreclaimable_gib": 90.0,
+                "device_owned_bytes": 23 * GIB + GIB / 2,
+                "profiles": {
+                    "product": profile_ledger("product", 768, GIB, 0),
+                    "primitive_selftest": profile_ledger("primitive_selftest", 512, GIB / 2, GIB),
+                },
+            },
         })
     }
 
@@ -3595,21 +3706,28 @@ mod slowlink_receipt_tests {
 
     #[test]
     fn slowlink_receipt_memory_ledger_needs_the_owned_census_in_the_manifest() {
+        let profile_ledger = |purpose: &str| {
+            json!({
+                "purpose": purpose, "device_owned_bytes": 20 * GIB,
+                "device_weights_bytes": 10 * GIB, "s1_tile_census_bytes": 2 * GIB,
+                "s1_extras_bytes": 7 * GIB, "sequential_diag_bytes": GIB,
+                "safety_margin_bytes": GIB / 2,
+            })
+        };
         let manifest = json!({"memory_ledger": {
-            "owned_device_bytes": 21474836480u64, "owned_host_bytes": 85899345920u64,
+            "owned_host_bytes": 85899345920u64,
             "census_basis": "A census + 2 GiB cache pool",
-            "device_weights_bytes": 10 * GIB, "s1_tile_census_bytes": 2 * GIB,
-            "s1_extras_bytes": 7 * GIB, "sequential_diag_bytes": GIB,
-            "safety_margin_bytes": GIB / 2,
+            "profiles": {"primitive_selftest": profile_ledger("primitive_selftest")},
         }});
-        let ledger = memory_ledger(&manifest).unwrap();
+        let profile = PROFILE_PRIMITIVE;
+        let ledger = memory_ledger(&manifest, profile).unwrap();
         assert_eq!(ledger.owned_device_bytes, 20 * GIB);
         assert_eq!(ledger.owned_host_bytes, 80 * GIB);
         assert_eq!(ledger.decomposition, decomposition());
+        // The product profile is a different ledger: absent here, so it refuses.
+        assert!(memory_ledger(&manifest, PROFILE_PRODUCT).is_err());
         for key in [
-            "owned_device_bytes",
-            "owned_host_bytes",
-            "census_basis",
+            "device_owned_bytes",
             "device_weights_bytes",
             "s1_tile_census_bytes",
             "s1_extras_bytes",
@@ -3617,31 +3735,53 @@ mod slowlink_receipt_tests {
             "safety_margin_bytes",
         ] {
             let mut m = manifest.clone();
-            m["memory_ledger"].as_object_mut().unwrap().remove(key);
-            assert!(memory_ledger(&m).is_err(), "{key}");
+            m["memory_ledger"]["profiles"][profile]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(memory_ledger(&m, profile).is_err(), "{key}");
         }
+        for key in ["owned_host_bytes", "census_basis"] {
+            let mut m = manifest.clone();
+            m["memory_ledger"].as_object_mut().unwrap().remove(key);
+            assert!(memory_ledger(&m, profile).is_err(), "{key}");
+        }
+        // No flat-profile fallback: the old root-level figures are not read.
+        let mut flat = manifest.clone();
+        flat["memory_ledger"]["profiles"] = json!({});
+        for (k, v) in [
+            ("device_owned_bytes", 20 * GIB),
+            ("device_weights_bytes", 10 * GIB),
+            ("s1_tile_census_bytes", 2 * GIB),
+            ("s1_extras_bytes", 7 * GIB),
+            ("sequential_diag_bytes", GIB),
+            ("safety_margin_bytes", GIB / 2),
+        ] {
+            flat["memory_ledger"][k] = json!(v);
+        }
+        assert!(memory_ledger(&flat, profile).is_err());
         let mut m = manifest.clone();
         m["memory_ledger"]["owned_host_bytes"] = json!(0);
-        assert!(memory_ledger(&m).is_err());
+        assert!(memory_ledger(&m, profile).is_err());
         let mut m = manifest.clone();
-        m["memory_ledger"]["safety_margin_bytes"] = json!(0);
-        assert!(memory_ledger(&m).is_err(), "zero safety margin");
+        m["memory_ledger"]["profiles"][profile]["safety_margin_bytes"] = json!(0);
+        assert!(memory_ledger(&m, profile).is_err(), "zero safety margin");
         // A decomposition whose four-part sum is not the owned bytes refuses.
         let mut m = manifest.clone();
-        m["memory_ledger"]["s1_extras_bytes"] = json!(7 * GIB + 1);
-        let e = memory_ledger(&m).unwrap_err();
-        assert!(e.contains("not owned_device_bytes"), "{e}");
+        m["memory_ledger"]["profiles"][profile]["s1_extras_bytes"] = json!(7 * GIB + 1);
+        let e = memory_ledger(&m, profile).unwrap_err();
+        assert!(e.contains("not device_owned_bytes"), "{e}");
         // The safety margin is not part of the sum.
         let mut m = manifest.clone();
-        m["memory_ledger"]["owned_device_bytes"] = json!(20 * GIB + GIB / 2);
-        assert!(memory_ledger(&m).is_err());
+        m["memory_ledger"]["profiles"][profile]["device_owned_bytes"] = json!(20 * GIB + GIB / 2);
+        assert!(memory_ledger(&m, profile).is_err());
         // A sum that overflows u64 refuses rather than wrapping.
         let mut m = manifest.clone();
-        m["memory_ledger"]["device_weights_bytes"] = json!(u64::MAX);
-        assert!(memory_ledger(&m).unwrap_err().contains("overflows"));
+        m["memory_ledger"]["profiles"][profile]["device_weights_bytes"] = json!(u64::MAX);
+        assert!(memory_ledger(&m, profile).unwrap_err().contains("overflows"));
         let mut m = manifest;
         m["memory_ledger"]["census_basis"] = json!("  ");
-        assert!(memory_ledger(&m).is_err());
+        assert!(memory_ledger(&m, profile).is_err());
     }
 
     #[test]
@@ -3852,7 +3992,7 @@ mod slowlink_receipt_tests {
     fn slowlink_receipt_unreadable_ledger_or_telemetry_is_an_info_error_not_a_check() {
         // The census is missing from the manifest: an info_error with the samples kept.
         let samples = good_memory();
-        let diag = memory_diagnostic(&samples, memory_ledger(&manifest()));
+        let diag = memory_diagnostic(&samples, memory_ledger(&manifest(), PROFILE_PRIMITIVE));
         assert!(diag["info_error"]
             .as_str()
             .unwrap()
@@ -3917,10 +4057,8 @@ mod slowlink_receipt_tests {
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "slowlink-progress-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("slowlink-progress-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -3949,7 +4087,10 @@ mod slowlink_receipt_tests {
             json!({"case": "state.p512", "repeat": 0, "status": "ok", "wall_s": 1.5,
                    "state_digest": "aa", "logits_digest": "bb"}),
         );
-        log.record("check", json!({"name": "identity.manifest", "status": "pass"}));
+        log.record(
+            "check",
+            json!({"name": "identity.manifest", "status": "pass"}),
+        );
         log.record("repeat_start", json!({"case": "state.p512", "repeat": 1}));
         if final_claims_pass {
             log.record("final", json!({"status": "pass", "report_sha256": "ff"}));
@@ -4080,7 +4221,10 @@ mod slowlink_receipt_tests {
             assert_eq!(summary["torn_tail"], true);
             assert_eq!(summary["last_event"], "check");
             assert_eq!(summary["cases"]["state.p512"]["repeats_completed"], 1);
-            assert_eq!(summary["cases"]["state.p512"]["in_flight_repeat"], Value::Null);
+            assert_eq!(
+                summary["cases"]["state.p512"]["in_flight_repeat"],
+                Value::Null
+            );
             assert_eq!(summary["status"], "incomplete");
         }
     }
@@ -4105,11 +4249,18 @@ mod slowlink_receipt_tests {
         log.record("plan", json!({"required": required_names()}));
         let mut checks = Checks::new(&required_names());
         checks.pass("identity.manifest", Value::Null);
-        checks.fail("state.p512.route_receipt", "repeat 1: hipMalloc failed", Value::Null);
+        checks.fail(
+            "state.p512.route_receipt",
+            "repeat 1: hipMalloc failed",
+            Value::Null,
+        );
         log.checks(&checks);
         let summary = progress_summary(&log_text(&lines));
         assert_eq!(summary["status"], "fail");
-        assert_eq!(summary["failed_checks"], json!(["state.p512.route_receipt"]));
+        assert_eq!(
+            summary["failed_checks"],
+            json!(["state.p512.route_receipt"])
+        );
         assert_eq!(
             summary["missing_required"],
             json!(["state.p512.repeat_determinism", "progress.durability"])
@@ -4174,9 +4325,18 @@ mod slowlink_receipt_tests {
         let output = dir.join("state.json");
         let arg = |s: &str| s.to_string();
         let args = parse_args([
-            arg("--model"), arg("/m"), arg("--fixture"), arg("/f"), arg("--manifest"),
-            arg("/man"), arg("--output"), output.to_string_lossy().into_owned(),
-            arg("--mode"), arg("state"), arg("--route"), arg("layer-major"),
+            arg("--model"),
+            arg("/m"),
+            arg("--fixture"),
+            arg("/f"),
+            arg("--manifest"),
+            arg("/man"),
+            arg("--output"),
+            output.to_string_lossy().into_owned(),
+            arg("--mode"),
+            arg("state"),
+            arg("--route"),
+            arg("layer-major"),
         ])
         .unwrap();
         // No sidecar yet: the report says so rather than inventing one.
@@ -4191,7 +4351,10 @@ mod slowlink_receipt_tests {
             report["progress"]["summary"]["cases"]["state.p512"]["repeats_completed"],
             1
         );
-        assert!(report.get("checks").is_none(), "no verdict rows are invented");
+        assert!(
+            report.get("checks").is_none(),
+            "no verdict rows are invented"
+        );
         write_report(&output, &report).unwrap();
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
@@ -4259,5 +4422,298 @@ mod slowlink_receipt_tests {
         assert!(summary[0].get("spans_ms").is_none());
         assert!(summary[0].get("cache_usage").is_none());
         assert!(summary[1].is_null(), "a missing receipt stays missing");
+    }
+
+    fn product_receipt(tile: u64) -> Value {
+        let mut r = receipt();
+        r["tile_rows"] = json!(tile);
+        r["retained_scratch_rows"] = json!(tile);
+        r
+    }
+
+    #[test]
+    fn slowlink_receipt_product_receipt_must_name_the_admitted_tile_not_just_stay_under_1536() {
+        let product = purpose_tile_rows(AdmissionPurpose::Product) as u64;
+        assert_eq!(product, 768);
+        // The exact admitted tile passes.
+        let ok = call_problems(
+            Expect::LayerMajor,
+            product,
+            Some(&product_receipt(768)),
+            16384,
+            true,
+            true,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // The old 1,536 tile and the primitive 512 tile are each under the generic
+        // 1,536 upper bound and must still fail a product claim.
+        for wrong in [1536u64, 512, 1024] {
+            let bad = call_problems(
+                Expect::LayerMajor,
+                product,
+                Some(&product_receipt(wrong)),
+                16384,
+                true,
+                true,
+            );
+            assert!(
+                bad.iter().any(|p| p.contains("admitted profile")),
+                "tile {wrong}: {bad:?}"
+            );
+        }
+        // A product tile with more retained scratch than the tile fails too.
+        let mut roomy = product_receipt(768);
+        roomy["retained_scratch_rows"] = json!(1536);
+        assert!(
+            !call_problems(Expect::LayerMajor, product, Some(&roomy), 16384, true, true)
+                .is_empty()
+        );
+        // The generic historical validator is unchanged: no expected tile, 1,536 passes.
+        let generic = Limits {
+            require_single_window: true,
+            require_overlap: true,
+            ..Limits::default()
+        };
+        assert!(validate(Some(&receipt()), Expect::LayerMajor, &generic).is_empty());
+        assert!(validate(Some(&product_receipt(768)), Expect::LayerMajor, &generic).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_primitive_purpose_expects_512_and_keeps_the_named_short_bypass() {
+        let primitive = purpose_tile_rows(AdmissionPurpose::PrimitiveSelftest) as u64;
+        assert_eq!(primitive, 512);
+        let ok = call_problems(
+            Expect::LayerMajor,
+            primitive,
+            Some(&product_receipt(512)),
+            16384,
+            true,
+            true,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        assert!(!call_problems(
+            Expect::LayerMajor,
+            primitive,
+            Some(&product_receipt(768)),
+            16384,
+            true,
+            true
+        )
+        .is_empty());
+        // The approved <=1536-row named incumbent bypass is independent of the tile.
+        let mut bypass = incumbent();
+        bypass["bypass_reason"] = json!("request at most one tile");
+        bypass["prompt_rows"] = json!(1536);
+        bypass["windows"] = json!([{"start": 0, "rows": 1536}]);
+        bypass["launch_cuts"] = json!([]);
+        for tile in [768u64, 512] {
+            let bad = call_problems(Expect::LayerMajor, tile, Some(&bypass), 1536, false, false);
+            assert!(bad.is_empty(), "tile {tile}: {bad:?}");
+            // ...but the bypass without a named reason still fails.
+            bypass["bypass_reason"] = Value::Null;
+            assert!(
+                !call_problems(Expect::LayerMajor, tile, Some(&bypass), 1536, false, false)
+                    .is_empty()
+            );
+            bypass["bypass_reason"] = json!("request at most one tile");
+        }
+        // A call longer than the bypass bound must run layer-major, whatever the tile.
+        let bad = call_problems(Expect::LayerMajor, 768, Some(&incumbent()), 1537, false, false);
+        assert!(!bad.is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_one_manifest_represents_both_purpose_profiles() {
+        let m = manifest();
+        assert_eq!(PROFILE_PRODUCT, "product");
+        assert_eq!(PROFILE_PRIMITIVE, "primitive_selftest");
+        assert_eq!(manifest_profile_tile(&m, PROFILE_PRODUCT), Some(768));
+        assert_eq!(manifest_profile_tile(&m, PROFILE_PRIMITIVE), Some(512));
+        assert_eq!(
+            purpose_name(AdmissionPurpose::Product),
+            PROFILE_PRODUCT,
+            "the product cells read the product profile"
+        );
+        assert_eq!(
+            purpose_name(load_purpose(Mode::Primitives)),
+            PROFILE_PRIMITIVE,
+            "only the primitive cell reads the primitive profile"
+        );
+        for mode in [Mode::State, Mode::Product, Mode::Perf] {
+            assert_eq!(purpose_name(load_purpose(mode)), PROFILE_PRODUCT);
+        }
+        assert!(manifest_problems(&m, &observed()).is_empty());
+        let admitted = (
+            purpose_tile_rows(AdmissionPurpose::Product) as u64,
+            purpose_tile_rows(AdmissionPurpose::PrimitiveSelftest) as u64,
+        );
+        assert!(profile_admission_problems(&m, admitted.0, admitted.1).is_empty());
+        // One tile claimed for both purposes, a missing or zero profile, a
+        // tile above the historical bound and a manifest that names a tile
+        // other than the one this binary admits all fail closed.
+        let mut same = manifest();
+        for profile in [PROFILE_PRODUCT, PROFILE_PRIMITIVE] {
+            same["memory_ledger"]["profiles"][profile]["tile_rows"] = json!(1536);
+        }
+        assert!(manifest_problems(&same, &observed())
+            .iter()
+            .any(|p| p.contains("same tile 1536")));
+        assert!(!profile_admission_problems(&same, admitted.0, admitted.1).is_empty());
+        for broken in [json!(0), json!(1537), json!("768"), Value::Null] {
+            let mut m = manifest();
+            m["memory_ledger"]["profiles"]["product"]["tile_rows"] = broken;
+            assert!(!manifest_problems(&m, &observed()).is_empty());
+        }
+        let mut swapped = manifest();
+        swapped["memory_ledger"]["profiles"]["product"]["tile_rows"] = json!(512);
+        swapped["memory_ledger"]["profiles"]["primitive_selftest"]["tile_rows"] = json!(768);
+        assert!(manifest_problems(&swapped, &observed()).is_empty());
+        let bad = profile_admission_problems(&swapped, admitted.0, admitted.1);
+        assert_eq!(bad.len(), 2, "{bad:?}");
+    }
+
+    #[test]
+    fn slowlink_receipt_profile_ledgers_are_full_and_the_root_owned_bytes_are_the_max() {
+        let m = manifest();
+        assert!(profile_shape_problems(&m).is_empty());
+        // Root device_owned_bytes is the MAX of the per-purpose owned bytes, not
+        // the product core plus the primitive diagnostic.
+        let product = manifest_profile_u64(&m, PROFILE_PRODUCT, "device_owned_bytes").unwrap();
+        let primitive = manifest_profile_u64(&m, PROFILE_PRIMITIVE, "device_owned_bytes").unwrap();
+        assert_eq!(
+            u64_at(&m, "memory_ledger.device_owned_bytes"),
+            Some(product.max(primitive))
+        );
+        let mut sum = manifest();
+        sum["memory_ledger"]["device_owned_bytes"] = json!(product + primitive);
+        assert!(profile_shape_problems(&sum)
+            .iter()
+            .any(|p| p.contains("MAX")));
+        // Every profile field is required, there is no flat fallback, and a
+        // missing field in either profile fails identity.
+        for profile in [PROFILE_PRODUCT, PROFILE_PRIMITIVE] {
+            for key in [
+                "purpose",
+                "tile_rows",
+                "resident_expert_layers",
+                "window_rows",
+                "page_count",
+                "device_weights_bytes",
+                "s1_tile_census_bytes",
+                "s1_tile_census_terms",
+                "s1_extras_bytes",
+                "s1_extras_terms",
+                "device_core_bytes",
+                "sequential_diag_bytes",
+                "device_owned_bytes",
+                "runtime_budget_bytes",
+                "safety_margin_bytes",
+            ] {
+                let mut m = manifest();
+                m["memory_ledger"]["profiles"][profile]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                assert!(
+                    !manifest_problems(&m, &observed()).is_empty(),
+                    "{profile}.{key} must be required"
+                );
+            }
+        }
+        let mut flat = manifest();
+        flat["memory_ledger"]["profiles"] = json!({});
+        assert!(!manifest_problems(&flat, &observed()).is_empty());
+        // The purpose names its own profile; the product carries no diagnostic
+        // reserve; the primitive does; the arithmetic must close.
+        let mut wrong = manifest();
+        wrong["memory_ledger"]["profiles"]["product"]["purpose"] = json!("primitive_selftest");
+        assert!(!profile_shape_problems(&wrong).is_empty());
+        let mut diag = manifest();
+        diag["memory_ledger"]["profiles"]["product"]["sequential_diag_bytes"] = json!(GIB);
+        assert!(profile_shape_problems(&diag)
+            .iter()
+            .any(|p| p.contains("no diagnostic reserve")));
+        let mut nodiag = manifest();
+        nodiag["memory_ledger"]["profiles"]["primitive_selftest"]["sequential_diag_bytes"] =
+            json!(0);
+        assert!(!profile_shape_problems(&nodiag).is_empty());
+        let mut core = manifest();
+        core["memory_ledger"]["profiles"]["product"]["device_core_bytes"] = json!(GIB);
+        assert!(!profile_shape_problems(&core).is_empty());
+        let mut few = manifest();
+        few["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] = json!(9);
+        assert!(!profile_shape_problems(&few).is_empty());
+        let mut window = manifest();
+        window["memory_ledger"]["profiles"]["product"]["window_rows"] = json!(8192);
+        assert!(!profile_shape_problems(&window).is_empty());
+        // The primitive ledger the memory diagnostic reads is its own profile's.
+        let mut with_root = manifest();
+        with_root["memory_ledger"]["census_basis"] = json!("basis");
+        with_root["memory_ledger"]["owned_host_bytes"] = json!(80 * GIB);
+        let ledger = memory_ledger(&with_root, PROFILE_PRIMITIVE).unwrap();
+        assert_eq!(ledger.owned_device_bytes, primitive);
+        assert_eq!(ledger.decomposition.sequential_diag, GIB);
+        assert_eq!(
+            memory_ledger(&with_root, PROFILE_PRODUCT).unwrap_err().contains("sequential_diag_bytes"),
+            true,
+            "the product profile has no diagnostic bytes to decompose"
+        );
+    }
+
+    #[test]
+    fn slowlink_receipt_actual_admitted_profile_must_match_the_sealed_profile() {
+        let m = manifest();
+        let ok = profile_load_problems(
+            &m,
+            PROFILE_PRODUCT,
+            "product",
+            Some(768),
+            Some(16384),
+            Some(10),
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        let ok = profile_load_problems(
+            &m,
+            PROFILE_PRIMITIVE,
+            "primitive_selftest",
+            Some(512),
+            Some(16384),
+            Some(10),
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // A product cell whose bundle admitted the primitive profile, another
+        // tile, another window, other resident layers or no profile at all fails.
+        for (purpose, tile, window, resident) in [
+            ("primitive_selftest", Some(768), Some(16384), Some(10)),
+            ("product", Some(512), Some(16384), Some(10)),
+            ("product", Some(1536), Some(16384), Some(10)),
+            ("product", Some(768), Some(8192), Some(10)),
+            ("product", Some(768), Some(16384), Some(11)),
+            ("product", None, None, None),
+        ] {
+            let bad =
+                profile_load_problems(&m, PROFILE_PRODUCT, purpose, tile, window, resident);
+            assert!(!bad.is_empty(), "{purpose} {tile:?} {window:?} {resident:?}");
+        }
+    }
+
+    #[test]
+    fn slowlink_receipt_profile_evidence_reports_the_primitive_512_as_kernel_only() {
+        let m = manifest();
+        let primitive = s1_profile_evidence(AdmissionPurpose::PrimitiveSelftest, &m);
+        assert_eq!(primitive["admitted_purpose"], "primitive_selftest");
+        assert_eq!(primitive["admitted_tile_rows"], 512);
+        assert!(primitive["qualification"]
+            .as_str()
+            .unwrap()
+            .contains("not a product-shape"));
+        let product = s1_profile_evidence(AdmissionPurpose::Product, &m);
+        assert_eq!(product["admitted_purpose"], "product");
+        assert_eq!(product["admitted_tile_rows"], 768);
+        assert_eq!(product["manifest_primitive_tile_rows"], 512);
+        assert!(product["qualification"]
+            .as_str()
+            .unwrap()
+            .contains("product-shape claim"));
     }
 }

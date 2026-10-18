@@ -72,6 +72,10 @@ pub struct Limits {
     /// A timing/overlap claim: cross-layer L compute / L+1 H2D intersections
     /// must be observed.
     pub require_overlap: bool,
+    /// The admitted profile's exact tile (from the sealed manifest, equal to
+    /// the load purpose's tile). `None` keeps only the generic upper bound
+    /// `max_tile_rows`, for historical and non-purpose-bound receipts.
+    pub expected_tile_rows: Option<u64>,
 }
 
 impl Default for Limits {
@@ -84,6 +88,7 @@ impl Default for Limits {
             min_ring_lookahead_bytes: MIN_RING_LOOKAHEAD_BYTES,
             require_single_window: false,
             require_overlap: false,
+            expected_tile_rows: None,
         }
     }
 }
@@ -304,11 +309,21 @@ pub fn validate(receipt: Option<&Value>, expect: Expect, limits: &Limits) -> Vec
             limits.max_tile_rows
         ));
     }
+    // A purpose-bound claim: the receipt must name exactly the admitted
+    // profile's tile (and retain no more scratch rows than it); being under
+    // the generic upper bound is not enough.
+    if let Some(expected) = limits.expected_tile_rows {
+        if tile != expected {
+            bad.push(format!(
+                "tile_rows {tile} != the admitted profile's {expected}-row tile"
+            ));
+        }
+    }
     let scratch = u64_at(r, "retained_scratch_rows").unwrap_or(u64::MAX);
-    if scratch > limits.max_tile_rows {
+    let scratch_bound = limits.expected_tile_rows.unwrap_or(limits.max_tile_rows);
+    if scratch > scratch_bound {
         bad.push(format!(
-            "retained_scratch_rows {scratch} > {}: ordinary 8192/full-prompt scratch is retained",
-            limits.max_tile_rows
+            "retained_scratch_rows {scratch} > {scratch_bound}: ordinary 8192/full-prompt scratch is retained"
         ));
     }
     let resident = u64_at(r, "resident_layers").unwrap_or(0);
@@ -540,7 +555,10 @@ pub const PROGRESS_TIME_SOURCES: &str = "utc/unix_ms: SystemTime::now (CLOCK_REA
 
 /// The sidecar next to `output`: `<output file name>.progress.jsonl`.
 pub fn progress_path(output: &Path) -> PathBuf {
-    let mut name = output.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = output
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(PROGRESS_SUFFIX);
     output.with_file_name(name)
 }
@@ -666,7 +684,12 @@ impl ProgressLog {
         file.sync_all()
             .and_then(|()| sync_parent(path))
             .map_err(|e| fail("sync progress sidecar", e))?;
-        Ok(Self::new(Box::new(FileSink(file)), system_clock(), run_id, echo))
+        Ok(Self::new(
+            Box::new(FileSink(file)),
+            system_clock(),
+            run_id,
+            echo,
+        ))
     }
 
     /// The current `(unix_ms, mono_ns)` of this log's clock.
@@ -715,11 +738,14 @@ impl ProgressLog {
             Ok(()) => {
                 inner.seq += 1;
                 if inner.echo {
-                    eprintln!("qwen4_slowlink_gate: progress #{seq} {event} utc={utc} mono_ns={mono_ns}");
+                    eprintln!(
+                        "qwen4_slowlink_gate: progress #{seq} {event} utc={utc} mono_ns={mono_ns}"
+                    );
                 }
             }
             Err(e) => {
-                let message = format!("progress record #{seq} ({event}) was not durably written: {e}");
+                let message =
+                    format!("progress record #{seq} ({event}) was not durably written: {e}");
                 eprintln!("qwen4_slowlink_gate: FAIL progress.durability: {message}");
                 inner.error = Some(message);
             }
@@ -755,7 +781,10 @@ impl ProgressLog {
 /// rename, fsync of the directory. A failure removes the temporary file and
 /// leaves `path` as it was; the caller must treat it as a gate failure.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(format!(".tmp-{}", std::process::id()));
     let temporary = path.with_file_name(name);
     let result = (|| -> std::io::Result<()> {
@@ -832,7 +861,11 @@ pub fn progress_summary(text: &str) -> Value {
             "plan" => {
                 required = record["required"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|n| n.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
             }
             "repeat_start" => {
@@ -856,7 +889,8 @@ pub fn progress_summary(text: &str) -> Value {
                         });
                     } else {
                         case.failed += 1;
-                        case.last_error = json!({"repeat": record["repeat"], "error": record["error"]});
+                        case.last_error =
+                            json!({"repeat": record["repeat"], "error": record["error"]});
                     }
                 }
             }
@@ -1725,18 +1759,20 @@ impl DeviceDecomposition {
     }
 }
 
-/// The owned census from `memory_ledger.{owned_device_bytes,
-/// owned_host_bytes,census_basis}` and the device decomposition
-/// `memory_ledger.{device_weights_bytes,s1_tile_census_bytes,s1_extras_bytes,
-/// sequential_diag_bytes,safety_margin_bytes}`; any missing or zero figure
-/// refuses, as does a decomposition whose checked four-part sum is not the
-/// owned device bytes. Only the primitive cell reads it.
-pub fn memory_ledger(manifest: &Value) -> Result<MemoryLedger, String> {
+/// The owned census of one purpose profile: `memory_ledger.{census_basis,
+/// owned_host_bytes}` (shared, root) and the profile's
+/// `memory_ledger.profiles.<profile>.{device_owned_bytes,device_weights_bytes,
+/// s1_tile_census_bytes,s1_extras_bytes,sequential_diag_bytes,
+/// safety_margin_bytes}`; any missing or zero figure refuses, as does a
+/// decomposition whose checked four-part sum is not the profile's owned device
+/// bytes. The primitive cell reads `primitive_selftest` only.
+pub fn memory_ledger(manifest: &Value, profile: &str) -> Result<MemoryLedger, String> {
     let bytes = |path: &str| {
         u64_at(manifest, path).filter(|&n| n > 0).ok_or_else(|| {
             format!("manifest key {path} missing or not a positive integer (owned census bytes)")
         })
     };
+    let field = |key: &str| bytes(&profile_path(profile, key));
     let census_basis = get(manifest, "memory_ledger.census_basis")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
@@ -1744,19 +1780,19 @@ pub fn memory_ledger(manifest: &Value) -> Result<MemoryLedger, String> {
             "manifest key memory_ledger.census_basis missing (how the owned census was derived)",
         )?
         .to_string();
-    let owned_device_bytes = bytes("memory_ledger.owned_device_bytes")?;
+    let owned_device_bytes = field("device_owned_bytes")?;
     let decomposition = DeviceDecomposition {
-        weights: bytes("memory_ledger.device_weights_bytes")?,
-        s1_tile_census: bytes("memory_ledger.s1_tile_census_bytes")?,
-        s1_extras: bytes("memory_ledger.s1_extras_bytes")?,
-        sequential_diag: bytes("memory_ledger.sequential_diag_bytes")?,
-        safety_margin: bytes("memory_ledger.safety_margin_bytes")?,
+        weights: field("device_weights_bytes")?,
+        s1_tile_census: field("s1_tile_census_bytes")?,
+        s1_extras: field("s1_extras_bytes")?,
+        sequential_diag: field("sequential_diag_bytes")?,
+        safety_margin: field("safety_margin_bytes")?,
     };
     match decomposition.committed_sum() {
         Some(sum) if sum == owned_device_bytes => {}
         Some(sum) => {
             return Err(format!(
-                "memory_ledger decomposition sums to {sum} B (weights + tile census + extras + sequential diag), not owned_device_bytes {owned_device_bytes} B"
+                "memory_ledger profile {profile} decomposition sums to {sum} B (weights + tile census + extras + sequential diag), not device_owned_bytes {owned_device_bytes} B"
             ))
         }
         None => return Err("memory_ledger decomposition sum overflows u64".to_string()),
@@ -1946,9 +1982,224 @@ pub fn memory_problems(samples: &[Value], ledger: &MemoryLedger) -> (Vec<String>
     (bad, receipt)
 }
 
+// ── per-purpose S1 profiles ────────────────────────────────────────────
+//
+// One H1 manifest represents BOTH admitted purpose profiles, each a FULL source
+// profile ledger: `memory_ledger.profiles.product` and
+// `memory_ledger.profiles.primitive_selftest` (`purpose`, `tile_rows`,
+// `resident_expert_layers`, `window_rows`, `page_count`, `device_weights_bytes`,
+// `s1_tile_census_bytes`/`_terms`, `s1_extras_bytes`/`_terms`,
+// `device_core_bytes`, `sequential_diag_bytes`, `device_owned_bytes`,
+// `runtime_budget_bytes`, `safety_margin_bytes`). The root keeps only the
+// shared card/fabric/host figures and `device_owned_bytes`, the MAX of the
+// per-purpose owned bytes (the two purposes load sequentially, so the peak is
+// not product core plus the primitive diagnostic). There is no flat-profile
+// fallback. The product cells (state, headroom, greedy, perf) read
+// `product`; the primitive cell reads `primitive_selftest`, which is kernel
+// correctness at its own tile only and no product-shape qualification. The
+// generic `MAX_TILE_ROWS` stays the historical upper bound of the default
+// [`Limits`]; it can never pass a product receipt on its own.
+
+pub const PROFILE_PRODUCT: &str = "product";
+pub const PROFILE_PRIMITIVE: &str = "primitive_selftest";
+
+fn profile_path(profile: &str, key: &str) -> String {
+    format!("memory_ledger.profiles.{profile}.{key}")
+}
+
+/// One u64 field of a sealed purpose profile, if present.
+pub fn manifest_profile_u64(manifest: &Value, profile: &str, key: &str) -> Option<u64> {
+    u64_at(manifest, &profile_path(profile, key))
+}
+
+/// The sealed tile of one purpose profile, if the manifest carries it.
+pub fn manifest_profile_tile(manifest: &Value, profile: &str) -> Option<u64> {
+    manifest_profile_u64(manifest, profile, "tile_rows")
+}
+
+/// Strictly positive integers of every profile ledger.
+const PROFILE_POSITIVE_KEYS: [&str; 11] = [
+    "tile_rows",
+    "resident_expert_layers",
+    "window_rows",
+    "page_count",
+    "device_weights_bytes",
+    "s1_tile_census_bytes",
+    "s1_extras_bytes",
+    "device_core_bytes",
+    "device_owned_bytes",
+    "runtime_budget_bytes",
+    "safety_margin_bytes",
+];
+
+/// Shape and arithmetic of both sealed profile ledgers: every field present,
+/// the purpose equal to the profile name, tile within the historical bound and
+/// distinct between the profiles, the resident floor and the full window,
+/// `core = weights + tile census + extras`, `owned = core + sequential diag`,
+/// no diagnostic reserve on the product profile and one on the primitive, and
+/// the root `device_owned_bytes` equal to the MAX of the two owned figures.
+pub fn profile_shape_problems(manifest: &Value) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut tiles = Vec::new();
+    let mut owned = Vec::new();
+    for profile in [PROFILE_PRODUCT, PROFILE_PRIMITIVE] {
+        let at = |key: &str| manifest_profile_u64(manifest, profile, key);
+        let mut complete = true;
+        for key in PROFILE_POSITIVE_KEYS {
+            if at(key).filter(|&n| n > 0).is_none() {
+                complete = false;
+                bad.push(format!(
+                    "manifest {} missing or not a positive integer",
+                    profile_path(profile, key)
+                ));
+            }
+        }
+        if at("sequential_diag_bytes").is_none() {
+            complete = false;
+            bad.push(format!(
+                "manifest {} missing or not an integer",
+                profile_path(profile, "sequential_diag_bytes")
+            ));
+        }
+        for key in ["s1_tile_census_terms", "s1_extras_terms"] {
+            if matches!(get(manifest, &profile_path(profile, key)), None | Some(Value::Null)) {
+                bad.push(format!("manifest {} missing", profile_path(profile, key)));
+            }
+        }
+        if get(manifest, &profile_path(profile, "purpose")).and_then(Value::as_str)
+            != Some(profile)
+        {
+            bad.push(format!(
+                "manifest {} is not {profile:?}",
+                profile_path(profile, "purpose")
+            ));
+        }
+        if !complete {
+            continue;
+        }
+        let (tile, resident, window) = (
+            at("tile_rows").unwrap_or(0),
+            at("resident_expert_layers").unwrap_or(0),
+            at("window_rows").unwrap_or(0),
+        );
+        if tile > MAX_TILE_ROWS {
+            bad.push(format!(
+                "manifest {} {tile} is above the historical {MAX_TILE_ROWS}-row bound",
+                profile_path(profile, "tile_rows")
+            ));
+        }
+        if resident < MIN_RESIDENT_LAYERS {
+            bad.push(format!(
+                "manifest {} {resident} < {MIN_RESIDENT_LAYERS}",
+                profile_path(profile, "resident_expert_layers")
+            ));
+        }
+        if window != TARGET_ROWS {
+            bad.push(format!(
+                "manifest {} {window} != the {TARGET_ROWS}-row window",
+                profile_path(profile, "window_rows")
+            ));
+        }
+        let part = |key: &str| at(key).unwrap_or(0);
+        let core = part("device_weights_bytes")
+            .checked_add(part("s1_tile_census_bytes"))
+            .and_then(|n| n.checked_add(part("s1_extras_bytes")));
+        if core != Some(part("device_core_bytes")) {
+            bad.push(format!(
+                "manifest {profile} device_core_bytes {} != weights + tile census + extras {core:?}",
+                part("device_core_bytes")
+            ));
+        }
+        let total = part("device_core_bytes").checked_add(part("sequential_diag_bytes"));
+        if total != Some(part("device_owned_bytes")) {
+            bad.push(format!(
+                "manifest {profile} device_owned_bytes {} != core + sequential diag {total:?}",
+                part("device_owned_bytes")
+            ));
+        }
+        match (profile == PROFILE_PRODUCT, part("sequential_diag_bytes")) {
+            (true, 0) | (false, 1..) => {}
+            (true, n) => bad.push(format!(
+                "manifest {profile} sequential_diag_bytes {n}: the product purpose carries no diagnostic reserve"
+            )),
+            (false, _) => bad.push(format!(
+                "manifest {profile} sequential_diag_bytes is 0: the primitive self-test reserve is missing"
+            )),
+        }
+        tiles.push(tile);
+        owned.push(part("device_owned_bytes"));
+    }
+    if tiles.len() == 2 && tiles[0] == tiles[1] {
+        bad.push(format!(
+            "manifest memory_ledger.profiles claim the same tile {} for the product and primitive purposes",
+            tiles[0]
+        ));
+    }
+    if owned.len() == 2 {
+        let peak = owned[0].max(owned[1]);
+        if u64_at(manifest, "memory_ledger.device_owned_bytes") != Some(peak) {
+            bad.push(format!(
+                "manifest memory_ledger.device_owned_bytes {:?} != the MAX {peak} of the per-purpose owned bytes",
+                u64_at(manifest, "memory_ledger.device_owned_bytes")
+            ));
+        }
+    }
+    bad
+}
+
+/// The sealed profiles must equal what this binary admits for each purpose
+/// (`slowlink_admission::purpose_tile_rows`, passed in by the caller): a
+/// manifest that names another tile than the one the loader will admit is an
+/// identity failure before any GPU work.
+pub fn profile_admission_problems(manifest: &Value, product: u64, primitive: u64) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (profile, admitted) in [(PROFILE_PRODUCT, product), (PROFILE_PRIMITIVE, primitive)] {
+        if manifest_profile_tile(manifest, profile) != Some(admitted) {
+            bad.push(format!(
+                "manifest {} {:?} != the {admitted}-row tile this binary admits for the {profile} purpose",
+                profile_path(profile, "tile_rows"),
+                manifest_profile_tile(manifest, profile)
+            ));
+        }
+    }
+    bad
+}
+
+/// What the load actually admitted (the bundle's profile) against the sealed
+/// profile it was chosen from.
+pub fn profile_load_problems(
+    manifest: &Value,
+    profile: &str,
+    admitted_purpose: &str,
+    admitted_tile: Option<u64>,
+    admitted_window: Option<u64>,
+    admitted_resident: Option<u64>,
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    if admitted_purpose != profile {
+        bad.push(format!(
+            "the admitted purpose {admitted_purpose:?} is not the {profile:?} profile this cell selects"
+        ));
+    }
+    for (key, actual) in [
+        ("tile_rows", admitted_tile),
+        ("window_rows", admitted_window),
+        ("resident_expert_layers", admitted_resident),
+    ] {
+        let sealed = manifest_profile_u64(manifest, profile, key);
+        if actual.is_none() || actual != sealed {
+            bad.push(format!(
+                "the admitted {key} {actual:?} != the sealed {} {sealed:?}",
+                profile_path(profile, key)
+            ));
+        }
+    }
+    bad
+}
+
 // ── manifest identity ──────────────────────────────────────────────────
 
-pub const MANIFEST_REQUIRED: [&str; 18] = [
+pub const MANIFEST_REQUIRED: [&str; 20] = [
     "source.base",
     "source.tip",
     "binary.sha256",
@@ -1967,6 +2218,8 @@ pub const MANIFEST_REQUIRED: [&str; 18] = [
     "link.topology_walk",
     "memory_ledger.device_gib",
     "memory_ledger.host_unreclaimable_gib",
+    "memory_ledger.profiles.product.tile_rows",
+    "memory_ledger.profiles.primitive_selftest.tile_rows",
 ];
 
 #[derive(Clone, Debug)]
@@ -1996,6 +2249,7 @@ pub fn manifest_problems(manifest: &Value, observed: &Observed) -> Vec<String> {
     if !bad.is_empty() {
         return bad;
     }
+    bad.extend(profile_shape_problems(manifest));
     for path in ["source.base", "source.tip"] {
         if !is_hex(get(manifest, path).and_then(Value::as_str), 40) {
             bad.push(format!("manifest {path} is not a full 40-hex commit"));

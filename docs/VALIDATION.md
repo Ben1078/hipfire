@@ -370,7 +370,8 @@ fabric hold):
 | [`qwen4_parity --mode slowlink-state`](../crates/hipfire-arch-qwen4/examples/qwen4_parity.rs) | Raw-byte SHA-256 digests of GDN/QSA/PLE state and a final-logit summary over repeated whole-prompt prefills; same-route determinism, one route per setting. |
 | [`slowlink_prefill_hw`](../crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs), the S1 test in [`session_cache_hw`](../crates/hipfire-arch-qwen4/tests/session_cache_hw.rs) | Focused hardware tests (primitives on the admitted profile, repeated epochs, injected failures, decode-after-prefill replay, session restore through the layer-major route). The un-ignored receipt/hold-guard tests are GPU-free. |
 
-Because S1's 1,536-row mixer tile differs from the incumbent's 8,192-row
+Because S1's mixer tile (768 rows for the product profile, 512 for the primitive
+profile; never the 8,192-row incumbent chunk) differs from the incumbent's 8,192-row
 manifest, a layer-major result is never labelled bitwise-identical to the
 incumbent: exact greedy ids and the paired KLD verdict are the cross-route
 gates, and identical digests are required only between repeats of one route.
@@ -433,6 +434,42 @@ not an actual driver figure; GPU-pool parked bytes are counted as used. This is
 a headroom product question and does not select a driver explanation. A
 missing cell is `incomplete`, not a pass.
 
+Purpose profiles (Main's choice from the joint admission frontier). The load
+admits one tile per purpose and a request never falls to the other's: the
+**product** profile (every state, headroom, greedy and perf cell, and any later
+product claim) is a **768-row** tile with at least ten resident layers; the
+**primitive_selftest** profile (`--mode primitives`) is a **512-row** tile that
+funds the self-test diagnostic inside the reserve. The primitive cell therefore
+proves kernel correctness at 512 rows only; it is not a product-shape
+qualification, and its report carries `evidence.s1_profile` saying so. One H1
+manifest holds both sealed profiles as full source ledgers,
+`memory_ledger.profiles.product` and `memory_ledger.profiles.primitive_selftest`
+(each: `purpose`, `tile_rows`, `resident_expert_layers`, `window_rows`,
+`page_count`, `device_weights_bytes`, `s1_tile_census_bytes`/`_terms`,
+`s1_extras_bytes`/`_terms`, `device_core_bytes`, `sequential_diag_bytes`,
+`device_owned_bytes`, `runtime_budget_bytes`, `safety_margin_bytes`), with no
+flat fallback. The root keeps the shared card/fabric/host figures and
+`device_owned_bytes` as the MAX of the two per-purpose owned figures (they load
+sequentially; the peak is not product core plus the primitive diagnostic). The
+state, product and perf cells select `product` (tile 768, no diagnostic bytes);
+the primitive cell selects `primitive_selftest` (tile 512, with diagnostic
+bytes), and its census diagnostic reads that profile alone. `identity.manifest`
+fails before GPU work if a profile is incomplete, its arithmetic does not close
+(core = weights + tile census + extras; owned = core + diagnostic), the tiles are
+equal or above 1,536, the root owned bytes are not the MAX, or either tile
+differs from the tile this binary's loader admits for that purpose. Every
+layer-major receipt of a cell must name exactly its own profile's tile (and
+retain no more scratch rows than it), and `load.placement` fails unless the
+bundle's actually admitted purpose, tile, window rows and resident layers equal
+the selected sealed profile. A product receipt at 1,536, 1,024 or 512 rows is
+therefore a failure even though it is under the historical bound. A manifest
+without both profiles describes an older binary and is refused.
+The generic 1,536-row
+limit (`Limits::default`) remains only for historical validators and as the
+bound of the approved named incumbent bypass for requests of at most 1,536 rows,
+which is unchanged. The `tile <=1,536 rows` in the gate table above is that
+generic bound, not the expected tile. No cut, repeat or case was removed.
+
 Hold 1 attempt 4 (`j1778`) corrected the proof, not the gates, and S1 stays
 default OFF. Its primitive cell passed, but the state cell failed S1
 initialization on the route-region allocation and then ran the incumbent until
@@ -443,8 +480,9 @@ runtime now read one shared capability predicate for the model-lifetime
 BF16-to-F16 weight shadows (the census had charged them on exact gfx1201 only,
 so gfx1100 charged 0 of the real artifact's 1,298,923,520 B; the existing
 512-row threshold and cold-owner bound are unchanged); S1 admission evaluates
-(tile, resident layers) jointly and keeps the >=10 resident floor, the 1,536
-tile bound, the full 16,384-row window and the lookahead charge; every admitted
+(tile, resident layers) jointly and keeps the >=10 resident floor, a tile of at
+most 1,536 rows (the admitted purpose profile above), the full 16,384-row window
+and the lookahead charge; every admitted
 S1 owner (page ring, route region, HC arena, window scratch, boundary stages)
 is bound once at the selected load and requests only consume it, an allocation
 failure being a named load failure that reports whether cleanup parked or
