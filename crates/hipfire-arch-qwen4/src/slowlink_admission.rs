@@ -30,7 +30,7 @@
 //! 4. the measured host link ([`link_verdict`]): discrete and **below**
 //!    16 GB/s. A fast link, unified memory and an unmeasured link never select
 //!    S1, whatever the selector says;
-//! 5. the joint placement ([`admit`]): the 1,536-row tile, the prompt arena,
+//! 5. the joint placement ([`admit`]): the purpose's tile ([`purpose_tile_rows`]), the prompt arena,
 //!    the expert page store, the route storage and A4 sidecars, the HC arena and the boundary state are all
 //!    charged together, and the placement that remains must still keep
 //!    [`S1_MIN_RESIDENT_LAYERS`] trunk layers resident. A shortfall is refused
@@ -50,10 +50,26 @@ use std::fmt;
 /// Developer variable of the selector (`developer.qwen4_slowlink_prefill`).
 pub const SLOWLINK_PREFILL_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_PREFILL";
 
-/// Rows of the S1 mixer tile: the chunk the load sizes its forward scratch
-/// from and the largest chunk the forward ever runs. Never the 8192-row
-/// incumbent chunk.
+/// LARGEST legal S1 mixer tile, in rows: the upper bound of
+/// [`legal_tile_rungs`] and of the named short-request incumbent bypass
+/// ([`S1_MIN_FORCED_REQUEST_ROWS`]). It is NOT the admitted tile: the load's
+/// forward scratch is sized from, and the forward runs, the
+/// [`SlowlinkProfile::tile_rows`] that [`admit`] chose from the load's
+/// [`AdmissionPurpose`] ([`purpose_tile_rows`]). Never the 8192-row incumbent
+/// chunk.
 pub const S1_TILE_ROWS: usize = 1536;
+
+/// The tile a [`AdmissionPurpose::Product`] load admits: the largest legal
+/// rung that keeps at least [`S1_MIN_RESIDENT_LAYERS`] resident beside the
+/// whole charged reserve on the j1778 fixture (Main's choice from the joint
+/// frontier). Every state, headroom, greedy and product claim runs on it.
+pub const S1_PRODUCT_TILE_ROWS: usize = 768;
+
+/// The tile an [`AdmissionPurpose::PrimitiveSelftest`] load admits: the
+/// largest legal rung that still funds the primitive self-test diagnostic
+/// inside the reserve with at least [`S1_MIN_RESIDENT_LAYERS`] resident
+/// (kernel coverage only; never a product claim).
+pub const S1_PRIMITIVE_TILE_ROWS: usize = 512;
 
 /// Prompt rows one S1 window admits. A longer prompt runs several windows
 /// (each its own expert sweep) and is receipted as such; it never claims one
@@ -209,9 +225,12 @@ pub enum SlowlinkDecline {
     UnqualifiedArch(String),
     UnifiedMemory,
     Unsupported(&'static str),
-    /// `HIPFIRE_PREFILL_CHUNK_ROWS` asks for a chunk other than the S1 tile.
+    /// `HIPFIRE_PREFILL_CHUNK_ROWS` asks for a chunk other than the admitted S1
+    /// tile (`tile`: the purpose's tile, `None` before admission when the value
+    /// is not a legal tile at all).
     ExplicitChunk {
         rows: usize,
+        tile: Option<usize>,
     },
     ShortContext {
         max_seq: usize,
@@ -249,9 +268,16 @@ impl fmt::Display for SlowlinkDecline {
             Self::UnqualifiedArch(arch) => write!(f, "{arch} is not gfx1100"),
             Self::UnifiedMemory => write!(f, "unified memory has no link to stream over"),
             Self::Unsupported(what) => write!(f, "unsupported mode: {what}"),
-            Self::ExplicitChunk { rows } => write!(
+            Self::ExplicitChunk { rows, tile: None } => write!(
                 f,
-                "HIPFIRE_PREFILL_CHUNK_ROWS={rows} conflicts with the fixed {S1_TILE_ROWS}-row tile"
+                "HIPFIRE_PREFILL_CHUNK_ROWS={rows} is not a legal S1 tile ({S1_MIN_TILE_ROWS}..={S1_TILE_ROWS} rows in 256-row steps)"
+            ),
+            Self::ExplicitChunk {
+                rows,
+                tile: Some(tile),
+            } => write!(
+                f,
+                "HIPFIRE_PREFILL_CHUNK_ROWS={rows} conflicts with the admitted {tile}-row tile"
             ),
             Self::ShortContext { max_seq } => write!(
                 f,
@@ -330,9 +356,12 @@ pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), Slowli
     if let Some((_, what)) = unsupported.into_iter().find(|(hit, _)| *hit) {
         return Err(SlowlinkDecline::Unsupported(what));
     }
+    // An explicit chunk must at least be a legal S1 tile; it must then equal
+    // the PURPOSE's tile, which is known only once admission has run
+    // ([`select_profile`] checks that).
     if let Some(rows) = explicit_chunk_rows(shape.chunk_rows_env) {
-        if rows != S1_TILE_ROWS {
-            return Err(SlowlinkDecline::ExplicitChunk { rows });
+        if !legal_tile_rungs().contains(&rows) {
+            return Err(SlowlinkDecline::ExplicitChunk { rows, tile: None });
         }
     }
     if shape.max_seq < S1_MIN_FORCED_REQUEST_ROWS {
@@ -815,6 +844,16 @@ pub enum AdmissionPurpose {
     PrimitiveSelftest,
 }
 
+/// The tile a load of `purpose` admits ([`S1_PRODUCT_TILE_ROWS`] /
+/// [`S1_PRIMITIVE_TILE_ROWS`]). A later request never falls to another
+/// purpose's tile: the load's profile is immutable.
+pub fn purpose_tile_rows(purpose: AdmissionPurpose) -> usize {
+    match purpose {
+        AdmissionPurpose::Product => S1_PRODUCT_TILE_ROWS,
+        AdmissionPurpose::PrimitiveSelftest => S1_PRIMITIVE_TILE_ROWS,
+    }
+}
+
 /// Device bytes the primitive self-tests allocate beyond the tile call's own
 /// tensors, from the authoritative helpers (no copied case list or constants):
 /// the transport's [`PanelPoolSpec::selftest_reserve`] total and the dispatch
@@ -987,9 +1026,10 @@ pub struct AdmissionInputs {
     pub gate_up_layer_bytes: u64,
     pub down_layer_bytes: u64,
     pub trunk_layers: usize,
-    /// [`crate::expert_residency::AutoReserve::census_total`] at
-    /// [`S1_TILE_ROWS`]: the S1 base reserve (census alone; the S1 terms and
-    /// the safety margin are charged on top).
+    /// [`crate::expert_residency::AutoReserve::census_total`] at the PURPOSE's
+    /// tile ([`purpose_tile_rows`]), F16 weight shadow cold bound included: the
+    /// S1 base reserve (census alone; the S1 terms and the safety margin are
+    /// charged on top).
     pub base_reserve: u64,
     /// Layers the incumbent placement at the requested chunk would keep with
     /// the safety margin and no dedicated G2 stage charge (log only; see
@@ -1014,10 +1054,13 @@ pub struct AdmissionInputs {
     pub base_runtime_reserved_bytes: u64,
     /// The incumbent's requested prefill chunk resolved at load: the non-S1
     /// checkpoint cadence (8192 on the narrow target). NEVER used for
-    /// placement or scratch; those stay on the 1,536-row tile.
+    /// placement or scratch; those are the purpose's tile.
     pub checkpoint_stride_rows: usize,
     pub window_rows: usize,
     pub link_gbps: f64,
+    /// What the profile is for; [`purpose_tile_rows`] of it is the tile
+    /// [`admit`] admits.
+    pub purpose: AdmissionPurpose,
 }
 
 /// The immutable admitted S1 profile: the frozen placement the load took and
@@ -1025,7 +1068,12 @@ pub struct AdmissionInputs {
 /// forward attaches; never mutated by a request.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SlowlinkProfile {
+    /// The tile the load admitted ([`purpose_tile_rows`] of [`Self::purpose`]):
+    /// the forward's scratch rows and the only tile a request ever runs.
     pub tile_rows: usize,
+    /// What the load is for ([`AdmissionPurpose`]); immutable. A profile never
+    /// serves another purpose.
+    pub purpose: AdmissionPurpose,
     pub window_rows: usize,
     pub geometry: ModelGeometry,
     pub pages: PanelPageLayout,
@@ -1102,13 +1150,13 @@ impl SlowlinkProfile {
 }
 
 /// The layouts and the term-by-term census of an S1 profile for `inputs` at
-/// the selected tile ([`S1_TILE_ROWS`]), exactly what [`admit`] charges and
-/// the forward allocates from. Pure; the hold ledger reads it too, so no
+/// the purpose's tile ([`purpose_tile_rows`]), exactly what [`admit`] charges
+/// and the forward allocates from. Pure; the hold ledger reads it too, so no
 /// figure is computed twice.
 pub fn census_of(
     inputs: &AdmissionInputs,
 ) -> Result<(PanelPageLayout, PromptArenaLayout, SlowlinkCensus), String> {
-    census_at_tile(inputs, S1_TILE_ROWS)
+    census_at_tile(inputs, purpose_tile_rows(inputs.purpose))
 }
 
 /// [`census_of`] at an explicit tile: only the HC-stream arena slack depends
@@ -1144,8 +1192,8 @@ fn census_at_tile(
     Ok((pages, arena, census))
 }
 
-/// The joint placement arithmetic of one tile, shared by [`admit`] (the
-/// runtime, at [`S1_TILE_ROWS`]) and [`tile_frontier`] (the CPU proof).
+/// The joint placement arithmetic of one tile, shared by [`admit_at_tile`] (the
+/// runtime, at the purpose's tile) and [`tile_frontier`] (the CPU proof).
 struct JointPlacement {
     pages: PanelPageLayout,
     arena: PromptArenaLayout,
@@ -1227,16 +1275,36 @@ fn judge_placement(
     Ok(())
 }
 
-/// The joint S1 placement: charge the tile, HC arena, route storage, A4 sidecars, page store
-/// and boundary state together, then count the layers that remain. Refuses,
-/// before anything is allocated, with the exact deficit when fewer than
-/// [`S1_MIN_RESIDENT_LAYERS`] stay resident. The tile is the fixed
-/// [`S1_TILE_ROWS`]; other tiles are only ever evaluated by [`tile_frontier`].
+/// The joint S1 placement at the purpose's tile
+/// ([`purpose_tile_rows`]`(inputs.purpose)`): charge the tile, HC arena, route
+/// storage, A4 sidecars, page store and boundary state together, then count
+/// the layers that remain. Refuses, before anything is allocated, with the
+/// exact deficit when fewer than [`S1_MIN_RESIDENT_LAYERS`] stay resident; a
+/// product load never falls to the primitive tile (or any other) on a refusal.
+/// `inputs.base_reserve` must be the census at that tile.
 pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDecline> {
-    let joint = joint_placement(inputs, S1_TILE_ROWS)?;
+    admit_at_tile(inputs, purpose_tile_rows(inputs.purpose))
+}
+
+/// [`admit`] at an explicit legal tile ([`legal_tile_rungs`]) through the same
+/// joint arithmetic, census, floor and verdict: the shared helper tests use to
+/// build a real computed profile at any rung (the historical 1,536-row
+/// counterfactual included). Production admission goes through [`admit`] only.
+/// `inputs.base_reserve` and `base_runtime_reserved_bytes` must describe the
+/// base reserve at `tile_rows`.
+pub(crate) fn admit_at_tile(
+    inputs: &AdmissionInputs,
+    tile_rows: usize,
+) -> Result<SlowlinkProfile, SlowlinkDecline> {
+    if !legal_tile_rungs().contains(&tile_rows) {
+        return Err(SlowlinkDecline::Geometry(format!(
+            "slow-link prefill tile {tile_rows} is not a legal rung"
+        )));
+    }
+    let joint = joint_placement(inputs, tile_rows)?;
     judge_placement(inputs, &joint)?;
     Ok(SlowlinkProfile {
-        tile_rows: S1_TILE_ROWS,
+        tile_rows,
         window_rows: inputs.window_rows,
         geometry: inputs.geometry,
         pages: joint.pages,
@@ -1246,6 +1314,7 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
         baseline_layers: inputs.baseline_layers,
         checkpoint_stride_rows: inputs.checkpoint_stride_rows,
         link_gbps: inputs.link_gbps,
+        purpose: inputs.purpose,
     })
 }
 
@@ -1261,7 +1330,8 @@ pub const S1_MIN_TILE_ROWS: usize =
 
 /// Every legal S1 tile, largest first: the existing 256-row chunk granularity
 /// ([`crate::gpu_forward::explicit_prefill_chunk_rows`]) from [`S1_TILE_ROWS`]
-/// (the selected tile and the largest allowed) down to [`S1_MIN_TILE_ROWS`].
+/// (the largest allowed) down to [`S1_MIN_TILE_ROWS`]; both purposes' tiles
+/// ([`S1_PRODUCT_TILE_ROWS`], [`S1_PRIMITIVE_TILE_ROWS`]) are rungs.
 /// No new tile size is introduced: each rung is a value the explicit chunk
 /// policy already accepts unchanged.
 pub fn legal_tile_rungs() -> Vec<usize> {
@@ -1275,8 +1345,8 @@ pub fn legal_tile_rungs() -> Vec<usize> {
 }
 
 /// One (tile, resident layers) point of the joint admission, every memory
-/// figure the proof reads. Not a runtime profile: [`admit`] never returns a
-/// tile other than [`S1_TILE_ROWS`].
+/// figure the proof reads. Not a runtime profile: [`admit`] only returns the
+/// purpose's tile ([`purpose_tile_rows`], [`Self::selected`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrontierPoint {
     pub tile_rows: usize,
@@ -1303,9 +1373,14 @@ pub struct FrontierPoint {
     pub trunk_layers: usize,
     /// Layers the charged placement keeps resident (before the floor).
     pub resident_layers: usize,
-    /// The runtime verdict: `Ok` only when [`admit`] would admit this tile
-    /// (at least [`S1_MIN_RESIDENT_LAYERS`] resident and a host layer left).
+    /// The runtime verdict: `Ok` only when [`admit_at_tile`] would admit this
+    /// tile (at least [`S1_MIN_RESIDENT_LAYERS`] resident and a host layer
+    /// left). `Ok` on a point that is not [`Self::selected`] is "would fit",
+    /// never an admission: [`admit`] only ever takes the purpose's tile.
     pub verdict: Result<(), SlowlinkDecline>,
+    /// This is the tile [`admit`] takes for the inputs' purpose
+    /// ([`purpose_tile_rows`]); every other point is a would-fit report.
+    pub selected: bool,
     /// Another feasible point has at least this tile AND at least these
     /// resident layers (strictly more of one).
     pub dominated: bool,
@@ -1370,6 +1445,7 @@ pub fn tile_frontier(
             trunk_layers: at.trunk_layers,
             resident_layers: joint.layers,
             verdict: judge_placement(&at, &joint),
+            selected: tile_rows == purpose_tile_rows(inputs.purpose),
             dominated: false,
         });
     }
@@ -1402,8 +1478,9 @@ pub struct LoadFacts<'a> {
     pub purpose: AdmissionPurpose,
     /// Free device bytes the placement is sized from.
     pub free: u64,
-    /// [`crate::expert_residency::AutoReserve::census_total`] at
-    /// [`S1_TILE_ROWS`] (`placement_bytes(true)`): the S1 profile's base
+    /// [`crate::expert_residency::AutoReserve::census_total`] at the PURPOSE's
+    /// tile ([`purpose_tile_rows`], `placement_bytes(true)`; F16 weight shadow
+    /// cold bound included): the S1 profile's base
     /// reserve is the bottom-up census alone, never the historical floor.
     pub tile_reserve: u64,
     /// [`crate::expert_residency::AutoReserve::bytes`] (the incumbent's
@@ -1509,6 +1586,7 @@ pub fn load_admission_inputs(
         checkpoint_stride_rows: facts.checkpoint_stride_rows,
         window_rows: facts.window_rows,
         link_gbps,
+        purpose: facts.purpose,
     })
 }
 
@@ -1534,6 +1612,13 @@ pub fn select_profile(
         Ok(()) => match link_verdict(link())
             .and_then(inputs)
             .and_then(|inputs| admit(&inputs))
+            .and_then(|profile| match explicit_chunk_rows(shape.chunk_rows_env) {
+                Some(rows) if rows != profile.tile_rows => Err(SlowlinkDecline::ExplicitChunk {
+                    rows,
+                    tile: Some(profile.tile_rows),
+                }),
+                _ => Ok(profile),
+            })
         {
             Ok(profile) => {
                 eprintln!("  qwen4 {}", profile.describe());
@@ -1666,14 +1751,14 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
     let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
     // The tile reserve once: its census total sizes the placement and its
     // runtime charge is the credit the S1 runtime budget supplements.
-    let tile_reserve = single_device_reserve(load, S1_TILE_ROWS)?;
+    let tile_reserve = single_device_reserve(load, purpose_tile_rows(load.purpose))?;
     Ok(LoadFacts {
         purpose: load.purpose,
         config: load.config,
         weights: load.weights,
         bytes_of: load.bytes_of,
         free: free as u64,
-        // S1 sizes its 1,536-row tile from the bottom-up census alone
+        // S1 sizes the purpose's tile from the bottom-up census alone
         // (`AutoReserve::placement_bytes(true)`, which carries the F16 weight
         // shadow cold bound); the incumbent/log baseline keeps `bytes()`, the
         // larger of the historical floor and the census.
@@ -1719,7 +1804,8 @@ fn single_device_reserve(
 /// single-device load at the measured `link_gbps`: the same facts and
 /// per-tile reserves the loader's admission reads. Emits memory only; the
 /// rate model and any floor change are Main's, and the runtime still admits
-/// only [`S1_TILE_ROWS`] with at least [`S1_MIN_RESIDENT_LAYERS`].
+/// only the purpose's tile ([`purpose_tile_rows`], the point with
+/// [`FrontierPoint::selected`]) with at least [`S1_MIN_RESIDENT_LAYERS`].
 pub fn single_device_tile_frontier(
     load: &SingleDeviceLoad<'_>,
     link_gbps: f64,
@@ -1874,12 +1960,13 @@ mod tests {
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
+            purpose: AdmissionPurpose::Product,
         }
     }
 
     /// The non-S1 checkpoint cadence survives an attached S1 profile: the
     /// stride is the incumbent's requested chunk (8192 on the narrow target),
-    /// never the 1,536-row mixer tile. The boundaries are the incumbent's own
+    /// never the mixer tile. The boundaries are the incumbent's own
     /// planner (`session_cache::stride_boundaries`, GLOBAL multiples of the
     /// stride in `(entry, end]`), fed the profile's stride: a 16K prompt has
     /// one interior boundary, resumed or not.
@@ -1887,7 +1974,7 @@ mod tests {
     fn slowlink_admission_checkpoint_cadence_is_the_incumbent_chunk_not_the_tile() {
         use hipfire_runtime::session_cache::stride_boundaries;
         let profile = admit(&inputs(free_for(&inputs(0), 10))).unwrap();
-        assert_eq!(profile.tile_rows, 1536);
+        assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
         assert_eq!(profile.checkpoint_stride_rows, 8192);
         let stride = profile.checkpoint_stride_rows;
         let interior = |stride: usize, entry: usize, end: usize| -> Vec<usize> {
@@ -1905,10 +1992,15 @@ mod tests {
         // A short prompt or an exact stride has no interior boundary.
         assert!(interior(stride, 0, 8192).is_empty());
         assert!(interior(stride, 0, 100).is_empty());
-        // The mixer tile would have placed ten interior boundaries: it is
-        // never the checkpoint cadence.
-        assert_eq!(interior(S1_TILE_ROWS, 0, 16384).len(), 10);
-        assert_ne!(interior(stride, 0, 16384), interior(S1_TILE_ROWS, 0, 16384));
+        // The mixer tile would have placed an interior boundary every tile
+        // (21 at 768 rows): it is never the checkpoint cadence.
+        let tile_boundaries = (16384 - 1) / profile.tile_rows;
+        assert_eq!(interior(profile.tile_rows, 0, 16384).len(), tile_boundaries);
+        assert_eq!(tile_boundaries, 21, "768-row product tile");
+        assert_ne!(
+            interior(stride, 0, 16384),
+            interior(profile.tile_rows, 0, 16384)
+        );
     }
 
     fn census_total(inputs: &AdmissionInputs) -> u64 {
@@ -1918,8 +2010,12 @@ mod tests {
             inputs.down_layer_bytes,
         )
         .unwrap();
-        let arena =
-            PromptArenaLayout::new(&inputs.geometry, inputs.window_rows, S1_TILE_ROWS).unwrap();
+        let arena = PromptArenaLayout::new(
+            &inputs.geometry,
+            inputs.window_rows,
+            purpose_tile_rows(inputs.purpose),
+        )
+        .unwrap();
         pages.total_bytes().unwrap()
             + route_storage_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + a4_sidecar_bytes(&inputs.geometry, inputs.window_rows).unwrap()
@@ -2176,23 +2272,31 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_explicit_chunk_rows_must_equal_the_tile() {
+    fn slowlink_admission_explicit_chunk_rows_must_equal_the_purpose_tile() {
         let with = |env| LoadShape {
             chunk_rows_env: Some(env),
             ..shape()
         };
-        assert_eq!(preflight(SlowlinkMode::Force, &with("1536")), Ok(()));
-        assert_eq!(preflight(SlowlinkMode::Force, &with(" 1536 ")), Ok(()));
+        // Probe-free: any legal tile passes the preflight (the purpose's tile
+        // is known only after admission, checked below).
+        for legal in ["1536", " 1536 ", "1280", "1024", "768", "512"] {
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &with(legal)),
+                Ok(()),
+                "{legal}"
+            );
+        }
         // Rounded down to whole 256-row tiles like the chunk policy.
         assert_eq!(preflight(SlowlinkMode::Force, &with("1600")), Ok(()));
-        assert_eq!(
-            preflight(SlowlinkMode::Force, &with("8192")),
-            Err(SlowlinkDecline::ExplicitChunk { rows: 8192 })
-        );
-        assert_eq!(
-            preflight(SlowlinkMode::Force, &with("1024")),
-            Err(SlowlinkDecline::ExplicitChunk { rows: 1024 })
-        );
+        // Not a legal S1 tile: above the maximum or below the WMMA threshold.
+        for illegal in ["8192", "2048", "256"] {
+            let rows = illegal.parse().unwrap();
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &with(illegal)),
+                Err(SlowlinkDecline::ExplicitChunk { rows, tile: None }),
+                "{illegal}"
+            );
+        }
         // Unusable values are unset, as in the chunk policy.
         for env in ["", "abc", "100", "-1"] {
             assert_eq!(
@@ -2201,6 +2305,22 @@ mod tests {
                 "{env:?}"
             );
         }
+        // After admission an explicit chunk must equal the PURPOSE's tile:
+        // a product load admits 768, so 1536 is the incumbent (not a capacity
+        // refusal) and 768 admits.
+        let select = |env| {
+            select_profile(
+                SlowlinkMode::Force,
+                &with(env),
+                || HostLink::Discrete { gbps: 7.09 },
+                |_| Ok(inputs(free_for(&inputs(0), 10))),
+            )
+        };
+        assert_eq!(select("1536"), Ok(None));
+        assert_eq!(select("512"), Ok(None));
+        let profile = select("768").unwrap().expect("the purpose tile admits");
+        assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
+        assert!(select("").unwrap().is_some());
     }
 
     #[test]
@@ -2388,11 +2508,25 @@ mod tests {
         .unwrap()
     }
 
-    /// The real j1778 admission inputs for a route, purpose and free figure.
+    /// The real j1778 admission inputs for a route, purpose and free figure, at
+    /// the PURPOSE's tile exactly as the loader hands them to [`admit`]: the
+    /// base reserve is the census at [`purpose_tile_rows`] and the purpose is
+    /// the load's own, never inferred from the diagnostic bytes.
     fn j1778_inputs(route: WindowRoute, purpose: AdmissionPurpose, free: u64) -> AdmissionInputs {
+        j1778_inputs_at(route, purpose, free, purpose_tile_rows(purpose))
+    }
+
+    /// [`j1778_inputs`] with the base reserve at an explicit `tile` (the
+    /// historical 1,536-row counterfactual, admitted through [`admit_at_tile`]).
+    fn j1778_inputs_at(
+        route: WindowRoute,
+        purpose: AdmissionPurpose,
+        free: u64,
+        tile: usize,
+    ) -> AdmissionInputs {
         let config = crate::config::compact_test_config();
         let geometry = ModelGeometry::from_config(&config, route).unwrap();
-        let reserve = j1778_reserve_at(S1_TILE_ROWS);
+        let reserve = j1778_reserve_at(tile);
         AdmissionInputs {
             geometry,
             free,
@@ -2420,39 +2554,101 @@ mod tests {
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS.min(J1778_MAX_SEQ),
             link_gbps: 7.09,
+            purpose,
         }
     }
 
-    /// The real 24 GiB XTX fixture with the CORRECTED source census: the base
-    /// reserve at the 1,536-row tile is the measured 2,237,111,724 B census
-    /// PLUS the 1,298,923,520 B F16 weight shadow cold bound of the real
-    /// artifact (the gfx1100 runtime predicate holds there), so ten layers no
-    /// longer fit beside the S1 terms, the 1 GiB runtime budget and the 512 MiB
-    /// safety margin: the admission declines with its exact deficit and keeps
-    /// no underfunded profile. The incumbent's reserve policy
-    /// (`max(historical floor, census)`) is unchanged.
+    /// `free - needed` for `layers` resident layers of an admitted `profile`:
+    /// needed is the non-expert weights, the layers, the base reserve at the
+    /// profile's tile (F16 shadow cold bound inside), every S1 term (runtime
+    /// budget and diagnostic included) and the 512 MiB safety margin on top.
+    fn j1778_slack(inputs: &AdmissionInputs, profile: &SlowlinkProfile, layers: u64) -> i128 {
+        let needed = i128::from(inputs.non_expert)
+            + i128::from(layers) * i128::from(LAYER)
+            + i128::from(inputs.base_reserve)
+            + i128::from(profile.census.total().unwrap())
+            + i128::from(J1778_MARGIN);
+        i128::from(inputs.free) - needed
+    }
+
+    /// The legal rungs' base reserves (census incl. the F16 shadow cold bound)
+    /// and the N=10 slack of each purpose on each route, from the real
+    /// fixture: the frontier the product and primitive tiles were chosen on
+    /// (1536, 1280, 1024, 768, 512).
+    const J1778_RUNG_BASE: [u64; 5] = [
+        3_536_035_244,
+        3_251_920_428,
+        2_967_805_612,
+        2_683_690_796,
+        2_399_575_980,
+    ];
+    const J1778_AGG_PRODUCT_SLACK: [i128; 5] = [
+        -711_505_388,
+        -422_147_692,
+        -132_789_996,
+        156_567_700,
+        445_925_396,
+    ];
+    const J1778_AGG_PRIMITIVE_SLACK: [i128; 5] = [
+        -929_326_572,
+        -639_968_876,
+        -350_611_180,
+        -61_253_484,
+        228_104_212,
+    ];
+    const J1778_SLAB_PRODUCT_SLACK: [i128; 5] = [
+        -709_961_196,
+        -420_603_500,
+        -131_245_804,
+        158_111_892,
+        447_469_588,
+    ];
+    const J1778_SLAB_PRIMITIVE_SLACK: [i128; 5] = [
+        -927_782_380,
+        -638_424_684,
+        -349_066_988,
+        -59_709_292,
+        229_648_404,
+    ];
+
+    /// The HISTORICAL 1,536-row COUNTERFACTUAL on the real 24 GiB XTX fixture
+    /// with the CORRECTED source census (admitted through [`admit_at_tile`],
+    /// never by production [`admit`]): the base reserve at the 1,536-row tile is
+    /// the measured 2,237,111,724 B census PLUS the 1,298,923,520 B F16 weight
+    /// shadow cold bound of the real artifact (the gfx1100 runtime predicate
+    /// holds there), so ten layers no longer fit beside the S1 terms, the
+    /// 1 GiB runtime budget and the 512 MiB safety margin: the admission
+    /// declines with its exact deficit and keeps no underfunded profile. The
+    /// incumbent's reserve policy (`max(historical floor, census)`) is
+    /// unchanged.
     #[test]
-    fn slowlink_residency_real_fixture_declines_below_ten_layers_with_the_corrected_shadow_census()
-    {
+    fn slowlink_residency_real_fixture_1536_counterfactual_declines_with_the_corrected_shadow_census(
+    ) {
         let reserve = j1778_reserve_at(S1_TILE_ROWS);
         assert_eq!(reserve.census.f16_shadows, J1778_SHADOWS);
         assert_eq!(reserve.census_total, 2_237_111_724 + J1778_SHADOWS);
         assert_eq!(reserve.placement_bytes(true), 3_536_035_244);
         // Incumbent policy untouched: `max(historical floor, census)` for every
         // load that is not an admitted S1 profile; S1 reads the census alone.
-        let historical = reserve.historical.expect("a discrete gfx1100 keeps its floor");
+        let historical = reserve
+            .historical
+            .expect("a discrete gfx1100 keeps its floor");
         assert_eq!(reserve.bytes(), historical.max(reserve.census_total));
         assert_eq!(reserve.placement_bytes(false), reserve.bytes());
-        assert!(historical > reserve.census_total, "the stale floor still wins");
+        assert!(
+            historical > reserve.census_total,
+            "the stale floor still wins"
+        );
         assert_eq!(reserve.winner(), "historical floor");
 
-        let inputs = j1778_inputs(
+        let inputs = j1778_inputs_at(
             WindowRoute::SlabIu4,
             AdmissionPurpose::Product,
             J1778_PRELOAD_FREE,
+            S1_TILE_ROWS,
         );
         assert_eq!(GATE_UP_LAYER + DOWN_LAYER, 1_336_934_400);
-        let (_, _, extras) = census_of(&inputs).unwrap();
+        let (_, _, extras) = census_at_tile(&inputs, S1_TILE_ROWS).unwrap();
         assert_eq!(extras.owned_total().unwrap(), 2_543_094_592);
         assert_eq!(extras.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
         assert_eq!(
@@ -2462,7 +2658,7 @@ mod tests {
         // Census base + S1 owned + 1 GiB runtime + 512 MiB safety, on top.
         let charged = 3_536_035_244 + 2_543_094_592 + S1_RUNTIME_OVERHEAD_BYTES + J1778_MARGIN;
         assert_eq!(charged, 7_689_742_572);
-        match admit(&inputs) {
+        match admit_at_tile(&inputs, S1_TILE_ROWS) {
             Err(SlowlinkDecline::Deficit(deficit)) => {
                 assert_eq!(deficit.resident_layers, 9);
                 assert_eq!(deficit.required_layers, S1_MIN_RESIDENT_LAYERS);
@@ -2481,13 +2677,18 @@ mod tests {
             base_reserve: 2_237_111_724,
             ..inputs
         };
-        assert_eq!(admit(&omitted).unwrap().resident_layers, 10);
+        assert_eq!(
+            admit_at_tile(&omitted, S1_TILE_ROWS)
+                .unwrap()
+                .resident_layers,
+            10
+        );
         // The stale historical floor as the base is a deeper deficit.
         let floor = AdmissionInputs {
             base_reserve: J1778_HISTORICAL_1536,
             ..inputs
         };
-        match admit(&floor) {
+        match admit_at_tile(&floor, S1_TILE_ROWS) {
             Err(SlowlinkDecline::Deficit(deficit)) => assert_eq!(deficit.resident_layers, 7),
             other => panic!("the historical floor must be a deficit, got {other:?}"),
         }
@@ -2497,10 +2698,15 @@ mod tests {
             free: 24 * GIB - 3 * GIB / 2,
             ..inputs
         };
-        match admit(&conservative) {
+        match admit_at_tile(&conservative, S1_TILE_ROWS) {
             Err(SlowlinkDecline::Deficit(deficit)) => assert_eq!(deficit.resident_layers, 8),
             other => panic!("the double-reserved input must decline, got {other:?}"),
         }
+        // A tile outside the legal rungs is never admitted.
+        assert!(matches!(
+            admit_at_tile(&inputs, 256),
+            Err(SlowlinkDecline::Geometry(_))
+        ));
     }
 
     /// The primitive self-test budget is the authoritative transport/dispatch
@@ -2543,14 +2749,15 @@ mod tests {
         }
     }
 
-    /// The j1778 admission on both the slab and the aggregate (the real MQ4
-    /// artifact) route, product (diagnostic 0) and primitive self-test
-    /// (diagnostic 217,821,184 B): every purpose declines at the fixed 1,536-row
-    /// tile with its exact byte deficit. The 512 MiB safety margin and the
-    /// 1 GiB runtime budget stay visible beside the corrected census, and a
-    /// tenth layer's shortfall is exactly the deficit (never a shrunk floor).
+    /// The 1,536-row COUNTERFACTUAL on both routes and purposes: every purpose
+    /// declines at the historical maximum tile with its exact byte deficit
+    /// (the aggregate N=10 slack is the negated deficit). The 512 MiB safety
+    /// margin and the 1 GiB runtime budget stay visible beside the corrected
+    /// census, and a tenth layer's shortfall is exactly the deficit (never a
+    /// shrunk floor). Admitted through [`admit_at_tile`]; production never
+    /// admits it.
     #[test]
-    fn slowlink_residency_j1778_purposes_decline_with_exact_deficits_on_both_routes() {
+    fn slowlink_residency_j1778_1536_counterfactual_declines_with_exact_deficits() {
         use hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout;
         for route in [WindowRoute::SlabIu4, WindowRoute::Aggregate] {
             let mut previous = None;
@@ -2562,9 +2769,9 @@ mod tests {
                     J1778_PRIMITIVE_DIAGNOSTIC,
                 ),
             ] {
-                let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+                let inputs = j1778_inputs_at(route, purpose, J1778_PRELOAD_FREE, S1_TILE_ROWS);
                 assert_eq!(inputs.diagnostic_bytes, diagnostic, "{label}");
-                let (pages, _, census) = census_of(&inputs).unwrap();
+                let (pages, _, census) = census_at_tile(&inputs, S1_TILE_ROWS).unwrap();
                 assert_eq!(pages.total_pages(), 18, "{label}");
                 assert_eq!(
                     census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES,
@@ -2574,7 +2781,7 @@ mod tests {
                 let charged = inputs.base_reserve
                     + census.total().unwrap()
                     + crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES;
-                match admit(&inputs) {
+                match admit_at_tile(&inputs, S1_TILE_ROWS) {
                     Err(SlowlinkDecline::Deficit(deficit)) => {
                         assert_eq!(deficit.resident_layers, 9, "{route:?} {label}");
                         assert_eq!(deficit.reserve, charged, "{route:?} {label}");
@@ -2597,11 +2804,9 @@ mod tests {
                 }
                 if route == WindowRoute::Aggregate {
                     assert_eq!(census.a4_sidecars, 0, "{label}");
-                    let layout = PromptRouteLayout::new(&route_dims(
-                        &inputs.geometry,
-                        inputs.window_rows,
-                    ))
-                    .unwrap();
+                    let layout =
+                        PromptRouteLayout::new(&route_dims(&inputs.geometry, inputs.window_rows))
+                            .unwrap();
                     assert_eq!(layout.route(), WindowRoute::Aggregate);
                     assert_eq!(census.route_storage, layout.total_bytes() as u64);
                     assert_eq!(
@@ -2613,40 +2818,145 @@ mod tests {
         }
     }
 
-    /// With exactly the missing bytes the joint admission admits ten layers at
-    /// the selected tile, as the frontier predicts, and one byte fewer
-    /// declines: the safety margin stays on top of the physical sum.
+    /// The purpose-derived tile: product 768, primitive 512, both legal rungs
+    /// below the 1,536 maximum, each a value the existing explicit chunk policy
+    /// accepts.
     #[test]
-    fn slowlink_residency_j1778_admits_ten_layers_only_when_the_corrected_sum_fits() {
-        for purpose in [
-            AdmissionPurpose::Product,
-            AdmissionPurpose::PrimitiveSelftest,
-        ] {
-            let declined = j1778_inputs(WindowRoute::Aggregate, purpose, J1778_PRELOAD_FREE);
-            let Err(SlowlinkDecline::Deficit(deficit)) = admit(&declined) else {
-                panic!("{purpose:?} must decline at the measured free");
+    fn slowlink_admission_purpose_tiles_are_legal_rungs_below_the_maximum() {
+        assert_eq!(purpose_tile_rows(AdmissionPurpose::Product), 768);
+        assert_eq!(purpose_tile_rows(AdmissionPurpose::PrimitiveSelftest), 512);
+        assert_eq!(S1_PRODUCT_TILE_ROWS, 768);
+        assert_eq!(S1_PRIMITIVE_TILE_ROWS, 512);
+        assert!(S1_PRODUCT_TILE_ROWS < S1_TILE_ROWS);
+        let rungs = legal_tile_rungs();
+        assert!(rungs.contains(&S1_PRODUCT_TILE_ROWS));
+        assert!(rungs.contains(&S1_PRIMITIVE_TILE_ROWS));
+        assert_eq!(rungs.first(), Some(&S1_TILE_ROWS));
+        // The short-request incumbent bypass keeps its 1,536-row bound (the
+        // maximum tile), not the purpose's tile.
+        assert_eq!(S1_MIN_FORCED_REQUEST_ROWS, S1_TILE_ROWS + 1);
+    }
+
+    /// The ACTUAL chosen profiles on the real j1778 fixture, both routes:
+    /// product 768 and primitive 512 each admit exactly ten resident layers
+    /// with the 16K window and 18 pages, 1 GiB runtime and 512 MiB safety on
+    /// top, with the frontier's exact N=10 slack; one byte less free declines,
+    /// and an eleventh layer never fits.
+    #[test]
+    fn slowlink_residency_j1778_chosen_profiles_admit_ten_layers_with_exact_slack() {
+        let cases = [
+            (
+                WindowRoute::Aggregate,
+                AdmissionPurpose::Product,
+                S1_PRODUCT_TILE_ROWS,
+                J1778_AGG_PRODUCT_SLACK[3],
+            ),
+            (
+                WindowRoute::Aggregate,
+                AdmissionPurpose::PrimitiveSelftest,
+                S1_PRIMITIVE_TILE_ROWS,
+                J1778_AGG_PRIMITIVE_SLACK[4],
+            ),
+            (
+                WindowRoute::SlabIu4,
+                AdmissionPurpose::Product,
+                S1_PRODUCT_TILE_ROWS,
+                J1778_SLAB_PRODUCT_SLACK[3],
+            ),
+            (
+                WindowRoute::SlabIu4,
+                AdmissionPurpose::PrimitiveSelftest,
+                S1_PRIMITIVE_TILE_ROWS,
+                J1778_SLAB_PRIMITIVE_SLACK[4],
+            ),
+        ];
+        // The two actual real-artifact (aggregate) slacks Main chose on.
+        assert_eq!(J1778_AGG_PRODUCT_SLACK[3], 156_567_700);
+        assert_eq!(J1778_AGG_PRIMITIVE_SLACK[4], 228_104_212);
+        for (route, purpose, tile, slack) in cases {
+            let label = format!("{route:?} {purpose:?}");
+            let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+            assert_eq!(inputs.purpose, purpose, "{label}");
+            let profile = admit(&inputs).unwrap_or_else(|decline| panic!("{label}: {decline}"));
+            assert_eq!(profile.purpose, purpose, "{label}");
+            assert_eq!(profile.tile_rows, tile, "{label}");
+            assert_eq!(profile.tile_rows, purpose_tile_rows(purpose), "{label}");
+            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(profile.resident_layers, 10, "{label}");
+            assert_eq!(profile.pages.total_pages(), 18, "{label}");
+            assert_eq!(profile.arena.tile_rows, tile, "{label}");
+            assert_eq!(profile.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
+            assert_eq!(
+                profile.census.diagnostic,
+                if purpose == AdmissionPurpose::Product {
+                    0
+                } else {
+                    J1778_PRIMITIVE_DIAGNOSTIC
+                },
+                "{label}"
+            );
+            assert_eq!(j1778_slack(&inputs, &profile, 10), slack, "{label}");
+            assert!(j1778_slack(&inputs, &profile, 11) < 0, "{label}");
+            // The safety margin sits on top: the slack is what remains AFTER it.
+            assert!(slack > 0, "{label}");
+            // Exact boundary: the slack in bytes less free still admits ten
+            // layers, one byte fewer declines.
+            let slack_bytes = u64::try_from(slack).unwrap();
+            let edge = AdmissionInputs {
+                free: J1778_PRELOAD_FREE - slack_bytes,
+                ..inputs
             };
-            let fits = AdmissionInputs {
-                free: J1778_PRELOAD_FREE + deficit.deficit_bytes,
-                ..declined
+            assert_eq!(admit(&edge).unwrap().resident_layers, 10, "{label}");
+            let below = AdmissionInputs {
+                free: edge.free - 1,
+                ..edge
             };
-            let profile = admit(&fits).expect("the exact deficit funds ten layers");
-            assert_eq!(profile.resident_layers, 10);
-            assert_eq!(profile.tile_rows, S1_TILE_ROWS);
-            let short = AdmissionInputs {
-                free: fits.free - 1,
-                ..fits
-            };
-            assert!(matches!(admit(&short), Err(SlowlinkDecline::Deficit(_))));
-            let points = tile_frontier(&fits, |tile| Ok(j1778_reserve_at(tile))).unwrap();
-            let selected = &points[0];
-            assert_eq!(selected.tile_rows, S1_TILE_ROWS);
-            assert!(selected.admits());
-            assert_eq!(selected.verdict, admit(&fits).map(|_| ()));
-            assert_eq!(selected.resident_layers, 10);
-            assert_eq!(selected.slack_for(10), 0);
-            assert_eq!(selected.safety_margin, J1778_MARGIN);
+            assert!(
+                matches!(admit(&below), Err(SlowlinkDecline::Deficit(_))),
+                "{label}"
+            );
         }
+    }
+
+    /// A product load never silently falls to the finer primitive tile (and a
+    /// primitive load never takes the product tile): with less free memory
+    /// than 768 needs but 512 would fit, `admit` declines with the exact
+    /// deficit while the frontier only REPORTS 512 as would-fit; and the
+    /// primitive purpose at 768 declines with its exact N=9 deficit.
+    #[test]
+    fn slowlink_residency_j1778_purposes_never_fall_to_another_purposes_tile() {
+        let free = J1778_PRELOAD_FREE - 200_000_000;
+        let product = j1778_inputs(WindowRoute::Aggregate, AdmissionPurpose::Product, free);
+        let Err(SlowlinkDecline::Deficit(deficit)) = admit(&product) else {
+            panic!("product 768 must decline when 200 MB are missing");
+        };
+        assert_eq!(deficit.resident_layers, 9);
+        assert_eq!(deficit.deficit_bytes, 200_000_000 - 156_567_700);
+        let points = tile_frontier(&product, |tile| Ok(j1778_reserve_at(tile))).unwrap();
+        let selected: Vec<_> = points.iter().filter(|point| point.selected).collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].tile_rows, S1_PRODUCT_TILE_ROWS);
+        assert!(!selected[0].admits());
+        let finer = points
+            .iter()
+            .find(|point| point.tile_rows == S1_PRIMITIVE_TILE_ROWS)
+            .unwrap();
+        assert!(finer.admits(), "512 would fit: report only");
+        assert!(!finer.selected);
+
+        // The primitive purpose at the product's 768 tile: the diagnostic is
+        // not funded (N=9), so only 512 admits it.
+        let primitive = j1778_inputs_at(
+            WindowRoute::Aggregate,
+            AdmissionPurpose::PrimitiveSelftest,
+            J1778_PRELOAD_FREE,
+            S1_PRODUCT_TILE_ROWS,
+        );
+        let Err(SlowlinkDecline::Deficit(deficit)) = admit_at_tile(&primitive, 768) else {
+            panic!("the diagnostic is not funded at 768");
+        };
+        assert_eq!(deficit.resident_layers, 9);
+        assert_eq!(deficit.deficit_bytes, 61_253_484);
     }
 
     fn frontier_json(points: &[FrontierPoint]) -> serde_json::Value {
@@ -2661,7 +2971,8 @@ mod tests {
                         "tiles_per_window": point.tiles_per_window,
                         "final_tile_rows": point.final_tile_rows,
                         "resident_layers": point.resident_layers,
-                        "admits": point.admits(),
+                        "would_fit_ten_layers": point.admits(),
+                        "selected_by_purpose": point.selected,
                         "decline": point.verdict.as_ref().err().map(|decline| decline.to_string()),
                         "dominated": point.dominated,
                         "free_bytes": point.free,
@@ -2699,8 +3010,9 @@ mod tests {
     /// and the primitive-purpose profiles: every legal tile rung from the
     /// existing 256-row chunk granularity, each with exact physical capacity,
     /// cold F16 shadow bound, S1 owned terms, the runtime budget, the
-    /// diagnostic and the safety margin separately. Emits one JSON line
-    /// (`--nocapture`); memory only, no rate model, nothing lowered.
+    /// diagnostic and the safety margin separately. The purpose's tile is
+    /// `selected`; every other point is a would-fit report only. Emits one JSON
+    /// line (`--nocapture`); memory only, no rate model, nothing lowered.
     #[test]
     fn slowlink_residency_j1778_feasible_tile_frontier_for_both_purposes() {
         // Legal rungs: the existing chunk granularity, never below the WMMA
@@ -2731,12 +3043,24 @@ mod tests {
                 let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
                 let points = tile_frontier(&inputs, |tile| Ok(j1778_reserve_at(tile))).unwrap();
                 assert_eq!(points.len(), 5);
-                // The selected tile's verdict is exactly the runtime's.
-                assert_eq!(points[0].tile_rows, S1_TILE_ROWS);
-                assert_eq!(points[0].verdict, admit(&inputs).map(|_| ()));
-                assert_eq!(points[0].base_reserve, 3_536_035_244, "{route:?} {label}");
+                // Exactly the purpose's tile is selected and its verdict is
+                // exactly the runtime's.
+                let chosen = points.iter().filter(|point| point.selected).count();
+                assert_eq!(chosen, 1, "{route:?} {label}");
+                let selected = points.iter().find(|point| point.selected).unwrap();
+                assert_eq!(selected.tile_rows, purpose_tile_rows(purpose));
+                assert_eq!(selected.verdict, admit(&inputs).map(|_| ()));
+                assert!(selected.admits(), "{route:?} {label}");
+                let (slack, max_layers) = match (route, purpose) {
+                    (WindowRoute::Aggregate, AdmissionPurpose::Product) => {
+                        (J1778_AGG_PRODUCT_SLACK, [9, 9, 9, 10, 10])
+                    }
+                    (WindowRoute::Aggregate, _) => (J1778_AGG_PRIMITIVE_SLACK, [9, 9, 9, 9, 10]),
+                    (_, AdmissionPurpose::Product) => (J1778_SLAB_PRODUCT_SLACK, [9, 9, 9, 10, 10]),
+                    (_, _) => (J1778_SLAB_PRIMITIVE_SLACK, [9, 9, 9, 9, 10]),
+                };
                 let mut last_layers = 0;
-                for point in &points {
+                for (index, point) in points.iter().enumerate() {
                     let census = &point.census;
                     // Every rung charges the cold shadow bound, once, inside the base.
                     assert_eq!(point.f16_shadow_bytes, J1778_SHADOWS);
@@ -2749,6 +3073,10 @@ mod tests {
                     );
                     assert_eq!(point.free, J1778_PRELOAD_FREE);
                     assert!(point.free < J1778_TOTAL);
+                    let at = format!("{route:?} {label} tile {}", point.tile_rows);
+                    assert_eq!(point.base_reserve, J1778_RUNG_BASE[index], "{at}");
+                    assert_eq!(point.slack_for(10), slack[index], "{at}");
+                    assert_eq!(point.resident_layers, max_layers[index], "{at}");
                     // Smaller tiles never keep fewer layers.
                     assert!(point.resident_layers >= last_layers);
                     last_layers = point.resident_layers;
@@ -2775,8 +3103,7 @@ mod tests {
                         assert!(point.final_tile_rows <= S1_F32_TILE_ROWS_MAX);
                     }
                 }
-                let finals: Vec<usize> =
-                    points.iter().map(|point| point.final_tile_rows).collect();
+                let finals: Vec<usize> = points.iter().map(|point| point.final_tile_rows).collect();
                 assert_eq!(finals, vec![1024, 1024, 1024, 256, 512]);
                 if label == "product" {
                     product_layers = points.iter().map(|point| point.resident_layers).collect();
@@ -2791,8 +3118,15 @@ mod tests {
                     .filter(|point| point.admits() && !point.dominated)
                     .map(|point| point.tile_rows)
                     .collect();
+                // The only feasible, undominated tile is the purpose's own.
+                assert_eq!(
+                    feasible,
+                    vec![purpose_tile_rows(purpose)],
+                    "{route:?} {label}"
+                );
                 purposes.push(serde_json::json!({
-                    "purpose": label,
+                    "purpose": format!("{purpose:?}"),
+                    "purpose_tile_rows": purpose_tile_rows(purpose),
                     "diagnostic_budget_bytes": diagnostic,
                     "feasible_frontier_tiles": feasible,
                     "points": frontier_json(&points),
@@ -2822,6 +3156,9 @@ mod tests {
                 "runtime_budget_bytes": S1_RUNTIME_OVERHEAD_BYTES,
                 "safety_margin_bytes": J1778_MARGIN,
                 "legal_tile_rungs": legal_tile_rungs(),
+                "product_tile_rows": S1_PRODUCT_TILE_ROWS,
+                "primitive_tile_rows": S1_PRIMITIVE_TILE_ROWS,
+                "max_tile_rows": S1_TILE_ROWS,
                 "note": "CPU census of declared inputs, not a GPU measurement; memory only",
             },
             "routes": routes,
@@ -2829,6 +3166,107 @@ mod tests {
         println!(
             "SLOWLINK_J1778_TILE_FRONTIER {}",
             serde_json::to_string(&report).unwrap()
+        );
+    }
+
+    /// Emits the ACTUAL chosen profiles of the real j1778 fixture (purpose
+    /// `Product` at 768 and `PrimitiveSelftest` at 512, both routes), each with
+    /// its full base-census breakdown (forward, state, QSA context, workspace,
+    /// F16 weight shadow), the S1 owned terms and arena, the diagnostic,
+    /// runtime and safety budgets and the N=10 needed/free/slack, as one JSON
+    /// line (`SLOWLINK_J1778_CHOSEN_PROFILES`, `--nocapture`). Every figure is
+    /// read from the real getters ([`admit`], the census), not copied.
+    #[test]
+    fn slowlink_residency_j1778_emits_the_chosen_profiles_with_the_full_base_breakdown() {
+        let mut profiles = Vec::new();
+        for route in [WindowRoute::Aggregate, WindowRoute::SlabIu4] {
+            for purpose in [
+                AdmissionPurpose::Product,
+                AdmissionPurpose::PrimitiveSelftest,
+            ] {
+                let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+                let profile = admit(&inputs).expect("the chosen profile admits");
+                assert_eq!(profile.purpose, purpose);
+                let tile = profile.tile_rows;
+                let reserve = j1778_reserve_at(tile);
+                let census = &profile.census;
+                assert_eq!(reserve.placement_bytes(true), inputs.base_reserve);
+                let workspace_total: u64 = reserve.census.workspace.iter().map(|t| t.1).sum();
+                let needed_ten = i128::from(inputs.non_expert)
+                    + 10 * i128::from(LAYER)
+                    + i128::from(inputs.base_reserve)
+                    + i128::from(census.total().unwrap())
+                    + i128::from(J1778_MARGIN);
+                let terms = |terms: &[(&str, u64)]| {
+                    terms
+                        .iter()
+                        .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
+                        .collect::<Vec<_>>()
+                };
+                profiles.push(serde_json::json!({
+                    "route": format!("{route:?}"),
+                    "purpose": format!("{purpose:?}"),
+                    "tile_rows": tile,
+                    "window_rows": profile.window_rows,
+                    "page_count": profile.pages.total_pages(),
+                    "resident_layers": profile.resident_layers,
+                    "base_census": {
+                        "forward_bytes": reserve.census.forward,
+                        "state_bytes": reserve.census.state,
+                        "qsa_context_bytes": reserve.census.qsa_context,
+                        "workspace_total_bytes": workspace_total,
+                        "workspace_terms": terms(&reserve.census.workspace),
+                        "f16_weight_shadow_bytes": reserve.census.f16_shadows,
+                        "qsa_selector_bytes": reserve.census.qsa_selector,
+                        "mtp_bytes": reserve.census.mtp,
+                        "gather_bytes": reserve.census.gather,
+                        "runtime_bytes": reserve.census.runtime,
+                        "census_total_bytes": reserve.census_total,
+                        "s1_placement_base_bytes": reserve.placement_bytes(true),
+                        "incumbent_historical_floor_bytes": reserve.historical,
+                    },
+                    "s1": {
+                        "owned_terms": terms(&census.owned_terms()),
+                        "owned_total_bytes": census.owned_total().unwrap(),
+                        "hc_arena_bytes": profile.arena.total_bytes,
+                        "hc_arena_tile_rows": profile.arena.tile_rows,
+                        "diagnostic_budget_bytes": census.diagnostic,
+                        "runtime_budget_bytes": census.runtime_overhead,
+                        "s1_reserve_bytes": census.total().unwrap(),
+                    },
+                    "safety_margin_bytes": J1778_MARGIN,
+                    "projection": {
+                        "hip_total_bytes": J1778_TOTAL,
+                        "free_bytes": inputs.free,
+                        "non_expert_bytes": inputs.non_expert,
+                        "resident_expert_bytes": 10 * LAYER,
+                        // Physical owners only (no runtime/diagnostic budget, no
+                        // safety): weights, then + the base census and S1 owned
+                        // terms (core), then + this purpose's sequential diagnostic.
+                        "device_weights_bytes": inputs.non_expert + 10 * LAYER,
+                        "device_core_bytes": inputs.non_expert
+                            + 10 * LAYER
+                            + reserve.census_total
+                            + census.owned_total().unwrap(),
+                        "device_owned_bytes": inputs.non_expert
+                            + 10 * LAYER
+                            + reserve.census_total
+                            + census.owned_total().unwrap()
+                            + census.diagnostic,
+                        "needed_at_ten_bytes": i64::try_from(needed_ten).unwrap(),
+                        "slack_at_ten_bytes": i64::try_from(j1778_slack(&inputs, &profile, 10)).unwrap(),
+                    },
+                }));
+            }
+        }
+        println!(
+            "SLOWLINK_J1778_CHOSEN_PROFILES {}",
+            serde_json::to_string(&serde_json::json!({
+                "fixture": "j1778 real-artifact inputs (CPU census, not a GPU measurement)",
+                "max_seq": J1778_MAX_SEQ,
+                "profiles": profiles,
+            }))
+            .unwrap()
         );
     }
 
@@ -2896,6 +3334,7 @@ mod tests {
                 checkpoint_stride_rows: 8192,
                 window_rows: S1_WINDOW_ROWS,
                 link_gbps: 7.09,
+                purpose: AdmissionPurpose::Product,
             };
             let (_, _, census) = census_of(&inputs).unwrap();
             // The supplement is exactly what the base lacks.
@@ -3004,7 +3443,7 @@ mod tests {
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
         };
-        let (max_seq, tile) = (16_640usize, S1_TILE_ROWS);
+        let (max_seq, tile) = (16_640usize, purpose_tile_rows(AdmissionPurpose::Product));
 
         // S1 layout: the known boundary stage and the known census total.
         let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
@@ -3026,13 +3465,18 @@ mod tests {
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
+            purpose: AdmissionPurpose::Product,
         };
         let (pages, arena, census) = census_of(&inputs).unwrap();
         let s1_total = census.owned_total().unwrap();
         // Route storage includes D's `k1_shared` (245,760 B) and the cohort
         // count words (2,048 B): 386,072,832 B, charged with A4 and the
         // grouped-scatter scratch at 471,927,040 B.
-        assert_eq!(s1_total, 2_543_094_592, "S1 layout, no MTP");
+        assert_eq!(
+            s1_total,
+            2_543_094_592 - (S1_TILE_ROWS - tile) as u64 * inputs.geometry.wide().unwrap() * 2,
+            "S1 layout at the product tile, no MTP"
+        );
         // The ledger's sums agree before anything is emitted: the owned terms
         // sum to the owned total, and owned + budgets is the placement reserve.
         let owned_sum: u64 = census.owned_terms().iter().map(|(_, bytes)| bytes).sum();
@@ -3053,7 +3497,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             mtp_census.owned_total().unwrap(),
-            2_543_135_552,
+            2_543_135_552 - (S1_TILE_ROWS - tile) as u64 * inputs.geometry.wide().unwrap() * 2,
             "S1 layout, native MTP"
         );
         assert_eq!(census.boundary_state, 4 * 34_128_016);
@@ -3335,8 +3779,9 @@ mod tests {
         );
         assert!(profile.census.group_scatter > 0);
         assert_eq!(profile.reserve_bytes().unwrap(), census_total(&inputs));
-        assert_eq!(profile.tile_rows, 1536);
-        assert!(profile.tile_rows <= 1536);
+        assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
+        assert_eq!(profile.purpose, AdmissionPurpose::Product);
+        assert!(profile.tile_rows <= S1_TILE_ROWS);
         assert_eq!(profile.window_rows, 16384);
         // Seven owned terms then two budget terms, every one itemised in log order.
         let names: Vec<&str> = profile
