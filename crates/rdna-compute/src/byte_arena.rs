@@ -608,31 +608,35 @@ pub fn clear_shadow_arena<R, V, D: ExactRootDevice<Root = R>>(
     set.release(dev)
 }
 
-/// Drop the cached shadow VIEW of one registered source so it can be recomputed
-/// after the source was rewritten in place. Only a registered source whose cache
-/// entry is a view (`is_view`) is touched: the device is quiesced FIRST and the view
-/// removed only on success (a failed quiesce returns the error with view, binding
-/// and root all kept). The planned root and binding are never changed, so the next
-/// conversion for the same source re-fills the same span with no allocation.
-/// Returns `Ok(false)` (no device traffic) for an unknown, uncached or owning entry.
-pub fn invalidate_shadow_source<R, V, D: ExactRootDevice<Root = R>>(
+/// Prepare an in-place rewrite of one arena weight's bytes/format (its pointer
+/// stays). With an active arena the device is quiesced ONCE, whether or not the
+/// weight has a cached F16 view or any shadow member: only after the fence succeeds
+/// is anything mutated. Then the weight's shadow cache entry (view or owning) is
+/// removed and returned for the caller to free if owning, and `forget_value_caches`
+/// drops the other pointer-keyed value-dependent state. The planned roots and
+/// bindings are never touched, so the next conversion for the same source re-fills
+/// the same span with no allocation. A failed fence returns the error with the cache,
+/// callback, binding and roots all untouched. Without an arena this is a no-op
+/// (`Ok(None)`: no fence, no mutation, no callback).
+pub fn invalidate_weight_source<R, V, D: ExactRootDevice<Root = R>>(
     cache: &mut HashMap<usize, V>,
-    is_view: impl Fn(&V) -> bool,
     set: &ShadowRootSet<R>,
     dev: &mut D,
     source_ptr: usize,
-) -> Result<bool, String> {
-    if set.lookup(source_ptr).is_none() || !cache.get(&source_ptr).is_some_and(&is_view) {
-        return Ok(false);
+    forget_value_caches: impl FnOnce(),
+) -> Result<Option<Option<V>>, String> {
+    if !set.is_active() {
+        return Ok(None);
     }
     dev.quiesce().map_err(|e| {
         format!(
-            "quiesce before dropping the F16 shadow view of source 0x{source_ptr:x} failed \
-             ({e}); view, binding and root kept"
+            "quiesce before rewriting the arena weight at 0x{source_ptr:x} failed ({e}); \
+             cache, binding and root kept"
         )
     })?;
-    cache.remove(&source_ptr);
-    Ok(true)
+    let removed = cache.remove(&source_ptr);
+    forget_value_caches();
+    Ok(Some(removed))
 }
 
 #[cfg(test)]
@@ -1388,8 +1392,22 @@ mod tests {
         );
     }
 
+    /// Production helper under test, with the value-cache callback recorded in the
+    /// same event log as the device and the view drops.
+    fn invalidate(
+        cache: &mut HashMap<usize, LoggedView>,
+        set: &ShadowRootSet<MockRoot>,
+        dev: &mut MockDevice,
+        ptr: usize,
+    ) -> Result<Option<Option<LoggedView>>, String> {
+        let log = dev.log.clone();
+        invalidate_weight_source(cache, set, dev, ptr, || {
+            log.borrow_mut().push("forget value caches".into())
+        })
+    }
+
     #[test]
-    fn invalidate_quiesces_before_dropping_the_view_and_keeps_root_and_binding() {
+    fn invalidate_fences_once_before_any_mutation_and_keeps_root_and_binding() {
         let model = model_plan();
         let mut set = ShadowRootSet::<MockRoot>::new();
         let mut dev = MockDevice::new();
@@ -1401,13 +1419,16 @@ mod tests {
         let mut cache: HashMap<usize, LoggedView> = HashMap::new();
         cache_view(&mut cache, 0x2000, "view_c", &log);
 
-        let dropped =
-            invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap();
-        assert!(dropped);
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap();
+        let removed = removed.expect("active arena fences").expect("view removed");
+        assert!(removed.borrowed);
+        drop(removed);
         let events = log.borrow().clone();
+        assert_eq!(events.iter().filter(|e| *e == "quiesce").count(), 1);
         let quiesce = events.iter().position(|e| e == "quiesce").unwrap();
+        let forget = events.iter().position(|e| e == "forget value caches").unwrap();
         let drop_view = events.iter().position(|e| e == "drop view_c").unwrap();
-        assert!(quiesce < drop_view, "quiesce before the view drop: {events:?}");
+        assert!(quiesce < forget && quiesce < drop_view, "fence first: {events:?}");
         assert!(cache.is_empty());
         // Root, binding and pointer survive; nothing was allocated or freed.
         assert_eq!(set.lookup(0x2000), Some(c));
@@ -1439,10 +1460,8 @@ mod tests {
             let (root, offset) = set.ensure_member(&mut dev, c, need).unwrap();
             seen.push((root.addr, offset));
             cache_view(&mut cache, 0x2000, "view_c", &log);
-            assert!(
-                invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000)
-                    .unwrap()
-            );
+            let removed = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap();
+            assert!(removed.unwrap().is_some());
             assert!(cache.is_empty());
         }
         assert!(seen.windows(2).all(|w| w[0] == w[1]), "pointer stable: {seen:?}");
@@ -1450,11 +1469,11 @@ mod tests {
         // A refill that would overrun the reserved span is still refused.
         assert!(set.ensure_member(&mut dev, c, 2049).is_err());
         assert_eq!(dev.mallocs, 1);
-        assert_eq!(dev.quiesces, 4);
+        assert_eq!(dev.quiesces, 4, "one fence per invalidation");
     }
 
     #[test]
-    fn failed_quiesce_keeps_view_binding_and_root_and_returns_err() {
+    fn failed_fence_mutates_nothing_and_returns_err() {
         let model = model_plan();
         let mut set = ShadowRootSet::<MockRoot>::new();
         let mut dev = MockDevice::new();
@@ -1466,65 +1485,85 @@ mod tests {
         cache_view(&mut cache, 0x2000, "view_c", &log);
 
         dev.fail_quiesce = true;
-        let err = invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000)
-            .unwrap_err();
+        let err = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap_err();
         assert!(err.contains("kept"), "{err}");
         assert!(cache.contains_key(&0x2000), "view kept");
-        assert!(!log.borrow().iter().any(|e| e.starts_with("drop")));
+        let events = log.borrow().clone();
+        assert!(
+            !events.iter().any(|e| e.starts_with("drop") || e == "forget value caches"),
+            "no mutation behind a failed fence: {events:?}"
+        );
         assert_eq!(set.lookup(0x2000), Some(c), "binding kept");
         assert_eq!(set.live_roots(), 1, "root kept");
         assert_eq!((dev.mallocs, dev.frees), (1, 0));
 
         // Recoverable: once the device quiesces the same view drops.
         dev.fail_quiesce = false;
-        assert!(
-            invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap()
-        );
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap();
+        assert!(removed.unwrap().is_some());
         assert!(cache.is_empty());
     }
 
     #[test]
-    fn unknown_uncached_owned_or_inactive_sources_are_untouched() {
+    fn weight_without_a_shadow_member_or_view_still_fences_and_forgets() {
         let model = model_plan();
         let mut set = ShadowRootSet::<MockRoot>::new();
         let mut dev = MockDevice::new();
         let log = dev.log.clone();
         let mut cache: HashMap<usize, LoggedView> = HashMap::new();
-
-        // Inactive set (non-S1): never quiesces, never touches the cache.
-        cache_view(&mut cache, 0x2000, "view_c", &log);
-        assert!(
-            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap()
-        );
-        assert_eq!(cache.len(), 1);
-        cache.clear();
-        log.borrow_mut().clear();
-
         set.bind(model, &[0x1000, 0x2000, 0x3000]).unwrap();
-        // Unknown source: even with a borrowed entry under that key.
-        cache_view(&mut cache, 0x9999, "view_unknown", &log);
-        assert!(
-            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x9999).unwrap()
-        );
-        // Registered but no cached view yet.
-        assert!(
-            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap()
-        );
-        // Registered with an owning (legacy) entry: never dropped here.
+
+        // A weight of the arena that has no F16 shadow member and no cached entry
+        // (e.g. a direct BF16 reader): one fence, value caches forgotten.
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x7777).unwrap();
+        assert_eq!(removed.map(|r| r.is_none()), Some(true));
+        assert_eq!(dev.quiesces, 1);
+        assert!(log.borrow().iter().any(|e| e == "forget value caches"));
+        // A registered shadow member with no view yet behaves the same.
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap();
+        assert_eq!(removed.map(|r| r.is_none()), Some(true));
+        assert_eq!(dev.quiesces, 2);
+        assert_eq!((dev.mallocs, dev.frees), (0, 0));
+        assert!(set.lookup(0x2000).is_some(), "binding kept");
+
+        // An owning (legacy, e.g. HFQ4 rocBLAS) shadow under the weight's pointer is
+        // stale after an in-place rewrite too: it is handed back for the caller to
+        // free through its normal path.
         cache.insert(
-            0x1000,
+            0x7777,
             LoggedView {
                 borrowed: false,
                 name: "owned",
                 log: log.clone(),
             },
         );
-        assert!(
-            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x1000).unwrap()
-        );
-        assert_eq!(cache.len(), 2);
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x7777).unwrap();
+        let owned = removed.unwrap().expect("owning entry returned");
+        assert!(!owned.borrowed);
+        assert!(cache.is_empty());
+        assert_eq!(dev.quiesces, 3);
+        assert!(!log.borrow().iter().any(|e| e == "drop owned"));
+        std::mem::forget(owned);
+    }
+
+    #[test]
+    fn no_arena_means_no_fence_no_mutation_no_callback() {
+        let mut set = ShadowRootSet::<MockRoot>::new();
+        let mut dev = MockDevice::new();
+        let log = dev.log.clone();
+        let mut cache: HashMap<usize, LoggedView> = HashMap::new();
+        cache_view(&mut cache, 0x2000, "view_c", &log);
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap();
+        assert!(removed.is_none(), "inactive arena: legacy no-op");
+        assert_eq!(cache.len(), 1);
         assert_eq!((dev.quiesces, dev.mallocs, dev.frees), (0, 0, 0));
         assert!(log.borrow().is_empty());
-        assert!(set.lookup(0x2000).is_some() && set.live_roots() == 0);
+        // After a clear the arena is inactive again.
+        set.bind(model_plan(), &[1, 2, 3]).unwrap();
+        assert_eq!(set.release(&mut dev).unwrap(), 0);
+        log.borrow_mut().clear();
+        let removed = invalidate(&mut cache, &set, &mut dev, 0x2000).unwrap();
+        assert!(removed.is_none());
+        assert_eq!(dev.quiesces, 0);
     }
 }

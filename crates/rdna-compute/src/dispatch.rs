@@ -5345,28 +5345,46 @@ impl Gpu {
         .map_err(|msg| HipError::new(0, &format!("clear_f16_shadow_arena: {msg}")))
     }
 
-    /// Drop the cached F16 shadow VIEW of one arena-registered source so its shadow
-    /// can be recomputed after the source's bytes were rewritten in place (same
-    /// pointer, new format). The planned root and the source binding stay: the next
-    /// `ensure_*` conversion for the same pointer re-fills the SAME planned span.
-    /// The device is quiesced before returning when a view was dropped, so no
-    /// queued kernel can still read the old shadow bytes. Returns `Ok(true)` when a
-    /// view was dropped, `Ok(false)` for an unregistered source or no cached view
-    /// (nothing touched). Only borrowed (arena) views are ever dropped here.
-    pub fn invalidate_f16_shadow_source(&mut self, source_ptr: usize) -> HipResult<bool> {
-        if self.f16_shadow_arena.lookup(source_ptr).is_none() {
+    /// Prepare an in-place rewrite (bytes and/or format, same pointer) of one weight
+    /// owned by the S1 arena. With an active arena the device is quiesced ONCE —
+    /// even when the weight has no cached F16 shadow or only direct readers — and
+    /// only after that succeeds is anything mutated: the weight's `fp16_shadow_cache`
+    /// entry (an arena view is dropped; an owning shadow is released to the pool) and
+    /// its `mmq_screen` verdict (the other pointer-keyed, value-dependent cache
+    /// `invalidate_weight_caches` clears) are forgotten. The F16 arena plan, source
+    /// bindings and roots are NEVER cleared, so the next `ensure_*` conversion for the
+    /// same pointer re-fills the SAME planned span with no allocation. A failed
+    /// quiesce returns the error and changes nothing. Returns `Ok(true)` when the
+    /// arena was active (the fence ran), `Ok(false)` with no arena (no fence, no
+    /// lock, no mutation: legacy behaviour).
+    pub fn invalidate_arena_weight_source(&mut self, source_ptr: usize) -> HipResult<bool> {
+        if !self.f16_shadow_arena.is_active() {
             return Ok(false);
         }
         self.bind_thread()?;
         let mut device = DirectHipRuntime { hip: &self.hip };
-        crate::byte_arena::invalidate_shadow_source(
+        let screen_cache = &mut self.mmq_screen.cache;
+        let outcome = crate::byte_arena::invalidate_weight_source(
             &mut self.fp16_shadow_cache,
-            |t| t.buf.is_borrowed(),
             &self.f16_shadow_arena,
             &mut device,
             source_ptr,
+            || {
+                screen_cache.remove(&source_ptr);
+            },
         )
-        .map_err(|msg| HipError::new(0, &format!("invalidate_f16_shadow_source: {msg}")))
+        .map_err(|msg| HipError::new(0, &format!("invalidate_arena_weight_source: {msg}")))?;
+        match outcome {
+            None => Ok(false),
+            Some(removed) => {
+                // An arena view is non-owning (dropped); an owning shadow returns to
+                // the pool through the normal free path, now that the device is idle.
+                if let Some(shadow) = removed.filter(|t| !t.buf.is_borrowed()) {
+                    self.free_tensor(shadow)?;
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Destination of a model-lifetime F16 shadow of `n` elements for the source at
