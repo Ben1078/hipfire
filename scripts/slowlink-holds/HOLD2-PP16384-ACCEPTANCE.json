@@ -1,0 +1,10 @@
+{
+  "authority":"Main relaying Kaden's release acceptance ruling",
+  "scope":"Hold2 matched full-path timing, not Hold1 correctness/admission",
+  "primary":{"rows":16384,"metric":"all-nine median prefill tokens/second per arm","s1_minimum_tokens_per_second":2000,"minimum_over_incumbent_fraction":0.10,"retain_earlier_floor_tokens_per_second":1400},
+  "sampling":{"fresh_processes_per_arm":3,"timed_observations_per_process":3,"required_observations_per_arm":9,"combine":"median of all nine raw observations, NEVER median of three process medians","pairing":"Matched A/B, identical token ids, context, state/PLE configuration and timing bracket; official three-process lane warmup/timing contract","required_reporting":["all nine raw rates and durations per arm","per-process grouping and dispersion","all-nine median per arm","S1/incumbent ratio","explicit >=2000 result in addition to earlier >=1400 and >=10-percent bars","actual placement and actual decode engine"]},
+  "placement":"Auto placement on each route; no forced resident-layer pin in any timing or anchor cell. S1 owns its adaptive admitted placement (the largest resident layer count that fits, ten preferred, never a floor) and scratch when selected; incumbent retains shipped chunk/default placement. R5 D2 RULE: every cell carries HIPFIRE_QWEN4_D2_DEFAULT=0 and is the recorded NON-DEFAULT arm; the earlier no-env-default acceptance is blocked by the current rule until Main lifts the ban, and any H2 result is labelled non-default, never the shipped default.",
+  "anchor":"The immutable shipped-beta pp16384 product process remains an additional incumbent anchor, not a substitute for any of the nine paired observations.",
+  "promotion":"Failure to reach2000 at pp16384 is a target miss even when1400 and10percent pass. Correctness/identity/state/KLD gates unchanged. S1 remains defaultOFF until all required gates and Main approval.",
+  "hold1":"UNCHANGED: no new timing cell, no change to primitive/state/greedy cells or approved 1500second budget; no hold submitted by S1Integrate."
+}
