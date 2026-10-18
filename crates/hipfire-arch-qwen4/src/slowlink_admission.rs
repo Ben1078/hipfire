@@ -856,13 +856,13 @@ pub fn diagnostic_budget_bytes(
         n_exp: geometry.num_experts,
         mi: geometry.moe_intermediate,
         binding_experts: limits.experts_per_slot.min(geometry.num_experts),
-        // Slab: the few-row K1 arm (3 rows). Aggregate: the F32-tail calls
-        // the k1_tail_cohort runs, up to the largest 2..511-row F32 tile
-        // (one 9..511-row call beside the 3-row arm), so the budget is never
-        // understated.
+        // Slab: the few-row K1 arm (3 rows). Aggregate: the F32-tail calls the
+        // k1_tail_cohort diagnostic really runs, the 3-row indexed-down arm and
+        // the 9-row grouped-down arm (`FEW_ROW_ROUTE_ROWS + 1`, the first
+        // grouped-down row count): the maximum, 9.
         k1_rows: match geometry.route {
             WindowRoute::SlabIu4 => 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
-            WindowRoute::Aggregate => S1_F32_TILE_ROWS_MAX,
+            WindowRoute::Aggregate => rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1,
         },
         shared_intermediate: geometry.shared_intermediate,
         route: geometry.route,
@@ -2399,8 +2399,8 @@ mod tests {
             DOWN_LAYER,
         )
         .unwrap();
-        // The dispatch suite over the aggregate route (largest F32-tail call,
-        // 511 rows) stays below the transport's reserve, which is therefore
+        // The dispatch suite over the aggregate route (the real 9-row
+        // grouped-down F32-tail call) stays below the transport's reserve, which is therefore
         // the budget; no exact suite figure is pinned for this route.
         assert_eq!(selftest, 217_821_184);
         for (label, diagnostic) in [("product", 0u64), ("primitive selftest", selftest)] {
