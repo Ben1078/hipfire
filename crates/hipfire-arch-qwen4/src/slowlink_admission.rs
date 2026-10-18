@@ -44,6 +44,7 @@
 
 use crate::host_link::{HostLink, NARROW_LINK_GBPS};
 use crate::Qwen4Config;
+pub use hipfire_dispatch::pipeline::slowlink_prefill::WindowRoute;
 use std::fmt;
 
 /// Developer variable of the selector (`developer.qwen4_slowlink_prefill`).
@@ -354,6 +355,23 @@ pub fn link_verdict(link: HostLink) -> Result<f64, SlowlinkDecline> {
     }
 }
 
+/// The window route of a manifest, from the REAL artifact layout and never a
+/// default: a slab layer arena in the manifest is the sealed expert-slab route
+/// ([`WindowRoute::SlabIu4`], A4 sidecars); stacked per-layer expert tensors
+/// are the aggregate route ([`WindowRoute::AggregateWmma`], window F16
+/// activations). The dispatch side refuses any tile whose own sealed route
+/// differs from this declaration, so a wrong declaration cannot run.
+pub fn window_route_of(weights: &[hipfire_runtime::weight_manifest::WeightEntry]) -> WindowRoute {
+    if weights
+        .iter()
+        .any(|entry| entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX))
+    {
+        WindowRoute::SlabIu4
+    } else {
+        WindowRoute::AggregateWmma
+    }
+}
+
 /// The model dimensions the S1 layouts are sized from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelGeometry {
@@ -363,11 +381,17 @@ pub struct ModelGeometry {
     pub experts_per_token: usize,
     pub moe_intermediate: usize,
     pub shared_intermediate: usize,
+    /// The routed lowering the window's K2 panels run, fixed by the artifact's
+    /// declared layout ([`window_route_of`]). Every route-dependent byte (the
+    /// A4 sidecars, the window F16 activations, the F32 tails) is read from
+    /// the dispatch layout of THIS route.
+    pub route: WindowRoute,
 }
 
 impl ModelGeometry {
-    /// A MoE profile's dimensions; a dense profile has nothing to stream.
-    pub fn from_config(config: &Qwen4Config) -> Result<Self, String> {
+    /// A MoE profile's dimensions on the window `route` of its artifact
+    /// ([`window_route_of`]); a dense profile has nothing to stream.
+    pub fn from_config(config: &Qwen4Config, route: WindowRoute) -> Result<Self, String> {
         match crate::gpu_forward::program_dims(config) {
             dims @ crate::program::Qwen4ProgramDims {
                 ffn:
@@ -385,6 +409,7 @@ impl ModelGeometry {
                 experts_per_token,
                 moe_intermediate: intermediate,
                 shared_intermediate: shared,
+                route,
             }),
             _ => Err("slow-link prefill needs a routed-expert (MoE) profile".to_string()),
         }
@@ -714,6 +739,7 @@ pub fn route_dims(
         mi: geometry.moe_intermediate,
         shared_intermediate: geometry.shared_intermediate,
         k1_rows: S1_K1_TAIL_ROWS,
+        route: geometry.route,
     }
 }
 
@@ -815,6 +841,7 @@ pub fn diagnostic_budget_bytes(
         binding_experts: limits.experts_per_slot.min(geometry.num_experts),
         k1_rows: 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
         shared_intermediate: geometry.shared_intermediate,
+        route: geometry.route,
     };
     let suite = suite_diagnostic_bytes(&DEFAULT_SUITE, &diag_geometry, limits)
         .map_err(|error| error.to_string())?;
@@ -1193,7 +1220,9 @@ pub fn load_admission_inputs(
     link_gbps: f64,
 ) -> Result<AdmissionInputs, SlowlinkDecline> {
     use crate::expert_residency as residency;
-    let geometry = ModelGeometry::from_config(facts.config).map_err(SlowlinkDecline::Geometry)?;
+    let route = window_route_of(facts.weights);
+    let geometry =
+        ModelGeometry::from_config(facts.config, route).map_err(SlowlinkDecline::Geometry)?;
     let (non_expert, layer_expert_bytes) = residency::resident_split(facts.weights, facts.bytes_of)
         .map_err(SlowlinkDecline::Geometry)?;
     let baseline_layers = residency::PlacementCharges::new(layer_expert_bytes, false)
@@ -1588,7 +1617,8 @@ mod tests {
     }
 
     fn geometry() -> ModelGeometry {
-        ModelGeometry::from_config(&crate::config::compact_test_config()).unwrap()
+        ModelGeometry::from_config(&crate::config::compact_test_config(), WindowRoute::SlabIu4)
+            .unwrap()
     }
 
     fn inputs(free: u64) -> AdmissionInputs {
@@ -2079,7 +2109,7 @@ mod tests {
 
         let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
         let inputs = |base_reserve: u64| AdmissionInputs {
-            geometry: ModelGeometry::from_config(&config).unwrap(),
+            geometry: ModelGeometry::from_config(&config, WindowRoute::SlabIu4).unwrap(),
             free: 25_713_180_672,
             non_expert: 5_364_055_296,
             layer_expert_bytes: 1_336_934_400,
@@ -2199,7 +2229,7 @@ mod tests {
         assert_eq!(reserve.census_total, TILE_CENSUS);
         let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
         let inputs = |diagnostic_bytes: u64| AdmissionInputs {
-            geometry: ModelGeometry::from_config(&config).unwrap(),
+            geometry: ModelGeometry::from_config(&config, WindowRoute::SlabIu4).unwrap(),
             free: FREE_PRELOAD,
             non_expert: NON_EXPERT,
             layer_expert_bytes: LAYER,
@@ -2230,13 +2260,14 @@ mod tests {
                 binding_experts: 32,
                 k1_rows: 3,
                 shared_intermediate: 640,
+                route: WindowRoute::SlabIu4,
             },
             hipfire_dispatch::pipeline::slowlink_prefill::PanelLimits::S1,
         )
         .unwrap();
         assert_eq!(suite.device_total(), 182_065_968);
         let selftest = diagnostic_budget_bytes(
-            &ModelGeometry::from_config(&config).unwrap(),
+            &ModelGeometry::from_config(&config, WindowRoute::SlabIu4).unwrap(),
             AdmissionPurpose::PrimitiveSelftest,
             GATE_UP_LAYER,
             DOWN_LAYER,
@@ -2245,7 +2276,7 @@ mod tests {
         assert_eq!(selftest, 217_821_184, "the transport reserve is the larger");
         assert_eq!(
             diagnostic_budget_bytes(
-                &ModelGeometry::from_config(&config).unwrap(),
+                &ModelGeometry::from_config(&config, WindowRoute::SlabIu4).unwrap(),
                 AdmissionPurpose::Product,
                 GATE_UP_LAYER,
                 DOWN_LAYER,
@@ -2346,7 +2377,7 @@ mod tests {
             .unwrap();
             assert_eq!(reserve.census_total, non_runtime + base_runtime);
             let inputs = AdmissionInputs {
-                geometry: ModelGeometry::from_config(&config).unwrap(),
+                geometry: ModelGeometry::from_config(&config, WindowRoute::SlabIu4).unwrap(),
                 free: 40 * GIB,
                 non_expert: 5_364_055_296,
                 layer_expert_bytes: GATE_UP_LAYER + DOWN_LAYER,
@@ -2472,7 +2503,7 @@ mod tests {
         let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
         assert_eq!(stage, 34_128_016, "target-only boundary stage (no MTP)");
         let inputs = AdmissionInputs {
-            geometry: ModelGeometry::from_config(&config).unwrap(),
+            geometry: ModelGeometry::from_config(&config, WindowRoute::SlabIu4).unwrap(),
             free: 0,
             non_expert: 0,
             layer_expert_bytes: GATE_UP_LAYER + DOWN_LAYER,
@@ -2640,6 +2671,73 @@ mod tests {
             "SLOWLINK_RESIDENCY_LEDGER {}",
             serde_json::to_string(&ledger).unwrap()
         );
+    }
+
+    /// The window route comes from the REAL artifact layout, never a default,
+    /// and reaches every dispatch dimension the census reads: a slab layer
+    /// arena in the manifest is the slab route, stacked per-layer expert
+    /// tensors are the aggregate route, and the declared route is what the
+    /// route dims, the census layout and the diagnostic geometry carry.
+    #[test]
+    fn slowlink_admission_window_route_follows_the_artifact_layout() {
+        use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
+        let entry = |name: &str| {
+            WeightEntry::model(
+                name,
+                vec![4, 4, 256],
+                rdna_compute::DType::MQ4G256V2,
+                ShardPolicy::Replicate,
+            )
+        };
+        let aggregate = vec![
+            entry("model.language_model.layers.0.mlp.experts.gate_up_proj"),
+            entry("model.language_model.layers.0.mlp.experts.down_proj"),
+        ];
+        let slab = vec![entry(&format!(
+            "model.language_model.layers.0{}",
+            crate::expert_arena::ARENA_SUFFIX
+        ))];
+        assert_eq!(window_route_of(&aggregate), WindowRoute::AggregateWmma);
+        assert_eq!(window_route_of(&slab), WindowRoute::SlabIu4);
+        // An empty manifest has no arena: stacked tensors are the layout.
+        assert_eq!(window_route_of(&[]), WindowRoute::AggregateWmma);
+
+        let config = crate::config::compact_test_config();
+        for route in [WindowRoute::SlabIu4, WindowRoute::AggregateWmma] {
+            let geometry = ModelGeometry::from_config(&config, route).unwrap();
+            assert_eq!(geometry.route, route);
+            assert_eq!(route_dims(&geometry, 16384).route, route);
+            // The census reads the layout of THIS route: A4 sidecars exist only
+            // on the slab route, and the aggregate route's window F16
+            // activations are inside its region.
+            let layout = hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(
+                &route_dims(&geometry, 16384),
+            )
+            .unwrap();
+            assert_eq!(layout.route(), route);
+            assert_eq!(
+                route_storage_bytes(&geometry, 16384).unwrap(),
+                layout.total_bytes() as u64
+            );
+            assert_eq!(
+                a4_sidecar_bytes(&geometry, 16384).unwrap(),
+                layout.a4_sidecar_bytes() as u64
+            );
+            assert_eq!(
+                group_scatter_bytes(&geometry, 16384).unwrap(),
+                layout.group_scatter_bytes() as u64
+            );
+            match route {
+                WindowRoute::SlabIu4 => {
+                    assert!(layout.a4_sidecar_bytes() > 0);
+                }
+                WindowRoute::AggregateWmma => {
+                    assert_eq!(layout.a4_sidecar_bytes(), 0);
+                    assert_eq!(layout.x_f16_bytes(), 16384 * 2560 * 2);
+                    assert_eq!(layout.x_f16_bytes(), 83_886_080);
+                }
+            }
+        }
     }
 
     /// The fixture every layout test sizes from is the real MQ4 model, not a
