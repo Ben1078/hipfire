@@ -1667,24 +1667,30 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
         crate::state::Qwen4State::device_allocation_sizes(config, *state_format, &census_context)
             .ok_or_else(|| "request state allocation sizes overflow".to_string())?;
     // The native MTP allocations of the SAME call `placement_inputs` charges
-    // (`mtp_for(&census_context)`): empty without a kept head.
+    // (`mtp_for(&census_context)`): zero without a kept head. The head's
+    // build scratch (released at attach) and the first request's allocations
+    // are alternatives of the logical peak; their BACKING is judged per phase
+    // ([`native_mtp_granule_slack`]), never by which has the larger logical sum.
     let native_mtp = if *mtp_kept {
         let head = language_head_dtype(weights).ok_or("manifest has no language head")?;
         let drafts = crate::mtp_spec::native_mtp_proposal_drafts(*max_k, &gpu.arch);
         let row_capture =
             crate::mtp_spec::native_mtp_capture(gpu, config, state_format.gdn, drafts);
-        crate::mtp_spec::native_mtp_allocation_sizes(
+        let (resident, build_scratch) =
+            crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(config, &census_context, head)
+                .ok_or_else(|| "native MTP head allocation sizes overflow".to_string())?;
+        let request = crate::mtp_spec::native_mtp_request_allocation_sizes(
             config,
-            &census_context,
+            census_context.max_seq,
             *chunk_rows,
             drafts,
-            head,
             row_capture,
             crate::mtp_spec::native_mtp_fill_scratch(gpu),
         )
-        .ok_or_else(|| "native MTP allocation sizes overflow".to_string())?
+        .ok_or_else(|| "native MTP request allocation sizes overflow".to_string())?;
+        native_mtp_granule_slack(&resident, &build_scratch, &request, *granule)?
     } else {
-        Vec::new()
+        0
     };
     // The gathered-prefill workspace is one allocation on the legacy backend;
     // a VMM workspace maps granule-rounded pages (no second rounding). The
@@ -1713,9 +1719,44 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
             reserve.census.workspace.iter().map(|term| term.1),
             *granule,
         )?,
-        native_mtp: granule_slack_total(native_mtp, *granule)?,
+        native_mtp,
         qsa_workspace,
     })
+}
+
+/// Granule slack of the native MTP charge over the LOGICAL peak
+/// `resident + max(build_scratch, request)` that `native_mtp_device_bytes`
+/// (and so the census) holds. The two phases are alternatives, so the backing
+/// peak is `resident backing + max(build backing, request backing)`; the
+/// phase with the larger logical sum need not have the larger backing (a
+/// smaller phase whose allocations round up more can win). Returned: that
+/// backing peak minus the logical peak (never negative: a phase's backing is
+/// at least its payload), checked.
+pub fn native_mtp_granule_slack(
+    resident: &[u64],
+    build_scratch: &[u64],
+    request: &[u64],
+    granule: u64,
+) -> Result<u64, String> {
+    let overflow = || "native MTP granule slack overflows".to_string();
+    let sum = |sizes: &[u64]| {
+        sizes
+            .iter()
+            .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+            .ok_or_else(overflow)
+    };
+    let backing = |sizes: &[u64]| {
+        sum(sizes)?
+            .checked_add(granule_slack_total(sizes.iter().copied(), granule)?)
+            .ok_or_else(overflow)
+    };
+    let logical_peak = sum(resident)?
+        .checked_add(sum(build_scratch)?.max(sum(request)?))
+        .ok_or_else(overflow)?;
+    let backing_peak = backing(resident)?
+        .checked_add(backing(build_scratch)?.max(backing(request)?))
+        .ok_or_else(overflow)?;
+    backing_peak.checked_sub(logical_peak).ok_or_else(overflow)
 }
 
 /// The reserve `auto` keeps free: the larger of the historical measured
@@ -7236,5 +7277,59 @@ mod tests {
         };
         assert!(slack.total().unwrap_err().contains("overflows"));
         assert_eq!(GranuleSlack::default().total(), Ok(0));
+    }
+
+    /// The native MTP slack follows the phase with the larger BACKING, not the
+    /// larger logical sum: here the build scratch is the logical winner (1000
+    /// vs 990) but the request's allocations round up to a larger backing
+    /// (1100 vs 1000), so the request sets the peak. Empty (no kept head),
+    /// granule 0 and overflow are explicit.
+    #[test]
+    fn slowlink_granule_native_mtp_slack_follows_the_larger_backing_phase() {
+        let g = 100;
+        let resident = [250u64];
+        let build = [1000u64];
+        let request = [450u64, 540];
+        // Resident 250 -> 300; build 1000 -> 1000 (logical peak phase);
+        // request 990 -> 500 + 600 = 1100 (backing peak phase).
+        assert_eq!(granule_slack_total(build, g), Ok(0));
+        assert_eq!(granule_slack_total(request, g), Ok(110));
+        // backing peak 300 + 1100, logical peak 250 + 1000.
+        assert_eq!(
+            native_mtp_granule_slack(&resident, &build, &request, g),
+            Ok(1400 - 1250)
+        );
+        // What charging only the logical winner would have produced: 50.
+        assert_eq!(
+            granule_slack_total(resident.iter().chain(build.iter()).copied(), g),
+            Ok(50)
+        );
+        // The same inputs with the phases swapped agree (alternatives).
+        assert_eq!(
+            native_mtp_granule_slack(&resident, &request, &build, g),
+            Ok(150)
+        );
+        // The logical winner also winning on backing keeps its own slack.
+        assert_eq!(
+            native_mtp_granule_slack(&resident, &[1000], &[500], g),
+            Ok(50)
+        );
+        // No kept head (all lists empty) and no granule model add nothing, and
+        // the slack is never negative.
+        assert_eq!(native_mtp_granule_slack(&[], &[], &[], g), Ok(0));
+        assert_eq!(
+            native_mtp_granule_slack(&resident, &build, &request, 0),
+            Ok(0)
+        );
+        // Overflow of a list sum or of the backing is a named error.
+        for lists in [
+            (vec![u64::MAX, 1], vec![1], vec![1]),
+            (vec![1], vec![u64::MAX, 1], vec![1]),
+            (vec![1], vec![1], vec![u64::MAX, 1]),
+            (vec![u64::MAX - 1], vec![u64::MAX - 1], vec![1]),
+        ] {
+            let error = native_mtp_granule_slack(&lists.0, &lists.1, &lists.2, g).unwrap_err();
+            assert!(error.contains("overflows"), "{error}");
+        }
     }
 }
