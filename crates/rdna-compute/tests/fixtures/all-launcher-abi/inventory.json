@@ -1,5 +1,5 @@
 {
-  "scope": "Kernels and launchers changed by 38ce67a44 (fix/moe-router-nonfinite). hip_sources/pm_emitters/pm_images are the 154/8/9 entries of the landed touched-kernels receipt. Launchers under crates/*/src, examples/, tests/ and benches/ are all checked; only the OLD-ABI call variants in old_variants are exempt, one per call.",
+  "scope": "Kernels and launchers changed by 38ce67a44 (fix/moe-router-nonfinite) plus the S1 slow-link kernels moved to kernels/src/slowlink_prefill.hip. hip_sources/pm_emitters/pm_images are the closed lists below, not a counted receipt: the tests derive their sizes from these lists. Launchers under crates/*/src, examples/, tests/ and benches/ are all checked; only the OLD-ABI call variants in old_variants are exempt, one per call.",
   "hip_sources": [
     "kernels/src/ep_gather_rows_by_owner.hip",
     "kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip",
