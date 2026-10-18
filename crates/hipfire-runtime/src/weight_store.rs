@@ -3920,12 +3920,14 @@ mod weight_store_arena {
         };
         assert!(arena
             .view(&past_end, &[1], DType::Raw)
-            .unwrap_err()
+            .err()
+            .expect("a span past its root is an error")
             .contains("exceeds root"));
         let bad_root = NamedByteArenaSpan { root: 9, ..a_span };
         assert!(arena
             .view(&bad_root, &[1], DType::Raw)
-            .unwrap_err()
+            .err()
+            .expect("a span naming a missing root is an error")
             .contains("names root"));
     }
 
