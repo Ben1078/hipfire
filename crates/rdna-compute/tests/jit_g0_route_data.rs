@@ -357,7 +357,10 @@ fn measured_q8_route_symbols_are_in_the_packaged_index() {
         // codecs; gfx1100/gfx1201 recorded the Q8 KV paths too. Nothing is asserted that an
         // arch's trace did not record: its remaining Q8 capability is the source-export
         // closure in the `kernel_registry` tests.
-        assert!(!q8.is_empty(), "{arch}: fixture records no Q8 tensor_ops route symbols");
+        assert!(
+            !q8.is_empty(),
+            "{arch}: fixture records no Q8 tensor_ops route symbols"
+        );
         if arch != "gfx1151" {
             for kv in [
                 "indexed_attention_decode_prologue_q8",
