@@ -239,15 +239,14 @@ impl CpuSlabOwners {
 /// Per-expert span entries of one layer's arena plan, resolved exactly as the
 /// layer build resolves them: each expert's own format (an absent, pruned
 /// expert carries the MQ4 pair and a zero-length span), its payload extents and
-/// its offsets. The one place the plan turns into [`SlabSpanEntry`]s, shared by
+/// its offsets; `kept` is the layer's `qwen4.expert_keep` row (a pruned expert
+/// with zero-byte spans is absent). The one place the plan turns into [`SlabSpanEntry`]s, shared by
 /// the layer build and the D2 default's real-arm probe. MQ2-I4 has no
 /// expert-slab route and is refused.
 pub(super) fn plan_entries(
     plan: &crate::expert_arena::ExpertArenaLayer,
-    config: &Qwen4Config,
-    layer: usize,
+    kept: Option<&[u16]>,
 ) -> Result<Vec<SlabSpanEntry>, String> {
-    let kept = config.kept_expert_ids(layer, false);
     plan.experts
         .iter()
         .enumerate()
@@ -441,6 +440,159 @@ mod tests {
         assert!(
             err.contains("expert 1") && err.contains("no CPU decoder"),
             "{err}"
+        );
+    }
+
+    /// A real E8P/MQ4 mixed slab layer, from the arena plan to the production
+    /// CPU arm: every slot's GPU read bytes are its OWN plan format's gate/up +
+    /// down payload (E8P 1,305,600 B, MQ4 2,611,200 B at the mq2 shape), an
+    /// independent input from the CPU span lengths and quant, and a mixed
+    /// batch's byte count is the sum of its slots'. CPU only.
+    #[test]
+    fn mixed_real_e8p_mq4_slots_carry_their_own_gpu_read_bytes() {
+        use crate::d2_default::{sample_cpu_arm, PROBE_SAMPLES, PROBE_WARM_BATCHES};
+        use crate::expert_arena::{ArenaExpert, ExpertArenaLayer};
+
+        const E8P_SLOT: u64 = 1_305_600;
+        const MQ4_SLOT: u64 = 2_611_200;
+        assert_eq!((E8P.0 + E8P.1) as u64, E8P_SLOT);
+        assert_eq!((MQ4.0 + MQ4.1) as u64, MQ4_SLOT);
+        let (dim, mi, top_k) = (2560, 640, 2);
+        let timed = (PROBE_WARM_BATCHES + PROBE_SAMPLES) * top_k;
+        // Experts 0..12: MQ4 where `i % 3 == 2`, E8P elsewhere; expert 12 is
+        // a pruned (absent) expert at the layer's tail.
+        let format_of = |expert: usize| {
+            if expert % 3 == 2 {
+                ExpertFormat::Mq4Xts
+            } else {
+                ExpertFormat::E8pI4
+            }
+        };
+        let mut experts = Vec::new();
+        let mut at = 0;
+        for expert in 0..timed {
+            let format = format_of(expert);
+            experts.push(ArenaExpert {
+                format,
+                gate_up_offset: at,
+                down_offset: at + format.gate_up_bytes(),
+            });
+            at += format.slab_bytes();
+        }
+        experts.push(ArenaExpert {
+            format: ExpertFormat::Mq4Xts,
+            gate_up_offset: at,
+            down_offset: at,
+        });
+        let plan = ExpertArenaLayer {
+            file_offset: 0,
+            bytes: at,
+            experts,
+        };
+        let kept: Vec<u16> = (0..timed as u16).collect();
+        let entries = plan_entries(&plan, Some(&kept)).unwrap();
+        assert_eq!(entries.len(), timed + 1);
+        assert!(entries[timed].absent && !entries[..timed].iter().any(|entry| entry.absent));
+        for (expert, entry) in entries[..timed].iter().enumerate() {
+            let want = if expert % 3 == 2 { MQ4 } else { E8P };
+            assert_eq!((entry.gate_up_len, entry.down_len), want, "expert {expert}");
+        }
+
+        // Real E8P tensors: a codes plane of arbitrary 16-bit words (every word
+        // is a legal E8P word) then a plane of finite f16 scales. MQ4 spans are
+        // arbitrary bytes, as in the other slot tests.
+        let e8p_tensor = |len: usize, seed: usize| {
+            let mut bytes = vec![0u8; len];
+            let mut state = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for byte in bytes.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = (state >> 24) as u8;
+            }
+            bytes
+        };
+        let mut host = vec![0u8; plan.bytes + 4096];
+        for (expert, entry) in entries[..timed].iter().enumerate() {
+            let gate_up = e8p_tensor(entry.gate_up_len, expert);
+            let down = e8p_tensor(entry.down_len, expert + 1000);
+            host[entry.gate_up_offset..][..gate_up.len()].copy_from_slice(&gate_up);
+            host[entry.down_offset..][..down.len()].copy_from_slice(&down);
+        }
+        // Finite f16 scales over the E8P scale planes (the last
+        // `rows * (k / 128) * 2` bytes of each E8P tensor).
+        for (expert, entry) in entries[..timed].iter().enumerate() {
+            if expert % 3 == 2 {
+                continue;
+            }
+            for (offset, len, rows, k) in [
+                (entry.gate_up_offset, entry.gate_up_len, 1280, 2560),
+                (entry.down_offset, entry.down_len, 2560, 640),
+            ] {
+                let scales = rows * (k / 128) * 2;
+                assert_eq!(len, rows * k / 4 + scales);
+                for (i, pair) in host[offset + len - scales..offset + len]
+                    .chunks_exact_mut(2)
+                    .enumerate()
+                {
+                    // f16 0x2800 + (0..64) = 2^-7 .. 2^-4 scale, finite.
+                    pair.copy_from_slice(&(0x2800u16 + (i % 64) as u16).to_le_bytes());
+                }
+            }
+        }
+        let owners = CpuSlabOwners::from_host(&host, plan.bytes, entries.iter().copied()).unwrap();
+        let gpu_bytes = gpu_read_bytes(&plan);
+        assert_eq!(gpu_bytes.len(), timed + 1);
+        assert_eq!(gpu_bytes[timed], None, "an absent expert moves no bytes");
+        assert!(
+            owners.probe_expert(timed, 1).is_none(),
+            "an absent expert is no probe slot"
+        );
+
+        let mut probes = Vec::new();
+        for expert in 0..timed {
+            let probe = owners
+                .probe_expert(expert, gpu_bytes[expert].unwrap())
+                .unwrap_or_else(|| panic!("expert {expert} resolves"));
+            let (quant_gu, quant_dn, want) = if expert % 3 == 2 {
+                (DType::MQ4G256V2, DType::MQ4G128V2, MQ4_SLOT)
+            } else {
+                (DType::E8PI4G128R256, DType::E8PI4G128R128, E8P_SLOT)
+            };
+            assert_eq!(probe.gpu_read_bytes, want, "expert {expert}");
+            assert_eq!(Some(probe.cpu.gate_up_quant), cpu_quant_for(quant_gu));
+            assert_eq!(Some(probe.cpu.down_quant), cpu_quant_for(quant_dn));
+            // The CPU span is the same slot's payload (here the GPU reads that
+            // codec in place), but it is not where the GPU figure comes from.
+            assert_eq!(
+                (probe.cpu.gate_up.len() + probe.cpu.down.len()) as u64,
+                want
+            );
+            probes.push(probe);
+        }
+        assert_eq!(
+            owners.expert_formats(0).unwrap(),
+            [(DType::E8PI4G128R256, E8P.0), (DType::E8PI4G128R128, E8P.1)]
+        );
+        assert_eq!(
+            owners.expert_formats(2).unwrap(),
+            [(DType::MQ4G256V2, MQ4.0), (DType::MQ4G128V2, MQ4.1)]
+        );
+
+        // The production arm over the mixed slots; timed batches are experts
+        // (2,3) (4,5) (6,7) (8,9) (10,11): MQ4+E8P, E8P+MQ4, E8P+E8P, MQ4+E8P,
+        // E8P+MQ4.
+        let (samples, batch_bytes) = sample_cpu_arm(dim, mi, top_k, 13, &probes).unwrap();
+        assert!(samples.iter().all(|&ns| ns > 0), "{samples:?}");
+        assert_eq!(
+            batch_bytes,
+            [
+                MQ4_SLOT + E8P_SLOT,
+                E8P_SLOT + MQ4_SLOT,
+                2 * E8P_SLOT,
+                MQ4_SLOT + E8P_SLOT,
+                E8P_SLOT + MQ4_SLOT
+            ]
         );
     }
 }

@@ -3543,8 +3543,9 @@ impl Qwen4MoeLayerRuntime {
         }
         // The D2 slab span entries: the same plan resolution the D2 default's
         // real-arm probe reads ([`cpu_slab_owner::plan_entries`]).
-        let span_entries = cpu_slab_owner::plan_entries(plan, config, layer_label)
-            .map_err(|error| invalid(format!("layer {layer_label}: {error}")))?;
+        let span_entries =
+            cpu_slab_owner::plan_entries(plan, config.kept_expert_ids(layer_label, false))
+                .map_err(|error| invalid(format!("layer {layer_label}: {error}")))?;
         let table = ExpertTable::new(metadata)
             .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}")))?;
         let mut cache = table
