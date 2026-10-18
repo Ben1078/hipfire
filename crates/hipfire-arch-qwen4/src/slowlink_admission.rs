@@ -3062,6 +3062,9 @@ mod tests {
                 group_scatter_bytes(&geometry, 16384).unwrap(),
                 layout.group_scatter_bytes() as u64
             );
+            // Both routes carry a cohort (K1 rows are admitted on each), so
+            // each owns one I32 count word per expert inside its region.
+            assert_eq!(layout.cohort_counts_bytes(), geometry.num_experts * 4);
             match route {
                 WindowRoute::SlabIu4 => {
                     assert!(layout.a4_sidecar_bytes() > 0);
@@ -3070,10 +3073,17 @@ mod tests {
                     assert_eq!(layout.a4_sidecar_bytes(), 0);
                     assert_eq!(layout.x_f16_bytes(), 16384 * 2560 * 2);
                     assert_eq!(layout.x_f16_bytes(), 83_886_080);
-                    // The tail ids are inside total_bytes (40 B per tail row,
-                    // 256-aligned) at the full 3,066-row worst case.
-                    assert_eq!(layout.tail_ids_bytes() % 256, 0);
-                    assert!(layout.tail_ids_bytes() >= 40 * S1_AGGREGATE_TAIL_ROWS);
+                    // The tail ids are inside total_bytes: the getter is the raw
+                    // 40 B (10 top-k I32) per tail row at the full 3,066-row
+                    // worst case (122,640 B); the 256 B alignment belongs to the
+                    // region field that holds them, not to this getter.
+                    assert_eq!(
+                        layout.tail_ids_bytes(),
+                        S1_AGGREGATE_TAIL_ROWS
+                            * hipfire_dispatch::pipeline::slowlink_prefill::K_TOP
+                            * 4
+                    );
+                    assert_eq!(layout.tail_ids_bytes(), 122_640);
                     assert_eq!(
                         layout.charged_bytes() as u64,
                         route_storage_bytes(&geometry, 16384).unwrap()
