@@ -893,8 +893,7 @@ impl WeightStore {
                         }
                     }
                     Err(error) => {
-                        ARENA_ROOT_QUARANTINES
-                            .with(|count| count.set(count.get() + roots.len()));
+                        ARENA_ROOT_QUARANTINES.with(|count| count.set(count.get() + roots.len()));
                         if first_error.is_none() {
                             first_error = Some(hip_bridge::HipError::new(
                                 error.code,
@@ -1790,7 +1789,9 @@ pub fn compact_owned_experts(
     assign: ExpertAssign,
 ) -> Result<Vec<u8>, String> {
     if assign != ExpertAssign::Stride {
-        return Err(format!("compact expert upload supports Stride assignment, got {assign:?}"));
+        return Err(format!(
+            "compact expert upload supports Stride assignment, got {assign:?}"
+        ));
     }
     if ranks == 0 || rank >= ranks {
         return Err(format!("expert rank {rank} is outside {ranks} ranks"));
@@ -2736,7 +2737,10 @@ mod tests {
                 // Local index e / ranks holds expert e.
                 for e in (rank..n).step_by(ranks) {
                     let local = e / ranks;
-                    assert_eq!(&compact[local * b..(local + 1) * b], &stack[e * b..(e + 1) * b]);
+                    assert_eq!(
+                        &compact[local * b..(local + 1) * b],
+                        &stack[e * b..(e + 1) * b]
+                    );
                 }
                 owned_total += compact.len();
             }
@@ -3838,8 +3842,8 @@ mod weight_store_arena {
         let mut bump = Bump::new();
         bump.fail_at = Some(1);
         let mut store = empty_store();
-        let error = acquire_weight_roots(&mut store, plan(), |bytes| bump.alloc(bytes))
-            .unwrap_err();
+        let error =
+            acquire_weight_roots(&mut store, plan(), |bytes| bump.alloc(bytes)).unwrap_err();
         assert!(error.contains("root 1"), "{error}");
         assert!(error.contains("exact allocation failed"), "{error}");
         assert_eq!(test_support::arena_root_allocations(), 1);
@@ -3872,9 +3876,19 @@ mod weight_store_arena {
             .collect();
         assert_eq!(
             spans,
-            vec![("a", 0, 0, 1000), ("b", 1, 0, 1500), ("c", 1, 1536, 0), ("d", 2, 0, 600)]
+            vec![
+                ("a", 0, 0, 1000),
+                ("b", 1, 0, 1500),
+                ("c", 1, 1536, 0),
+                ("d", 2, 0, 600)
+            ]
         );
-        let expected = [("a", r0, 1000), ("b", r1, 1500), ("c", r1 + 1536, 0), ("d", r2, 600)];
+        let expected = [
+            ("a", r0, 1000),
+            ("b", r1, 1500),
+            ("c", r1 + 1536, 0),
+            ("d", r2, 600),
+        ];
         for (name, ptr, bytes) in expected {
             let Some(WeightHandle::Resident(view)) = store.get(name, None, 0) else {
                 panic!("{name} has no resident view")
@@ -3908,10 +3922,7 @@ mod weight_store_arena {
             .view(&past_end, &[1], DType::Raw)
             .unwrap_err()
             .contains("exceeds root"));
-        let bad_root = NamedByteArenaSpan {
-            root: 9,
-            ..a_span
-        };
+        let bad_root = NamedByteArenaSpan { root: 9, ..a_span };
         assert!(arena
             .view(&bad_root, &[1], DType::Raw)
             .unwrap_err()
@@ -4024,11 +4035,16 @@ mod weight_store_arena {
         let mut ops = FakeRelease::default();
         store.release_with(&mut ops).unwrap();
         assert_eq!(
-            ops.log.iter().filter(|line| line.starts_with("root:")).count(),
+            ops.log
+                .iter()
+                .filter(|line| line.starts_with("root:"))
+                .count(),
             3
         );
         assert!(
-            ops.log.iter().all(|line| !line.starts_with("free_resident")),
+            ops.log
+                .iter()
+                .all(|line| !line.starts_with("free_resident")),
             "restored views are still borrowed and are never freed: {:?}",
             ops.log
         );
@@ -4077,13 +4093,22 @@ mod weight_store_arena {
         let mut bump = Bump::new();
         let mut transaction = WeightLoadTransaction::new(arena_store(&mut bump));
         assert!(!transaction.is_empty());
-        assert_eq!(transaction.weight_arena_root_capacities(), vec![1000, 1536, 600]);
-        assert_eq!(transaction.weight_arena_root_requests(), vec![1000, 1536, 600]);
+        assert_eq!(
+            transaction.weight_arena_root_capacities(),
+            vec![1000, 1536, 600]
+        );
+        assert_eq!(
+            transaction.weight_arena_root_requests(),
+            vec![1000, 1536, 600]
+        );
         let mut ops = FakeRelease::default();
         transaction.rollback_via(&mut ops).unwrap();
         let first = ops.log.clone();
         transaction.rollback_via(&mut ops).unwrap();
-        assert_eq!(ops.log, first, "the second rollback performs no device work");
+        assert_eq!(
+            ops.log, first,
+            "the second rollback performs no device work"
+        );
         assert_eq!(test_support::arena_root_releases(), 3);
         assert!(transaction.weight_arena_plan().is_none());
         assert!(transaction.weight_arena_root_capacities().is_empty());
@@ -4110,7 +4135,10 @@ mod weight_store_arena {
                 .unwrap();
             assert!(clear < quiesce && quiesce < first_root, "{round:?}");
         }
-        assert_eq!(base_seen[0], base_seen[2], "the address was genuinely reused");
+        assert_eq!(
+            base_seen[0], base_seen[2],
+            "the address was genuinely reused"
+        );
         assert_eq!(
             ops.log.iter().filter(|line| *line == "clear").count(),
             3,
@@ -4152,11 +4180,18 @@ mod weight_store_arena {
         let error = store.release_with(&mut ops).unwrap_err();
         assert!(error.message.contains("fake root release failure"));
         assert_eq!(
-            ops.log.iter().filter(|line| line.starts_with("root:")).count(),
+            ops.log
+                .iter()
+                .filter(|line| line.starts_with("root:"))
+                .count(),
             3,
             "every root is attempted exactly once"
         );
-        assert_eq!(test_support::arena_root_releases(), 2, "only successes are counted");
+        assert_eq!(
+            test_support::arena_root_releases(),
+            2,
+            "only successes are counted"
+        );
     }
 
     #[test]
@@ -4181,7 +4216,9 @@ mod weight_store_arena {
 
         // A resident that is not the planned view (an owned copy) is refused.
         let mut copied = arena_store(&mut Bump::new());
-        let Some(WeightHandle::Resident(b)) = copied.placements.get_mut(&WeightPlacementKey::new("b", None, 0))
+        let Some(WeightHandle::Resident(b)) = copied
+            .placements
+            .get_mut(&WeightPlacementKey::new("b", None, 0))
         else {
             panic!()
         };
@@ -4211,7 +4248,10 @@ mod weight_store_arena {
         assert!(store.weight_arena_plan().is_none());
         assert!(store.arena_root_capacities().is_empty());
         assert!(store.arena_root_requests().is_empty());
-        assert_eq!(shadow_source_ptrs(&store, &manifest()).unwrap(), Vec::<usize>::new());
+        assert_eq!(
+            shadow_source_ptrs(&store, &manifest()).unwrap(),
+            Vec::<usize>::new()
+        );
         store
             .stage_alias("alias", None, 0, "source", projection(DType::F16))
             .unwrap();

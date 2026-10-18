@@ -3119,7 +3119,9 @@ impl ReplaceOps for GpuReplace<'_> {
     }
 
     fn free(&mut self, tensor: GpuTensor) -> Result<(), String> {
-        self.0.free_tensor(tensor).map_err(|error| error.to_string())
+        self.0
+            .free_tensor(tensor)
+            .map_err(|error| error.to_string())
     }
 
     fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
@@ -3274,8 +3276,7 @@ fn replace_in_arena_span(
     };
     let (view, before, after, temp) = match replacement {
         Replacement::Qt44(bytes) => {
-            let view =
-                arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::MQ4G256V2)?;
+            let view = arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::MQ4G256V2)?;
             ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
             ops.write_host(&old.buf, &bytes)?;
             (view, old.buf.size(), bytes.len(), None)
@@ -6892,8 +6893,11 @@ mod weight_store_arena_replacement {
             Ok(true)
         }
         fn write_host(&mut self, dst: &DeviceBuffer, bytes: &[u8]) -> Result<(), String> {
-            self.log
-                .push(format!("write:{:#x}:{}", dst.as_ptr() as usize, bytes.len()));
+            self.log.push(format!(
+                "write:{:#x}:{}",
+                dst.as_ptr() as usize,
+                bytes.len()
+            ));
             Ok(())
         }
         fn copy_device(
@@ -6913,7 +6917,8 @@ mod weight_store_arena_replacement {
             Ok(())
         }
         fn free(&mut self, tensor: GpuTensor) -> Result<(), String> {
-            self.log.push(format!("free:{:#x}", tensor.buf.as_ptr() as usize));
+            self.log
+                .push(format!("free:{:#x}", tensor.buf.as_ptr() as usize));
             Ok(())
         }
         fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
@@ -6960,7 +6965,11 @@ mod weight_store_arena_replacement {
             Ok(())
         })
         .unwrap();
-        assert_eq!(freed, vec![TEMP_BASE], "only the owned tensor reaches the free path");
+        assert_eq!(
+            freed,
+            vec![TEMP_BASE],
+            "only the owned tensor reaches the free path"
+        );
     }
 
     #[test]
@@ -7029,7 +7038,11 @@ mod weight_store_arena_replacement {
             let WeightHandle::Resident(now) = &weight.handle else {
                 panic!("not resident")
             };
-            assert_eq!(now.buf.as_ptr() as usize, ROOT_BASE, "{target:?}: pointer stable");
+            assert_eq!(
+                now.buf.as_ptr() as usize,
+                ROOT_BASE,
+                "{target:?}: pointer stable"
+            );
             assert!(now.buf.is_borrowed(), "{target:?}: still a borrowed view");
             assert_eq!(now.buf.size(), span, "{target:?}: span capacity preserved");
             assert_eq!(now.dtype, target);
@@ -7094,8 +7107,12 @@ mod weight_store_arena_replacement {
         );
         let small = vec![1u8; m * (k / 256) * 72];
         let mut ops = Fake::default();
-        replace_resident_with(&mut ops, &mut weight, Replacement::Qt44(Cow::Borrowed(&small)))
-            .unwrap();
+        replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&small)),
+        )
+        .unwrap();
         // A larger payload than the first, still within the planned span.
         let larger = vec![2u8; m * (k / 256) * 200];
         let mut ops = Fake::default();
@@ -7126,7 +7143,11 @@ mod weight_store_arena_replacement {
         )
         .unwrap_err();
         assert!(error.contains("exceeds the planned arena span"), "{error}");
-        assert!(ops.log.is_empty(), "no invalidate, write or fallback: {:?}", ops.log);
+        assert!(
+            ops.log.is_empty(),
+            "no invalidate, write or fallback: {:?}",
+            ops.log
+        );
         assert_eq!(ptr_of(&weight), ROOT_BASE, "the original view is untouched");
 
         // A kernel-produced tensor too large for the span is refused the same
@@ -7165,13 +7186,20 @@ mod weight_store_arena_replacement {
         assert!(error.contains("fake quiesce failure"));
         assert_eq!(
             ops.log,
-            vec![format!("invalidate:{ROOT_BASE:#x}"), format!("free:{TEMP_BASE:#x}")],
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("free:{TEMP_BASE:#x}")
+            ],
             "no write; only the temporary owner is released"
         );
         let WeightHandle::Resident(now) = &weight.handle else {
             panic!("not resident")
         };
-        assert_eq!(now.dtype, DType::BF16, "the weight keeps its original metadata");
+        assert_eq!(
+            now.dtype,
+            DType::BF16,
+            "the weight keeps its original metadata"
+        );
 
         let payload = vec![0u8; expected];
         let mut ops = Fake {
@@ -7235,7 +7263,10 @@ mod weight_store_arena_replacement {
             Ok(())
         })
         .unwrap();
-        assert_eq!(freed, 0, "the retagged view is still borrowed: the root owner frees it");
+        assert_eq!(
+            freed, 0,
+            "the retagged view is still borrowed: the root owner frees it"
+        );
     }
 
     #[test]
