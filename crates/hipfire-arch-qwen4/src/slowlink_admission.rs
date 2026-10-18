@@ -2422,7 +2422,9 @@ mod tests {
                 window_rows: S1_WINDOW_ROWS,
                 link_gbps: 7.09,
             })
-            .unwrap_or_else(|decline| panic!("{label} must admit on the aggregate route: {decline}"));
+            .unwrap_or_else(|decline| {
+                panic!("{label} must admit on the aggregate route: {decline}")
+            });
             assert_eq!(profile.resident_layers, 10, "{label}");
             assert_eq!(profile.tile_rows, 1536, "{label}");
             assert_eq!(profile.pages.total_pages(), 18, "{label}");
@@ -2441,13 +2443,10 @@ mod tests {
             );
             // The 512 MiB margin still sits on top of the whole reserve: ten
             // layers fit beside it.
-            let reserve_total = reserve.placement_bytes(true)
-                + profile.census.total().unwrap()
-                + MARGIN;
+            let reserve_total =
+                reserve.placement_bytes(true) + profile.census.total().unwrap() + MARGIN;
             assert!(
-                profile.resident_layers as u64 * 1_336_934_400
-                    + 5_364_055_296
-                    + reserve_total
+                profile.resident_layers as u64 * 1_336_934_400 + 5_364_055_296 + reserve_total
                     <= 25_713_180_672,
                 "{label}"
             );
@@ -2567,8 +2566,9 @@ mod tests {
                 window_rows: S1_WINDOW_ROWS,
                 link_gbps: 7.09,
             };
-            let profile = admit(&inputs)
-                .unwrap_or_else(|decline| panic!("{label} must admit on the aggregate route: {decline}"));
+            let profile = admit(&inputs).unwrap_or_else(|decline| {
+                panic!("{label} must admit on the aggregate route: {decline}")
+            });
             assert_eq!(profile.resident_layers, 10, "{label}");
             assert_eq!(profile.tile_rows, 1536, "{label}");
             assert_eq!(profile.pages.total_pages(), 18, "{label}");
