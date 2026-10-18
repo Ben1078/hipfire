@@ -1,0 +1,588 @@
+{
+  "hold": "Hold1R5adaptive; split1a=primitive+state+state-headroom and1b=sealedheadroom+greedy; MAIN-only model submission",
+  "census_final": true,
+  "pending_final": [],
+  "census_role": "INFORMATION only: exact source-owner capacity arithmetic of what the S1 aggregate-route product and primitive-selftest purposes own at the real fixture (CPU census of declared source inputs, expressed as the MODEL of queried-granule/observed allocator capacity over those payloads; not a GPU physical-backing or recovery measurement, never a driver figure, never gated). The Hold 1 product question is the observed free-VRAM headroom (check_headroom.py: external 20 ms sysfs sampler AND in-process hipMemGetInfo pre_load/post_load/end, both >= 536,870,912 B); the 1 GiB runtime budget and the 512 MiB safety margin are unchanged and the slack over them is non-gating information.",
+  "source_emit": "FRESH CPU source 40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5: SOURCE-CENSUS-R5.json binds SLOWLINK_J1778_CHOSEN_PROFILES (current owner getters, log01 line819) and four SLOWLINK_ADMISSION_QUOTE_R5 records (log00d lines811-814). All canonical reference figures derive from the actual-post-initialization input of j1811 (25,560,088,576 B), N9; pre=post/no-loss N10 is explicitly COUNTERFACTUAL. This is a source/queried-granule backing model, not an R5 GPU measurement.",
+  "route": "aggregate",
+  "fixture": {
+    "hidden_size": 2560,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 640,
+    "shared_expert_intermediate_size": 640,
+    "trunk_layers": 48,
+    "weight_layers_in_index": 49,
+    "mtp_weights": "1 layer of weights, native_mtp=false (weights fulfilled, runtime state/scratch reserve dropped)",
+    "native_mtp": false,
+    "gdn_state_format": "q8",
+    "qsa_state_format": "q8",
+    "max_seq": 16640,
+    "resident_expert_layers": 9,
+    "projection_role": "reference",
+    "window_rows": 16384,
+    "page_count": 18,
+    "arch": "gfx1100",
+    "cold_f16": {
+      "bytes": 1298923520,
+      "tile_census_term": "f16_weight_shadow_bytes",
+      "tile_census_term_count": 1,
+      "extras_term_count": 0,
+      "note": "the cold BF16->F16 weight shadow PAYLOAD bound 1,298,923,520 is charged ONCE, as exactly one s1_tile_census_terms term of each purpose profile (and stated by f16_shadow_cold_bound_bytes); it is in no extras term and no second F16 term exists. Its modelled granule backing (1,300,234,240 = payload + 1,310,720 padding) is NOT an F16 term: the padding is carried inside the named allocation_backing_padding_bytes term of the tile census",
+      "backing_bytes": 1300234240
+    }
+  },
+  "device_weights": {
+    "non_expert_bytes": 5375000576,
+    "expert_layer_bytes": 1337982976,
+    "resident_expert_layers": 9,
+    "projection_role": "reference",
+    "resident_expert_bytes": 12041846784,
+    "basis": "CANONICAL POST-INITIALIZATION REFERENCE backing, from the shared quote: non-expert payload plus its named weight-tensor backing pad, and selected N times the already-backed expert layer cost. Count9 is reference data, NEVER a hardcoded target or an observed R5 result.",
+    "model_payload_metadata": {
+      "note": "model-index PAYLOAD bytes (logical tensor sizes), recorded separately from the physical backing above; informational, the profiles charge the backing",
+      "non_expert_payload_bytes": 5364055296,
+      "expert_layer_payload_bytes": 1336934400,
+      "resident_expert_payload_bytes": 12032409600,
+      "total_payload_bytes": 17396464896,
+      "non_expert_backing_padding_bytes": 10945280,
+      "expert_layer_backing_padding_bytes": 1048576,
+      "granule_bytes": 2097152,
+      "source": "SOURCE-CENSUS-R5.json canonical profiles and raw quote; logical payloads informational, the ledger charges backing"
+    }
+  },
+  "profiles": {
+    "product": {
+      "purpose": "product",
+      "tile_rows": 768,
+      "projection_role": "reference",
+      "resident_expert_layers": 9,
+      "window_rows": 16384,
+      "page_count": 18,
+      "device_weights_bytes": 17416847360,
+      "s1_tile_census_bytes": 2761329452,
+      "s1_tile_census_terms": [
+        {
+          "name": "forward_bytes",
+          "bytes": 1011232772
+        },
+        {
+          "name": "state_bytes",
+          "bytes": 68514080
+        },
+        {
+          "name": "qsa_context_bytes",
+          "bytes": 281149440
+        },
+        {
+          "name": "workspace_total_bytes",
+          "bytes": 23870984
+        },
+        {
+          "name": "f16_weight_shadow_bytes",
+          "bytes": 1298923520
+        },
+        {
+          "name": "qsa_selector_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "mtp_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "gather_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "runtime_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "allocation_backing_padding_bytes",
+          "bytes": 77638656
+        }
+      ],
+      "f16_shadow_cold_bound_bytes": 1298923520,
+      "s1_extras_bytes": 2537898560,
+      "s1_extras_terms": [
+        {
+          "name": "expert ring",
+          "bytes": 167206912
+        },
+        {
+          "name": "expert lookahead",
+          "bytes": 1337655296
+        },
+        {
+          "name": "route storage",
+          "bytes": 470192384
+        },
+        {
+          "name": "A4 sidecars",
+          "bytes": 0
+        },
+        {
+          "name": "group scatter",
+          "bytes": 3278848
+        },
+        {
+          "name": "HC arena",
+          "bytes": 414064640
+        },
+        {
+          "name": "boundary state",
+          "bytes": 136512064
+        },
+        {
+          "name": "allocation_backing_padding_bytes",
+          "bytes": 8988416
+        }
+      ],
+      "device_core_bytes": 22716075372,
+      "sequential_diag_bytes": 0,
+      "device_owned_bytes": 22716075372,
+      "runtime_budget_bytes": 1073741824,
+      "safety_margin_bytes": 536870912
+    },
+    "primitive_selftest": {
+      "purpose": "primitive_selftest",
+      "tile_rows": 512,
+      "projection_role": "reference",
+      "resident_expert_layers": 9,
+      "window_rows": 16384,
+      "page_count": 18,
+      "device_weights_bytes": 17416847360,
+      "s1_tile_census_bytes": 2484701100,
+      "s1_tile_census_terms": [
+        {
+          "name": "forward_bytes",
+          "bytes": 735014276
+        },
+        {
+          "name": "state_bytes",
+          "bytes": 68514080
+        },
+        {
+          "name": "qsa_context_bytes",
+          "bytes": 281149440
+        },
+        {
+          "name": "workspace_total_bytes",
+          "bytes": 15974664
+        },
+        {
+          "name": "f16_weight_shadow_bytes",
+          "bytes": 1298923520
+        },
+        {
+          "name": "qsa_selector_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "mtp_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "gather_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "runtime_bytes",
+          "bytes": 0
+        },
+        {
+          "name": "allocation_backing_padding_bytes",
+          "bytes": 85125120
+        }
+      ],
+      "f16_shadow_cold_bound_bytes": 1298923520,
+      "s1_extras_bytes": 2531607104,
+      "s1_extras_terms": [
+        {
+          "name": "expert ring",
+          "bytes": 167206912
+        },
+        {
+          "name": "expert lookahead",
+          "bytes": 1337655296
+        },
+        {
+          "name": "route storage",
+          "bytes": 470192384
+        },
+        {
+          "name": "A4 sidecars",
+          "bytes": 0
+        },
+        {
+          "name": "group scatter",
+          "bytes": 3278848
+        },
+        {
+          "name": "HC arena",
+          "bytes": 408821760
+        },
+        {
+          "name": "boundary state",
+          "bytes": 136512064
+        },
+        {
+          "name": "allocation_backing_padding_bytes",
+          "bytes": 7939840
+        }
+      ],
+      "device_core_bytes": 22433155564,
+      "sequential_diag_bytes": 217821184,
+      "device_owned_bytes": 22650976748,
+      "runtime_budget_bytes": 1073741824,
+      "safety_margin_bytes": 536870912
+    }
+  },
+  "admission_quotes": {
+    "schema": "SLOWLINK_ADMISSION_QUOTE_R5",
+    "canonical_observation": "post_initialization_actual",
+    "canonical_note": "BOUND to the fresh CPU quote at j1811 post-initialization free25,560,088,576 (selected9). The no-loss pre=post25,713,180,672 selected10 row remains a counterfactual, unchanged and never relabelled. Actual future hardware cells must carry their own maximal-fits witness; this ledger is REFERENCE data, not an expected count.",
+    "status": "FOUR_FRESH_CPU_QUOTES_BOUND;ALL41_CPU_COMMANDS_PASS;NOT_A_GPU_MEASUREMENT",
+    "source_commit": "40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5",
+    "entries_format": "list of {purpose: product|primitive_selftest, memory_observation: post_initialization_actual|reference_pre_initialization, tile_rows: 768|512, source_observation_label: the raw emit's ORIGINAL label (actual_post_initialization -> post_initialization_actual, reference_pre_equals_post -> reference_pre_initialization; metadata only, never swapped; required by the production seal), host_owners: the raw quote's host_owners object UNCHANGED ({weight_layers_with_experts, selected:{resident_layers,host_layers,host_owner_entries,host_payload_bytes,host_owner_pad_bytes,host_total_bytes}, preferred:{...}}; required by the production seal, bound to the canonical row only), witness: the 14 receipt witness scalars (free_before_initialization_bytes, free_at_admission_bytes, observed_initialization_bytes, non_expert_bytes, resident_layer_bytes, joint_reserve_bytes, trunk_layers, resident_layers, preferred_resident_layers, needed_bytes, slack_bytes, preferred_deficit_bytes, memory_basis, initialization_charged_via_free)}; exactly four entries in a FINAL ledger",
+    "entries": [
+      {
+        "purpose": "product",
+        "memory_observation": "reference_pre_initialization",
+        "tile_rows": 768,
+        "source_observation_label": "reference_pre_equals_post",
+        "source_emit_line": 811,
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        },
+        "witness": {
+          "free_before_initialization_bytes": 25713180672,
+          "free_at_admission_bytes": 25713180672,
+          "observed_initialization_bytes": 0,
+          "non_expert_bytes": 5364055296,
+          "resident_layer_bytes": 1337982976,
+          "joint_reserve_bytes": 6920786028,
+          "trunk_layers": 48,
+          "resident_layers": 10,
+          "preferred_resident_layers": 10,
+          "needed_bytes": 25664671084,
+          "slack_bytes": 48509588,
+          "preferred_deficit_bytes": 0,
+          "memory_basis": "post_initialization_actual",
+          "initialization_charged_via_free": true
+        }
+      },
+      {
+        "purpose": "product",
+        "memory_observation": "post_initialization_actual",
+        "tile_rows": 768,
+        "source_observation_label": "actual_post_initialization",
+        "source_emit_line": 812,
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 9,
+            "host_layers": 40,
+            "host_owner_entries": 80,
+            "host_payload_bytes": 53477376000,
+            "host_owner_pad_bytes": 83886080,
+            "host_total_bytes": 53561262080
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        },
+        "witness": {
+          "free_before_initialization_bytes": 25713180672,
+          "free_at_admission_bytes": 25560088576,
+          "observed_initialization_bytes": 153092096,
+          "non_expert_bytes": 5364055296,
+          "resident_layer_bytes": 1337982976,
+          "joint_reserve_bytes": 6920786028,
+          "trunk_layers": 48,
+          "resident_layers": 9,
+          "preferred_resident_layers": 10,
+          "needed_bytes": 24326688108,
+          "slack_bytes": 1233400468,
+          "preferred_deficit_bytes": 104582508,
+          "memory_basis": "post_initialization_actual",
+          "initialization_charged_via_free": true
+        }
+      },
+      {
+        "purpose": "primitive_selftest",
+        "memory_observation": "reference_pre_initialization",
+        "tile_rows": 512,
+        "source_observation_label": "reference_pre_equals_post",
+        "source_emit_line": 813,
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        },
+        "witness": {
+          "free_before_initialization_bytes": 25713180672,
+          "free_at_admission_bytes": 25713180672,
+          "observed_initialization_bytes": 0,
+          "non_expert_bytes": 5364055296,
+          "resident_layer_bytes": 1337982976,
+          "joint_reserve_bytes": 6855687404,
+          "trunk_layers": 48,
+          "resident_layers": 10,
+          "preferred_resident_layers": 10,
+          "needed_bytes": 25599572460,
+          "slack_bytes": 113608212,
+          "preferred_deficit_bytes": 0,
+          "memory_basis": "post_initialization_actual",
+          "initialization_charged_via_free": true
+        }
+      },
+      {
+        "purpose": "primitive_selftest",
+        "memory_observation": "post_initialization_actual",
+        "tile_rows": 512,
+        "source_observation_label": "actual_post_initialization",
+        "source_emit_line": 814,
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 9,
+            "host_layers": 40,
+            "host_owner_entries": 80,
+            "host_payload_bytes": 53477376000,
+            "host_owner_pad_bytes": 83886080,
+            "host_total_bytes": 53561262080
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        },
+        "witness": {
+          "free_before_initialization_bytes": 25713180672,
+          "free_at_admission_bytes": 25560088576,
+          "observed_initialization_bytes": 153092096,
+          "non_expert_bytes": 5364055296,
+          "resident_layer_bytes": 1337982976,
+          "joint_reserve_bytes": 6855687404,
+          "trunk_layers": 48,
+          "resident_layers": 9,
+          "preferred_resident_layers": 10,
+          "needed_bytes": 24261589484,
+          "slack_bytes": 1298499092,
+          "preferred_deficit_bytes": 39483884,
+          "memory_basis": "post_initialization_actual",
+          "initialization_charged_via_free": true
+        }
+      }
+    ]
+  },
+  "device_owned_bytes": 22716075372,
+  "device_owned_note": "MAX of the canonical per-purpose SOURCE/BACKING reference figures, not their sum and not observed allocation: product 22716075372 B; primitive 22650976748 B (includes its sequential diagnostic). Actual cells report their admitted N; owned/residual attribution is NON-GATING.",
+  "device_projection": {
+    "kind": "CPU projection of declared historical input, NOT an R5 GPU measurement",
+    "projection_role": "reference",
+    "memory_basis": "post_initialization_actual",
+    "preload_free_bytes": 25560088576,
+    "by_purpose": {
+      "product": {
+        "slack_over_safety_bytes": 1233400468
+      },
+      "primitive_selftest": {
+        "slack_over_safety_bytes": 1298499092
+      }
+    },
+    "arithmetic": "Shared Rust project_at_tile/admit/frontier quote, not a second admission formula. Product needed 24326688108 and slack 1233400468; primitive needed 24261589484 and slack 1298499092. Needed includes unchanged1GiB remaining-runtime and512MiB safety. Measured146MiB interval already charged ONCE through lower actual free, NEVER added as a tax. Product headroom gate remains observed sysfs and HIP minimum free >=536,870,912 B."
+  },
+  "card_bytes": 25769803776,
+  "physical_card_gib": 24,
+  "fabric_reservation_device_gib": 22.4,
+  "card_bytes_note": "card_bytes is the PHYSICAL 24 GiB card; the fabric exclusive-use device reservation (22.4 GiB) is separate and is what --print-memory prints as the device figure",
+  "session_cache_budget_cap_bytes_not_committed": 2147483648,
+  "session_cache_note": "the 2 GiB device session cache is a NOMINAL best-effort cap, NOT a commitment: recorded, never added to the owned census or to any reservation. The actual discretionary cache budget is derived by the runtime from the free device bytes at admission; at this fixture the product slack above the 512 MiB Safety margin is only 48,509,588 B",
+  "pending_working_set_ceiling_bytes_not_charged": 620021760,
+  "pending_ceiling_note": "information only; the 620,021,760 B pending working-set ceiling now lies INSIDE the bounded host snapshot cap (bounded_host_snapshot_cap_bytes 2 GiB TOTAL covering pending, resident, parked and quarantined snapshots per purpose) and is not an additional VRAM commitment",
+  "host_census": {
+    "product": {
+      "terms": [
+        {
+          "name": "pinned_expert_owners_bytes",
+          "bytes": 53477376000
+        },
+        {
+          "name": "host_map_owner_pad_bytes",
+          "bytes": 83886080
+        },
+        {
+          "name": "external_ple_row_decoded_staging_bytes",
+          "bytes": 83886080
+        },
+        {
+          "name": "ple_page_cache_bytes",
+          "bytes": 268435456
+        },
+        {
+          "name": "t_pinned_tables_bytes",
+          "bytes": 147456
+        },
+        {
+          "name": "max_sequential_diag_readback_d_bytes",
+          "bytes": 351518720
+        },
+        {
+          "name": "forward_ple_stage_bytes",
+          "bytes": 3932160
+        },
+        {
+          "name": "forward_token_stage_bytes",
+          "bytes": 3072
+        },
+        {
+          "name": "forward_mesh_token_stage_bytes",
+          "bytes": 3072
+        },
+        {
+          "name": "bounded_host_snapshot_cap_bytes",
+          "bytes": 2147483648
+        }
+      ],
+      "total_bytes": 56416671744
+    },
+    "primitive_selftest": {
+      "terms": [
+        {
+          "name": "pinned_expert_owners_bytes",
+          "bytes": 53477376000
+        },
+        {
+          "name": "host_map_owner_pad_bytes",
+          "bytes": 83886080
+        },
+        {
+          "name": "external_ple_row_decoded_staging_bytes",
+          "bytes": 83886080
+        },
+        {
+          "name": "ple_page_cache_bytes",
+          "bytes": 268435456
+        },
+        {
+          "name": "t_pinned_tables_bytes",
+          "bytes": 147456
+        },
+        {
+          "name": "max_sequential_diag_readback_d_bytes",
+          "bytes": 351518720
+        },
+        {
+          "name": "forward_ple_stage_bytes",
+          "bytes": 2621440
+        },
+        {
+          "name": "forward_token_stage_bytes",
+          "bytes": 2048
+        },
+        {
+          "name": "forward_mesh_token_stage_bytes",
+          "bytes": 2048
+        },
+        {
+          "name": "bounded_host_snapshot_cap_bytes",
+          "bytes": 2147483648
+        }
+      ],
+      "total_bytes": 56415358976
+    }
+  },
+  "host_owned_bytes": 56416671744,
+  "host_owned_note": "SOURCE CAPACITY UPPER BOUND, not an observed peak: canonical N9 has40 host weight layers (39 trunk plus the weight-only MTP layer),80 host entries, payload53,477,376,000 B plus83,886,080 B map guards, from the real header placement query. The bounded2GiB host snapshot cap ALREADY includes resident/pending/deferred/parked/quarantined ownership; pending620,021,760 B ceiling is not charged twice. Other owner-getter capacity ceilings and unchanged beta G2 mirrors remain included.",
+  "host_reservation_owned_bytes": 56416671744,
+  "host_reservation": {
+    "sequential_arm": "immutable beta ff799626e greedy arm (quality reference pin 10, allowed, no arithmetic impact; G2 mirrors UNCHANGED, EXPERT_STAGE never 0)",
+    "terms": [
+      {
+        "name": "beta_old_max_bytes",
+        "bytes": 55698259968
+      },
+      {
+        "name": "beta_forward_ple_stage_bytes",
+        "bytes": 41943040
+      },
+      {
+        "name": "beta_forward_token_stage_bytes",
+        "bytes": 32768
+      },
+      {
+        "name": "beta_forward_mesh_token_stage_bytes",
+        "bytes": 32768
+      }
+    ],
+    "beta_old_composition": "52,574,552,064 base + 3,123,707,904 construction (steady 4 mirrors 2,678,063,104 + last live Vec 445,644,800)",
+    "beta_chunk_rows_ceiling": 8192,
+    "total_bytes": 55740268544
+  },
+  "host_reservation_note": "Arms sequential fresh processes: reserve MAX, never sum. S1 product N9 reference56,416,671,744 B dominates S1 primitive56,415,358,976 and immutable beta55,740,268,544. +2GiB declared HOST allowance =58,564,155,392 B <=55GiB59,055,800,320 B (491,644,928 B residual). Beta quality reference pin10 unchanged; EXPERT_STAGE never0. Legacy G2 donor-restore mirror owners: beta ff799626e gpu_forward.rs:3961-3985; construction3,123,707,904 B =four steady mirrors2,678,063,104 +last Vec445,644,800. Accounting/reservation proof, not measured RSS.",
+  "host_allowance_bytes": 2147483648,
+  "host_total_with_allowance_bytes": 58564155392,
+  "fabric_hostmem_gib": 55,
+  "fabric_hostmem_bytes": 59055800320,
+  "host_slack_bytes": 491644928,
+  "allowances_are_declared_not_measured": true,
+  "census_basis": "Fresh runtime40a4e3bee CPU owner getters plus SAME pure project_at_tile/admit/frontier quote, canonical actual-post-initialization input from j1811. Exact named backing padding, runtime and safety close to needed. No count floor, assumed initialization tax, device-session-cache double charge or second F16 shadow charge. Backing census/residual NON-GATING diagnostics; product min-free512MiB from two sources gates hardware.",
+  "provenance": {
+    "model_config_sha256": "09bdc80f4f47dab77700880add826259a4cf6b0c2e9809219ed96b63d5af4a08",
+    "model_index_sha256": "0da73ebaf81137a16bfb83f138fc092febfb158a63b74bc342cddd895625706a",
+    "r4_reference_census_source_commit": "32c507c7b5cecab23cf6e14b001d4d87898c0416",
+    "r4_reference_census_source_tree": "83a3e87203e8af97ba6d1f97bb3712a69e2ff5bf",
+    "r4_reference_census_source_base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981",
+    "census_source_commit": "40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5",
+    "census_source_tree": "c8321cbd114cba12dae66445ecf7157471568647",
+    "census_source_base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981",
+    "header_fixture_json_sha256": "78e329f28f723c04f56e4b00bd08179b9e6fd0b22b7ca3b056edbc8183d8d6b5",
+    "model_header_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013",
+    "raw_owner_log_sha256": "92f0c95c2377b2fc018f9ab175e2a2a13b41a3045631c5ac065b56677fa84afa",
+    "raw_quote_log_sha256": "cd15fbc8bc21127d144a4234df8f7e7a99284efbc75b0322e4de03d20c9a1ab1",
+    "source_census_sha256": "a061bdf3d05fa738bdb0b40d0dad5a0f5ee6061cc0930880ae0fc7bfba8030d3"
+  },
+  "provenance_note": "CPU evidence bound to clean frozen40a4e3bee/treec8321cbd and exact fresh log hashes/lines in SOURCE-CENSUS-R5.json. Model config/index hashes identify split-base metadata. Tracked fixture JSON SHA78e329f2 differs from embedded raw HFQM header SHA8703bb16; both are explicit identities. R4 identities labelled reference-only. No R5 model run/headroom result claimed."
+}

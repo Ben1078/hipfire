@@ -1,0 +1,1742 @@
+{
+  "schema": "s1.source_census.v5",
+  "measurement_kind": "CPU/source owner census and queried-granule BACKING MODEL; historical measured free inputs, NOT an R5 GPU measurement",
+  "source": {
+    "tip": "40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5",
+    "tree": "c8321cbd114cba12dae66445ecf7157471568647",
+    "base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981"
+  },
+  "cpu_proof": {
+    "path": "/home/kaden/qcal/release-0.4.3/slowlink-prefill/holds/CPU-R5-INTEGRATION-RUN1.json",
+    "status": "all_passed",
+    "commands": 41,
+    "source_identity": {
+      "head": "40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5",
+      "tree": "c8321cbd114cba12dae66445ecf7157471568647",
+      "status_porcelain": "",
+      "expected": {
+        "tip": "40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5",
+        "tree": "c8321cbd114cba12dae66445ecf7157471568647",
+        "base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981"
+      }
+    }
+  },
+  "real_metadata_fixture": {
+    "path": "crates/rdna-compute/tests/fixtures/jit-g0/header-flash-next.json",
+    "json_sha256": "78e329f28f723c04f56e4b00bd08179b9e6fd0b22b7ca3b056edbc8183d8d6b5",
+    "embedded_model_header_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013",
+    "model_file_size": 125288544792,
+    "header_bytes": 14442496,
+    "note": "Whole JSON export hash and raw embedded HFQM header hash identify DIFFERENT objects; neither is the125GB model SHA"
+  },
+  "raw_sources": [
+    {
+      "command": "cargo test -p hipfire-arch-qwen4 --lib slowlink_residency -- --test-threads=1 --nocapture",
+      "raw_log": "/home/kaden/qcal/release-0.4.3/slowlink-prefill/holds/cpu-r5-run1-logs/01-slowlink-residency.log",
+      "stage_relative_log": "receipts/cpu-r5-run1-logs/01-slowlink-residency.log",
+      "raw_log_sha256": "92f0c95c2377b2fc018f9ab175e2a2a13b41a3045631c5ac065b56677fa84afa",
+      "record_prefix": "SLOWLINK_J1778_CHOSEN_PROFILES",
+      "line": 819
+    },
+    {
+      "command": "cargo test -p hipfire-arch-qwen4 --lib slowlink_arena -- --nocapture --test-threads=1",
+      "raw_log": "/home/kaden/qcal/release-0.4.3/slowlink-prefill/holds/cpu-r5-run1-logs/00d-slowlink-arena.log",
+      "stage_relative_log": "receipts/cpu-r5-run1-logs/00d-slowlink-arena.log",
+      "raw_log_sha256": "cd15fbc8bc21127d144a4234df8f7e7a99284efbc75b0322e4de03d20c9a1ab1",
+      "record_prefix": "SLOWLINK_ADMISSION_QUOTE_R5",
+      "lines": [
+        811,
+        812,
+        813,
+        814
+      ]
+    }
+  ],
+  "census": {
+    "fixture": "j1778 real-artifact inputs (CPU census, not a GPU measurement)",
+    "max_seq": 16640,
+    "profiles": [
+      {
+        "route": "Aggregate",
+        "purpose": "Product",
+        "tile_rows": 768,
+        "window_rows": 16384,
+        "page_count": 18,
+        "resident_layers": 10,
+        "base_census": {
+          "forward_bytes": 1011232772,
+          "state_bytes": 68514080,
+          "qsa_context_bytes": 281149440,
+          "workspace_total_bytes": 23870984,
+          "workspace_terms": [
+            {
+              "name": "fp16_x",
+              "bytes": 15728640
+            },
+            {
+              "name": "ksplit_det",
+              "bytes": 3932160
+            },
+            {
+              "name": "int4_xq",
+              "bytes": 1105920
+            },
+            {
+              "name": "moe_group",
+              "bytes": 155648
+            },
+            {
+              "name": "down_i4q",
+              "bytes": 2764800
+            },
+            {
+              "name": "slab_tiles",
+              "bytes": 7680
+            },
+            {
+              "name": "slab_union",
+              "bytes": 7688
+            },
+            {
+              "name": "mq_fixed",
+              "bytes": 167424
+            },
+            {
+              "name": "gdn_dense_a",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_dense_ef",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_pair_counters",
+              "bytes": 1024
+            }
+          ],
+          "f16_weight_shadow_bytes": 1298923520,
+          "qsa_selector_bytes": 0,
+          "mtp_bytes": 0,
+          "gather_bytes": 0,
+          "runtime_bytes": 0,
+          "census_total_bytes": 2683690796,
+          "s1_placement_base_bytes": 2683690796,
+          "incumbent_historical_floor_bytes": 4688552320
+        },
+        "s1": {
+          "owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 470192384
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 0
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 414064640
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "owned_total_bytes": 2528910144,
+          "hc_arena_bytes": 414064640,
+          "hc_arena_tile_rows": 768,
+          "diagnostic_budget_bytes": 0,
+          "runtime_budget_bytes": 1073741824,
+          "s1_reserve_bytes": 3602651968
+        },
+        "safety_margin_bytes": 536870912,
+        "projection": {
+          "hip_total_bytes": 25753026560,
+          "free_bytes": 25713180672,
+          "non_expert_bytes": 5364055296,
+          "resident_expert_bytes": 13369344000,
+          "device_weights_bytes": 18733399296,
+          "device_core_bytes": 23946000236,
+          "device_owned_bytes": 23946000236,
+          "needed_at_ten_bytes": 25556612972,
+          "slack_at_ten_bytes": 156567700
+        }
+      },
+      {
+        "route": "Aggregate",
+        "purpose": "PrimitiveSelftest",
+        "tile_rows": 512,
+        "window_rows": 16384,
+        "page_count": 18,
+        "resident_layers": 10,
+        "base_census": {
+          "forward_bytes": 735014276,
+          "state_bytes": 68514080,
+          "qsa_context_bytes": 281149440,
+          "workspace_total_bytes": 15974664,
+          "workspace_terms": [
+            {
+              "name": "fp16_x",
+              "bytes": 10485760
+            },
+            {
+              "name": "ksplit_det",
+              "bytes": 2621440
+            },
+            {
+              "name": "int4_xq",
+              "bytes": 737280
+            },
+            {
+              "name": "moe_group",
+              "bytes": 104448
+            },
+            {
+              "name": "down_i4q",
+              "bytes": 1843200
+            },
+            {
+              "name": "slab_tiles",
+              "bytes": 6400
+            },
+            {
+              "name": "slab_union",
+              "bytes": 7688
+            },
+            {
+              "name": "mq_fixed",
+              "bytes": 167424
+            },
+            {
+              "name": "gdn_dense_a",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_dense_ef",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_pair_counters",
+              "bytes": 1024
+            }
+          ],
+          "f16_weight_shadow_bytes": 1298923520,
+          "qsa_selector_bytes": 0,
+          "mtp_bytes": 0,
+          "gather_bytes": 0,
+          "runtime_bytes": 0,
+          "census_total_bytes": 2399575980,
+          "s1_placement_base_bytes": 2399575980,
+          "incumbent_historical_floor_bytes": 4412333824
+        },
+        "s1": {
+          "owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 470192384
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 0
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 408821760
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "owned_total_bytes": 2523667264,
+          "hc_arena_bytes": 408821760,
+          "hc_arena_tile_rows": 512,
+          "diagnostic_budget_bytes": 217821184,
+          "runtime_budget_bytes": 1073741824,
+          "s1_reserve_bytes": 3815230272
+        },
+        "safety_margin_bytes": 536870912,
+        "projection": {
+          "hip_total_bytes": 25753026560,
+          "free_bytes": 25713180672,
+          "non_expert_bytes": 5364055296,
+          "resident_expert_bytes": 13369344000,
+          "device_weights_bytes": 18733399296,
+          "device_core_bytes": 23656642540,
+          "device_owned_bytes": 23874463724,
+          "needed_at_ten_bytes": 25485076460,
+          "slack_at_ten_bytes": 228104212
+        }
+      },
+      {
+        "route": "SlabIu4",
+        "purpose": "Product",
+        "tile_rows": 768,
+        "window_rows": 16384,
+        "page_count": 18,
+        "resident_layers": 10,
+        "base_census": {
+          "forward_bytes": 1011232772,
+          "state_bytes": 68514080,
+          "qsa_context_bytes": 281149440,
+          "workspace_total_bytes": 23870984,
+          "workspace_terms": [
+            {
+              "name": "fp16_x",
+              "bytes": 15728640
+            },
+            {
+              "name": "ksplit_det",
+              "bytes": 3932160
+            },
+            {
+              "name": "int4_xq",
+              "bytes": 1105920
+            },
+            {
+              "name": "moe_group",
+              "bytes": 155648
+            },
+            {
+              "name": "down_i4q",
+              "bytes": 2764800
+            },
+            {
+              "name": "slab_tiles",
+              "bytes": 7680
+            },
+            {
+              "name": "slab_union",
+              "bytes": 7688
+            },
+            {
+              "name": "mq_fixed",
+              "bytes": 167424
+            },
+            {
+              "name": "gdn_dense_a",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_dense_ef",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_pair_counters",
+              "bytes": 1024
+            }
+          ],
+          "f16_weight_shadow_bytes": 1298923520,
+          "qsa_selector_bytes": 0,
+          "mtp_bytes": 0,
+          "gather_bytes": 0,
+          "runtime_bytes": 0,
+          "census_total_bytes": 2683690796,
+          "s1_placement_base_bytes": 2683690796,
+          "incumbent_historical_floor_bytes": 4688552320
+        },
+        "s1": {
+          "owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 386072832
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 82575360
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 414064640
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "owned_total_bytes": 2527365952,
+          "hc_arena_bytes": 414064640,
+          "hc_arena_tile_rows": 768,
+          "diagnostic_budget_bytes": 0,
+          "runtime_budget_bytes": 1073741824,
+          "s1_reserve_bytes": 3601107776
+        },
+        "safety_margin_bytes": 536870912,
+        "projection": {
+          "hip_total_bytes": 25753026560,
+          "free_bytes": 25713180672,
+          "non_expert_bytes": 5364055296,
+          "resident_expert_bytes": 13369344000,
+          "device_weights_bytes": 18733399296,
+          "device_core_bytes": 23944456044,
+          "device_owned_bytes": 23944456044,
+          "needed_at_ten_bytes": 25555068780,
+          "slack_at_ten_bytes": 158111892
+        }
+      },
+      {
+        "route": "SlabIu4",
+        "purpose": "PrimitiveSelftest",
+        "tile_rows": 512,
+        "window_rows": 16384,
+        "page_count": 18,
+        "resident_layers": 10,
+        "base_census": {
+          "forward_bytes": 735014276,
+          "state_bytes": 68514080,
+          "qsa_context_bytes": 281149440,
+          "workspace_total_bytes": 15974664,
+          "workspace_terms": [
+            {
+              "name": "fp16_x",
+              "bytes": 10485760
+            },
+            {
+              "name": "ksplit_det",
+              "bytes": 2621440
+            },
+            {
+              "name": "int4_xq",
+              "bytes": 737280
+            },
+            {
+              "name": "moe_group",
+              "bytes": 104448
+            },
+            {
+              "name": "down_i4q",
+              "bytes": 1843200
+            },
+            {
+              "name": "slab_tiles",
+              "bytes": 6400
+            },
+            {
+              "name": "slab_union",
+              "bytes": 7688
+            },
+            {
+              "name": "mq_fixed",
+              "bytes": 167424
+            },
+            {
+              "name": "gdn_dense_a",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_dense_ef",
+              "bytes": 0
+            },
+            {
+              "name": "gdn_pair_counters",
+              "bytes": 1024
+            }
+          ],
+          "f16_weight_shadow_bytes": 1298923520,
+          "qsa_selector_bytes": 0,
+          "mtp_bytes": 0,
+          "gather_bytes": 0,
+          "runtime_bytes": 0,
+          "census_total_bytes": 2399575980,
+          "s1_placement_base_bytes": 2399575980,
+          "incumbent_historical_floor_bytes": 4412333824
+        },
+        "s1": {
+          "owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 386072832
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 82575360
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 408821760
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "owned_total_bytes": 2522123072,
+          "hc_arena_bytes": 408821760,
+          "hc_arena_tile_rows": 512,
+          "diagnostic_budget_bytes": 217821184,
+          "runtime_budget_bytes": 1073741824,
+          "s1_reserve_bytes": 3813686080
+        },
+        "safety_margin_bytes": 536870912,
+        "projection": {
+          "hip_total_bytes": 25753026560,
+          "free_bytes": 25713180672,
+          "non_expert_bytes": 5364055296,
+          "resident_expert_bytes": 13369344000,
+          "device_weights_bytes": 18733399296,
+          "device_core_bytes": 23655098348,
+          "device_owned_bytes": 23872919532,
+          "needed_at_ten_bytes": 25483532268,
+          "slack_at_ten_bytes": 229648404
+        }
+      }
+    ]
+  },
+  "census_role": "UNMODIFIED RAW GETTER FIXTURE: N10 payload-domain reference projections are counterfactual/no-init input data; canonical backing totals below are N9 post-init reference, never observed R5 allocation",
+  "admission_quote_records": [
+    {
+      "line": 811,
+      "record": {
+        "schema": "SLOWLINK_ADMISSION_QUOTE_R5",
+        "observation": "reference_pre_equals_post",
+        "purpose": "Product",
+        "tile_rows": 768,
+        "memory_basis": "post_initialization_actual",
+        "initialization_charged_via_free": true,
+        "memory": {
+          "pre_init_free_bytes": 25713180672,
+          "free_bytes": 25713180672,
+          "observed_initialization_bytes": 0,
+          "free_gained_after_initialization_bytes": 0
+        },
+        "non_expert_bytes": 5364055296,
+        "layer_payload_bytes": 1336934400,
+        "layer_granule_slack_bytes": 1048576,
+        "resident_layer_bytes": 1337982976,
+        "reserve_bytes": 6920786028,
+        "trunk_layers": 48,
+        "preferred_resident_layers": 10,
+        "selected_layers": 10,
+        "verdict": "admit 10",
+        "needed_bytes": 25664671084,
+        "slack_bytes": 48509588,
+        "next_layer_needed_bytes": 27002654060,
+        "next_layer_slack_bytes": -1289473388,
+        "base_deficit_bytes": 0,
+        "preferred_needed_bytes": 25664671084,
+        "preferred_slack_bytes": 48509588,
+        "preferred_deficit_bytes": 0,
+        "pre_init_domain_slack_at_selected_bytes": 48509588,
+        "device_snapshot_budget_bytes": 48509588,
+        "owner_terms": {
+          "base_reserve_bytes": 2683690796,
+          "safety_margin_bytes": 536870912,
+          "s1_owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 470192384
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 0
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 414064640
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "s1_owned_total_bytes": 2528910144,
+          "runtime_budget_bytes": 1073741824,
+          "diagnostic_budget_bytes": 0,
+          "s1_census_total_bytes": 3602651968,
+          "granule_terms": [
+            {
+              "name": "weight tensors",
+              "bytes": 10945280
+            },
+            {
+              "name": "F16 weight shadows",
+              "bytes": 1310720
+            },
+            {
+              "name": "forward scratch",
+              "bytes": 14801920
+            },
+            {
+              "name": "request state",
+              "bytes": 58785792
+            },
+            {
+              "name": "kernel workspace",
+              "bytes": 2740224
+            },
+            {
+              "name": "native MTP",
+              "bytes": 0
+            },
+            {
+              "name": "QSA workspace",
+              "bytes": 0
+            },
+            {
+              "name": "expert pages",
+              "bytes": 5234688
+            },
+            {
+              "name": "route region",
+              "bytes": 1666816
+            },
+            {
+              "name": "HC arena",
+              "bytes": 1171456
+            },
+            {
+              "name": "window scratch",
+              "bytes": 915456
+            },
+            {
+              "name": "boundary stages",
+              "bytes": 0
+            }
+          ],
+          "granule_total_bytes": 97572352,
+          "hc_arena_bytes": 414064640,
+          "page_count": 18
+        },
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        }
+      }
+    },
+    {
+      "line": 812,
+      "record": {
+        "schema": "SLOWLINK_ADMISSION_QUOTE_R5",
+        "observation": "actual_post_initialization",
+        "purpose": "Product",
+        "tile_rows": 768,
+        "memory_basis": "post_initialization_actual",
+        "initialization_charged_via_free": true,
+        "memory": {
+          "pre_init_free_bytes": 25713180672,
+          "free_bytes": 25560088576,
+          "observed_initialization_bytes": 153092096,
+          "free_gained_after_initialization_bytes": 0
+        },
+        "non_expert_bytes": 5364055296,
+        "layer_payload_bytes": 1336934400,
+        "layer_granule_slack_bytes": 1048576,
+        "resident_layer_bytes": 1337982976,
+        "reserve_bytes": 6920786028,
+        "trunk_layers": 48,
+        "preferred_resident_layers": 10,
+        "selected_layers": 9,
+        "verdict": "admit 9",
+        "needed_bytes": 24326688108,
+        "slack_bytes": 1233400468,
+        "next_layer_needed_bytes": 25664671084,
+        "next_layer_slack_bytes": -104582508,
+        "base_deficit_bytes": 0,
+        "preferred_needed_bytes": 25664671084,
+        "preferred_slack_bytes": -104582508,
+        "preferred_deficit_bytes": 104582508,
+        "pre_init_domain_slack_at_selected_bytes": 1386492564,
+        "device_snapshot_budget_bytes": 1233400468,
+        "owner_terms": {
+          "base_reserve_bytes": 2683690796,
+          "safety_margin_bytes": 536870912,
+          "s1_owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 470192384
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 0
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 414064640
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "s1_owned_total_bytes": 2528910144,
+          "runtime_budget_bytes": 1073741824,
+          "diagnostic_budget_bytes": 0,
+          "s1_census_total_bytes": 3602651968,
+          "granule_terms": [
+            {
+              "name": "weight tensors",
+              "bytes": 10945280
+            },
+            {
+              "name": "F16 weight shadows",
+              "bytes": 1310720
+            },
+            {
+              "name": "forward scratch",
+              "bytes": 14801920
+            },
+            {
+              "name": "request state",
+              "bytes": 58785792
+            },
+            {
+              "name": "kernel workspace",
+              "bytes": 2740224
+            },
+            {
+              "name": "native MTP",
+              "bytes": 0
+            },
+            {
+              "name": "QSA workspace",
+              "bytes": 0
+            },
+            {
+              "name": "expert pages",
+              "bytes": 5234688
+            },
+            {
+              "name": "route region",
+              "bytes": 1666816
+            },
+            {
+              "name": "HC arena",
+              "bytes": 1171456
+            },
+            {
+              "name": "window scratch",
+              "bytes": 915456
+            },
+            {
+              "name": "boundary stages",
+              "bytes": 0
+            }
+          ],
+          "granule_total_bytes": 97572352,
+          "hc_arena_bytes": 414064640,
+          "page_count": 18
+        },
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 9,
+            "host_layers": 40,
+            "host_owner_entries": 80,
+            "host_payload_bytes": 53477376000,
+            "host_owner_pad_bytes": 83886080,
+            "host_total_bytes": 53561262080
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        }
+      }
+    },
+    {
+      "line": 813,
+      "record": {
+        "schema": "SLOWLINK_ADMISSION_QUOTE_R5",
+        "observation": "reference_pre_equals_post",
+        "purpose": "PrimitiveSelftest",
+        "tile_rows": 512,
+        "memory_basis": "post_initialization_actual",
+        "initialization_charged_via_free": true,
+        "memory": {
+          "pre_init_free_bytes": 25713180672,
+          "free_bytes": 25713180672,
+          "observed_initialization_bytes": 0,
+          "free_gained_after_initialization_bytes": 0
+        },
+        "non_expert_bytes": 5364055296,
+        "layer_payload_bytes": 1336934400,
+        "layer_granule_slack_bytes": 1048576,
+        "resident_layer_bytes": 1337982976,
+        "reserve_bytes": 6855687404,
+        "trunk_layers": 48,
+        "preferred_resident_layers": 10,
+        "selected_layers": 10,
+        "verdict": "admit 10",
+        "needed_bytes": 25599572460,
+        "slack_bytes": 113608212,
+        "next_layer_needed_bytes": 26937555436,
+        "next_layer_slack_bytes": -1224374764,
+        "base_deficit_bytes": 0,
+        "preferred_needed_bytes": 25599572460,
+        "preferred_slack_bytes": 113608212,
+        "preferred_deficit_bytes": 0,
+        "pre_init_domain_slack_at_selected_bytes": 113608212,
+        "device_snapshot_budget_bytes": 113608212,
+        "owner_terms": {
+          "base_reserve_bytes": 2399575980,
+          "safety_margin_bytes": 536870912,
+          "s1_owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 470192384
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 0
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 408821760
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "s1_owned_total_bytes": 2523667264,
+          "runtime_budget_bytes": 1073741824,
+          "diagnostic_budget_bytes": 217821184,
+          "s1_census_total_bytes": 3815230272,
+          "granule_terms": [
+            {
+              "name": "weight tensors",
+              "bytes": 10945280
+            },
+            {
+              "name": "F16 weight shadows",
+              "bytes": 1310720
+            },
+            {
+              "name": "forward scratch",
+              "bytes": 23455744
+            },
+            {
+              "name": "request state",
+              "bytes": 58785792
+            },
+            {
+              "name": "kernel workspace",
+              "bytes": 1572864
+            },
+            {
+              "name": "native MTP",
+              "bytes": 0
+            },
+            {
+              "name": "QSA workspace",
+              "bytes": 0
+            },
+            {
+              "name": "expert pages",
+              "bytes": 5234688
+            },
+            {
+              "name": "route region",
+              "bytes": 1666816
+            },
+            {
+              "name": "HC arena",
+              "bytes": 122880
+            },
+            {
+              "name": "window scratch",
+              "bytes": 915456
+            },
+            {
+              "name": "boundary stages",
+              "bytes": 0
+            }
+          ],
+          "granule_total_bytes": 104010240,
+          "hc_arena_bytes": 408821760,
+          "page_count": 18
+        },
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        }
+      }
+    },
+    {
+      "line": 814,
+      "record": {
+        "schema": "SLOWLINK_ADMISSION_QUOTE_R5",
+        "observation": "actual_post_initialization",
+        "purpose": "PrimitiveSelftest",
+        "tile_rows": 512,
+        "memory_basis": "post_initialization_actual",
+        "initialization_charged_via_free": true,
+        "memory": {
+          "pre_init_free_bytes": 25713180672,
+          "free_bytes": 25560088576,
+          "observed_initialization_bytes": 153092096,
+          "free_gained_after_initialization_bytes": 0
+        },
+        "non_expert_bytes": 5364055296,
+        "layer_payload_bytes": 1336934400,
+        "layer_granule_slack_bytes": 1048576,
+        "resident_layer_bytes": 1337982976,
+        "reserve_bytes": 6855687404,
+        "trunk_layers": 48,
+        "preferred_resident_layers": 10,
+        "selected_layers": 9,
+        "verdict": "admit 9",
+        "needed_bytes": 24261589484,
+        "slack_bytes": 1298499092,
+        "next_layer_needed_bytes": 25599572460,
+        "next_layer_slack_bytes": -39483884,
+        "base_deficit_bytes": 0,
+        "preferred_needed_bytes": 25599572460,
+        "preferred_slack_bytes": -39483884,
+        "preferred_deficit_bytes": 39483884,
+        "pre_init_domain_slack_at_selected_bytes": 1451591188,
+        "device_snapshot_budget_bytes": 1298499092,
+        "owner_terms": {
+          "base_reserve_bytes": 2399575980,
+          "safety_margin_bytes": 536870912,
+          "s1_owned_terms": [
+            {
+              "name": "expert ring",
+              "bytes": 167206912
+            },
+            {
+              "name": "expert lookahead",
+              "bytes": 1337655296
+            },
+            {
+              "name": "route storage",
+              "bytes": 470192384
+            },
+            {
+              "name": "A4 sidecars",
+              "bytes": 0
+            },
+            {
+              "name": "group scatter",
+              "bytes": 3278848
+            },
+            {
+              "name": "HC arena",
+              "bytes": 408821760
+            },
+            {
+              "name": "boundary state",
+              "bytes": 136512064
+            }
+          ],
+          "s1_owned_total_bytes": 2523667264,
+          "runtime_budget_bytes": 1073741824,
+          "diagnostic_budget_bytes": 217821184,
+          "s1_census_total_bytes": 3815230272,
+          "granule_terms": [
+            {
+              "name": "weight tensors",
+              "bytes": 10945280
+            },
+            {
+              "name": "F16 weight shadows",
+              "bytes": 1310720
+            },
+            {
+              "name": "forward scratch",
+              "bytes": 23455744
+            },
+            {
+              "name": "request state",
+              "bytes": 58785792
+            },
+            {
+              "name": "kernel workspace",
+              "bytes": 1572864
+            },
+            {
+              "name": "native MTP",
+              "bytes": 0
+            },
+            {
+              "name": "QSA workspace",
+              "bytes": 0
+            },
+            {
+              "name": "expert pages",
+              "bytes": 5234688
+            },
+            {
+              "name": "route region",
+              "bytes": 1666816
+            },
+            {
+              "name": "HC arena",
+              "bytes": 122880
+            },
+            {
+              "name": "window scratch",
+              "bytes": 915456
+            },
+            {
+              "name": "boundary stages",
+              "bytes": 0
+            }
+          ],
+          "granule_total_bytes": 104010240,
+          "hc_arena_bytes": 408821760,
+          "page_count": 18
+        },
+        "host_owners": {
+          "weight_layers_with_experts": 49,
+          "selected": {
+            "resident_layers": 9,
+            "host_layers": 40,
+            "host_owner_entries": 80,
+            "host_payload_bytes": 53477376000,
+            "host_owner_pad_bytes": 83886080,
+            "host_total_bytes": 53561262080
+          },
+          "preferred": {
+            "resident_layers": 10,
+            "host_layers": 39,
+            "host_owner_entries": 78,
+            "host_payload_bytes": 52140441600,
+            "host_owner_pad_bytes": 81788928,
+            "host_total_bytes": 52222230528
+          }
+        }
+      }
+    }
+  ],
+  "canonical_observation": "actual_post_initialization",
+  "canonical_observation_role": "REFERENCE_INPUT_FROM_j1811; future hardware cells expose their own actual maximal-fits witness, not a fixed N9 target",
+  "physical_profiles": [
+    {
+      "route": "Aggregate",
+      "projection_role": "reference",
+      "purpose": "product",
+      "weights": {
+        "non_expert_backing_bytes": 5375000576,
+        "non_expert_payload_bytes": 5364055296,
+        "non_expert_backing_pad_bytes": 10945280,
+        "expert_layer_backing_bytes": 1337982976,
+        "expert_layer_payload_bytes": 1336934400,
+        "expert_layer_backing_pad_bytes": 1048576,
+        "resident_layers": 9,
+        "total_backing_bytes": 17416847360
+      },
+      "profile": {
+        "purpose": "product",
+        "tile_rows": 768,
+        "projection_role": "reference",
+        "resident_expert_layers": 9,
+        "window_rows": 16384,
+        "page_count": 18,
+        "device_weights_bytes": 17416847360,
+        "s1_tile_census_bytes": 2761329452,
+        "s1_tile_census_terms": [
+          {
+            "name": "forward_bytes",
+            "bytes": 1011232772
+          },
+          {
+            "name": "state_bytes",
+            "bytes": 68514080
+          },
+          {
+            "name": "qsa_context_bytes",
+            "bytes": 281149440
+          },
+          {
+            "name": "workspace_total_bytes",
+            "bytes": 23870984
+          },
+          {
+            "name": "f16_weight_shadow_bytes",
+            "bytes": 1298923520
+          },
+          {
+            "name": "qsa_selector_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "mtp_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "gather_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "runtime_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "allocation_backing_padding_bytes",
+            "bytes": 77638656
+          }
+        ],
+        "f16_shadow_cold_bound_bytes": 1298923520,
+        "s1_extras_bytes": 2537898560,
+        "s1_extras_terms": [
+          {
+            "name": "expert ring",
+            "bytes": 167206912
+          },
+          {
+            "name": "expert lookahead",
+            "bytes": 1337655296
+          },
+          {
+            "name": "route storage",
+            "bytes": 470192384
+          },
+          {
+            "name": "A4 sidecars",
+            "bytes": 0
+          },
+          {
+            "name": "group scatter",
+            "bytes": 3278848
+          },
+          {
+            "name": "HC arena",
+            "bytes": 414064640
+          },
+          {
+            "name": "boundary state",
+            "bytes": 136512064
+          },
+          {
+            "name": "allocation_backing_padding_bytes",
+            "bytes": 8988416
+          }
+        ],
+        "device_core_bytes": 22716075372,
+        "sequential_diag_bytes": 0,
+        "device_owned_bytes": 22716075372,
+        "runtime_budget_bytes": 1073741824,
+        "safety_margin_bytes": 536870912
+      },
+      "shared_quote_needed_bytes": 24326688108,
+      "shared_quote_slack_bytes": 1233400468,
+      "host_owners": {
+        "weight_layers_with_experts": 49,
+        "selected": {
+          "resident_layers": 9,
+          "host_layers": 40,
+          "host_owner_entries": 80,
+          "host_payload_bytes": 53477376000,
+          "host_owner_pad_bytes": 83886080,
+          "host_total_bytes": 53561262080
+        },
+        "preferred": {
+          "resident_layers": 10,
+          "host_layers": 39,
+          "host_owner_entries": 78,
+          "host_payload_bytes": 52140441600,
+          "host_owner_pad_bytes": 81788928,
+          "host_total_bytes": 52222230528
+        }
+      },
+      "host_census": {
+        "terms": [
+          {
+            "name": "pinned_expert_owners_bytes",
+            "bytes": 53477376000
+          },
+          {
+            "name": "host_map_owner_pad_bytes",
+            "bytes": 83886080
+          },
+          {
+            "name": "external_ple_row_decoded_staging_bytes",
+            "bytes": 83886080
+          },
+          {
+            "name": "ple_page_cache_bytes",
+            "bytes": 268435456
+          },
+          {
+            "name": "t_pinned_tables_bytes",
+            "bytes": 147456
+          },
+          {
+            "name": "max_sequential_diag_readback_d_bytes",
+            "bytes": 351518720
+          },
+          {
+            "name": "forward_ple_stage_bytes",
+            "bytes": 3932160
+          },
+          {
+            "name": "forward_token_stage_bytes",
+            "bytes": 3072
+          },
+          {
+            "name": "forward_mesh_token_stage_bytes",
+            "bytes": 3072
+          },
+          {
+            "name": "bounded_host_snapshot_cap_bytes",
+            "bytes": 2147483648
+          }
+        ],
+        "total_bytes": 56416671744
+      }
+    },
+    {
+      "route": "Aggregate",
+      "projection_role": "reference",
+      "purpose": "primitive_selftest",
+      "weights": {
+        "non_expert_backing_bytes": 5375000576,
+        "non_expert_payload_bytes": 5364055296,
+        "non_expert_backing_pad_bytes": 10945280,
+        "expert_layer_backing_bytes": 1337982976,
+        "expert_layer_payload_bytes": 1336934400,
+        "expert_layer_backing_pad_bytes": 1048576,
+        "resident_layers": 9,
+        "total_backing_bytes": 17416847360
+      },
+      "profile": {
+        "purpose": "primitive_selftest",
+        "tile_rows": 512,
+        "projection_role": "reference",
+        "resident_expert_layers": 9,
+        "window_rows": 16384,
+        "page_count": 18,
+        "device_weights_bytes": 17416847360,
+        "s1_tile_census_bytes": 2484701100,
+        "s1_tile_census_terms": [
+          {
+            "name": "forward_bytes",
+            "bytes": 735014276
+          },
+          {
+            "name": "state_bytes",
+            "bytes": 68514080
+          },
+          {
+            "name": "qsa_context_bytes",
+            "bytes": 281149440
+          },
+          {
+            "name": "workspace_total_bytes",
+            "bytes": 15974664
+          },
+          {
+            "name": "f16_weight_shadow_bytes",
+            "bytes": 1298923520
+          },
+          {
+            "name": "qsa_selector_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "mtp_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "gather_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "runtime_bytes",
+            "bytes": 0
+          },
+          {
+            "name": "allocation_backing_padding_bytes",
+            "bytes": 85125120
+          }
+        ],
+        "f16_shadow_cold_bound_bytes": 1298923520,
+        "s1_extras_bytes": 2531607104,
+        "s1_extras_terms": [
+          {
+            "name": "expert ring",
+            "bytes": 167206912
+          },
+          {
+            "name": "expert lookahead",
+            "bytes": 1337655296
+          },
+          {
+            "name": "route storage",
+            "bytes": 470192384
+          },
+          {
+            "name": "A4 sidecars",
+            "bytes": 0
+          },
+          {
+            "name": "group scatter",
+            "bytes": 3278848
+          },
+          {
+            "name": "HC arena",
+            "bytes": 408821760
+          },
+          {
+            "name": "boundary state",
+            "bytes": 136512064
+          },
+          {
+            "name": "allocation_backing_padding_bytes",
+            "bytes": 7939840
+          }
+        ],
+        "device_core_bytes": 22433155564,
+        "sequential_diag_bytes": 217821184,
+        "device_owned_bytes": 22650976748,
+        "runtime_budget_bytes": 1073741824,
+        "safety_margin_bytes": 536870912
+      },
+      "shared_quote_needed_bytes": 24261589484,
+      "shared_quote_slack_bytes": 1298499092,
+      "host_owners": {
+        "weight_layers_with_experts": 49,
+        "selected": {
+          "resident_layers": 9,
+          "host_layers": 40,
+          "host_owner_entries": 80,
+          "host_payload_bytes": 53477376000,
+          "host_owner_pad_bytes": 83886080,
+          "host_total_bytes": 53561262080
+        },
+        "preferred": {
+          "resident_layers": 10,
+          "host_layers": 39,
+          "host_owner_entries": 78,
+          "host_payload_bytes": 52140441600,
+          "host_owner_pad_bytes": 81788928,
+          "host_total_bytes": 52222230528
+        }
+      },
+      "host_census": {
+        "terms": [
+          {
+            "name": "pinned_expert_owners_bytes",
+            "bytes": 53477376000
+          },
+          {
+            "name": "host_map_owner_pad_bytes",
+            "bytes": 83886080
+          },
+          {
+            "name": "external_ple_row_decoded_staging_bytes",
+            "bytes": 83886080
+          },
+          {
+            "name": "ple_page_cache_bytes",
+            "bytes": 268435456
+          },
+          {
+            "name": "t_pinned_tables_bytes",
+            "bytes": 147456
+          },
+          {
+            "name": "max_sequential_diag_readback_d_bytes",
+            "bytes": 351518720
+          },
+          {
+            "name": "forward_ple_stage_bytes",
+            "bytes": 2621440
+          },
+          {
+            "name": "forward_token_stage_bytes",
+            "bytes": 2048
+          },
+          {
+            "name": "forward_mesh_token_stage_bytes",
+            "bytes": 2048
+          },
+          {
+            "name": "bounded_host_snapshot_cap_bytes",
+            "bytes": 2147483648
+          }
+        ],
+        "total_bytes": 56415358976
+      }
+    }
+  ],
+  "individual_owner_backing": {
+    "line": 823,
+    "record": [
+      {
+        "owner": "forward scratch + spec buffers",
+        "payload_bytes": 1011232772,
+        "individual_physical_bytes": 1026034692,
+        "packed_physical_bytes": 1012924416,
+        "recovered_vs_individual_bytes": 13110276,
+        "recovered_credit_vs_census_bytes": 13110276
+      },
+      {
+        "owner": "request state + snapshot mirror",
+        "payload_bytes": 349663520,
+        "individual_physical_bytes": 408449312,
+        "packed_physical_bytes": 350224384,
+        "recovered_vs_individual_bytes": 58224928,
+        "recovered_credit_vs_census_bytes": 58224928
+      },
+      {
+        "owner": "kernel workspace terms",
+        "payload_bytes": 23870984,
+        "individual_physical_bytes": 26611208,
+        "packed_physical_bytes": 25165824,
+        "recovered_vs_individual_bytes": 1445384,
+        "recovered_credit_vs_census_bytes": 1445384
+      },
+      {
+        "owner": "F16 shadows (291 owners, 256 B multiples)",
+        "payload_bytes": 1298923520,
+        "individual_physical_bytes": 1686110208,
+        "packed_physical_bytes": 1300234240,
+        "recovered_vs_individual_bytes": 385875968,
+        "recovered_credit_vs_census_bytes": 385875968
+      },
+      {
+        "owner": "resident non-expert weights (model-index)",
+        "payload_bytes": 5364055296,
+        "individual_physical_bytes": 5999795456,
+        "packed_physical_bytes": 5364514816,
+        "recovered_vs_individual_bytes": 635280640,
+        "recovered_credit_vs_census_bytes": 635280640
+      }
+    ]
+  },
+  "arena_backing_model": {
+    "kind": "named backing pads from the FRESH shared quote; queried-granule model, not per-allocation measurement",
+    "product_granule_terms": [
+      {
+        "name": "weight tensors",
+        "bytes": 10945280
+      },
+      {
+        "name": "F16 weight shadows",
+        "bytes": 1310720
+      },
+      {
+        "name": "forward scratch",
+        "bytes": 14801920
+      },
+      {
+        "name": "request state",
+        "bytes": 58785792
+      },
+      {
+        "name": "kernel workspace",
+        "bytes": 2740224
+      },
+      {
+        "name": "native MTP",
+        "bytes": 0
+      },
+      {
+        "name": "QSA workspace",
+        "bytes": 0
+      },
+      {
+        "name": "expert pages",
+        "bytes": 5234688
+      },
+      {
+        "name": "route region",
+        "bytes": 1666816
+      },
+      {
+        "name": "HC arena",
+        "bytes": 1171456
+      },
+      {
+        "name": "window scratch",
+        "bytes": 915456
+      },
+      {
+        "name": "boundary stages",
+        "bytes": 0
+      }
+    ],
+    "primitive_granule_terms": [
+      {
+        "name": "weight tensors",
+        "bytes": 10945280
+      },
+      {
+        "name": "F16 weight shadows",
+        "bytes": 1310720
+      },
+      {
+        "name": "forward scratch",
+        "bytes": 23455744
+      },
+      {
+        "name": "request state",
+        "bytes": 58785792
+      },
+      {
+        "name": "kernel workspace",
+        "bytes": 1572864
+      },
+      {
+        "name": "native MTP",
+        "bytes": 0
+      },
+      {
+        "name": "QSA workspace",
+        "bytes": 0
+      },
+      {
+        "name": "expert pages",
+        "bytes": 5234688
+      },
+      {
+        "name": "route region",
+        "bytes": 1666816
+      },
+      {
+        "name": "HC arena",
+        "bytes": 122880
+      },
+      {
+        "name": "window scratch",
+        "bytes": 915456
+      },
+      {
+        "name": "boundary stages",
+        "bytes": 0
+      }
+    ],
+    "unchanged_canonical_layout_reference": {
+      "source": {
+        "tip": "32c507c7b5cecab23cf6e14b001d4d87898c0416",
+        "tree": "83a3e87203e8af97ba6d1f97bb3712a69e2ff5bf",
+        "base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981"
+      },
+      "record": {
+        "measurement_kind": "Exact metadata-backed CPU arithmetic for proposed layout; no arena implementation or GPU recovery measurement",
+        "order": "Ascending UTF-8 bytewise tensor name; all fixture names are ASCII",
+        "alignment_bytes": 256,
+        "max_root_request_bytes": 675430400,
+        "weights": {
+          "roots": 9,
+          "requests": [
+            496640000,
+            675430400,
+            669773824,
+            670208512,
+            672281088,
+            669822720,
+            663380480,
+            663380480,
+            183149312
+          ],
+          "logical": 5364055296,
+          "packedExtent": 5364066816,
+          "backing": 5375000576,
+          "current_backing": 5999795456,
+          "recovery": 624794880
+        },
+        "shadows": {
+          "roots": 2,
+          "requests": [
+            672399360,
+            626524160
+          ],
+          "logical": 1298923520,
+          "packedExtent": 1298923520,
+          "backing": 1300234240,
+          "current_backing": 1686110208,
+          "recovery": 385875968
+        },
+        "combined_recovery_bytes": 1010670848,
+        "projected_frontier": [
+          {
+            "purpose": "Product",
+            "tile_rows": 1536,
+            "slack_at_ten_bytes": -826898412
+          },
+          {
+            "purpose": "Product",
+            "tile_rows": 1280,
+            "slack_at_ten_bytes": -551294060
+          },
+          {
+            "purpose": "Product",
+            "tile_rows": 1024,
+            "slack_at_ten_bytes": -242020588
+          },
+          {
+            "purpose": "Product",
+            "tile_rows": 768,
+            "slack_at_ten_bytes": 48509588
+          },
+          {
+            "purpose": "Product",
+            "tile_rows": 512,
+            "slack_at_ten_bytes": 331429396
+          },
+          {
+            "purpose": "PrimitiveSelftest",
+            "tile_rows": 1536,
+            "slack_at_ten_bytes": -1044719596
+          },
+          {
+            "purpose": "PrimitiveSelftest",
+            "tile_rows": 1280,
+            "slack_at_ten_bytes": -769115244
+          },
+          {
+            "purpose": "PrimitiveSelftest",
+            "tile_rows": 1024,
+            "slack_at_ten_bytes": -459841772
+          },
+          {
+            "purpose": "PrimitiveSelftest",
+            "tile_rows": 768,
+            "slack_at_ten_bytes": -169311596
+          },
+          {
+            "purpose": "PrimitiveSelftest",
+            "tile_rows": 512,
+            "slack_at_ten_bytes": 113608212
+          }
+        ],
+        "product_ledger": {
+          "logical_core_bytes": 23946000236,
+          "remaining_padding_bytes": 108058112,
+          "backing_core_bytes": 24054058348,
+          "runtime_allowance_bytes": 1073741824,
+          "safety_bytes": 536870912,
+          "preload_free_bytes": 25713180672,
+          "discretionary_slack_bytes": 48509588
+        }
+      },
+      "note": "Immutable R4 canonical root request/ordering reference only. Fresh quote emits the compact weight/shadow backing pads and exact current owner closure; no new physical recovery measurement claimed."
+    }
+  },
+  "host_fixed_owner_capacity_reference": {
+    "source": {
+      "tip": "32c507c7b5cecab23cf6e14b001d4d87898c0416",
+      "tree": "83a3e87203e8af97ba6d1f97bb3712a69e2ff5bf",
+      "base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981"
+    },
+    "note": "Only expert source ownership changes with selectedN. Remaining PLE/cache/staging/readback/snapshot capacity terms are unchanged owner-defined ceilings; current source41-command proof includes allocation_sizes, moe_runtime_allocation_sizes, fixed-state/native-MTP and cache tests. Snapshot2GiB cap includes every live/pending/deferred/parked/quarantined byte; pending ceiling not added again.",
+    "beta_mirrors": "UNCHANGED ff799626e gpu_forward.rs:3961-3985; four steady donor-restore mirrors plus last live construction Vec"
+  },
+  "initialization_evidence": {
+    "j1811": "Observed pre_load25,713,180,672 ->load_failed25,560,088,576; delta153,092,096. Charged through actualfree ONCE, never a constant tax.",
+    "j1855": "/home/kaden/qcal/release-0.4.3/slowlink-prefill/holds/COPY-PATH-R5-J1855-RESULT.json",
+    "j1855_scope": "Four pinned-only model-free raw HIP arms isolated146MiB at first stream/queue creation (before copy/event), synchronous copy initializes same state; no R5 model claim."
+  },
+  "arithmetic_assertion": "Each canonical profile owned+remaining-runtime+safety == the SAME Rust quote needed; free-needed == same quote slack. Weight, base and S1 padding are partitioned exactly once; no parallel placement policy."
+}
