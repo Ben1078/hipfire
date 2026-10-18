@@ -720,6 +720,10 @@ fn arena_family_evidence(
             "granule_padding_bytes": granule_padding,
         },
         "actual": {
+            "capacity_observed": allocated > 0,
+            "capacity_observed_roots": allocated,
+            "backing_model": "ceil(observed buf.size, queried allocation granule) per live root; a model, not a per-allocation physical measurement",
+            "physical_backing_measured": false,
             "state": state,
             "live_roots": allocated,
             "unallocated_roots": roots.saturating_sub(allocated),
@@ -752,7 +756,8 @@ fn arena_evidence(
             );
         }
         return (
-            json!({"present": false, "planned_is_actual": false, "arena_claim": false}),
+            json!({"present": false, "planned_is_actual": false, "capacity_observed": false,
+                   "physical_backing_measured": false, "recovery_measured": false, "arena_claim": false}),
             problems,
         );
     };
@@ -783,6 +788,9 @@ fn arena_evidence(
         "weights": weight_evidence,
         "f16_shadows": shadow_evidence,
         "planned_is_actual": false,
+        "backing_model": "ceil(root request, queried allocation granule) per root; capacity_observed is true only for live owners; the physical gate is the external sysfs and HIP minimum-free (512 MiB) measurement, not this census",
+        "physical_backing_measured": false,
+        "recovery_measured": false,
         "arena_claim": false,
     });
     (evidence, problems)
@@ -4148,6 +4156,21 @@ mod slowlink_receipt_tests {
         assert_ne!(shadows["planned"]["backing_bytes"], json!(0));
         assert_eq!(evidence["planned_is_actual"], json!(false));
         assert_eq!(evidence["arena_claim"], json!(false));
+        // Capacity is observed only for live owners; the backing is a model and
+        // nothing here is a physical or recovery measurement.
+        assert_eq!(weights["actual"]["capacity_observed"], json!(true));
+        assert_eq!(shadows["actual"]["capacity_observed"], json!(false));
+        assert_eq!(shadows["actual"]["capacity_observed_roots"], json!(0));
+        for family in ["weights", "f16_shadows"] {
+            assert_eq!(evidence[family]["actual"]["physical_backing_measured"], json!(false));
+            assert!(evidence[family]["actual"]["backing_model"].as_str().unwrap().contains("not a per-allocation physical"));
+        }
+        assert_eq!(evidence["physical_backing_measured"], json!(false));
+        assert_eq!(evidence["recovery_measured"], json!(false));
+        assert!(evidence["backing_model"].as_str().unwrap().contains("minimum-free"));
+        let (none, _) = arena_evidence(None, &[], &[]);
+        assert_eq!(none["capacity_observed"], json!(false));
+        assert_eq!(none["physical_backing_measured"], json!(false));
         // Additive payload / request / padding / backing chain for each family.
         for family in ["weights", "f16_shadows"] {
             let planned = &evidence[family]["planned"];
