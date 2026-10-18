@@ -2098,13 +2098,20 @@ fn load_qwen4_rank_scoped(
     // before any allocation: the probe-free checks first, the host link only
     // for a load that passes them, then the joint placement at the purpose's
     // tile (`AdmissionPurpose::Product`: the 768-row tile, prompt arena, expert
-    // page store, panel scratch, boundary state) which must still keep ten
-    // layers resident. Every other load keeps today's placement,
-    // reserve and log byte for byte (zero S1 charge).
+    // page store, panel scratch, boundary state), keeping the LARGEST resident
+    // layer count that fits the post-initialization free memory (ten is only
+    // the preferred count, never a floor; zero is valid when the base fits).
+    // Every other load keeps today's placement, reserve and log byte for byte
+    // (zero S1 charge).
     let slowlink_mode = hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env();
     // Construct one immutable plan only inside the selector's lazy facts
     // closure. The same plan is charged below and handed to fulfillment.
     let mut slowlink_weight_arenas = None;
+    // Device free memory sampled immediately before the host-link
+    // initialization, ONLY once the selector has decided to probe the link
+    // (so a default-off, fast, unified or unmeasured load queries nothing).
+    // The admission's own free sample is taken after the initialization.
+    let slowlink_pre_init_free = std::cell::Cell::new(None::<u64>);
     let slowlink_profile = {
         use hipfire_arch_qwen4::slowlink_admission as s1;
         let chunk_rows_env = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS").ok();
@@ -2138,7 +2145,15 @@ fn load_qwen4_rank_scoped(
         s1::select_load_profile(
             slowlink_mode,
             &shape,
-            || hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu),
+            || {
+                slowlink_pre_init_free.set(
+                    ctx.gpu
+                        .device_mem_info()
+                        .ok()
+                        .map(|(free, _)| free as u64),
+                );
+                hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu)
+            },
             || {
                 let load = s1::SingleDeviceLoad {
                     gpu: &*ctx.gpu,
@@ -2161,7 +2176,11 @@ fn load_qwen4_rank_scoped(
                     purpose: s1::AdmissionPurpose::Product,
                 };
                 let arenas = s1::single_device_arena_plan(&load)?;
-                let facts = s1::single_device_facts_with_arenas(&load, &arenas)?;
+                let facts = s1::single_device_facts_with_arenas(
+                    &load,
+                    &arenas,
+                    slowlink_pre_init_free.get(),
+                )?;
                 slowlink_weight_arenas = Some(arenas);
                 Ok(facts)
             },
@@ -2589,11 +2608,12 @@ fn load_qwen4_rank_scoped(
             }
         };
         if let Some(profile) = &slowlink_profile {
-            // The admitted joint plan kept at least ten layers; the placement
-            // just resolved from the same inputs must agree, or the load stops
-            // before anything is placed.
+            // The admitted joint plan selected its maximal-fitting resident
+            // count (ten is only preferred, never a floor); the placement just
+            // resolved from the same post-initialization inputs must keep
+            // EXACTLY that count, or the load stops before anything is placed.
             let kept = vram_layers.min(config.num_hidden_layers);
-            if kept < hipfire_arch_qwen4::slowlink_admission::S1_MIN_RESIDENT_LAYERS {
+            if kept != profile.resident_layers {
                 return Err(format!(
                     "qwen4: slow-link prefill (S1) was admitted at {} resident layers but the placement kept {kept}; free GPU memory or set {}=0",
                     profile.resident_layers,
@@ -7597,9 +7617,19 @@ mod qwen4_slowlink_tests {
     }
 
     fn inputs(free: u64, link_gbps: f64) -> s1::AdmissionInputs {
+        inputs_with_memory(
+            s1::AdmissionMemory {
+                pre_init_free_bytes: None,
+                free_bytes: free,
+            },
+            link_gbps,
+        )
+    }
+
+    fn inputs_with_memory(memory: s1::AdmissionMemory, link_gbps: f64) -> s1::AdmissionInputs {
         s1::AdmissionInputs {
             geometry: geometry(),
-            free,
+            memory,
             non_expert: NON_EXPERT,
             layer_expert_bytes: LAYER,
             gate_up_layer_bytes: 512 * 1_740_800,
@@ -7628,6 +7658,25 @@ mod qwen4_slowlink_tests {
         link: HostLink,
         free: u64,
     ) -> (u32, u32, Result<Option<s1::SlowlinkProfile>, String>) {
+        select_memory(
+            mode,
+            arch,
+            link,
+            s1::AdmissionMemory {
+                pre_init_free_bytes: None,
+                free_bytes: free,
+            },
+        )
+    }
+
+    /// [`select`] from an explicit memory observation (the optional sample
+    /// before the link initialization and the actual one after it).
+    fn select_memory(
+        mode: s1::SlowlinkMode,
+        arch: &str,
+        link: HostLink,
+        memory: s1::AdmissionMemory,
+    ) -> (u32, u32, Result<Option<s1::SlowlinkProfile>, String>) {
         let (probes, builds) = (Cell::new(0), Cell::new(0));
         let outcome = s1::select_profile(
             mode,
@@ -7638,7 +7687,7 @@ mod qwen4_slowlink_tests {
             },
             |gbps| {
                 builds.set(builds.get() + 1);
-                Ok(inputs(free, gbps))
+                Ok(inputs_with_memory(memory, gbps))
             },
         );
         (probes.get(), builds.get(), outcome)
@@ -7693,6 +7742,8 @@ mod qwen4_slowlink_tests {
             let profile = outcome.unwrap();
             assert_eq!(profile.is_some(), selected, "{link:?}");
             if let Some(profile) = profile {
+                // `free_for(10)` keeps exactly ten, so ten is also the maximal fit
+                // (the count is chosen by fit; ten is only the preferred count).
                 assert_eq!(profile.resident_layers, 10);
                 assert_eq!(profile.tile_rows, s1::S1_PRODUCT_TILE_ROWS);
                 assert_eq!(profile.purpose, s1::AdmissionPurpose::Product);
@@ -7700,14 +7751,47 @@ mod qwen4_slowlink_tests {
         }
     }
 
+    /// The resident count is the LARGEST that fits (never a floor): zero is a
+    /// valid fit when the base fits, nine and ten are plain data, eleven is
+    /// admitted when the free memory keeps it.
     #[test]
-    fn slowlink_forced_deficit_fails_the_load_with_the_exact_bytes() {
-        let nine = free_for(9);
+    fn slowlink_forced_admission_keeps_the_maximal_fitting_resident_count() {
+        for layers in [0u64, 1, 9, 10, 11] {
+            let (_, builds, outcome) = select(
+                s1::SlowlinkMode::Force,
+                "gfx1100",
+                HostLink::Discrete { gbps: 7.09 },
+                free_for(layers),
+            );
+            assert_eq!(builds, 1);
+            let profile = outcome.unwrap().expect("a fitting load is admitted");
+            assert_eq!(profile.resident_layers as u64, layers, "{layers}");
+            // One byte above the layer boundary is the whole discretionary slack.
+            assert_eq!(profile.device_snapshot_budget_bytes, 1, "{layers}");
+        }
+        // One byte less than layer `n` keeps `n - 1` with the rest as slack.
+        for layers in [1u64, 10] {
+            let (_, _, outcome) = select(
+                s1::SlowlinkMode::Force,
+                "gfx1100",
+                HostLink::Discrete { gbps: 7.09 },
+                free_for(layers) - 2,
+            );
+            let profile = outcome.unwrap().expect("a fitting load is admitted");
+            assert_eq!(profile.resident_layers as u64, layers - 1, "{layers}");
+            assert_eq!(profile.device_snapshot_budget_bytes, LAYER - 1, "{layers}");
+        }
+    }
+
+    /// A base that does not fit is a forced capacity refusal naming the
+    /// selector, distinct from the valid zero-resident fit above.
+    #[test]
+    fn slowlink_forced_base_deficit_fails_the_load_not_a_zero_resident_fit() {
         let (_, builds, outcome) = select(
             s1::SlowlinkMode::Force,
             "gfx1100",
             HostLink::Discrete { gbps: 7.09 },
-            nine,
+            free_for(0) - 2,
         );
         assert_eq!(builds, 1);
         let error = outcome.unwrap_err();
@@ -7715,8 +7799,47 @@ mod qwen4_slowlink_tests {
             error.contains("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1"),
             "{error}"
         );
-        assert!(error.contains("keeps 9 of the required 10"), "{error}");
-        assert!(error.contains(&(LAYER - 1).to_string()), "{error}");
+    }
+
+    /// The measured initialization loss reaches admission only through the
+    /// actual free sample taken after it: the same pre-initialization free
+    /// keeps ten with no loss and nine after the j1811 measured 153,092,096 B
+    /// interval. No tax is assumed and no sample is invented when unknown.
+    #[test]
+    fn slowlink_admission_charges_the_measured_initialization_loss_once() {
+        const MEASURED_LOSS: u64 = 25_713_180_672 - 25_560_088_576;
+        assert_eq!(MEASURED_LOSS, 153_092_096);
+        let before = free_for(10);
+        let link = HostLink::Discrete { gbps: 7.09 };
+        let admit = |memory| {
+            select_memory(s1::SlowlinkMode::Force, "gfx1100", link, memory)
+                .2
+                .unwrap()
+                .expect("admitted")
+        };
+        let same = admit(s1::AdmissionMemory {
+            pre_init_free_bytes: Some(before),
+            free_bytes: before,
+        });
+        assert_eq!(same.resident_layers, 10);
+        assert_eq!(same.placement.memory.observed_initialization_bytes(), Some(0));
+        let lost = admit(s1::AdmissionMemory {
+            pre_init_free_bytes: Some(before),
+            free_bytes: before - MEASURED_LOSS,
+        });
+        assert_eq!(lost.resident_layers, 9);
+        assert_eq!(
+            lost.placement.memory.observed_initialization_bytes(),
+            Some(MEASURED_LOSS)
+        );
+        // Charged once: slack is the actual free minus the nine-layer need.
+        assert_eq!(lost.device_snapshot_budget_bytes, LAYER + 1 - MEASURED_LOSS);
+        let unknown = admit(s1::AdmissionMemory {
+            pre_init_free_bytes: None,
+            free_bytes: before - MEASURED_LOSS,
+        });
+        assert_eq!(unknown.resident_layers, 9);
+        assert_eq!(unknown.placement.memory.observed_initialization_bytes(), None);
     }
 
     #[test]

@@ -263,13 +263,27 @@ fn load_inner(
             scratch_mode,
             purpose,
         };
+        // Device free memory just before the host-link initialization, sampled
+        // ONLY when the selector decides to probe the link (a default-off,
+        // fast, unified or unmeasured load queries nothing); the admission's
+        // own free sample is taken after that initialization.
+        let pre_init_free = std::cell::Cell::new(None::<u64>);
         let profile = s1::select_load_profile(
             s1::SlowlinkMode::from_env(),
             &shape,
-            || crate::host_link::host_link(load.gpu),
+            || {
+                pre_init_free.set(
+                    load.gpu
+                        .device_mem_info()
+                        .ok()
+                        .map(|(free, _)| free as u64),
+                );
+                crate::host_link::host_link(load.gpu)
+            },
             || {
                 let arenas = s1::single_device_arena_plan(&load)?;
-                let facts = s1::single_device_facts_with_arenas(&load, &arenas)?;
+                let facts =
+                    s1::single_device_facts_with_arenas(&load, &arenas, pre_init_free.get())?;
                 weight_arenas = Some(arenas);
                 Ok(facts)
             },

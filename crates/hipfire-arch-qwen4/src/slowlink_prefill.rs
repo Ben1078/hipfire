@@ -3928,7 +3928,10 @@ mod slowlink_prompt {
             ModelGeometry::from_config(&crate::config::compact_test_config(), route).unwrap();
         AdmissionInputs {
             geometry,
-            free: 40 << 30,
+            memory: crate::slowlink_admission::AdmissionMemory {
+                pre_init_free_bytes: None,
+                free_bytes: 40 << 30,
+            },
             non_expert: 5_364_000_000,
             layer_expert_bytes: GATE_UP_LAYER + DOWN_LAYER,
             gate_up_layer_bytes: GATE_UP_LAYER,
@@ -5449,6 +5452,103 @@ mod slowlink_prompt {
             }
         }
     }
+
+    /// ACTUAL fixture admission inputs with exactly `free` actual free bytes.
+    fn adaptive_inputs(
+        route: dsp::WindowRoute,
+        purpose: AdmissionPurpose,
+        free: u64,
+    ) -> AdmissionInputs {
+        let mut inputs = fixture_inputs(route, purpose, 0, 0);
+        inputs.memory = crate::slowlink_admission::AdmissionMemory {
+            pre_init_free_bytes: None,
+            free_bytes: free,
+        };
+        inputs
+    }
+
+    /// Bytes the shared quote needs to keep `layers` resident (the same
+    /// function `admit`, the frontier and the projection use).
+    fn adaptive_needed(route: dsp::WindowRoute, purpose: AdmissionPurpose, layers: usize) -> u64 {
+        let inputs = fixture_inputs(route, purpose, 0, 0);
+        let projection = crate::slowlink_admission::project_at_tile(&inputs, tile_of(purpose))
+            .expect("the fixture projects at its purpose's tile");
+        u64::try_from(projection.budget.needed_bytes_for(layers)).unwrap()
+    }
+
+    fn tile_of(purpose: AdmissionPurpose) -> usize {
+        crate::slowlink_admission::purpose_tile_rows(purpose)
+    }
+
+    /// CPU proof of the adaptive admission over the zero, nine and ten
+    /// resident schedules, for both purposes on both routes: the count is the
+    /// LARGEST that fits (no invented floor, ten is just data), a base that
+    /// does not fit is a capacity refusal distinct from the valid zero-resident
+    /// fit, an all-resident fit keeps the no-host bypass, the snapshot
+    /// allowance is exactly the surplus, and the prompt plan (tiles, windows,
+    /// cuts, retained checkpoint cadence) is the SAME whatever the count.
+    #[test]
+    fn slowlink_prompt_adaptive_zero_nine_ten_resident_keep_one_plan_and_exact_boundaries() {
+        use crate::slowlink_admission::SlowlinkDecline;
+        let cuts = [3, 4, 1536, 1537, 8192, 9000];
+        for route in BOTH_ROUTES {
+            for purpose in [
+                AdmissionPurpose::Product,
+                AdmissionPurpose::PrimitiveSelftest,
+            ] {
+                let need = |layers| adaptive_needed(route, purpose, layers);
+                let admit_free = |free| admit(&adaptive_inputs(route, purpose, free));
+                let layer_cost = need(1) - need(0);
+                // Base does not fit by one byte: refused with the exact
+                // capacity decline, never admitted as zero resident.
+                let refusal = admit_free(need(0) - 1).unwrap_err();
+                assert!(refusal.is_capacity(), "{route:?}/{purpose:?}: {refusal:?}");
+                let mut shared: Option<(usize, usize, Vec<WindowPlan>, Vec<usize>, Vec<usize>)> =
+                    None;
+                for layers in [0usize, 9, 10] {
+                    let exact = admit_free(need(layers)).unwrap();
+                    assert_eq!(exact.resident_layers, layers, "{route:?}/{purpose:?}");
+                    assert_eq!(exact.tile_rows, tile_of(purpose));
+                    assert_eq!(exact.purpose, purpose);
+                    assert_eq!(exact.device_snapshot_budget_bytes, 0);
+                    let spare = admit_free(need(layers) + 12_345).unwrap();
+                    assert_eq!(spare.resident_layers, layers);
+                    assert_eq!(spare.device_snapshot_budget_bytes, 12_345);
+                    if layers > 0 {
+                        let short = admit_free(need(layers) - 1).unwrap();
+                        assert_eq!(short.resident_layers, layers - 1);
+                        assert_eq!(short.device_snapshot_budget_bytes, layer_cost - 1);
+                    }
+                    let plan = plan_for_profile(&exact, 0, 40000, &cuts, &gfx1100_routing, 8)
+                        .unwrap()
+                        .expect("a qualified request plans");
+                    assert_chronology(&plan);
+                    let tiles: Vec<usize> = plan.tiles.iter().map(|tile| tile.rows).collect();
+                    let summary = (
+                        exact.checkpoint_stride_rows,
+                        exact.window_rows,
+                        plan.windows.clone(),
+                        plan.launch_cuts(),
+                        tiles,
+                    );
+                    assert_eq!(summary.0, 8192, "the retained snapshot cadence is unchanged");
+                    match &shared {
+                        None => shared = Some(summary),
+                        Some(first) => assert_eq!(
+                            first, &summary,
+                            "{route:?}/{purpose:?}: {layers} resident changes the prompt plan"
+                        ),
+                    }
+                }
+                // Every routed layer fitting is the no-host bypass, not an S1 profile.
+                assert!(matches!(
+                    admit_free(need(48)),
+                    Err(SlowlinkDecline::NoHostLayers { .. })
+                ));
+                assert_eq!(admit_free(need(47)).unwrap().resident_layers, 47);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5924,6 +6024,106 @@ mod slowlink_overlap {
         assert!(schedule.layer_groups(11).is_none());
         assert!(schedule.layer_groups(3).is_none());
         assert_eq!(schedule.layer_groups(10).unwrap().len(), 16);
+    }
+
+    /// CPU proof of the adaptive resident counts. Admission keeps the LARGEST
+    /// count that fits (ten is only preferred), so a window may stream all 48
+    /// routed layers (zero resident), 39 (nine resident) or 38 (ten resident).
+    /// The schedule, ring and walker never assume a resident prefix: the first
+    /// host layer is whichever layer follows the resident ones, its whole
+    /// payload is primed before any compute, every host layer is submitted
+    /// exactly once per window, and the next window restarts the same way.
+    #[test]
+    fn slowlink_overlap_adaptive_resident_counts_schedule_every_host_layer_once() {
+        const TRUNK: usize = 48;
+        let (_one_arena, _one_core, one) = fixture(&[0]);
+        let layer_bytes = one.sweep_bytes();
+        assert!(layer_bytes > 0);
+        for resident in [0usize, 9, 10] {
+            let host: Vec<usize> = (resident..TRUNK).collect();
+            let (_arena, mut core, mut schedule) = fixture(&host);
+            assert_eq!(
+                schedule.sweep_bytes(),
+                host.len() as u64 * layer_bytes,
+                "{resident} resident: one sweep is every host layer, nothing else"
+            );
+            for layer in 0..TRUNK {
+                assert_eq!(
+                    schedule.layer_groups(layer).is_some(),
+                    layer >= resident,
+                    "{resident} resident: layer {layer}"
+                );
+            }
+            for window in 0..2u64 {
+                let acquires_before = core
+                    .model_events()
+                    .iter()
+                    .filter(|event| matches!(event, Ev::Acquire { .. }))
+                    .count();
+                assert_eq!(
+                    schedule.prime(&mut core, &()).unwrap(),
+                    16,
+                    "{resident} resident: the whole first host layer fits the page store"
+                );
+                assert_eq!(
+                    core.model_events()
+                        .iter()
+                        .filter(|event| matches!(event, Ev::Acquire { .. }))
+                        .count(),
+                    acquires_before,
+                    "{resident} resident: priming reads no page"
+                );
+                assert!(
+                    (0..16).all(|group| schedule.ticket(resident, group).is_some()),
+                    "{resident} resident: layer {resident} is the first host layer"
+                );
+                assert!(schedule.ticket(resident + 1, 0).is_none());
+                // Resident layers only pump: the full lookahead is already queued.
+                for _ in 0..resident {
+                    assert_eq!(schedule.pump(&mut core, &()).unwrap(), 0);
+                }
+                let mut seen: Vec<(usize, usize)> = Vec::new();
+                for layer in resident..TRUNK {
+                    schedule.enter_layer(&mut core, &(), layer).unwrap();
+                    let work = work(&schedule, layer, |index| index % 3 != 0);
+                    let summary = walk_layer_groups(
+                        &mut CoreRing {
+                            core: &mut core,
+                            schedule: &mut schedule,
+                        },
+                        &mut (),
+                        layer,
+                        &work,
+                        &mut |_, index, parts| {
+                            assert!(parts.is_none(), "the model has no device binding");
+                            seen.push((layer, index));
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(summary.acquired + summary.discarded, 16);
+                }
+                let mut sorted = seen.clone();
+                sorted.sort_unstable();
+                assert_eq!(seen, sorted, "{resident} resident: ascending layer, group");
+                assert_eq!(seen.len(), host.len() * 10);
+                let stats = core.stats();
+                assert_eq!(stats.enqueued as usize, host.len() * 16, "{resident}");
+                assert_eq!(stats.retired as usize, host.len() * 16, "{resident}");
+                assert_eq!(stats.acquired as usize, host.len() * 10, "{resident}");
+                assert_eq!(stats.discarded as usize, host.len() * 6, "{resident}");
+                assert_eq!(stats.submitted_payload_bytes, schedule.sweep_bytes());
+                assert_eq!(
+                    core.model_payload(),
+                    (window + 1) * schedule.sweep_bytes(),
+                    "{resident} resident: no refetch, one sweep per window"
+                );
+                core.drain(&()).unwrap();
+            }
+            // Compute can never enter a layer the schedule does not hold: a
+            // resident layer is not a host layer, whatever the count.
+            assert!(schedule.enter_layer(&mut core, &(), TRUNK).is_err());
+        }
     }
 
     trait ModelView {
