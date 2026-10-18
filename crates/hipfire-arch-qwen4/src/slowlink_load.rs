@@ -263,10 +263,13 @@ fn load_inner(
             scratch_mode,
             purpose,
         };
-        // Device free memory just before the host-link initialization, sampled
-        // ONLY when the selector decides to probe the link (a default-off,
-        // fast, unified or unmeasured load queries nothing); the admission's
-        // own free sample is taken after that initialization.
+        // Device free memory just before the host-link initialization. The
+        // selector runs the link closure only after its probe-free
+        // preconditions pass (default-off, UMA and other ineligible loads never
+        // reach it), so those query nothing; an eligible load pays ONE
+        // `hipMemGetInfo` here even when the link then measures fast or fails
+        // to measure (the class is unknown until the probe runs). The
+        // admission's own free sample is taken after that initialization.
         let pre_init_free = std::cell::Cell::new(None::<u64>);
         let profile = s1::select_load_profile(
             s1::SlowlinkMode::from_env(),

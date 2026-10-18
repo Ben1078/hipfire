@@ -2108,9 +2108,12 @@ fn load_qwen4_rank_scoped(
     // closure. The same plan is charged below and handed to fulfillment.
     let mut slowlink_weight_arenas = None;
     // Device free memory sampled immediately before the host-link
-    // initialization, ONLY once the selector has decided to probe the link
-    // (so a default-off, fast, unified or unmeasured load queries nothing).
-    // The admission's own free sample is taken after the initialization.
+    // initialization. The selector runs the link closure only after its
+    // probe-free preconditions pass (default-off, UMA and other ineligible
+    // loads never reach it), so those query nothing; an eligible load pays ONE
+    // `hipMemGetInfo` here even when the link then measures fast or fails to
+    // measure (the class is unknown until the probe runs). The admission's own
+    // free sample is taken after the initialization.
     let slowlink_pre_init_free = std::cell::Cell::new(None::<u64>);
     let slowlink_profile = {
         use hipfire_arch_qwen4::slowlink_admission as s1;
