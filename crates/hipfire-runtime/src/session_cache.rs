@@ -55,11 +55,25 @@
 //! promotes them back. The parent of a device or pending snapshot is always
 //! on the device (I1); the parent of a disk snapshot is on the device or on
 //! disk (I2), so a chain's disk links are a suffix.
+//!
+//! Under [`SessionCache::enable_pressure_host_snapshots`] (opt-in, off by
+//! default) a capture chooses its tier by pressure: device memory only when
+//! the memory guard (keeping the product safety margin) and the policy's
+//! TOTAL device budget both permit, else directly owned pinned host memory
+//! ([`PressureHostSnapshotPolicy`]). A host snapshot is captured straight
+//! from the borrowed live parts into its final allocation (never through a
+//! device clone) and restored straight back into the live parts. The host
+//! budget bounds every pinned owner (published, pending, resident, deferred,
+//! parked), published host snapshots are evicted normally (dropped, never
+//! demoted), and a device snapshot whose parent lives on the host is never
+//! demoted to disk (the disk tier's parent invariant, I2, names the device
+//! and disk tiers only).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use hip_bridge::DeviceBuffer;
+use hip_bridge::{DeviceBuffer, HostAllocOwner};
 use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
 use rdna_compute::Gpu;
 
@@ -76,6 +90,14 @@ const PART_ALIGN: usize = 256;
 /// from host RAM instead ([`uma_headroom`]): an overshoot can reach the
 /// global OOM killer, so it keeps more.
 const VRAM_HEADROOM: u64 = 256 << 20;
+/// Free device bytes every device allocation of a cache under a
+/// [`PressureHostSnapshotPolicy`] leaves untouched: the product's 512 MiB
+/// safety margin. The cache's own guard headroom is the larger of this and
+/// [`VRAM_HEADROOM`] (or the unified-memory headroom).
+const POLICY_DEVICE_SAFETY: u64 = 512 << 20;
+/// `hipHostMallocPortable`, the flag `HipRuntime::host_buffer` allocates its
+/// pinned stages with.
+const HOST_PORTABLE: u32 = 1;
 
 /// Which decode route the snapshot serves. Routes own different state (MTP
 /// adds the draft head), so their snapshots never alias.
@@ -192,11 +214,80 @@ pub trait SessionState {
 }
 
 /// Where a snapshot's bytes live: device memory (VRAM, or system RAM on
-/// UMA), or one file of the disk tier, `file_bytes` long (header plus
-/// payload, what the disk budget counts).
+/// UMA), pinned host memory (the opt-in pressure tier), or one file of the
+/// disk tier, `file_bytes` long (header plus payload, what the disk budget
+/// counts).
 enum SnapshotLocation {
     Device(DeviceBuffer),
+    Host(HostBlock),
     Disk { path: PathBuf, file_bytes: u64 },
+}
+
+/// The memory behind one [`HostBlock`].
+enum HostMem {
+    /// A real `hipHostMalloc` allocation: freed once by its owner's last drop.
+    Pinned(HostAllocOwner),
+    /// CPU tests only: counts its single release.
+    #[cfg(test)]
+    Fake(FakeHost),
+}
+
+#[cfg(test)]
+struct FakeHost {
+    bytes: Vec<u8>,
+    drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for FakeHost {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Sole owner of one pinned host allocation of `bytes`. Every transfer that
+/// touches it drains the stream it was queued on before returning; a drain
+/// that fails flags the block `undrained`, and an undrained block is leaked
+/// (quarantined for the process lifetime) instead of freed, so memory with an
+/// outstanding GPU user is never released.
+struct HostBlock {
+    mem: Option<HostMem>,
+    bytes: usize,
+    undrained: AtomicBool,
+}
+
+impl HostBlock {
+    fn new(mem: HostMem, bytes: usize) -> Self {
+        Self {
+            mem: Some(mem),
+            bytes,
+            undrained: AtomicBool::new(false),
+        }
+    }
+
+    /// First byte of the allocation.
+    fn ptr(&self) -> *mut u8 {
+        match self.mem.as_ref().expect("host block memory is live") {
+            HostMem::Pinned(owner) => owner.host_ptr() as *mut u8,
+            #[cfg(test)]
+            HostMem::Fake(fake) => fake.bytes.as_ptr() as *mut u8,
+        }
+    }
+
+    /// A transfer on this block may still be in flight: never free it.
+    fn mark_undrained(&self) {
+        self.undrained.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for HostBlock {
+    fn drop(&mut self) {
+        if self.undrained.load(Ordering::Acquire) {
+            if let Some(mem) = self.mem.take() {
+                std::mem::forget(mem);
+            }
+        }
+    }
 }
 
 /// `(scoped domain, boundary, prefix fingerprint)`, the pool's key.
@@ -263,12 +354,21 @@ impl StoredSnapshot {
         )
         .0
     }
+
+    /// The device or host memory this snapshot owns; a disk snapshot owns none.
+    fn into_store(self) -> Option<Store> {
+        match self.location {
+            SnapshotLocation::Device(buf) => Some(Store::Device(buf)),
+            SnapshotLocation::Host(block) => Some(Store::Host(block)),
+            SnapshotLocation::Disk { .. } => None,
+        }
+    }
 }
 
 impl CheckpointBlob for StoredSnapshot {
     fn bytes_len(&self) -> u64 {
         match self.location {
-            SnapshotLocation::Device(_) => self.bytes,
+            SnapshotLocation::Device(_) | SnapshotLocation::Host(_) => self.bytes,
             SnapshotLocation::Disk { file_bytes, .. } => file_bytes,
         }
     }
@@ -292,7 +392,7 @@ struct Turn {
 /// still hold its `rows`, so a restore copies the fixed parts only.
 struct Resident {
     key: Key,
-    buf: DeviceBuffer,
+    buf: Store,
     fixed_bytes: Vec<usize>,
     rows: Vec<usize>,
     meta: Vec<u8>,
@@ -332,8 +432,9 @@ struct ParkCopy {
     bytes: usize,
 }
 
-/// Geometry of a parked buffer: every fixed part whole, then rows `[0, to)`
-/// of each stream, packed at [`PART_ALIGN`].
+/// Geometry of a packed store (a parked buffer, a delta snapshot, a resident):
+/// every fixed part whole, then each stream's rows `[from, to)`, packed at
+/// [`PART_ALIGN`]. The same copy list serves capture and restore.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParkPlan {
     fixed_bytes: Vec<usize>,
@@ -374,6 +475,38 @@ impl ParkPlan {
         })
     }
 
+    /// Geometry of a delta snapshot: the fixed parts whole, then each
+    /// stream's rows above `parent_ends` (its parent's segment ends; rows
+    /// from 0 without a parent) up to its live row count. `rows` is
+    /// `(row_bytes, live rows)` per stream.
+    fn delta(
+        fixed_bytes: Vec<usize>,
+        rows: &[(usize, usize)],
+        parent_ends: Option<&[usize]>,
+    ) -> Self {
+        let segments: Vec<Segment> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &(row_bytes, live))| Segment {
+                row_bytes,
+                from: parent_ends.map_or(0, |ends| ends[i]),
+                to: live,
+            })
+            .collect();
+        let (offsets, total) = layout(
+            fixed_bytes
+                .iter()
+                .copied()
+                .chain(segments.iter().map(Segment::bytes)),
+        );
+        Self {
+            fixed_bytes,
+            segments,
+            offsets,
+            total,
+        }
+    }
+
     /// Non-empty copies between live state and the parked buffer, in the
     /// same geometry for capture and restore. `fixed_offsets` are the live
     /// fixed parts' offsets; row streams start at byte 0.
@@ -406,7 +539,7 @@ impl ParkPlan {
 /// live state: fixed parts and the leading rows the side request can
 /// overwrite, plus the residents (which stay valid for the rest of the rows).
 struct Parked {
-    buf: DeviceBuffer,
+    buf: Store,
     plan: ParkPlan,
     meta: Vec<u8>,
     /// Rows each stream held at `position`.
@@ -423,7 +556,7 @@ struct Parked {
 }
 
 impl Parked {
-    fn into_buffers(self) -> Vec<DeviceBuffer> {
+    fn into_buffers(self) -> Vec<Store> {
         std::iter::once(self.buf)
             .chain(self.resident.map(|resident| resident.buf))
             .chain(self.tail.map(|tail| tail.buf))
@@ -431,12 +564,28 @@ impl Parked {
     }
 }
 
-/// Read-only occupancy of one [`SessionCache`]'s DEVICE-owned snapshot memory,
-/// from the cache's own bookkeeping (no estimate, no GPU query). Every owned
-/// device buffer is counted in exactly one byte field, so `pool_bytes +
-/// pending_bytes + resident_bytes + deferred_release_bytes + parked_bytes`
-/// is the cache's device footprint. Disk-tier snapshots are never counted
-/// (a demotion lowers `pool_bytes` and raises `evictions_total`).
+/// Opt-in policy of the pressure-selected pinned-host snapshot tier
+/// ([`SessionCache::enable_pressure_host_snapshots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PressureHostSnapshotPolicy {
+    /// Bound on EVERY pinned host owner of the cache together: published
+    /// pool, pending captures, residents, deferred releases, parked state.
+    pub host_budget_bytes: u64,
+    /// Bound on EVERY device owner of the cache together (pool, pending,
+    /// resident, tail, deferred, parked): the admitted discretionary slack,
+    /// never idle free memory.
+    pub device_budget_bytes: u64,
+}
+
+/// Read-only occupancy of one [`SessionCache`]'s snapshot memory, from the
+/// cache's own bookkeeping (no estimate, no GPU query). Every owned buffer is
+/// counted in exactly one byte field. The DEVICE fields (`pool_bytes +
+/// pending_bytes + resident_bytes + deferred_release_bytes + parked_bytes`,
+/// [`Self::device_total_bytes`]) are the cache's device footprint and never
+/// include a host byte; the `host_*` byte fields (same five categories,
+/// [`Self::host_total_bytes`]) are its pinned-host footprint. Disk-tier
+/// snapshots are never counted (a demotion lowers `pool_bytes` and raises
+/// `evictions_total`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionCacheUsage {
     /// Published device pool snapshots (what [`SessionCache::stored_bytes`] returns).
@@ -459,6 +608,50 @@ pub struct SessionCacheUsage {
     /// whether demoted to disk or dropped. Counts actual removals, never
     /// policy decisions.
     pub evictions_total: u64,
+    /// The pressure policy's host budget; 0 without the policy.
+    pub host_budget_bytes: u64,
+    /// Published pinned-host pool snapshots.
+    pub host_pool_bytes: u64,
+    /// Pinned-host pending snapshots, resident and tail captures.
+    pub host_pending_bytes: u64,
+    /// Published pinned-host resident and tail buffers.
+    pub host_resident_bytes: u64,
+    /// Displaced pinned-host snapshots and buffers waiting to be freed.
+    pub host_deferred_release_bytes: u64,
+    /// Pinned-host share of the parked conversation (buffer, resident, tail).
+    pub host_parked_bytes: u64,
+    /// Captures (snapshot, resident, tail or park) stored on the host.
+    pub host_captures_total: u64,
+    /// Restores that read at least one host-held source.
+    pub host_restores_total: u64,
+    /// Published host snapshots dropped by the host eviction path.
+    pub host_evictions_total: u64,
+    /// Captures the policy refused or failed to hold on either tier.
+    pub host_skips_total: u64,
+}
+
+impl SessionCacheUsage {
+    /// Sum of the five device owner categories.
+    pub fn device_total_bytes(&self) -> u64 {
+        saturating_total([
+            self.pool_bytes,
+            self.pending_bytes,
+            self.resident_bytes,
+            self.deferred_release_bytes,
+            self.parked_bytes,
+        ])
+    }
+
+    /// Sum of the five pinned-host owner categories, each owner once.
+    pub fn host_total_bytes(&self) -> u64 {
+        saturating_total([
+            self.host_pool_bytes,
+            self.host_pending_bytes,
+            self.host_resident_bytes,
+            self.host_deferred_release_bytes,
+            self.host_parked_bytes,
+        ])
+    }
 }
 
 pub struct SessionCache {
@@ -483,12 +676,22 @@ pub struct SessionCache {
     /// Track split lineage even when the memory guard skips its resident.
     live_cold_exact: bool,
     /// Displaced resident buffers; freed at the next `begin`/`clear`.
-    release_bufs: Vec<DeviceBuffer>,
+    release_bufs: Vec<Store>,
     disk: Option<disk::DiskTier>,
     /// The committed conversation parked around side requests (module docs).
     parked: Option<Parked>,
     /// Device snapshots that left the pool through `evict_device`.
     evictions_total: u64,
+    /// The opt-in pressure-selected host snapshot tier; `None` keeps the
+    /// device-only behavior.
+    pressure: Option<PressureHostSnapshotPolicy>,
+    /// Published pinned-host snapshots. Its own ceiling is `u64::MAX`: the
+    /// cache bounds the TOTAL of every host owner itself.
+    host_pool: CheckpointPool<StoredSnapshot>,
+    host_captures_total: u64,
+    host_restores_total: u64,
+    host_evictions_total: u64,
+    host_skips_total: u64,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -511,26 +714,475 @@ fn device_bytes(snapshot: &StoredSnapshot) -> u64 {
     }
 }
 
+/// Pinned-host bytes a snapshot owns.
+fn host_bytes(snapshot: &StoredSnapshot) -> u64 {
+    match snapshot.location {
+        SnapshotLocation::Host(_) => snapshot.bytes,
+        _ => 0,
+    }
+}
+
 fn free_device(gpu: &mut Gpu, buf: DeviceBuffer) {
     if let Err(error) = gpu.hip.free(buf) {
         eprintln!("  session cache: freeing a snapshot failed: {error}");
     }
 }
 
-/// Free a device snapshot's buffer; a disk snapshot is never passed here.
+/// Free a snapshot's device or host memory; a disk snapshot owns none.
 fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
-    if let SnapshotLocation::Device(buf) = snapshot.location {
-        free_device(gpu, buf);
+    if let Some(store) = snapshot.into_store() {
+        free_store(gpu, store);
     }
 }
 
+/// Release one owner. A host block needs no GPU call: every transfer that
+/// touched it drained its stream (or flagged the block `undrained`, which
+/// makes its drop a leak instead of a free).
+fn free_store(gpu: &mut Gpu, store: Store) {
+    match store {
+        Store::Device(buf) => free_device(gpu, buf),
+        Store::Host(block) => drop(block),
+    }
+}
+
+/// Owned memory of one resident, park or snapshot.
+enum Store {
+    Device(DeviceBuffer),
+    Host(HostBlock),
+}
+
+impl Store {
+    fn size(&self) -> usize {
+        match self {
+            Store::Device(buf) => buf.size(),
+            Store::Host(block) => block.bytes,
+        }
+    }
+
+    fn device_bytes(&self) -> u64 {
+        match self {
+            Store::Device(buf) => buf.size() as u64,
+            Store::Host(_) => 0,
+        }
+    }
+
+    fn host_bytes(&self) -> u64 {
+        match self {
+            Store::Device(_) => 0,
+            Store::Host(block) => block.bytes as u64,
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        matches!(self, Store::Host(_))
+    }
+}
+
+impl From<Store> for SnapshotLocation {
+    fn from(store: Store) -> Self {
+        match store {
+            Store::Device(buf) => SnapshotLocation::Device(buf),
+            Store::Host(block) => SnapshotLocation::Host(block),
+        }
+    }
+}
+
+/// Allocate one pinned host block of `bytes` and adopt it into a
+/// [`HostAllocOwner`], which holds the HIP library (and the emu pinned-host
+/// charge) alive until its last drop frees it.
+fn alloc_host(gpu: &mut Gpu, bytes: usize) -> Result<HostBlock, String> {
+    if bytes == 0 {
+        return Err("session cache: empty host snapshot".to_string());
+    }
+    gpu.bind_thread().map_err(|e| e.to_string())?;
+    let ptr = gpu
+        .hip
+        .host_malloc(bytes, HOST_PORTABLE)
+        .map_err(|e| e.to_string())?;
+    // SAFETY: `ptr` was just returned by this runtime's `host_malloc`, is not
+    // freed, and is adopted exactly once; from here only the returned owner
+    // frees it.
+    match unsafe { gpu.hip.adopt_host_allocation(ptr) } {
+        Ok(owner) => Ok(HostBlock::new(HostMem::Pinned(owner), bytes)),
+        Err(error) => {
+            let _ = gpu.hip.host_free(ptr);
+            Err(error.to_string())
+        }
+    }
+}
+
+/// Allocate `bytes` on `tier`.
+fn alloc_store(gpu: &mut Gpu, tier: Tier, bytes: usize) -> Result<Store, String> {
+    match tier {
+        Tier::Device => gpu
+            .bind_thread()
+            .and_then(|()| gpu.hip.malloc(bytes))
+            .map(Store::Device)
+            .map_err(|e| e.to_string()),
+        Tier::Host => alloc_host(gpu, bytes).map(Store::Host),
+    }
+}
+
+/// Which tier owns a capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    Device,
+    Host,
+}
+
+/// Bytes the cache owns right now, for one placement decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Owned {
+    /// Every device owner (pool, pending, resident, deferred, parked).
+    device: u64,
+    /// Every pinned host owner.
+    host: u64,
+    /// The published host pool alone (the only evictable host owner).
+    host_pool: u64,
+}
+
+/// Tier of a `need`-byte capture under `policy`: the device only when the
+/// pool has room (`pool_room`), the policy's TOTAL device budget holds
+/// `need` more and the real memory guard (`guard`, evaluated last and only
+/// then) passes; else the host when every pinned owner but the evictable
+/// published pool leaves `need` bytes of the host budget; else a refusal.
+fn plan_placement(
+    policy: &PressureHostSnapshotPolicy,
+    need: u64,
+    owned: Owned,
+    pool_room: bool,
+    guard: impl FnOnce() -> Option<bool>,
+) -> Result<Tier, &'static str> {
+    let in_budget = owned
+        .device
+        .checked_add(need)
+        .is_some_and(|total| total <= policy.device_budget_bytes);
+    if pool_room && in_budget && guard() == Some(true) {
+        return Ok(Tier::Device);
+    }
+    let pinned = owned.host.saturating_sub(owned.host_pool);
+    if pinned
+        .checked_add(need)
+        .is_some_and(|total| total <= policy.host_budget_bytes)
+    {
+        Ok(Tier::Host)
+    } else {
+        Err("host budget")
+    }
+}
+
+/// What a resident capture does with its pending buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentPlan {
+    /// The pending buffer already has the size: overwrite it in place.
+    Reuse,
+    Allocate(Tier),
+    /// Keep the previous pending capture.
+    Skip(&'static str),
+}
+
+/// Plan a resident (or tail) capture of `total` bytes over a pending buffer
+/// of `previous` bytes.
+fn resident_plan(
+    policy: Option<&PressureHostSnapshotPolicy>,
+    previous: Option<usize>,
+    total: usize,
+    owned: Owned,
+    guard: impl FnOnce() -> Option<bool>,
+) -> ResidentPlan {
+    if previous == Some(total) {
+        return ResidentPlan::Reuse;
+    }
+    match policy {
+        None => {
+            if guard() == Some(true) {
+                ResidentPlan::Allocate(Tier::Device)
+            } else {
+                ResidentPlan::Skip("memory guard")
+            }
+        }
+        Some(policy) => match plan_placement(policy, total as u64, owned, true, guard) {
+            Ok(tier) => ResidentPlan::Allocate(tier),
+            Err(reason) => ResidentPlan::Skip(reason),
+        },
+    }
+}
+
+/// Direction of a host transfer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dir {
+    /// Live state to the host block.
+    ToStore,
+    /// Host block to the live state.
+    ToLive,
+}
+
+/// One live-state range and its range of a host block.
+struct HostMove<'a> {
+    live: &'a DeviceBuffer,
+    live_offset: usize,
+    host: &'a HostBlock,
+    host_offset: usize,
+    bytes: usize,
+}
+
+/// Queue every move on the gpu's active stream (the stream the live state's
+/// kernels run on, so each copy is ordered after, or before, the compute
+/// that produced or consumes the bytes) and wait for THAT stream only: other
+/// streams (an expert ring's) are neither drained nor retired. If the wait
+/// fails the blocks are flagged `undrained` and will never be freed.
+fn host_transfer(gpu: &mut Gpu, dir: Dir, moves: &[HostMove<'_>]) -> Result<(), String> {
+    if moves.is_empty() {
+        return Ok(());
+    }
+    gpu.bind_thread().map_err(|e| e.to_string())?;
+    let mut result = Ok(());
+    for item in moves {
+        let in_live = item
+            .live_offset
+            .checked_add(item.bytes)
+            .is_some_and(|end| end <= item.live.size());
+        let in_host = item
+            .host_offset
+            .checked_add(item.bytes)
+            .is_some_and(|end| end <= item.host.bytes);
+        if !in_live || !in_host {
+            result = Err("session cache: host copy region exceeds its buffer".to_string());
+            break;
+        }
+        if item.bytes == 0 {
+            continue;
+        }
+        let view = item.live.byte_view(item.live_offset, item.bytes);
+        let stream = gpu.active_stream.as_ref();
+        let queued = match dir {
+            Dir::ToStore => {
+                // SAFETY: `[host_offset, host_offset + bytes)` lies inside the
+                // live pinned allocation (checked above); the GPU is its only
+                // writer until the drain below, and the block outlives it.
+                let host = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        item.host.ptr().add(item.host_offset),
+                        item.bytes,
+                    )
+                };
+                gpu.hip.memcpy_dtoh_async(host, &view, stream)
+            }
+            Dir::ToLive => {
+                // SAFETY: as above; the host range is only read until the drain.
+                let host = unsafe {
+                    std::slice::from_raw_parts(
+                        item.host.ptr().add(item.host_offset),
+                        item.bytes,
+                    )
+                };
+                match stream {
+                    Some(stream) => gpu.hip.memcpy_htod_async(&view, host, stream),
+                    None => gpu.hip.memcpy_htod_async_default(&view, host),
+                }
+            }
+        };
+        if let Err(error) = queued {
+            result = Err(error.to_string());
+            break;
+        }
+    }
+    let drained = match gpu.active_stream.as_ref() {
+        Some(stream) => gpu.hip.stream_synchronize(stream),
+        None => gpu.hip.stream_synchronize_default(),
+    };
+    if let Err(error) = drained {
+        for item in moves {
+            item.host.mark_undrained();
+        }
+        return Err(format!(
+            "session cache: host transfer could not be drained ({error}); its pinned memory is quarantined"
+        ));
+    }
+    result
+}
+
+/// The live-state buffer of copy part `part` (fixed parts first, then row
+/// streams).
+fn live_buf<'a>(live: &StateLayout<'a>, part: usize) -> &'a DeviceBuffer {
+    if part < live.fixed.len() {
+        live.fixed[part].buf
+    } else {
+        live.rows[part - live.fixed.len()].buf
+    }
+}
+
+/// Copy the live state's `copies` into `dst` (a device buffer in one batched
+/// launch, a host block by direct transfers).
+fn save_to_store(
+    gpu: &mut Gpu,
+    dst: &Store,
+    copies: &[ParkCopy],
+    live: &StateLayout<'_>,
+) -> Result<(), String> {
+    match dst {
+        Store::Device(buf) => {
+            let regions: Vec<CopyRegion<'_>> = copies
+                .iter()
+                .map(|copy| CopyRegion {
+                    dst: buf,
+                    dst_offset: copy.park_offset,
+                    src: live_buf(live, copy.part),
+                    src_offset: copy.live_offset,
+                    bytes: copy.bytes,
+                })
+                .collect();
+            copy_regions(gpu, &regions).map_err(|e| e.to_string())
+        }
+        Store::Host(block) => {
+            let moves: Vec<HostMove<'_>> = copies
+                .iter()
+                .map(|copy| HostMove {
+                    live: live_buf(live, copy.part),
+                    live_offset: copy.live_offset,
+                    host: block,
+                    host_offset: copy.park_offset,
+                    bytes: copy.bytes,
+                })
+                .collect();
+            host_transfer(gpu, Dir::ToStore, &moves)
+        }
+    }
+}
+
+/// Copy `src`'s `copies` over the live state.
+fn load_from_store(
+    gpu: &mut Gpu,
+    src: &Store,
+    copies: &[ParkCopy],
+    live: &StateLayout<'_>,
+) -> Result<(), String> {
+    match src {
+        Store::Device(buf) => {
+            let regions: Vec<CopyRegion<'_>> = copies
+                .iter()
+                .map(|copy| CopyRegion {
+                    dst: live_buf(live, copy.part),
+                    dst_offset: copy.live_offset,
+                    src: buf,
+                    src_offset: copy.park_offset,
+                    bytes: copy.bytes,
+                })
+                .collect();
+            copy_regions(gpu, &regions).map_err(|e| e.to_string())
+        }
+        Store::Host(block) => {
+            let moves: Vec<HostMove<'_>> = copies
+                .iter()
+                .map(|copy| HostMove {
+                    live: live_buf(live, copy.part),
+                    live_offset: copy.live_offset,
+                    host: block,
+                    host_offset: copy.park_offset,
+                    bytes: copy.bytes,
+                })
+                .collect();
+            host_transfer(gpu, Dir::ToLive, &moves)
+        }
+    }
+}
+
+/// Source of one link of a restore chain.
+#[derive(Clone, Copy)]
+enum Src<'a> {
+    Device(&'a DeviceBuffer),
+    Host(&'a HostBlock),
+}
+
+/// One copy of a chain restore: bytes `copy.park_offset..` of chain link
+/// `link` into the live part `copy.part` at `copy.live_offset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RestoreCopy {
+    link: usize,
+    copy: ParkCopy,
+}
+
+/// Geometry of restoring the root-first `chain` into a live state of
+/// `dst_fixed` (`(offset, bytes)` per fixed part) and `dst_rows`
+/// (`(row_bytes, rows)` per stream): the leaf's fixed parts, then each link's
+/// row segment, which must tile every stream from row 0 to its row count.
+/// Pure: the planner `restore_chain` executes.
+fn plan_chain_restore(
+    chain: &[&StoredSnapshot],
+    dst_fixed: &[(usize, usize)],
+    dst_rows: &[(usize, usize)],
+) -> Result<Vec<RestoreCopy>, String> {
+    let mismatch = || "session cache: snapshot layout mismatch".to_string();
+    let leaf_link = chain.len().checked_sub(1).ok_or_else(mismatch)?;
+    let leaf = chain[leaf_link];
+    if dst_fixed.len() != leaf.fixed_bytes.len()
+        || dst_fixed
+            .iter()
+            .zip(&leaf.fixed_bytes)
+            .any(|(&(_, bytes), &want)| bytes != want)
+        || dst_rows.len() != leaf.segments.len()
+    {
+        return Err(mismatch());
+    }
+    let fixed_count = dst_fixed.len();
+    let mut copies = Vec::new();
+    for (part, (&(live_offset, bytes), park_offset)) in
+        dst_fixed.iter().zip(leaf.offsets()).enumerate()
+    {
+        if bytes > 0 {
+            copies.push(RestoreCopy {
+                link: leaf_link,
+                copy: ParkCopy {
+                    part,
+                    live_offset,
+                    park_offset,
+                    bytes,
+                },
+            });
+        }
+    }
+    let mut next = vec![0usize; dst_rows.len()];
+    for (link, snapshot) in chain.iter().enumerate() {
+        if snapshot.segments.len() != dst_rows.len() {
+            return Err(mismatch());
+        }
+        let offsets = snapshot.offsets();
+        for (i, (segment, &(row_bytes, _))) in snapshot.segments.iter().zip(dst_rows).enumerate() {
+            if segment.row_bytes != row_bytes || segment.from != next[i] {
+                return Err(mismatch());
+            }
+            next[i] = segment.to;
+            if segment.bytes() > 0 {
+                copies.push(RestoreCopy {
+                    link,
+                    copy: ParkCopy {
+                        part: fixed_count + i,
+                        live_offset: segment.from * segment.row_bytes,
+                        park_offset: offsets[snapshot.fixed_bytes.len() + i],
+                        bytes: segment.bytes(),
+                    },
+                });
+            }
+        }
+    }
+    if next
+        .iter()
+        .zip(dst_rows)
+        .any(|(&rows, &(_, want))| rows != want)
+    {
+        return Err(mismatch());
+    }
+    Ok(copies)
+}
+
 /// Copy `resident`'s fixed parts over the live state, whose row streams must
-/// still hold its rows.
+/// still hold its rows. `host_restores` counts a restore from a host block.
 fn restore_resident(
     gpu: &mut Gpu,
     state: &mut dyn SessionState,
     route: SessionRoute,
     resident: &Resident,
+    host_restores: &mut u64,
 ) -> Result<(), String> {
     let dst = state.restore_parts(gpu, route, &resident.meta)?;
     let fixed = dst.fixed.iter().map(|part| part.bytes);
@@ -538,19 +1190,18 @@ fn restore_resident(
     if !fixed.eq(resident.fixed_bytes.iter().copied()) || !rows.eq(resident.rows.iter().copied()) {
         return Err("session cache: resident snapshot layout mismatch".to_string());
     }
-    let regions: Vec<CopyRegion<'_>> = dst
+    let fixed: Vec<(usize, usize)> = dst
         .fixed
         .iter()
-        .zip(layout(resident.fixed_bytes.iter().copied()).0)
-        .map(|(part, src_offset)| CopyRegion {
-            dst: part.buf,
-            dst_offset: part.offset,
-            src: &resident.buf,
-            src_offset,
-            bytes: part.bytes,
-        })
+        .map(|part| (part.offset, part.bytes))
         .collect();
-    copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
+    let plan =
+        ParkPlan::new(&fixed, &[], &[]).expect("a fixed-only plan has no streams to mismatch");
+    let offsets: Vec<usize> = dst.fixed.iter().map(|part| part.offset).collect();
+    load_from_store(gpu, &resident.buf, &plan.copies(&offsets), &dst)?;
+    if resident.buf.is_host() {
+        *host_restores = host_restores.saturating_add(1);
+    }
     state.finish_restore(gpu, route, &resident.meta)
 }
 
@@ -596,12 +1247,12 @@ fn saturating_total(bytes: impl IntoIterator<Item = u64>) -> u64 {
 }
 
 /// Whether `need` more device bytes, with `growth` more for the live state,
-/// leave the guard's headroom free in the pool the device allocates from
-/// (`Gpu::device_mem_info`: VRAM, a unified-memory APU's carve-out, or its GTT
-/// clamped to `MemAvailable` minus the CMA region plus TTM's page pool); `None`
-/// when the free-memory query itself fails. A caller allocates only right
-/// after `Some(true)`.
-fn memory_fits(gpu: &Gpu, need: u64, growth: u64) -> Option<bool> {
+/// leave the guard's headroom (at least `floor`) free in the pool the device
+/// allocates from (`Gpu::device_mem_info`: VRAM, a unified-memory APU's
+/// carve-out, or its GTT clamped to `MemAvailable` minus the CMA region plus
+/// TTM's page pool); `None` when the free-memory query itself fails. A
+/// caller allocates only right after `Some(true)`.
+fn memory_fits_floor(gpu: &Gpu, need: u64, growth: u64, floor: u64) -> Option<bool> {
     let (free, _) = gpu.device_mem_info().ok()?;
     let uma = gpu.is_uma();
     let mem_total = if uma {
@@ -613,8 +1264,20 @@ fn memory_fits(gpu: &Gpu, need: u64, growth: u64) -> Option<bool> {
         free as u64,
         need,
         growth,
-        headroom_for(uma, mem_total),
+        guard_headroom(headroom_for(uma, mem_total), floor),
     ))
+}
+
+/// Headroom a guard keeps free: the platform's own (`base`), but never below
+/// the `floor` a pressure-policy cache keeps for the product safety margin
+/// (0 without the policy: `base` unchanged).
+fn guard_headroom(base: u64, floor: u64) -> u64 {
+    base.max(floor)
+}
+
+/// [`memory_fits_floor`] with the plain headroom.
+fn memory_fits(gpu: &Gpu, need: u64, growth: u64) -> Option<bool> {
+    memory_fits_floor(gpu, need, growth, 0)
 }
 
 /// Whether the disk tier's host bounce buffer of `bytes` may be allocated now:
@@ -653,6 +1316,12 @@ impl SessionCache {
             disk: None,
             parked: None,
             evictions_total: 0,
+            pressure: None,
+            host_pool: CheckpointPool::new(u64::MAX),
+            host_captures_total: 0,
+            host_restores_total: 0,
+            host_evictions_total: 0,
+            host_skips_total: 0,
         }
     }
 
@@ -689,9 +1358,10 @@ impl SessionCache {
         self
     }
 
-    /// Published on the device or on disk.
+    /// Published on the device, on the host or on disk.
     fn present(&self, domain: &CacheDomain, p: u64, fp: u64) -> bool {
         self.pool.contains(domain, p, fp)
+            || self.host_pool.contains(domain, p, fp)
             || self
                 .disk
                 .as_ref()
@@ -708,11 +1378,15 @@ impl SessionCache {
         p: u64,
         fp: u64,
     ) -> bool {
-        let snapshot = self.pool.peek(domain, p, fp).or_else(|| {
-            self.disk
-                .as_ref()
-                .and_then(|disk| disk.pool.peek(domain, p, fp))
-        });
+        let snapshot = self
+            .pool
+            .peek(domain, p, fp)
+            .or_else(|| self.host_pool.peek(domain, p, fp))
+            .or_else(|| {
+                self.disk
+                    .as_ref()
+                    .and_then(|disk| disk.pool.peek(domain, p, fp))
+            });
         snapshot.is_some_and(|snapshot| state.snapshot_restorable(route, &snapshot.meta))
     }
 
@@ -770,18 +1444,31 @@ impl SessionCache {
 
     /// A published or pending snapshot.
     fn entry(&self, key: &Key) -> Option<&StoredSnapshot> {
-        self.pool.peek(&key.0, key.1, key.2).or_else(|| {
-            self.pending
-                .iter()
-                .find(|(pending, _)| pending == key)
-                .map(|(_, snapshot)| snapshot)
-        })
+        self.pool
+            .peek(&key.0, key.1, key.2)
+            .or_else(|| self.host_pool.peek(&key.0, key.1, key.2))
+            .or_else(|| {
+                self.pending
+                    .iter()
+                    .find(|(pending, _)| pending == key)
+                    .map(|(_, snapshot)| snapshot)
+            })
+    }
+
+    /// Pin `key` in whichever pool holds it.
+    fn pin_key(&mut self, key: &Key) -> bool {
+        self.pool.pin(&key.0, key.1, key.2) || self.host_pool.pin(&key.0, key.1, key.2)
+    }
+
+    /// Unpin `key` in whichever pool holds it.
+    fn unpin_key(&mut self, key: &Key) -> bool {
+        self.pool.unpin(&key.0, key.1, key.2) || self.host_pool.unpin(&key.0, key.1, key.2)
     }
 
     /// Record a child of `parent`, pinning it against eviction.
     fn link(&mut self, parent: &Key) {
         *self.children.entry(parent.clone()).or_default() += 1;
-        self.pool.pin(&parent.0, parent.1, parent.2);
+        self.pin_key(parent);
     }
 
     /// Drop a child of `parent`; its last child unpins it.
@@ -790,7 +1477,7 @@ impl SessionCache {
             *count -= 1;
             if *count == 0 {
                 self.children.remove(parent);
-                self.pool.unpin(&parent.0, parent.1, parent.2);
+                self.unpin_key(parent);
             }
         }
     }
@@ -817,8 +1504,19 @@ impl SessionCache {
     /// fails), then free it.
     fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot, growth: u64) {
         self.note_device_eviction(&snapshot);
+        // The disk tier's parents are on the device or on disk (I2): a child
+        // of a host snapshot cannot be demoted.
+        let host_parent = snapshot
+            .parent
+            .as_ref()
+            .is_some_and(|parent| self.host_pool.contains(&parent.0, parent.1, parent.2));
         if let Some(disk) = &mut self.disk {
-            if let Err(reason) = disk.demote(gpu, &key, &snapshot, growth) {
+            let demoted = if host_parent {
+                Err("its parent is on the host tier".to_string())
+            } else {
+                disk.demote(gpu, &key, &snapshot, growth)
+            };
+            if let Err(reason) = demoted {
                 eprintln!(
                     "  session cache: dropped {}-token snapshot instead of demoting it ({reason})",
                     key.1
@@ -832,7 +1530,7 @@ impl SessionCache {
     /// Evict device snapshots until `bytes` more fit the budget (counting
     /// pending snapshots) and the memory guard (counting `growth`).
     fn make_room(&mut self, gpu: &mut Gpu, bytes: u64, growth: u64) -> Result<(), &'static str> {
-        let pending_bytes: u64 = self.pending.iter().map(|entry| entry.1.bytes).sum();
+        let pending_bytes: u64 = self.pending.iter().map(|entry| device_bytes(&entry.1)).sum();
         loop {
             let over_budget = self
                 .pool
@@ -841,7 +1539,7 @@ impl SessionCache {
                 .saturating_add(bytes)
                 > self.pool.max_bytes();
             if !over_budget {
-                match memory_fits(gpu, bytes, growth) {
+                match self.device_fits(gpu, bytes, growth) {
                     Some(true) => return Ok(()),
                     Some(false) => {}
                     // Evicting cannot help a query that fails.
@@ -861,6 +1559,122 @@ impl SessionCache {
         }
     }
 
+    /// Opt into pressure-selected pinned-host snapshots under `policy`
+    /// ([`PressureHostSnapshotPolicy`]). Without it the cache is device-only
+    /// and allocates no host memory. Callable on a live cache; it only changes
+    /// where FUTURE captures land.
+    pub fn enable_pressure_host_snapshots(&mut self, policy: PressureHostSnapshotPolicy) {
+        self.pressure = Some(policy);
+    }
+
+    /// Free device bytes a cache allocation leaves beyond the guard's own
+    /// headroom: the product safety margin under the pressure policy.
+    fn device_floor(&self) -> u64 {
+        if self.pressure.is_some() {
+            POLICY_DEVICE_SAFETY
+        } else {
+            0
+        }
+    }
+
+    /// [`memory_fits_floor`] with this cache's floor.
+    fn device_fits(&self, gpu: &Gpu, need: u64, growth: u64) -> Option<bool> {
+        memory_fits_floor(gpu, need, growth, self.device_floor())
+    }
+
+    /// Every owner's bytes right now.
+    fn owned(&self) -> Owned {
+        let usage = self.usage();
+        Owned {
+            device: usage.device_total_bytes(),
+            host: usage.host_total_bytes(),
+            host_pool: usage.host_pool_bytes,
+        }
+    }
+
+    /// Whether the device pool's own budget holds `need` more bytes beside
+    /// its published and pending snapshots, evicting nothing.
+    fn pool_room(&self, need: u64) -> bool {
+        let pending: u64 = self.pending.iter().map(|entry| device_bytes(&entry.1)).sum();
+        self.pool
+            .total_bytes()
+            .saturating_add(pending)
+            .saturating_add(need)
+            <= self.pool.max_bytes()
+    }
+
+    /// Tier of a `need`-byte capture under the pressure policy
+    /// ([`plan_placement`]); `pooled` captures also need room in the device
+    /// pool's budget. Errors without a policy.
+    fn pick_tier(
+        &self,
+        need: u64,
+        pooled: bool,
+        guard: impl FnOnce() -> Option<bool>,
+    ) -> Result<Tier, &'static str> {
+        let policy = self.pressure.as_ref().ok_or("no pressure policy")?;
+        let room = !pooled || self.pool_room(need);
+        plan_placement(policy, need, self.owned(), room, guard)
+    }
+
+    /// [`Self::pick_tier`] with the real memory guard, and the host budget
+    /// made room for when the host is chosen.
+    fn place(
+        &mut self,
+        gpu: &mut Gpu,
+        need: u64,
+        growth: u64,
+        pooled: bool,
+    ) -> Result<Tier, &'static str> {
+        let tier = self.pick_tier(need, pooled, || self.device_fits(gpu, need, growth))?;
+        if tier == Tier::Host {
+            self.make_host_room(gpu, need)?;
+        }
+        Ok(tier)
+    }
+
+    /// Count a published host snapshot leaving the pool by eviction.
+    fn note_host_eviction(&mut self, snapshot: &StoredSnapshot) {
+        if let Some(parent) = &snapshot.parent {
+            self.unlink(parent);
+        }
+        self.host_evictions_total = self.host_evictions_total.saturating_add(1);
+    }
+
+    /// Pure bookkeeping of host eviction: pop the least recently used
+    /// unpinned host snapshots until `need` more pinned bytes fit the host
+    /// budget beside every other owner. Returns what left the pool (to free)
+    /// and whether `need` now fits.
+    fn evict_host_for(&mut self, need: u64) -> (Vec<Store>, bool) {
+        let budget = self.pressure.map_or(0, |policy| policy.host_budget_bytes);
+        let mut evicted = Vec::new();
+        loop {
+            if self.owned().host.saturating_add(need) <= budget {
+                return (evicted, true);
+            }
+            match self.host_pool.pop_lru() {
+                Some((_, snapshot)) => {
+                    self.note_host_eviction(&snapshot);
+                    evicted.extend(snapshot.into_store());
+                }
+                None => return (evicted, false),
+            }
+        }
+    }
+
+    /// Evict published host snapshots until `need` more pinned bytes fit.
+    fn make_host_room(&mut self, gpu: &mut Gpu, need: u64) -> Result<(), &'static str> {
+        let (evicted, fits) = self.evict_host_for(need);
+        for store in evicted {
+            free_store(gpu, store);
+        }
+        if fits {
+            Ok(())
+        } else {
+            Err("host budget")
+        }
+    }
+
     /// Unlink a snapshot that leaves the cache; free it at the next `begin`.
     fn retire(&mut self, snapshot: StoredSnapshot) {
         if let Some(parent) = &snapshot.parent {
@@ -872,10 +1686,10 @@ impl SessionCache {
     /// Drop the resident snapshot: the live rows are about to change.
     fn drop_resident(&mut self, gpu: &mut Gpu) {
         if let Some(resident) = self.resident.take() {
-            free_device(gpu, resident.buf);
+            free_store(gpu, resident.buf);
         }
         if let Some(tail) = self.tail.take() {
-            free_device(gpu, tail.buf);
+            free_store(gpu, tail.buf);
         }
     }
 
@@ -902,22 +1716,31 @@ impl SessionCache {
     /// Bookkeeping head of every turn: free displaced buffers and drop the
     /// previous turn's uncommitted captures.
     fn start_turn(&mut self, gpu: &mut Gpu) {
-        for snapshot in std::mem::take(&mut self.release) {
-            free_buffer(gpu, snapshot);
+        for store in self.take_turn_head() {
+            free_store(gpu, store);
         }
-        for buf in std::mem::take(&mut self.release_bufs) {
-            free_device(gpu, buf);
-        }
+    }
+
+    /// The bookkeeping of [`Self::start_turn`], no GPU: unlink the previous
+    /// turn's uncommitted captures and return every owner to free, in the
+    /// order they are freed (displaced snapshots, displaced buffers, pending
+    /// snapshots, pending resident, pending tail).
+    fn take_turn_head(&mut self) -> Vec<Store> {
+        let mut stores: Vec<Store> = std::mem::take(&mut self.release)
+            .into_iter()
+            .filter_map(StoredSnapshot::into_store)
+            .collect();
+        stores.append(&mut self.release_bufs);
         for (_, snapshot) in std::mem::take(&mut self.pending) {
-            self.drop_snapshot(gpu, snapshot);
+            if let Some(parent) = &snapshot.parent {
+                self.unlink(parent);
+            }
+            stores.extend(snapshot.into_store());
         }
-        if let Some(resident) = self.resident_pending.take() {
-            free_device(gpu, resident.buf);
-        }
-        if let Some(tail) = self.tail_pending.take() {
-            free_device(gpu, tail.buf);
-        }
+        stores.extend(self.resident_pending.take().map(|resident| resident.buf));
+        stores.extend(self.tail_pending.take().map(|tail| tail.buf));
         self.turn = None;
+        stores
     }
 
     /// Start a prefill of `prompt`: restore the `reused`-token snapshot
@@ -1022,9 +1845,15 @@ impl SessionCache {
                     .as_ref()
                     .is_some_and(|r| r.key.1 > reused as u64)
             {
-                free_device(gpu, self.resident.take().unwrap().buf);
+                free_store(gpu, self.resident.take().unwrap().buf);
             }
-            restore_resident(gpu, state, route, self.tail.as_ref().unwrap())
+            restore_resident(
+                gpu,
+                state,
+                route,
+                self.tail.as_ref().unwrap(),
+                &mut self.host_restores_total,
+            )
         } else if reused > 0
             && self
                 .resident
@@ -1033,12 +1862,12 @@ impl SessionCache {
         {
             if !stash {
                 if let Some(tail) = self.tail.take() {
-                    free_device(gpu, tail.buf);
+                    free_store(gpu, tail.buf);
                 }
             }
             let resident = self.resident.as_ref().unwrap();
             cold_exact = resident.cold_exact;
-            restore_resident(gpu, state, route, resident)
+            restore_resident(gpu, state, route, resident, &mut self.host_restores_total)
         } else {
             if !stash {
                 self.drop_resident(gpu);
@@ -1111,7 +1940,7 @@ impl SessionCache {
             .as_ref()
             .is_some_and(|tail| reused < tail.key.1 as usize)
         {
-            free_device(gpu, self.tail.take().unwrap().buf);
+            free_store(gpu, self.tail.take().unwrap().buf);
         }
         if !capture {
             return;
@@ -1150,6 +1979,34 @@ impl SessionCache {
         (boundaries.into(), lineage)
     }
 
+    /// The root-first chain of published snapshots (device, host or disk)
+    /// ending at the `prefix`-token snapshot, following each link's parent;
+    /// `None` when a link is missing. Each walk step refreshes that link's
+    /// LRU stamp.
+    fn chain_keys(&mut self, domain: &CacheDomain, prefix: &[u32]) -> Option<Vec<Key>> {
+        let mut keys = vec![(
+            domain.clone(),
+            prefix.len() as u64,
+            prefix_fingerprint(prefix),
+        )];
+        loop {
+            let key = keys.last().expect("non-empty chain");
+            let parent = match self.pool.get(&key.0, key.1, key.2) {
+                Some(snapshot) => snapshot.parent.clone(),
+                None => match self.host_pool.get(&key.0, key.1, key.2) {
+                    Some(snapshot) => snapshot.parent.clone(),
+                    None => self.disk.as_mut().and_then(|disk| disk.get(key))?.parent.clone(),
+                },
+            };
+            match parent {
+                Some(parent) => keys.push(parent),
+                None => break,
+            }
+        }
+        keys.reverse();
+        Some(keys)
+    }
+
     /// Copy the snapshot of `prefix` and its ancestors into the live state,
     /// promoting disk links to the device (or staging them in temporary
     /// buffers when the device tier has no room). `end` is the length of the
@@ -1167,30 +2024,9 @@ impl SessionCache {
             "session cache: planned {}-token snapshot is no longer present",
             prefix.len()
         );
-        // Leaf first; each `get` refreshes that link's LRU stamp.
-        let mut keys = vec![(
-            domain.clone(),
-            prefix.len() as u64,
-            prefix_fingerprint(prefix),
-        )];
-        loop {
-            let key = keys.last().expect("non-empty chain");
-            let parent = match self.pool.get(&key.0, key.1, key.2) {
-                Some(snapshot) => snapshot.parent.clone(),
-                None => self
-                    .disk
-                    .as_mut()
-                    .and_then(|disk| disk.get(key))
-                    .ok_or_else(|| missing.clone())?
-                    .parent
-                    .clone(),
-            };
-            match parent {
-                Some(parent) => keys.push(parent),
-                None => break,
-            }
-        }
-        keys.reverse();
+        let keys = self
+            .chain_keys(domain, prefix)
+            .ok_or_else(|| missing.clone())?;
         let growth = state.growth_reserve_bytes(gpu, end);
         if let Some(disk) = &mut self.disk {
             for key in &keys {
@@ -1234,8 +2070,12 @@ impl SessionCache {
     ) -> Result<(), String> {
         let first_disk = keys
             .iter()
-            .position(|key| !self.pool.contains(&key.0, key.1, key.2))
+            .position(|key| {
+                !self.pool.contains(&key.0, key.1, key.2)
+                    && !self.host_pool.contains(&key.0, key.1, key.2)
+            })
             .unwrap_or(keys.len());
+        let floor = self.device_floor();
         let mut promoting = true;
         for (i, key) in keys.iter().enumerate().skip(first_disk) {
             let disk = self
@@ -1266,7 +2106,7 @@ impl SessionCache {
                     .iter()
                     .filter_map(|key| disk.peek(key).map(|s| s.bytes)),
             );
-            if memory_fits(gpu, need, growth) != Some(true) {
+            if memory_fits_floor(gpu, need, growth, floor) != Some(true) {
                 return Err("session cache: no memory to stage disk snapshot".into());
             }
             let buf = gpu
@@ -1283,78 +2123,95 @@ impl SessionCache {
             }
         }
 
-        let chain: Vec<(&StoredSnapshot, &DeviceBuffer)> = keys
-            .iter()
+        if self.copy_chain(gpu, state, route, keys, temps, missing)? {
+            self.host_restores_total = self.host_restores_total.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// The root-first chain `keys` with where each link's bytes are: a staged
+    /// disk link in `temps`, else the device pool, else the host pool.
+    fn chain_sources<'a>(
+        &'a self,
+        keys: &[Key],
+        temps: &'a [(Key, DeviceBuffer)],
+        missing: &str,
+    ) -> Result<Vec<(&'a StoredSnapshot, Src<'a>)>, String> {
+        keys.iter()
             .map(|key| {
                 if let Some((_, buf)) = temps.iter().find(|(temp, _)| temp == key) {
                     let snapshot = self.disk.as_ref().and_then(|disk| disk.peek(key));
                     return snapshot
-                        .map(|s| (s, buf))
+                        .map(|s| (s, Src::Device(buf)))
                         .ok_or_else(|| missing.to_string());
                 }
-                match self.pool.peek(&key.0, key.1, key.2) {
-                    Some(
-                        s @ StoredSnapshot {
-                            location: SnapshotLocation::Device(buf),
-                            ..
-                        },
-                    ) => Ok((s, buf)),
-                    _ => Err(missing.to_string()),
+                let snapshot = self
+                    .pool
+                    .peek(&key.0, key.1, key.2)
+                    .or_else(|| self.host_pool.peek(&key.0, key.1, key.2));
+                match snapshot {
+                    Some(s) => match &s.location {
+                        SnapshotLocation::Device(buf) => Ok((s, Src::Device(buf))),
+                        SnapshotLocation::Host(block) => Ok((s, Src::Host(block))),
+                        SnapshotLocation::Disk { .. } => Err(missing.to_string()),
+                    },
+                    None => Err(missing.to_string()),
                 }
             })
-            .collect::<Result<_, _>>()?;
-        let (leaf, leaf_src) = *chain.last().expect("non-empty chain");
+            .collect()
+    }
+
+    /// Copy the chain `keys` (every link on the device, staged, or on the
+    /// host) straight into the live state: device links in one batched
+    /// launch, host links by direct transfers. Whether any link was read from
+    /// the host.
+    fn copy_chain(
+        &self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        route: SessionRoute,
+        keys: &[Key],
+        temps: &[(Key, DeviceBuffer)],
+        missing: &str,
+    ) -> Result<bool, String> {
+        let chain = self.chain_sources(keys, temps, missing)?;
+        let leaf = chain.last().expect("non-empty chain").0;
         let dst = state.restore_parts(gpu, route, &leaf.meta)?;
-        let mismatch = || "session cache: snapshot layout mismatch".to_string();
-        if dst.fixed.len() != leaf.fixed_bytes.len()
-            || dst
-                .fixed
-                .iter()
-                .zip(&leaf.fixed_bytes)
-                .any(|(part, &bytes)| part.bytes != bytes)
-            || dst.rows.len() != leaf.segments.len()
-        {
-            return Err(mismatch());
-        }
-        let mut regions = Vec::new();
-        for (part, src_offset) in dst.fixed.iter().zip(leaf.offsets()) {
-            regions.push(CopyRegion {
-                dst: part.buf,
-                dst_offset: part.offset,
-                src: leaf_src,
-                src_offset,
-                bytes: part.bytes,
-            });
-        }
-        let mut next = vec![0usize; dst.rows.len()];
-        for &(snapshot, src) in &chain {
-            let offsets = snapshot.offsets();
-            if snapshot.segments.len() != dst.rows.len() {
-                return Err(mismatch());
-            }
-            for (i, (segment, stream)) in snapshot.segments.iter().zip(&dst.rows).enumerate() {
-                if segment.row_bytes != stream.row_bytes || segment.from != next[i] {
-                    return Err(mismatch());
-                }
-                next[i] = segment.to;
-                regions.push(CopyRegion {
-                    dst: stream.buf,
-                    dst_offset: segment.from * segment.row_bytes,
-                    src,
-                    src_offset: offsets[snapshot.fixed_bytes.len() + i],
-                    bytes: segment.bytes(),
-                });
-            }
-        }
-        if next
+        let fixed: Vec<(usize, usize)> =
+            dst.fixed.iter().map(|part| (part.offset, part.bytes)).collect();
+        let rows: Vec<(usize, usize)> = dst
+            .rows
             .iter()
-            .zip(&dst.rows)
-            .any(|(&rows, stream)| rows != stream.rows)
-        {
-            return Err(mismatch());
+            .map(|stream| (stream.row_bytes, stream.rows))
+            .collect();
+        let links: Vec<&StoredSnapshot> = chain.iter().map(|(snapshot, _)| *snapshot).collect();
+        let copies = plan_chain_restore(&links, &fixed, &rows)?;
+        let mut regions = Vec::new();
+        let mut moves = Vec::new();
+        for item in &copies {
+            let live = live_buf(&dst, item.copy.part);
+            match chain[item.link].1 {
+                Src::Device(src) => regions.push(CopyRegion {
+                    dst: live,
+                    dst_offset: item.copy.live_offset,
+                    src,
+                    src_offset: item.copy.park_offset,
+                    bytes: item.copy.bytes,
+                }),
+                Src::Host(host) => moves.push(HostMove {
+                    live,
+                    live_offset: item.copy.live_offset,
+                    host,
+                    host_offset: item.copy.park_offset,
+                    bytes: item.copy.bytes,
+                }),
+            }
         }
         copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
-        state.finish_restore(gpu, route, &leaf.meta)
+        host_transfer(gpu, Dir::ToLive, &moves)?;
+        let used_host = !moves.is_empty();
+        state.finish_restore(gpu, route, &leaf.meta)?;
+        Ok(used_host)
     }
 
     /// Move the held disk snapshot at `key` into the device tier. `Ok(false)`
@@ -1370,6 +2227,13 @@ impl SessionCache {
     ) -> Result<bool, String> {
         if !self.pool.can_afford(key, bytes) {
             return Ok(false);
+        }
+        // Under the pressure policy a promotion is a device owner like any
+        // other: it must fit the TOTAL device budget.
+        if let Some(policy) = self.pressure {
+            if self.owned().device.saturating_add(bytes) > policy.device_budget_bytes {
+                return Ok(false);
+            }
         }
         // The disk read bounces through host staging memory: refuse, with
         // the snapshot still on disk, when that allocation would not fit.
@@ -1563,13 +2427,8 @@ impl SessionCache {
                 .collect()
         };
         let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
-        let pending = if lineage {
-            &mut self.tail_pending
-        } else {
-            &mut self.resident_pending
-        };
-        Self::capture_resident(
-            pending,
+        self.capture_resident(
+            lineage,
             gpu,
             (domain.clone(), p as u64, fp),
             &meta,
@@ -1589,38 +2448,17 @@ impl SessionCache {
         if in_pool {
             return Ok(());
         }
-        // The parent's segment ends are this capture's starts; a parent whose
-        // streams do not line up is ignored (rows from 0).
-        let parent = ancestors.into_iter().find_map(|key| {
-            let segments = &self.entry(&key)?.segments;
-            let fits = segments.len() == live.rows.len()
-                && segments.iter().zip(&live.rows).all(|(segment, stream)| {
-                    segment.row_bytes == stream.row_bytes && segment.to <= stream.rows
-                });
-            fits.then(|| (key, segments.iter().map(|s| s.to).collect::<Vec<_>>()))
-        });
-        let segments: Vec<Segment> = live
+        let fixed_bytes: Vec<usize> = live.fixed.iter().map(|part| part.bytes).collect();
+        let rows: Vec<(usize, usize)> = live
             .rows
             .iter()
-            .enumerate()
-            .map(|(i, stream)| Segment {
-                row_bytes: stream.row_bytes,
-                from: parent.as_ref().map_or(0, |(_, ends)| ends[i]),
-                to: stream.rows,
-            })
+            .map(|stream| (stream.row_bytes, stream.rows))
             .collect();
-        let parent = parent.map(|(key, _)| key);
-        let fixed_bytes: Vec<usize> = live.fixed.iter().map(|part| part.bytes).collect();
-        let (offsets, total) = layout(
-            fixed_bytes
-                .iter()
-                .copied()
-                .chain(segments.iter().map(Segment::bytes)),
-        );
-        let bytes = total as u64;
+        let (parent, plan) = self.plan_capture(ancestors, fixed_bytes, &rows);
+        let bytes = plan.total as u64;
         let skip =
             |reason: &str| eprintln!("  session cache: skipped {p}-token snapshot ({reason})");
-        if bytes > self.pool.max_bytes() {
+        if self.pressure.is_none() && bytes > self.pool.max_bytes() {
             skip("exceeds budget");
             return Ok(());
         }
@@ -1628,49 +2466,33 @@ impl SessionCache {
         if let Some(parent) = &parent {
             self.link(parent);
         }
-        let fits = self.make_room(gpu, bytes, growth);
-        let dst = match fits.and_then(|()| {
-            gpu.bind_thread()
-                .and_then(|()| gpu.hip.malloc(total))
-                .map_err(|_| "allocation")
-        }) {
+        let placed = match self.pressure {
+            None => self.make_room(gpu, bytes, growth).map(|()| Tier::Device),
+            Some(_) => self.place(gpu, bytes, growth, true),
+        };
+        let dst = placed
+            .and_then(|tier| alloc_store(gpu, tier, plan.total).map_err(|_| "allocation"));
+        let dst = match dst {
             Ok(dst) => dst,
             Err(reason) => {
                 if let Some(parent) = &parent {
                     self.unlink(parent);
                 }
+                if self.pressure.is_some() {
+                    self.host_skips_total = self.host_skips_total.saturating_add(1);
+                }
                 skip(reason);
                 return Ok(());
             }
         };
-        let fixed = live
-            .fixed
-            .iter()
-            .map(|part| (part.buf, part.offset, part.bytes));
-        let rows = live.rows.iter().zip(&segments).map(|(stream, segment)| {
-            (
-                stream.buf,
-                segment.from * segment.row_bytes,
-                segment.bytes(),
-            )
-        });
-        let regions: Vec<CopyRegion<'_>> = fixed
-            .chain(rows)
-            .zip(offsets)
-            .map(|((src, src_offset, bytes), dst_offset)| CopyRegion {
-                dst: &dst,
-                dst_offset,
-                src,
-                src_offset,
-                bytes,
-            })
-            .collect();
-        let copied = copy_regions(gpu, &regions);
+        let fixed_offsets: Vec<usize> = live.fixed.iter().map(|part| part.offset).collect();
+        let copied = save_to_store(gpu, &dst, &plan.copies(&fixed_offsets), &live);
+        let host = dst.is_host();
         let snapshot = StoredSnapshot {
-            location: SnapshotLocation::Device(dst),
+            location: dst.into(),
             parent,
-            fixed_bytes,
-            segments,
+            fixed_bytes: plan.fixed_bytes,
+            segments: plan.segments,
             meta,
             bytes,
         };
@@ -1678,16 +2500,61 @@ impl SessionCache {
             self.drop_snapshot(gpu, snapshot);
             return Err(format!("session cache: snapshot copy failed: {error}"));
         }
+        if host {
+            self.host_captures_total = self.host_captures_total.saturating_add(1);
+        }
         self.pending
             .push(((capture_domain, p as u64, fp), snapshot));
         Ok(())
     }
 
+    /// Geometry of the delta snapshot of a live state of `fixed_bytes` and
+    /// `rows` (`(row_bytes, rows)` per stream): its parent is the deepest of
+    /// `ancestors` (deepest first) that is published or pending and whose
+    /// streams line up with the live ones (else rows from 0), and its
+    /// segments start at the parent's segment ends. Pure bookkeeping.
+    fn plan_capture(
+        &self,
+        ancestors: Vec<Key>,
+        fixed_bytes: Vec<usize>,
+        rows: &[(usize, usize)],
+    ) -> (Option<Key>, ParkPlan) {
+        let parent = ancestors.into_iter().find_map(|key| {
+            let segments = &self.entry(&key)?.segments;
+            let fits = segments.len() == rows.len()
+                && segments
+                    .iter()
+                    .zip(rows)
+                    .all(|(segment, &(row_bytes, live))| {
+                        segment.row_bytes == row_bytes && segment.to <= live
+                    });
+            fits.then(|| (key, segments.iter().map(|s| s.to).collect::<Vec<_>>()))
+        });
+        let plan = ParkPlan::delta(
+            fixed_bytes,
+            rows,
+            parent.as_ref().map(|(_, ends)| ends.as_slice()),
+        );
+        (parent.map(|(key, _)| key), plan)
+    }
+
+    /// This turn's pending resident (or, for a lineage split, tail) slot.
+    fn pending_slot(&mut self, lineage: bool) -> &mut Option<Resident> {
+        if lineage {
+            &mut self.tail_pending
+        } else {
+            &mut self.resident_pending
+        }
+    }
+
     /// Copy the fixed parts of `live` (at boundary `key.1`) into this turn's
-    /// resident snapshot, reusing its buffer. A capture the memory guard
-    /// refuses is skipped and leaves the previous boundary's.
+    /// resident snapshot (the tail one when `lineage`), reusing its buffer.
+    /// A capture refused (memory guard, or under the pressure policy neither
+    /// tier can hold it) is skipped and leaves the previous boundary's.
+    #[allow(clippy::too_many_arguments)]
     fn capture_resident(
-        pending: &mut Option<Resident>,
+        &mut self,
+        lineage: bool,
         gpu: &mut Gpu,
         key: Key,
         meta: &[u8],
@@ -1695,49 +2562,84 @@ impl SessionCache {
         growth: u64,
         cold_exact: bool,
     ) -> Result<(), String> {
-        let fixed_bytes: Vec<usize> = live.fixed.iter().map(|part| part.bytes).collect();
-        let (offsets, total) = layout(fixed_bytes.iter().copied());
-        let buf = match pending.take() {
-            Some(resident) if resident.buf.size() == total => resident.buf,
-            previous => {
-                if memory_fits(gpu, total as u64, growth) != Some(true) {
-                    eprintln!(
-                        "  session cache: skipped {}-token resident snapshot (memory guard)",
-                        key.1
-                    );
-                    *pending = previous;
-                    return Ok(());
-                }
-                if let Some(resident) = previous {
-                    free_device(gpu, resident.buf);
+        let fixed: Vec<(usize, usize)> = live
+            .fixed
+            .iter()
+            .map(|part| (part.offset, part.bytes))
+            .collect();
+        let plan =
+            ParkPlan::new(&fixed, &[], &[]).expect("a fixed-only plan has no streams to mismatch");
+        let total = plan.total;
+        let fixed_offsets: Vec<usize> = live.fixed.iter().map(|part| part.offset).collect();
+        let owned = self.owned();
+        let previous_size = self.pending_slot(lineage).as_ref().map(|r| r.buf.size());
+        let floor = self.device_floor();
+        let action = resident_plan(self.pressure.as_ref(), previous_size, total, owned, || {
+            memory_fits_floor(gpu, total as u64, growth, floor)
+        });
+        let skip = |this: &mut Self, reason: &str| {
+            eprintln!(
+                "  session cache: skipped {}-token resident snapshot ({reason})",
+                key.1
+            );
+            if this.pressure.is_some() {
+                this.host_skips_total = this.host_skips_total.saturating_add(1);
+            }
+        };
+        let store = match action {
+            ResidentPlan::Skip(reason) => {
+                skip(self, reason);
+                return Ok(());
+            }
+            ResidentPlan::Reuse => self
+                .pending_slot(lineage)
+                .take()
+                .expect("reuse is planned over a pending buffer")
+                .buf,
+            ResidentPlan::Allocate(tier) if self.pressure.is_none() => {
+                debug_assert_eq!(tier, Tier::Device);
+                if let Some(previous) = self.pending_slot(lineage).take() {
+                    free_store(gpu, previous.buf);
                 }
                 gpu.bind_thread()
                     .and_then(|()| gpu.hip.malloc(total))
+                    .map(Store::Device)
                     .map_err(|e| format!("session cache: resident snapshot allocation: {e}"))?
             }
+            ResidentPlan::Allocate(tier) => {
+                // The previous capture stays owned (and counted) until the
+                // new one exists, so a refusal leaves it in place.
+                if tier == Tier::Host && self.make_host_room(gpu, total as u64).is_err() {
+                    skip(self, "host budget");
+                    return Ok(());
+                }
+                match alloc_store(gpu, tier, total) {
+                    Ok(store) => {
+                        if let Some(previous) = self.pending_slot(lineage).take() {
+                            free_store(gpu, previous.buf);
+                        }
+                        store
+                    }
+                    Err(_) => {
+                        skip(self, "allocation");
+                        return Ok(());
+                    }
+                }
+            }
         };
-        let regions: Vec<CopyRegion<'_>> = live
-            .fixed
-            .iter()
-            .zip(offsets)
-            .map(|(part, dst_offset)| CopyRegion {
-                dst: &buf,
-                dst_offset,
-                src: part.buf,
-                src_offset: part.offset,
-                bytes: part.bytes,
-            })
-            .collect();
-        if let Err(error) = copy_regions(gpu, &regions) {
-            free_device(gpu, buf);
+        if let Err(error) = save_to_store(gpu, &store, &plan.copies(&fixed_offsets), live) {
+            free_store(gpu, store);
             return Err(format!(
                 "session cache: resident snapshot copy failed: {error}"
             ));
         }
-        *pending = Some(Resident {
+        if store.is_host() {
+            self.host_captures_total = self.host_captures_total.saturating_add(1);
+        }
+        *self.pending_slot(lineage) = Some(Resident {
             key,
-            buf,
-            fixed_bytes,
+            buf: store,
+            fixed_bytes: live.fixed.iter().map(|part| part.bytes).collect(),
             rows: live.rows.iter().map(|stream| stream.rows).collect(),
             meta: meta.to_vec(),
             cold_exact,
@@ -1763,11 +2665,16 @@ impl SessionCache {
             let (domain, p, fp) = key.clone();
             // `at_boundary` already reserved room for every pending
             // snapshot, so this insert evicts nothing.
-            let (id, displaced) = self.pool.insert_unaligned(domain, p, fp, snapshot);
+            let host = matches!(snapshot.location, SnapshotLocation::Host(_));
+            let (id, displaced) = if host {
+                self.host_pool.insert_unaligned(domain, p, fp, snapshot)
+            } else {
+                self.pool.insert_unaligned(domain, p, fp, snapshot)
+            };
             if id == CheckpointId::NONE {
                 refused.insert(key);
             } else if self.children.contains_key(&key) {
-                self.pool.pin(&key.0, key.1, key.2);
+                self.pin_key(&key);
             }
             for snapshot in displaced {
                 self.retire(snapshot);
@@ -1792,36 +2699,67 @@ impl SessionCache {
         self.turn = None;
     }
 
-    /// Bytes of every published snapshot.
+    /// Bytes of every published device snapshot.
     pub fn stored_bytes(&self) -> u64 {
         self.pool.total_bytes()
     }
 
-    /// Device bytes owned per bookkeeping category, and the eviction count.
-    /// Pure read of the cache's own fields: no GPU access, no allocation.
+    /// Bytes owned per bookkeeping category (device, and the pinned-host
+    /// tier's), and the counters. Pure read of the cache's own fields: no
+    /// GPU access, no allocation.
     pub fn usage(&self) -> SessionCacheUsage {
-        let resident = |slot: &Option<Resident>| slot.as_ref().map_or(0, |r| r.buf.size() as u64);
-        let pending = self.pending.iter().map(|entry| device_bytes(&entry.1));
-        let deferred = self.release.iter().map(device_bytes);
+        let device = |slot: &Option<Resident>| slot.as_ref().map_or(0, |r| r.buf.device_bytes());
+        let host = |slot: &Option<Resident>| slot.as_ref().map_or(0, |r| r.buf.host_bytes());
         SessionCacheUsage {
             pool_bytes: self.pool.total_bytes(),
             budget_bytes: self.pool.max_bytes(),
-            pending_bytes: saturating_total(pending.chain([
-                resident(&self.resident_pending),
-                resident(&self.tail_pending),
-            ])),
-            resident_bytes: saturating_total([resident(&self.resident), resident(&self.tail)]),
+            pending_bytes: saturating_total(
+                self.pending
+                    .iter()
+                    .map(|entry| device_bytes(&entry.1))
+                    .chain([device(&self.resident_pending), device(&self.tail_pending)]),
+            ),
+            resident_bytes: saturating_total([device(&self.resident), device(&self.tail)]),
             deferred_release_bytes: saturating_total(
-                deferred.chain(self.release_bufs.iter().map(|buf| buf.size() as u64)),
+                self.release
+                    .iter()
+                    .map(device_bytes)
+                    .chain(self.release_bufs.iter().map(Store::device_bytes)),
             ),
             parked_bytes: self.parked.as_ref().map_or(0, |parked| {
                 saturating_total([
-                    parked.buf.size() as u64,
-                    resident(&parked.resident),
-                    resident(&parked.tail),
+                    parked.buf.device_bytes(),
+                    device(&parked.resident),
+                    device(&parked.tail),
                 ])
             }),
             evictions_total: self.evictions_total,
+            host_budget_bytes: self.pressure.map_or(0, |policy| policy.host_budget_bytes),
+            host_pool_bytes: self.host_pool.total_bytes(),
+            host_pending_bytes: saturating_total(
+                self.pending
+                    .iter()
+                    .map(|entry| host_bytes(&entry.1))
+                    .chain([host(&self.resident_pending), host(&self.tail_pending)]),
+            ),
+            host_resident_bytes: saturating_total([host(&self.resident), host(&self.tail)]),
+            host_deferred_release_bytes: saturating_total(
+                self.release
+                    .iter()
+                    .map(host_bytes)
+                    .chain(self.release_bufs.iter().map(Store::host_bytes)),
+            ),
+            host_parked_bytes: self.parked.as_ref().map_or(0, |parked| {
+                saturating_total([
+                    parked.buf.host_bytes(),
+                    host(&parked.resident),
+                    host(&parked.tail),
+                ])
+            }),
+            host_captures_total: self.host_captures_total,
+            host_restores_total: self.host_restores_total,
+            host_evictions_total: self.host_evictions_total,
+            host_skips_total: self.host_skips_total,
         }
     }
 
@@ -1840,17 +2778,27 @@ impl SessionCache {
                 self.evict_device(gpu, key, snapshot, 0);
             }
         }
+        for store in self.take_all_stores() {
+            free_store(gpu, store);
+        }
+    }
+
+    /// The bookkeeping of the final half of [`Self::clear`], no GPU: empty
+    /// every pool, pending and deferred list, resident and park, and return
+    /// each owner exactly once (to free).
+    fn take_all_stores(&mut self) -> Vec<Store> {
         let pooled = self.pool.drain_blobs();
+        let hosted = self.host_pool.drain_blobs();
         let pending = std::mem::take(&mut self.pending)
             .into_iter()
             .map(|entry| entry.1);
-        for snapshot in pooled
+        let mut stores: Vec<Store> = pooled
             .into_iter()
+            .chain(hosted)
             .chain(pending)
             .chain(std::mem::take(&mut self.release))
-        {
-            free_buffer(gpu, snapshot);
-        }
+            .filter_map(StoredSnapshot::into_store)
+            .collect();
         for resident in [
             self.resident.take(),
             self.resident_pending.take(),
@@ -1860,18 +2808,15 @@ impl SessionCache {
         .into_iter()
         .flatten()
         {
-            free_device(gpu, resident.buf);
+            stores.push(resident.buf);
         }
         if let Some(parked) = self.parked.take() {
-            for buf in parked.into_buffers() {
-                free_device(gpu, buf);
-            }
+            stores.extend(parked.into_buffers());
         }
-        for buf in std::mem::take(&mut self.release_bufs) {
-            free_device(gpu, buf);
-        }
+        stores.append(&mut self.release_bufs);
         self.children.clear();
         self.turn = None;
+        stores
     }
 
     /// Make room for `need` more device bytes the live state is about to
@@ -1887,13 +2832,16 @@ impl SessionCache {
             if memory_fits(gpu, need, 0) != Some(false) {
                 break;
             }
-            if let Some(buf) = self.release_bufs.pop() {
-                freed += buf.size() as u64;
-                free_device(gpu, buf);
+            // Only device owners relieve device pressure: a host block stays.
+            if let Some(i) = self.release_bufs.iter().rposition(|store| !store.is_host()) {
+                let store = self.release_bufs.remove(i);
+                freed += store.device_bytes();
+                free_store(gpu, store);
                 continue;
             }
-            let snapshot = match self.release.pop() {
-                Some(snapshot) => {
+            let snapshot = match self.release.iter().rposition(|s| device_bytes(s) > 0) {
+                Some(i) => {
+                    let snapshot = self.release.remove(i);
                     freed += snapshot.bytes;
                     free_buffer(gpu, snapshot);
                     continue;
@@ -1904,18 +2852,30 @@ impl SessionCache {
                         self.evict_device(gpu, key, snapshot, need);
                         continue;
                     }
-                    None => self.pending.pop().map(|entry| entry.1),
+                    None => self
+                        .pending
+                        .iter()
+                        .rposition(|entry| device_bytes(&entry.1) > 0)
+                        .map(|i| self.pending.remove(i).1),
                 },
             };
             let Some(snapshot) = snapshot else {
                 // The parked conversation goes last: it is the live state's
-                // own history, not an opportunistic snapshot.
-                let Some(parked) = self.parked.take() else {
+                // own history, not an opportunistic snapshot. A park that
+                // owns no device byte frees none.
+                let holds_device = self.parked.as_ref().is_some_and(|parked| {
+                    parked.buf.device_bytes()
+                        + parked.resident.as_ref().map_or(0, |r| r.buf.device_bytes())
+                        + parked.tail.as_ref().map_or(0, |t| t.buf.device_bytes())
+                        > 0
+                });
+                if !holds_device {
                     break;
-                };
-                for buf in parked.into_buffers() {
-                    freed += buf.size() as u64;
-                    free_device(gpu, buf);
+                }
+                let parked = self.parked.take().expect("checked above");
+                for store in parked.into_buffers() {
+                    freed += store.device_bytes();
+                    free_store(gpu, store);
                 }
                 continue;
             };
@@ -1970,8 +2930,8 @@ impl SessionCache {
     /// Free the park and its residents.
     fn discard_parked(&mut self, gpu: &mut Gpu) {
         if let Some(parked) = self.parked.take() {
-            for buf in parked.into_buffers() {
-                free_device(gpu, buf);
+            for store in parked.into_buffers() {
+                free_store(gpu, store);
             }
         }
     }
@@ -2024,37 +2984,36 @@ impl SessionCache {
             skip("row bound does not match the layout");
             return false;
         };
-        if plan.total == 0 || memory_fits(gpu, plan.total as u64, growth) != Some(true) {
-            skip("memory guard");
-            return false;
-        }
-        let buf = match gpu.bind_thread().and_then(|()| gpu.hip.malloc(plan.total)) {
+        let placed = if plan.total == 0 {
+            Err("memory guard")
+        } else {
+            match self.pressure {
+                None => (memory_fits(gpu, plan.total as u64, growth) == Some(true))
+                    .then_some(Tier::Device)
+                    .ok_or("memory guard"),
+                Some(_) => self.place(gpu, plan.total as u64, growth, false),
+            }
+        };
+        let buf = match placed
+            .and_then(|tier| alloc_store(gpu, tier, plan.total).map_err(|_| "allocation"))
+        {
             Ok(buf) => buf,
-            Err(_) => {
-                skip("allocation");
+            Err(reason) => {
+                if self.pressure.is_some() {
+                    self.host_skips_total = self.host_skips_total.saturating_add(1);
+                }
+                skip(reason);
                 return false;
             }
         };
-        let fixed_count = live.fixed.len();
         let copies = plan.copies(&fixed_offsets);
-        let regions: Vec<CopyRegion<'_>> = copies
-            .iter()
-            .map(|copy| CopyRegion {
-                dst: &buf,
-                dst_offset: copy.park_offset,
-                src: if copy.part < fixed_count {
-                    live.fixed[copy.part].buf
-                } else {
-                    live.rows[copy.part - fixed_count].buf
-                },
-                src_offset: copy.live_offset,
-                bytes: copy.bytes,
-            })
-            .collect();
-        if let Err(error) = copy_regions(gpu, &regions) {
-            skip(&error.to_string());
-            free_device(gpu, buf);
+        if let Err(error) = save_to_store(gpu, &buf, &copies, &live) {
+            skip(&error);
+            free_store(gpu, buf);
             return false;
+        }
+        if buf.is_host() {
+            self.host_captures_total = self.host_captures_total.saturating_add(1);
         }
         let live_rows = rows.iter().map(|&(_, rows)| rows).collect();
         self.parked = Some(Parked {
@@ -2078,6 +3037,7 @@ impl SessionCache {
         gpu: &mut Gpu,
         state: &mut dyn SessionState,
         parked: &Parked,
+        host_restores: &mut u64,
     ) -> Result<(), String> {
         let dst = state.restore_parts(gpu, parked.route, &parked.meta)?;
         let plan = &parked.plan;
@@ -2102,21 +3062,10 @@ impl SessionCache {
         }
         let fixed_offsets: Vec<usize> = dst.fixed.iter().map(|part| part.offset).collect();
         let copies = plan.copies(&fixed_offsets);
-        let regions: Vec<CopyRegion<'_>> = copies
-            .iter()
-            .map(|copy| CopyRegion {
-                dst: if copy.part < fixed_count {
-                    dst.fixed[copy.part].buf
-                } else {
-                    dst.rows[copy.part - fixed_count].buf
-                },
-                dst_offset: copy.live_offset,
-                src: &parked.buf,
-                src_offset: copy.park_offset,
-                bytes: copy.bytes,
-            })
-            .collect();
-        copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
+        load_from_store(gpu, &parked.buf, &copies, &dst)?;
+        if parked.buf.is_host() {
+            *host_restores = host_restores.saturating_add(1);
+        }
         state.finish_restore(gpu, parked.route, &parked.meta)
     }
 
@@ -2142,7 +3091,7 @@ impl SessionCache {
             && parked.position == reused
             && state.snapshot_scope(route).as_deref() == Some(parked.scope.as_str())
         {
-            Self::restore_parked(gpu, state, &parked)
+            Self::restore_parked(gpu, state, &parked, &mut self.host_restores_total)
         } else {
             Err("session cache: parked conversation does not match the request".to_string())
         };
@@ -2150,7 +3099,7 @@ impl SessionCache {
         self.release_bufs.push(parked.buf);
         if let Err(error) = restored {
             for resident in [resident, tail].into_iter().flatten() {
-                free_device(gpu, resident.buf);
+                free_store(gpu, resident.buf);
             }
             let _ = state.reset(gpu);
             self.drop_resident(gpu);
@@ -2313,6 +3262,13 @@ impl SessionDriver {
 
     pub fn cache(&self) -> &SessionCache {
         &self.cache
+    }
+
+    /// [`SessionCache::enable_pressure_host_snapshots`]: arm the opt-in
+    /// pressure-selected pinned-host snapshot tier on this driver's cache
+    /// (callable before or after the cache holds snapshots).
+    pub fn enable_pressure_host_snapshots(&mut self, policy: PressureHostSnapshotPolicy) {
+        self.cache.enable_pressure_host_snapshots(policy);
     }
 
     /// Bound the next [`Self::begin`]'s request: its prompt plus every row
@@ -2585,6 +3541,7 @@ impl SessionDriver {
         let fresh = cache.pool.is_empty()
             && cache.pending.is_empty()
             && cache.release.is_empty()
+            && cache.host_pool.is_empty()
             && cache.release_bufs.is_empty()
             && cache.children.is_empty()
             && cache.resident.is_none()
@@ -2628,6 +3585,7 @@ impl SessionDriver {
     /// resident-only and disk-only snapshots are not pieces.
     pub fn piece_resident(&self, key: &SessionPieceKey) -> bool {
         self.cache.pool.contains(&key.0 .0, key.0 .1, key.0 .2)
+            || self.cache.host_pool.contains(&key.0 .0, key.0 .1, key.0 .2)
     }
 
     /// Pin the piece against eviction (one pin per call, counted with the
@@ -4379,7 +5337,7 @@ mod tests {
     ) -> Parked {
         let (_, rows) = state.geometry();
         Parked {
-            buf: fake_buf(plan.total),
+            buf: Store::Device(fake_buf(plan.total)),
             plan,
             meta: Vec::new(),
             live_rows: rows.iter().map(|&(_, live)| live).collect(),
@@ -5485,6 +6443,16 @@ mod tests {
                 deferred_release_bytes: 0,
                 parked_bytes: 0,
                 evictions_total: 0,
+                host_budget_bytes: 0,
+                host_pool_bytes: 0,
+                host_pending_bytes: 0,
+                host_resident_bytes: 0,
+                host_deferred_release_bytes: 0,
+                host_parked_bytes: 0,
+                host_captures_total: 0,
+                host_restores_total: 0,
+                host_evictions_total: 0,
+                host_skips_total: 0,
             }
         );
 
@@ -5497,7 +6465,7 @@ mod tests {
         );
         let make_resident = |bytes: usize| Resident {
             key: resident_key.clone(),
-            buf: fake_buf(bytes),
+            buf: Store::Device(fake_buf(bytes)),
             fixed_bytes: Vec::new(),
             rows: Vec::new(),
             meta: Vec::new(),
@@ -5509,9 +6477,9 @@ mod tests {
         cache.tail_pending = Some(make_resident(400));
         cache.pending.push((resident_key.clone(), fake_snapshot(4)));
         cache.release.push(fake_snapshot(5));
-        cache.release_bufs.push(fake_buf(500));
+        cache.release_bufs.push(Store::Device(fake_buf(500)));
         cache.parked = Some(Parked {
-            buf: fake_buf(1000),
+            buf: Store::Device(fake_buf(1000)),
             plan: ParkPlan {
                 fixed_bytes: Vec::new(),
                 segments: Vec::new(),
@@ -5538,6 +6506,19 @@ mod tests {
         assert_eq!(usage.deferred_release_bytes, 4096 + 500);
         assert_eq!(usage.parked_bytes, 1000 + 2000 + 4000);
         assert_eq!(usage.evictions_total, 0);
+        assert_eq!(usage.device_total_bytes(), 8192 + 4796 + 300 + 4596 + 7000);
+        // Device-only owners: no host byte, no host counter.
+        assert_eq!(usage.host_total_bytes(), 0);
+        assert_eq!(
+            (
+                usage.host_budget_bytes,
+                usage.host_captures_total,
+                usage.host_restores_total,
+                usage.host_evictions_total,
+                usage.host_skips_total,
+            ),
+            (0, 0, 0, 0, 0)
+        );
         // Reading usage is pure.
         assert_eq!(cache.usage(), usage);
     }
@@ -5584,5 +6565,934 @@ mod tests {
         assert_eq!(cache.usage().evictions_total, 3);
         assert!(cache.children.is_empty());
         assert!(!cache.pool.is_pinned(&parent.0, parent.1, parent.2));
+    }
+
+    // ------------------------------------------------------------------
+    // slowlink_session_cache: pressure-selected pinned-host snapshots.
+    // Every test drives the production planners and bookkeeping (placement,
+    // capture geometry, parent choice, chain walk, restore geometry, commit,
+    // turn head, clear, usage); only the GPU allocation and copies, which
+    // need HIP, are left out.
+    // ------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    const QSA_FIXED: usize = 34_130_944;
+    const QSA_LAYERS: usize = 12;
+    /// A host budget no test fills.
+    const HUGE: u64 = 1 << 40;
+
+    /// Streams of the Q8/Q8 QSA fixture at `p` tokens: per layer K, V (544 B
+    /// rows), raw index keys (256 B) and the pooled keys (256 B, `p / 4`).
+    fn qsa_rows(p: usize) -> Vec<(usize, usize)> {
+        (0..QSA_LAYERS)
+            .flat_map(|_| [(544, p), (544, p), (256, p), (256, p / 4)])
+            .collect()
+    }
+
+    fn counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    fn released(drops: &Arc<AtomicUsize>) -> usize {
+        drops.load(Ordering::SeqCst)
+    }
+
+    /// A host store of `bytes` whose single release `drops` counts.
+    fn host_store(bytes: usize, drops: &Arc<AtomicUsize>) -> Store {
+        let mem = HostMem::Fake(FakeHost {
+            bytes: Vec::new(),
+            drops: Arc::clone(drops),
+        });
+        Store::Host(HostBlock::new(mem, bytes))
+    }
+
+    fn host_snapshot(bytes: u64, parent: Option<Key>, drops: &Arc<AtomicUsize>) -> StoredSnapshot {
+        StoredSnapshot {
+            location: host_store(bytes as usize, drops).into(),
+            parent,
+            fixed_bytes: vec![HOST_FIXED_A, HOST_FIXED_B],
+            segments: Vec::new(),
+            meta: Vec::new(),
+            bytes,
+        }
+    }
+
+    fn resident_of(store: Store) -> Resident {
+        Resident {
+            key: (domain(), 1, 1),
+            buf: store,
+            fixed_bytes: Vec::new(),
+            rows: Vec::new(),
+            meta: Vec::new(),
+            cold_exact: true,
+        }
+    }
+
+    fn parked_of(buf: Store, resident: Option<Resident>, tail: Option<Resident>) -> Parked {
+        Parked {
+            buf,
+            plan: ParkPlan {
+                fixed_bytes: Vec::new(),
+                segments: Vec::new(),
+                offsets: Vec::new(),
+                total: 0,
+            },
+            meta: Vec::new(),
+            live_rows: Vec::new(),
+            scope: "scope".to_string(),
+            route: AR,
+            position: 3,
+            through: 3,
+            live_cold_exact: true,
+            resident,
+            tail,
+        }
+    }
+
+    fn policy_cache(host: u64, device: u64) -> SessionCache {
+        let mut cache = SessionCache::new(domain(), 1 << 40);
+        cache.enable_pressure_host_snapshots(PressureHostSnapshotPolicy {
+            host_budget_bytes: host,
+            device_budget_bytes: device,
+        });
+        cache
+    }
+
+    fn cut_key(cache: &SessionCache, hist: &[u32], p: usize) -> Key {
+        (
+            capture_domain(&cache.domain.scoped("scope"), true),
+            p as u64,
+            prefix_fingerprint(&hist[..p]),
+        )
+    }
+
+    /// `at_boundary`'s pool capture minus the GPU: the production parent
+    /// choice and geometry ([`SessionCache::plan_capture`]), the production
+    /// tier choice ([`SessionCache::pick_tier`], `guard` standing for the real
+    /// memory query) and host-budget room, then the pending snapshot's
+    /// publication ([`SessionCache::commit`]).
+    #[allow(clippy::too_many_arguments)]
+    fn stage_cut(
+        cache: &mut SessionCache,
+        hist: &[u32],
+        cuts_below: &[usize],
+        p: usize,
+        fixed: Vec<usize>,
+        rows: &[(usize, usize)],
+        guard: Option<bool>,
+        drops: &Arc<AtomicUsize>,
+    ) -> Result<Tier, &'static str> {
+        let ancestors: Vec<Key> = cuts_below
+            .iter()
+            .rev()
+            .map(|&b| cut_key(cache, hist, b))
+            .collect();
+        let (parent, plan) = cache.plan_capture(ancestors, fixed, rows);
+        let bytes = plan.total as u64;
+        if let Some(parent) = &parent {
+            cache.link(parent);
+        }
+        let tier = cache.pick_tier(bytes, true, || guard);
+        let tier = match tier {
+            Ok(Tier::Host) => {
+                let (evicted, fits) = cache.evict_host_for(bytes);
+                drop(evicted);
+                if fits {
+                    Ok(Tier::Host)
+                } else {
+                    Err("host budget")
+                }
+            }
+            other => other,
+        };
+        let tier = match tier {
+            Ok(tier) => tier,
+            Err(reason) => {
+                if let Some(parent) = &parent {
+                    cache.unlink(parent);
+                }
+                return Err(reason);
+            }
+        };
+        let store = match tier {
+            Tier::Device => Store::Device(fake_buf(plan.total)),
+            Tier::Host => host_store(plan.total, drops),
+        };
+        let key = cut_key(cache, hist, p);
+        cache.pending.push((
+            key,
+            StoredSnapshot {
+                location: store.into(),
+                parent,
+                fixed_bytes: plan.fixed_bytes,
+                segments: plan.segments,
+                meta: Vec::new(),
+                bytes,
+            },
+        ));
+        cache.commit();
+        Ok(tier)
+    }
+
+    #[test]
+    fn slowlink_session_cache_placement_needs_guard_and_total_device_budget() {
+        let policy = PressureHostSnapshotPolicy {
+            host_budget_bytes: 1000,
+            device_budget_bytes: 600,
+        };
+        let owned = Owned {
+            device: 100,
+            host: 0,
+            host_pool: 0,
+        };
+        // 100 owned + 500 = the 600 total budget exactly.
+        assert_eq!(
+            plan_placement(&policy, 500, owned, true, || Some(true)),
+            Ok(Tier::Device)
+        );
+        // One byte over the TOTAL device budget goes to the host.
+        assert_eq!(
+            plan_placement(&policy, 501, owned, true, || Some(true)),
+            Ok(Tier::Host)
+        );
+        // The real guard refusing, or failing to answer, picks the host.
+        assert_eq!(
+            plan_placement(&policy, 500, owned, true, || Some(false)),
+            Ok(Tier::Host)
+        );
+        assert_eq!(
+            plan_placement(&policy, 500, owned, true, || None),
+            Ok(Tier::Host)
+        );
+        // No room in the device pool's own budget.
+        assert_eq!(
+            plan_placement(&policy, 500, owned, false, || Some(true)),
+            Ok(Tier::Host)
+        );
+        // The guard is only consulted once the budgets already permit.
+        let calls = std::cell::Cell::new(0);
+        let counted = || {
+            calls.set(calls.get() + 1);
+            Some(true)
+        };
+        assert_eq!(
+            plan_placement(&policy, 501, owned, true, counted),
+            Ok(Tier::Host)
+        );
+        assert_eq!(calls.get(), 0);
+        // A zero device budget is never a device credit, however much memory
+        // the idle device has (the 512 MiB safety margin is not cache capacity).
+        let none = PressureHostSnapshotPolicy {
+            host_budget_bytes: 1000,
+            device_budget_bytes: 0,
+        };
+        assert_eq!(
+            plan_placement(&none, 1, Owned::default(), true, || Some(true)),
+            Ok(Tier::Host)
+        );
+        // Neither tier: refused.
+        assert_eq!(
+            plan_placement(&none, 1001, Owned::default(), true, || Some(true)),
+            Err("host budget")
+        );
+        assert_eq!(
+            plan_placement(&policy, u64::MAX, owned, true, || Some(true)),
+            Err("host budget")
+        );
+    }
+
+    #[test]
+    fn slowlink_session_cache_host_bound_counts_every_pinned_owner_and_refuses_exactly() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(1000, 0);
+        // Published host pool snapshot (100), pending snapshot (200).
+        cache
+            .pending
+            .push((cut_key(&cache, &hist, 2), host_snapshot(100, None, &drops)));
+        cache.commit();
+        cache
+            .pending
+            .push((cut_key(&cache, &hist, 3), host_snapshot(200, None, &drops)));
+        // Resident 50, tail 25, pending resident 10, pending tail 6.
+        cache.resident = Some(resident_of(host_store(50, &drops)));
+        cache.tail = Some(resident_of(host_store(25, &drops)));
+        cache.resident_pending = Some(resident_of(host_store(10, &drops)));
+        cache.tail_pending = Some(resident_of(host_store(6, &drops)));
+        // Deferred: a displaced buffer (5) and a displaced snapshot (7).
+        cache.release_bufs.push(host_store(5, &drops));
+        cache.release.push(host_snapshot(7, None, &drops));
+        // Parked: its buffer (20), resident (3) and tail (2).
+        cache.parked = Some(parked_of(
+            host_store(20, &drops),
+            Some(resident_of(host_store(3, &drops))),
+            Some(resident_of(host_store(2, &drops))),
+        ));
+        // A device owner never counts against the host.
+        cache.release_bufs.push(Store::Device(fake_buf(9999)));
+
+        let usage = cache.usage();
+        assert_eq!(usage.host_budget_bytes, 1000);
+        assert_eq!(usage.host_pool_bytes, 100);
+        assert_eq!(usage.host_pending_bytes, 200 + 10 + 6);
+        assert_eq!(usage.host_resident_bytes, 50 + 25);
+        assert_eq!(usage.host_deferred_release_bytes, 5 + 7);
+        assert_eq!(usage.host_parked_bytes, 20 + 3 + 2);
+        assert_eq!(usage.host_total_bytes(), 100 + 216 + 75 + 12 + 25);
+        assert_eq!(usage.device_total_bytes(), 9999);
+        assert_eq!(usage.deferred_release_bytes, 9999);
+        let total = 428;
+        assert_eq!(usage.host_total_bytes(), total);
+        assert_eq!(cache.owned().host, total);
+
+        // Everything but the evictable published pool (100) is pinned: 328
+        // bytes, so exactly 672 more fit and 673 do not.
+        assert_eq!(cache.pick_tier(672, true, || Some(false)), Ok(Tier::Host));
+        assert_eq!(cache.pick_tier(673, true, || Some(false)), Err("host budget"));
+        // The device budget is 0: even a passing guard cannot place it there.
+        assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(Tier::Host));
+    }
+
+    #[test]
+    fn slowlink_session_cache_host_eviction_is_lru_leaf_only_and_releases_once() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(500, 0);
+        let (a, b) = (cut_key(&cache, &hist, 2), cut_key(&cache, &hist, 3));
+        cache
+            .pending
+            .push((a.clone(), host_snapshot(100, None, &drops)));
+        cache.commit();
+        cache
+            .pending
+            .push((b.clone(), host_snapshot(100, Some(a.clone()), &drops)));
+        cache.link(&a);
+        cache.commit();
+        // Another (non-pool) pinned host owner of 250.
+        cache.release_bufs.push(host_store(250, &drops));
+        assert_eq!(cache.owned().host, 450);
+        assert!(cache.host_pool.is_pinned(&a.0, a.1, a.2));
+
+        // 100 more do not fit; the pinned parent is no victim, its child is.
+        let (evicted, fits) = cache.evict_host_for(100);
+        assert!(fits);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(released(&drops), 0, "bookkeeping frees nothing");
+        drop(evicted);
+        assert_eq!(released(&drops), 1);
+        assert!(!cache.host_pool.contains(&b.0, b.1, b.2));
+        // Evicting the child unlinked it: its parent is evictable now.
+        assert!(!cache.host_pool.is_pinned(&a.0, a.1, a.2));
+        assert_eq!(cache.usage().host_evictions_total, 1);
+        // Device evictions are a different counter.
+        assert_eq!(cache.usage().evictions_total, 0);
+
+        // 300 more cannot fit beside the 250 pinned elsewhere: the parent is
+        // evicted too and the room still falls short (the caller refuses).
+        let (evicted, fits) = cache.evict_host_for(300);
+        assert!(!fits);
+        assert_eq!(evicted.len(), 1);
+        drop(evicted);
+        assert_eq!(cache.usage().host_evictions_total, 2);
+        assert_eq!(released(&drops), 2);
+        assert_eq!(cache.usage().host_pool_bytes, 0);
+    }
+
+    #[test]
+    fn slowlink_session_cache_cut_geometry_matches_the_source_derived_sizes() {
+        let cache = SessionCache::new(domain(), 1 << 30);
+        for (p, want) in [
+            (3, 34_183_168u64),
+            (4, 34_201_600),
+            (1536, 60_083_200),
+            (1537, 60_104_704),
+            (8192, 172_542_976),
+            (16384, 310_955_008),
+        ] {
+            let (parent, plan) = cache.plan_capture(Vec::new(), vec![QSA_FIXED], &qsa_rows(p));
+            assert!(parent.is_none());
+            assert_eq!(plan.total as u64, want, "standalone cut {p}");
+        }
+
+        let hist = prompt(1, 16_385);
+        let drops = counter();
+        for (cuts, want) in [
+            (vec![3usize, 4, 1536, 1537, 8192], 309_085_184u64),
+            (vec![8192, 16384], 345_085_952),
+        ] {
+            // Device-only and host-only chains cost the same bytes.
+            for guard in [Some(true), Some(false)] {
+                let mut cache = policy_cache(HUGE, HUGE);
+                let mut sum = 0;
+                for (i, &p) in cuts.iter().enumerate() {
+                    let tier = stage_cut(
+                        &mut cache,
+                        &hist,
+                        &cuts[..i],
+                        p,
+                        vec![QSA_FIXED],
+                        &qsa_rows(p),
+                        guard,
+                        &drops,
+                    )
+                    .unwrap();
+                    assert_eq!(tier == Tier::Device, guard == Some(true));
+                    sum += cache.entry(&cut_key(&cache, &hist, p)).unwrap().bytes;
+                }
+                assert_eq!(sum, want, "chain {cuts:?}");
+                let usage = cache.usage();
+                if guard == Some(true) {
+                    assert_eq!((usage.pool_bytes, usage.host_pool_bytes), (want, 0));
+                } else {
+                    assert_eq!((usage.pool_bytes, usage.host_pool_bytes), (0, want));
+                }
+            }
+        }
+    }
+
+    /// Bytes of each destination stream the copies cover, as ranges.
+    fn coverage(copies: &[RestoreCopy], part: usize) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = copies
+            .iter()
+            .filter(|item| item.copy.part == part)
+            .map(|item| (item.copy.live_offset, item.copy.bytes))
+            .collect();
+        ranges.sort_unstable();
+        ranges
+    }
+
+    #[test]
+    fn slowlink_session_cache_mixed_tier_chains_restore_parent_child_and_divergent_geometry() {
+        let drops = counter();
+        let cuts = [3usize, 4, 1536, 1537, 8192];
+        let main = prompt(1, 8193);
+        // The divergent continuation shares the first 1536 tokens and no more.
+        let mut other = main[..1536].to_vec();
+        other.extend(prompt(2, 8193 - 1536));
+        let mut cache = policy_cache(HUGE, HUGE);
+
+        let tiers = [true, false, false, true, false];
+        for (i, &p) in cuts.iter().enumerate() {
+            let tier = stage_cut(
+                &mut cache,
+                &main,
+                &cuts[..i],
+                p,
+                vec![QSA_FIXED],
+                &qsa_rows(p),
+                Some(tiers[i]),
+                &drops,
+            )
+            .unwrap();
+            assert_eq!(tier == Tier::Device, tiers[i], "cut {p}");
+        }
+        // The divergent branch: its own 1537 and 8192 under the shared 1536.
+        let branch = [3usize, 4, 1536];
+        assert_eq!(
+            stage_cut(
+                &mut cache,
+                &other,
+                &branch,
+                1537,
+                vec![QSA_FIXED],
+                &qsa_rows(1537),
+                Some(false),
+                &drops,
+            ),
+            Ok(Tier::Host)
+        );
+        assert_eq!(
+            stage_cut(
+                &mut cache,
+                &other,
+                &[3, 4, 1536, 1537],
+                8192,
+                vec![QSA_FIXED],
+                &qsa_rows(8192),
+                Some(true),
+                &drops,
+            ),
+            Ok(Tier::Device)
+        );
+
+        // Capture parented each cut on the previous one: deltas, not copies.
+        for (i, &p) in cuts.iter().enumerate().skip(1) {
+            let entry = cache.entry(&cut_key(&cache, &main, p)).unwrap();
+            assert_eq!(
+                entry.parent,
+                Some(cut_key(&cache, &main, cuts[i - 1])),
+                "cut {p}"
+            );
+            assert!(entry.segments.iter().any(|s| s.from > 0));
+        }
+        // The divergent 1537 hangs off the SHARED 1536 snapshot.
+        let shared = cut_key(&cache, &main, 1536);
+        assert_eq!(shared, cut_key(&cache, &other, 1536));
+        assert_eq!(
+            cache
+                .entry(&cut_key(&cache, &other, 1537))
+                .unwrap()
+                .parent
+                .as_ref(),
+            Some(&shared)
+        );
+        // Parents with children stay pinned wherever they live.
+        assert!(cache.host_pool.is_pinned(&shared.0, shared.1, shared.2));
+
+        let dst_fixed = [(0usize, QSA_FIXED)];
+        for (hist, leaf, want_tiers) in [
+            (&main, 8192usize, ["dev", "host", "host", "dev", "host"]),
+            (&other, 8192, ["dev", "host", "host", "host", "dev"]),
+        ] {
+            let domain = cache.domain.scoped("scope");
+            let exact = session_exact_domain(&domain);
+            assert_ne!(domain, exact);
+            let capture = capture_domain(&domain, true);
+            let keys = cache.chain_keys(&capture, &hist[..leaf]).unwrap();
+            assert_eq!(keys.len(), 5);
+            assert_eq!(keys[..3], [
+                cut_key(&cache, &main, 3),
+                cut_key(&cache, &main, 4),
+                cut_key(&cache, &main, 1536)
+            ]);
+            let chain = cache.chain_sources(&keys, &[], "gone").unwrap();
+            let tiers: Vec<&str> = chain
+                .iter()
+                .map(|(_, src)| match src {
+                    Src::Device(_) => "dev",
+                    Src::Host(_) => "host",
+                })
+                .collect();
+            assert_eq!(tiers, want_tiers);
+            let links: Vec<&StoredSnapshot> = chain.iter().map(|(s, _)| *s).collect();
+            let rows = qsa_rows(leaf);
+            let copies = plan_chain_restore(&links, &dst_fixed, &rows).unwrap();
+            // The leaf's fixed state, once, from the leaf link.
+            let fixed = coverage(&copies, 0);
+            assert_eq!(fixed, vec![(0, QSA_FIXED)]);
+            assert!(copies
+                .iter()
+                .filter(|item| item.copy.part == 0)
+                .all(|item| item.link == 4));
+            // Every stream is tiled exactly once, from row 0 to its row count.
+            for (i, &(row_bytes, live)) in rows.iter().enumerate() {
+                let mut next = 0;
+                for (offset, bytes) in coverage(&copies, 1 + i) {
+                    assert_eq!(offset, next, "stream {i}");
+                    next = offset + bytes;
+                }
+                assert_eq!(next, live * row_bytes, "stream {i}");
+            }
+            // Every read stays inside, and 256-aligned in, its link's buffer.
+            for item in &copies {
+                assert_eq!(item.copy.park_offset % PART_ALIGN, 0);
+                assert!(item.copy.park_offset + item.copy.bytes <= links[item.link].bytes as usize);
+            }
+        }
+
+        // A chain that does not tile the destination is refused, not guessed.
+        let main_keys = cache
+            .chain_keys(&capture_domain(&cache.domain.scoped("scope"), true), &main[..8192])
+            .unwrap();
+        let chain = cache.chain_sources(&main_keys, &[], "gone").unwrap();
+        let mut links: Vec<&StoredSnapshot> = chain.iter().map(|(s, _)| *s).collect();
+        let short = qsa_rows(8191);
+        assert!(plan_chain_restore(&links, &dst_fixed, &short).is_err());
+        links.remove(2);
+        assert!(plan_chain_restore(&links, &dst_fixed, &qsa_rows(8192)).is_err());
+        assert!(plan_chain_restore(&[], &dst_fixed, &qsa_rows(8192)).is_err());
+        // A missing link is reported, not restored around.
+        let mut gone = main_keys.clone();
+        gone[2].2 ^= 1;
+        assert!(cache.chain_sources(&gone, &[], "gone").is_err());
+    }
+
+    #[test]
+    fn slowlink_session_cache_capture_commit_abort_clear_and_deferred_release_each_free_once() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, 0);
+
+        // An aborted turn: pending snapshot, pending resident and tail.
+        let parent = cut_key(&cache, &hist, 2);
+        cache
+            .pending
+            .push((parent.clone(), host_snapshot(300, None, &drops)));
+        cache.resident_pending = Some(resident_of(host_store(30, &drops)));
+        cache.tail_pending = Some(resident_of(host_store(40, &drops)));
+        assert_eq!(cache.usage().host_pending_bytes, 370);
+        let freed = cache.take_turn_head();
+        assert_eq!(freed.len(), 3);
+        assert_eq!(cache.usage().host_total_bytes(), 0);
+        assert!(cache.host_pool.is_empty() && cache.pending.is_empty());
+        assert_eq!(released(&drops), 0, "bookkeeping frees nothing itself");
+        drop(freed);
+        assert_eq!(released(&drops), 3);
+
+        // A committed turn: the snapshots are published, the resident is live.
+        let child = cut_key(&cache, &hist, 3);
+        cache
+            .pending
+            .push((parent.clone(), host_snapshot(300, None, &drops)));
+        cache.pending.push((
+            child.clone(),
+            host_snapshot(120, Some(parent.clone()), &drops),
+        ));
+        cache.link(&parent);
+        cache.resident_pending = Some(resident_of(host_store(30, &drops)));
+        cache.commit();
+        let usage = cache.usage();
+        assert_eq!(
+            (
+                usage.host_pool_bytes,
+                usage.host_pending_bytes,
+                usage.host_resident_bytes
+            ),
+            (420, 0, 30)
+        );
+        assert!(cache.host_pool.is_pinned(&parent.0, parent.1, parent.2));
+
+        // The next commit displaces the resident: deferred, not yet freed.
+        cache.resident_pending = Some(resident_of(host_store(50, &drops)));
+        cache.commit();
+        let usage = cache.usage();
+        assert_eq!(
+            (usage.host_resident_bytes, usage.host_deferred_release_bytes),
+            (50, 30)
+        );
+        assert_eq!(released(&drops), 3);
+        // The turn head frees the displaced buffer once, nothing published.
+        let freed = cache.take_turn_head();
+        assert_eq!(freed.len(), 1);
+        drop(freed);
+        assert_eq!(released(&drops), 4);
+        assert_eq!(cache.usage().host_deferred_release_bytes, 0);
+        assert_eq!(cache.usage().host_pool_bytes, 420);
+
+        // Clear returns every remaining owner exactly once.
+        cache.parked = Some(parked_of(host_store(7, &drops), None, None));
+        cache.release.push(host_snapshot(11, None, &drops));
+        let freed = cache.take_all_stores();
+        assert_eq!(
+            freed.len(),
+            5,
+            "two pooled snapshots, the resident, the park and a deferred snapshot"
+        );
+        assert_eq!(cache.usage().host_total_bytes(), 0);
+        assert!(cache.children.is_empty());
+        drop(freed);
+        // Nine host blocks were made in all; each released exactly once.
+        assert_eq!(released(&drops), 9);
+    }
+
+    #[test]
+    fn slowlink_session_cache_resident_and_tail_overwrites_are_planned_and_protected() {
+        let policy = PressureHostSnapshotPolicy {
+            host_budget_bytes: 100,
+            device_budget_bytes: 0,
+        };
+        let owned = Owned {
+            device: 0,
+            host: 40,
+            host_pool: 0,
+        };
+        // The same size reuses the pending buffer in place: no placement, no
+        // guard, no allocation, on either tier and with or without the policy.
+        for policy in [Some(&policy), None] {
+            assert_eq!(
+                resident_plan(policy, Some(32), 32, owned, || panic!("no guard to reuse")),
+                ResidentPlan::Reuse
+            );
+        }
+        // A new size under pressure lands on the host while it fits...
+        assert_eq!(
+            resident_plan(Some(&policy), Some(32), 60, owned, || Some(false)),
+            ResidentPlan::Allocate(Tier::Host)
+        );
+        // ...and is skipped, keeping the previous pending capture, when it does not.
+        assert_eq!(
+            resident_plan(Some(&policy), Some(32), 61, owned, || Some(false)),
+            ResidentPlan::Skip("host budget")
+        );
+        // Without the policy only the guard decides, as before.
+        assert_eq!(
+            resident_plan(None, Some(32), 60, owned, || Some(true)),
+            ResidentPlan::Allocate(Tier::Device)
+        );
+        for guard in [Some(false), None] {
+            assert_eq!(
+                resident_plan(None, None, 60, owned, || guard),
+                ResidentPlan::Skip("memory guard")
+            );
+        }
+
+        // Commit never frees a displaced resident or tail: it defers them.
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, 0);
+        cache.resident = Some(resident_of(host_store(10, &drops)));
+        cache.tail = Some(Resident {
+            key: cut_key(&cache, &hist, 5),
+            ..resident_of(host_store(20, &drops))
+        });
+        cache.resident_pending = Some(resident_of(host_store(11, &drops)));
+        // A turn that restarted below the tail's boundary overwrites its rows.
+        cache.turn = Some(Turn {
+            domain: cache.domain.scoped("scope"),
+            route: AR,
+            boundaries: VecDeque::new(),
+            lineage: None,
+            cold_exact: true,
+            start: 3,
+            end: 8,
+        });
+        cache.commit();
+        assert!(cache.tail.is_none());
+        assert_eq!(cache.release_bufs.len(), 2);
+        assert_eq!(released(&drops), 0);
+        assert_eq!(cache.usage().host_deferred_release_bytes, 10 + 20);
+        assert_eq!(cache.usage().host_resident_bytes, 11);
+
+        // A turn that starts at or above the tail leaves it standing.
+        cache.tail = Some(Resident {
+            key: cut_key(&cache, &hist, 5),
+            ..resident_of(host_store(21, &drops))
+        });
+        cache.turn = Some(Turn {
+            domain: cache.domain.scoped("scope"),
+            route: AR,
+            boundaries: VecDeque::new(),
+            lineage: None,
+            cold_exact: true,
+            start: 5,
+            end: 8,
+        });
+        cache.commit();
+        assert!(cache.tail.is_some());
+        assert_eq!(cache.release_bufs.len(), 2);
+
+        // Parking moves the residents (which back the parked rows) intact.
+        cache.parked = Some(parked_of(host_store(5, &drops), None, None));
+        cache.stash_residents();
+        assert!(cache.resident.is_none() && cache.tail.is_none());
+        let usage = cache.usage();
+        assert_eq!(usage.host_resident_bytes, 0);
+        assert_eq!(usage.host_parked_bytes, 5 + 11 + 21);
+    }
+
+    #[test]
+    fn slowlink_session_cache_mtp_extra_fixed_parts_and_rollback_geometry() {
+        // MTP adds fixed draft-head parts and draft row streams to the AR
+        // layout; its snapshots never alias AR ones, and a restore of either
+        // into the other's layout is refused.
+        let mtp_fixed = vec![QSA_FIXED, 4096, 512];
+        let mtp_rows = |p: usize| {
+            let mut rows = qsa_rows(p);
+            rows.push((320, p));
+            rows
+        };
+        let hist = prompt(1, 4097);
+        let drops = counter();
+        let mut cache = policy_cache(HUGE, HUGE);
+        for (i, &p) in [1536usize, 4096].iter().enumerate() {
+            stage_cut(
+                &mut cache,
+                &hist,
+                &[1536usize][..i],
+                p,
+                mtp_fixed.clone(),
+                &mtp_rows(p),
+                Some(i == 0),
+                &drops,
+            )
+            .unwrap();
+        }
+        let (k1536, k4096) = (
+            cut_key(&cache, &hist, 1536),
+            cut_key(&cache, &hist, 4096),
+        );
+        let leaf = cache.entry(&k4096).unwrap();
+        assert_eq!(leaf.parent, Some(k1536.clone()));
+        assert_eq!(leaf.fixed_bytes, mtp_fixed);
+        // The draft head's rows are delta streams like the rest.
+        assert_eq!(leaf.segments.last().map(|s| (s.from, s.to)), Some((1536, 4096)));
+
+        let keys = cache
+            .chain_keys(&capture_domain(&cache.domain.scoped("scope"), true), &hist[..4096])
+            .unwrap();
+        let chain = cache.chain_sources(&keys, &[], "gone").unwrap();
+        let links: Vec<&StoredSnapshot> = chain.iter().map(|(s, _)| *s).collect();
+        let dst_fixed = [(0usize, QSA_FIXED), (QSA_FIXED, 4096), (QSA_FIXED + 4096, 512)];
+        let copies = plan_chain_restore(&links, &dst_fixed, &mtp_rows(4096)).unwrap();
+        // Every extra fixed part comes from the leaf, whole; the draft rows
+        // tile [0, 4096).
+        for (part, &(offset, bytes)) in dst_fixed.iter().enumerate() {
+            assert_eq!(coverage(&copies, part), vec![(offset, bytes)]);
+        }
+        let draft = coverage(&copies, dst_fixed.len() + mtp_rows(4096).len() - 1);
+        assert_eq!(draft, vec![(0, 1536 * 320), (1536 * 320, 2560 * 320)]);
+
+        // An AR destination (no draft head) refuses the MTP snapshot, and
+        // the MTP destination refuses an AR-shaped chain.
+        let ar_fixed = [(0usize, QSA_FIXED)];
+        assert!(plan_chain_restore(&links, &ar_fixed, &qsa_rows(4096)).is_err());
+        assert!(plan_chain_restore(&links, &dst_fixed, &qsa_rows(4096)).is_err());
+
+        // Rollback: the state restored to an earlier cut holds only that
+        // cut's rows, so the 1536 snapshot restores into a 1536-row layout
+        // and the 4096 one is refused for it.
+        let root = [links[0]];
+        assert!(plan_chain_restore(&root, &dst_fixed, &mtp_rows(1536)).is_ok());
+        assert!(plan_chain_restore(&root, &dst_fixed, &mtp_rows(4096)).is_err());
+        assert!(plan_chain_restore(&links, &dst_fixed, &mtp_rows(1536)).is_err());
+        // A capture after a rollback below the parent's rows ignores that
+        // parent and takes its rows from 0 instead of a negative delta.
+        let (parent, plan) = cache.plan_capture(
+            vec![k1536.clone()],
+            mtp_fixed.clone(),
+            &mtp_rows(1000),
+        );
+        assert!(parent.is_none());
+        assert!(plan.segments.iter().all(|s| s.from == 0));
+        // ...while at the parent's own rows it deltas against it.
+        let (parent, plan) =
+            cache.plan_capture(vec![k1536.clone()], mtp_fixed.clone(), &mtp_rows(1536));
+        assert_eq!(parent, Some(k1536));
+        assert!(plan.segments.iter().all(|s| s.from == s.to));
+    }
+
+    #[test]
+    fn slowlink_session_cache_host_block_has_one_owner_and_never_frees_undrained_memory() {
+        let drops = counter();
+        // Moving a store through a snapshot location and back releases once.
+        let snapshot = host_snapshot(64, None, &drops);
+        assert_eq!(host_bytes(&snapshot), 64);
+        assert_eq!(device_bytes(&snapshot), 0);
+        assert_eq!(snapshot.bytes_len(), 64);
+        let store = snapshot.into_store().expect("a host snapshot owns memory");
+        assert!(store.is_host());
+        assert_eq!((store.size(), store.host_bytes(), store.device_bytes()), (64, 64, 0));
+        assert_eq!(released(&drops), 0);
+        drop(store);
+        assert_eq!(released(&drops), 1);
+
+        // A disk snapshot owns none; a device one is no host owner.
+        let disk = StoredSnapshot {
+            location: SnapshotLocation::Disk {
+                path: PathBuf::new(),
+                file_bytes: 9,
+            },
+            ..host_snapshot(0, None, &counter())
+        };
+        assert!(disk.into_store().is_none());
+        let device = fake_snapshot(1);
+        assert_eq!((host_bytes(&device), device_bytes(&device)), (0, 4096));
+
+        // A transfer that could not be drained leaves the block quarantined:
+        // its memory is never released, however it is dropped.
+        let quarantined = host_store(32, &drops);
+        if let Store::Host(block) = &quarantined {
+            block.mark_undrained();
+        }
+        drop(quarantined);
+        assert_eq!(released(&drops), 1, "an undrained block is leaked, not freed");
+        // The drained sibling frees exactly once.
+        drop(host_store(32, &drops));
+        assert_eq!(released(&drops), 2);
+    }
+
+    #[test]
+    fn slowlink_session_cache_without_the_policy_nothing_changes() {
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        assert!(cache.pressure.is_none());
+        assert_eq!(cache.device_floor(), 0);
+        // The plain guard headroom is untouched; the policy floor only raises it.
+        assert_eq!(guard_headroom(VRAM_HEADROOM, 0), VRAM_HEADROOM);
+        assert_eq!(guard_headroom(VRAM_HEADROOM, POLICY_DEVICE_SAFETY), POLICY_DEVICE_SAFETY);
+        assert_eq!(POLICY_DEVICE_SAFETY, 512 << 20);
+        assert_eq!(guard_headroom(4 * GIB, POLICY_DEVICE_SAFETY), 4 * GIB);
+        // No tier choice, no host owner, no host budget.
+        assert_eq!(cache.pick_tier(1, true, || Some(true)), Err("no pressure policy"));
+        let usage = cache.usage();
+        assert_eq!((usage.host_budget_bytes, usage.host_total_bytes()), (0, 0));
+        assert!(cache.host_pool.is_empty());
+        assert_eq!(cache.owned(), Owned::default());
+        // The resident plan is the old guard-or-skip rule.
+        assert_eq!(
+            resident_plan(None, None, 8, Owned::default(), || Some(true)),
+            ResidentPlan::Allocate(Tier::Device)
+        );
+        assert_eq!(
+            resident_plan(None, Some(8), 16, Owned::default(), || None),
+            ResidentPlan::Skip("memory guard")
+        );
+        // Pool captures still pack and pin exactly as before.
+        let hist = prompt(1, 8);
+        let (parent, plan) = cache.plan_capture(Vec::new(), vec![100, 48], &[(16, 4)]);
+        assert!(parent.is_none());
+        assert_eq!(plan.total, 576);
+        let key = cut_key(&cache, &hist, 4);
+        cache.pending.push((key.clone(), fake_snapshot(4)));
+        cache.commit();
+        assert_eq!(cache.usage().pool_bytes, 4096);
+        assert!(cache.host_pool.is_empty());
+        assert!(cache.present(&key.0, key.1, key.2));
+        // Enabling the policy later is opt-in and idempotent: the configured
+        // pool budget and every published snapshot are untouched.
+        let before = cache.usage();
+        let policy = PressureHostSnapshotPolicy {
+            host_budget_bytes: 1 << 20,
+            device_budget_bytes: 4096,
+        };
+        cache.enable_pressure_host_snapshots(policy);
+        cache.enable_pressure_host_snapshots(policy);
+        let after = cache.usage();
+        assert_eq!(after.budget_bytes, before.budget_bytes);
+        assert_eq!(after.pool_bytes, before.pool_bytes);
+        assert_eq!(after.host_budget_bytes, 1 << 20);
+        assert_eq!(cache.device_floor(), POLICY_DEVICE_SAFETY);
+    }
+
+    #[test]
+    fn slowlink_session_cache_driver_forwards_the_policy_and_keeps_the_pool_budget() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 2 * GIB));
+        let policy = PressureHostSnapshotPolicy {
+            host_budget_bytes: 2 * GIB,
+            device_budget_bytes: 300 << 20,
+        };
+        assert_eq!(driver.cache().usage().host_budget_bytes, 0);
+        driver.enable_pressure_host_snapshots(policy);
+        let enabled = driver.cache().usage();
+        // The pool's configured budget is not the policy's device budget.
+        assert_eq!(enabled.budget_bytes, 2 * GIB);
+        assert_eq!(enabled.host_budget_bytes, 2 * GIB);
+        assert_eq!(driver.cache().pressure, Some(policy));
+
+        // Held host state survives a repeated identical enable untouched.
+        let key = cut_key(&driver.cache, &hist, 3);
+        driver
+            .cache
+            .pending
+            .push((key.clone(), host_snapshot(1000, None, &drops)));
+        driver.cache.commit();
+        let held = driver.cache().usage();
+        assert_eq!(held.host_pool_bytes, 1000);
+        driver.enable_pressure_host_snapshots(policy);
+        assert_eq!(driver.cache().usage(), held);
+        assert_eq!(released(&drops), 0);
+
+        // A published host snapshot is a pinnable piece like a device one.
+        let piece = SessionPieceKey(key.clone());
+        assert!(driver.piece_resident(&piece));
+        assert!(driver.pin_piece(&piece));
+        assert!(driver.cache.host_pool.is_pinned(&key.0, key.1, key.2));
+        driver.unpin_piece(&piece);
+        assert!(!driver.cache.host_pool.is_pinned(&key.0, key.1, key.2));
+        // A driver holding host state is no longer fresh for a load epoch.
+        assert!(driver.bind_load_epoch(9).is_err());
     }
 }
