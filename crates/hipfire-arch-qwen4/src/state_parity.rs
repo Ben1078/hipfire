@@ -2833,7 +2833,13 @@ pub fn run_slowlink_prefill_state(
         ));
     }
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let loaded = slowlink_load_bundle(&mut gpu, model_path, max_seq, None)?;
+    let loaded = slowlink_load_bundle(
+        &mut gpu,
+        model_path,
+        max_seq,
+        None,
+        crate::slowlink_admission::AdmissionPurpose::Product,
+    )?;
     let SlowlinkLoaded {
         mut bundle,
         vocab,

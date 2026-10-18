@@ -1345,8 +1345,14 @@ fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
         placement,
         slowlink_profile,
         ..
-    } = slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, Some(u64::MAX >> 1))
-        .expect("slowlink load");
+    } = slowlink_load_bundle(
+        &mut gpu,
+        &model,
+        MAX_SEQ,
+        Some(u64::MAX >> 1),
+        hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose::Product,
+    )
+    .expect("slowlink load");
     assert!(
         slowlink_profile && resident_layers >= 10,
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"

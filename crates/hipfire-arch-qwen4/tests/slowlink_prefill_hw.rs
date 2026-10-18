@@ -117,7 +117,14 @@ fn load() -> Hw {
         resident_layers,
         placement,
         ..
-    } = slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, None).expect("load");
+    } = slowlink_load_bundle(
+        &mut gpu,
+        &model,
+        MAX_SEQ,
+        None,
+        hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose::Product,
+    )
+    .expect("load");
     assert!(
         slowlink_profile && resident_layers >= MIN_RESIDENT_LAYERS as usize,
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
