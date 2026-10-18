@@ -2935,7 +2935,10 @@ mod slowlink_ring {
             model.allocs,
             vec![reserve.scratch_bytes, 64 << 20, 64 << 20]
         );
-        assert_eq!(model.allocs.iter().sum::<usize>(), reserve.total_device_bytes);
+        assert_eq!(
+            model.allocs.iter().sum::<usize>(),
+            reserve.total_device_bytes
+        );
         assert_eq!(model.peak, reserve.total_device_bytes);
         assert_eq!(buffers.delay.len(), reserve.delay_buffers);
         release_diag_after_drain(&mut model, buffers, Ok(())).unwrap();
@@ -2990,7 +2993,10 @@ mod slowlink_ring {
                 ..DiagModel::default()
             };
             assert!(alloc_diag(&mut model, &reserve).is_err());
-            assert!(model.live.is_empty(), "failure at allocation {fail_at} leaked");
+            assert!(
+                model.live.is_empty(),
+                "failure at allocation {fail_at} leaked"
+            );
             assert_eq!(model.frees, fail_at);
             // The next attempt starts clean and succeeds.
             let buffers = alloc_diag(&mut model, &reserve).unwrap();
@@ -3008,7 +3014,10 @@ mod slowlink_ring {
             .unwrap_err()
             .to_string();
         assert!(error.contains("drain failed"), "{error}");
-        assert_eq!(model.frees, 0, "nothing is freed while the device may use it");
+        assert_eq!(
+            model.frees, 0,
+            "nothing is freed while the device may use it"
+        );
         assert_eq!(model.live.len(), 3, "all three buffers stay owned (leaked)");
     }
 
