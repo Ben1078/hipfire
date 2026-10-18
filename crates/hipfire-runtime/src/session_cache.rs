@@ -7817,7 +7817,7 @@ mod tests {
         let drops = counter();
         // Moving a store through a snapshot location and back releases once.
         let snapshot = host_snapshot(64, None, &drops);
-        assert_eq!(host_bytes(&snapshot), 64);
+        assert_eq!(super::host_bytes(&snapshot), 64);
         assert_eq!(device_bytes(&snapshot), 0);
         assert_eq!(snapshot.bytes_len(), 64);
         let store = snapshot.into_store().expect("a host snapshot owns memory");
@@ -7837,7 +7837,10 @@ mod tests {
         };
         assert!(disk.into_store().is_none());
         let device = fake_snapshot(1);
-        assert_eq!((host_bytes(&device), device_bytes(&device)), (0, 4096));
+        assert_eq!(
+            (super::host_bytes(&device), device_bytes(&device)),
+            (0, 4096)
+        );
 
         // A transfer that could not be drained leaves the block quarantined:
         // its memory is never released, however it is dropped.
