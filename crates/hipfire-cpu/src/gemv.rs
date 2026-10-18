@@ -28,7 +28,7 @@ use std::collections::hash_map::Entry;
 #[cfg(target_arch = "x86_64")]
 use std::collections::HashMap;
 
-use crate::quant::{decode_group_codes, CpuQuant};
+use crate::quant::{decode_group_codes, CpuQuant, PLANAR_GROUP};
 use crate::simd;
 
 /// Largest group size over [`CpuQuant`] (256 for every G256 format). The decode
@@ -39,13 +39,49 @@ const MAX_GROUP_ELEMS: usize = 256;
 ///
 /// G256 formats need `k % 256 == 0`, the 128-group formats `k % 128 == 0`
 /// ([`CpuQuant::k_multiple`]); [`gemv`]/[`gemm`] assert it.
+///
+/// **Planar formats** ([`CpuQuant::is_planar`]) return the stride of one row in
+/// the *codes plane* only (W3 `3k/8`, E8P `k/4`). That is NOT the tensor size
+/// divided by `m`: the f16 scales live in a separate plane after all `m` code
+/// rows. Whole-tensor sizes must use [`tensor_bytes`].
 pub fn row_bytes(q: CpuQuant, k: usize) -> usize {
     q.row_header_bytes() + (k / q.group_elems()) * q.group_bytes()
 }
 
+/// Bytes of a whole `[m, k]` weight tensor: `m * row_bytes(q, k)` for the row
+/// formats; for the planar formats the codes plane plus the scale plane,
+/// `m * (row_bytes(q, k) + 2 * (k / 128))`.
+pub fn tensor_bytes(q: CpuQuant, m: usize, k: usize) -> usize {
+    if q.is_planar() {
+        m * (row_bytes(q, k) + 2 * (k / PLANAR_GROUP))
+    } else {
+        m * row_bytes(q, k)
+    }
+}
+
+/// Row `r` of an `[m, k]` tensor as `(codes_row, scales_row)`.
+///
+/// Row formats: the row's bytes run to the end of `packed` (kernels may read
+/// the bytes right up to the next row, as before) and `scales_row` is empty.
+/// Planar formats: `codes_row` is exactly the row's `row_bytes(q, k)` codes and
+/// `scales_row` exactly its `2 * (k / 128)` scale bytes, so a kernel that stays
+/// inside the two slices never reads a neighbouring row or the other plane.
+/// `packed` must hold at least [`tensor_bytes`].
+#[inline]
+fn row_slices(q: CpuQuant, packed: &[u8], m: usize, k: usize, r: usize) -> (&[u8], &[u8]) {
+    let rb = row_bytes(q, k);
+    if q.is_planar() {
+        let spr = 2 * (k / PLANAR_GROUP);
+        let at = m * rb + r * spr;
+        (&packed[r * rb..(r + 1) * rb], &packed[at..at + spr])
+    } else {
+        (&packed[r * rb..], &[])
+    }
+}
+
 /// `y[0..m] = W[m,k] · x[0..k]`.
 ///
-/// `packed` is the whole weight tensor's bytes, `m * row_bytes(q, k)` of them.
+/// `packed` is the whole weight tensor's bytes, [`tensor_bytes`]`(q, m, k)` of them.
 /// `x` carries the format's rotation (see the module docs).
 pub fn gemv(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32], y: &mut [f32]) {
     gemv_with_simd(q, packed, m, k, x, y, None)
@@ -68,6 +104,7 @@ pub fn gemv_with_simd(
         return;
     }
     let rb = row_bytes(q, k);
+    let tb = tensor_bytes(q, m, k);
     assert!(
         k % q.k_multiple() == 0,
         "gemv({q:?}): k={k} is not a multiple of {} (shape {m}x{k})",
@@ -84,8 +121,8 @@ pub fn gemv_with_simd(
         y.len()
     );
     assert!(
-        packed.len() >= m * rb,
-        "gemv({q:?}): packed has {} bytes, need m={m} rows of {rb}",
+        packed.len() >= tb,
+        "gemv({q:?}): packed has {} bytes, need {tb} for shape {m}x{k} (row stride {rb})",
         packed.len()
     );
     let x = &x[..k];
@@ -94,7 +131,8 @@ pub fn gemv_with_simd(
     // shape).
     let use_simd = simd::row_dot_enabled(q, requested);
     y[..m].par_iter_mut().enumerate().for_each(|(row, out)| {
-        *out = dot_row_simd(q, &packed[row * rb..], k, x, use_simd);
+        let (codes, scales) = row_slices(q, packed, m, k, row);
+        *out = dot_row_simd(q, codes, scales, k, x, use_simd);
     });
 }
 
@@ -122,6 +160,7 @@ pub fn gemm_with_simd(
         return;
     }
     let rb = row_bytes(q, k);
+    let tb = tensor_bytes(q, m, k);
     assert!(
         k % q.k_multiple() == 0,
         "gemm({q:?}): k={k} is not a multiple of {} (shape {n}x{m}x{k})",
@@ -140,8 +179,8 @@ pub fn gemm_with_simd(
         n * m
     );
     assert!(
-        packed.len() >= m * rb,
-        "gemm({q:?}): packed has {} bytes, need m={m} rows of {rb}",
+        packed.len() >= tb,
+        "gemm({q:?}): packed has {} bytes, need {tb} for shape {m}x{k} (row stride {rb})",
         packed.len()
     );
     let x = &x[..n * k];
@@ -151,7 +190,8 @@ pub fn gemm_with_simd(
         .enumerate()
         .for_each(|(flat, o)| {
             let (token, row) = (flat / m, flat % m);
-            *o = dot_row_simd(q, &packed[row * rb..], k, &x[token * k..], use_simd);
+            let (codes, scales) = row_slices(q, packed, m, k, row);
+            *o = dot_row_simd(q, codes, scales, k, &x[token * k..], use_simd);
         });
 }
 
@@ -267,6 +307,7 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
         let n = src.n(j);
         let q = src.quant(j);
         let rb = row_bytes(q, k);
+        let tb = tensor_bytes(q, m, k);
         assert!(
             k % q.k_multiple() == 0,
             "gemv_shared_sourced({q:?}): k={k} is not a multiple of {}",
@@ -274,8 +315,8 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
         );
         let packed = src.packed(j);
         assert!(
-            packed.len() >= m * rb,
-            "gemv_shared_sourced({q:?}): weight has {} bytes, need {m} rows of {rb}",
+            packed.len() >= tb,
+            "gemv_shared_sourced({q:?}): weight has {} bytes, need {tb} for shape {m}x{k} (row stride {rb})",
             packed.len()
         );
         for t in 0..n {
@@ -556,7 +597,6 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
             shared_rows_per_block(m, n, workers_per_job)
         };
         let q = src.quant(j);
-        let rb = row_bytes(q, k);
         #[cfg(target_arch = "x86_64")]
         let use_simd = job_simd[j];
         #[cfg(not(target_arch = "x86_64"))]
@@ -569,7 +609,7 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
             .for_each(|(block, rows)| {
                 for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
                     let r = block * rows_per_block + within_block;
-                    let row = &src.packed(j)[r * rb..];
+                    let (row, srow) = row_slices(q, src.packed(j), m, k, r);
                     #[cfg(target_arch = "x86_64")]
                     if prepared {
                         let base = token_base[j];
@@ -587,7 +627,7 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
                         continue;
                     }
                     for (t, v) in chunk.iter_mut().enumerate() {
-                        *v = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                        *v = dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
                     }
                 }
             });
@@ -596,28 +636,40 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.
 ///
+/// `row` / `scales_row` are [`row_slices`]'s pair: for the planar formats the
+/// row's codes and its f16 scales, for the row formats the row's bytes and an
+/// empty slice.
+///
 /// `use_simd` is resolved once per GEMV call by the caller
 /// ([`simd::row_dot_enabled`]); every format has a vector kernel, so when it is
 /// set the row is the kernel's and the scalar decode below is the ARM and
 /// non-AVX2 fallback (and the reference `simd::tests` compares against).
-fn dot_row_simd(q: CpuQuant, row: &[u8], k: usize, x: &[f32], use_simd: bool) -> f32 {
+fn dot_row_simd(
+    q: CpuQuant,
+    row: &[u8],
+    scales_row: &[u8],
+    k: usize,
+    x: &[f32],
+    use_simd: bool,
+) -> f32 {
     if use_simd {
-        return simd::row_dot_avx2(q, row, k, x);
+        return simd::row_dot_avx2(q, row, scales_row, k, x);
     }
-    dot_row_scalar(q, row, k, x)
+    dot_row_scalar(q, row, scales_row, k, x)
 }
 
 /// The `Mq4G256` row dot on the scalar path — the SIMD fallback and the
 /// reference `simd::tests` compares against.
 pub(crate) fn mq4g256_row_dot_scalar(row: &[u8], k: usize, x: &[f32]) -> f32 {
-    dot_row_scalar(CpuQuant::Mq4G256, row, k, x)
+    dot_row_scalar(CpuQuant::Mq4G256, row, &[], k, x)
 }
 
-fn dot_row_scalar(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
+fn dot_row_scalar(q: CpuQuant, row: &[u8], scales_row: &[u8], k: usize, x: &[f32]) -> f32 {
     let ge = q.group_elems();
     let gb = q.group_bytes();
     let mut scratch = [0.0f32; MAX_GROUP_ELEMS];
     let mut acc = 0.0f32;
+    let planar = q.is_planar();
     let e8 = q == CpuQuant::Mfp4G32E8;
     let row_scale = if e8 {
         crate::quant::half_f16_to_f32(u16::from_le_bytes([row[0], row[1]]))
@@ -626,7 +678,10 @@ fn dot_row_scalar(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
     };
     for g in 0..k / ge {
         let codes = &mut scratch[..ge];
-        if e8 {
+        if planar {
+            let d = u16::from_le_bytes([scales_row[2 * g], scales_row[2 * g + 1]]);
+            crate::quant::decode_planar_group(q, &row[g * gb..(g + 1) * gb], d, codes);
+        } else if e8 {
             crate::quant::decode_mfp4_e8_group(&row[16 + g * gb..], row_scale, codes);
         } else {
             decode_group_codes(q, &row[g * gb..], codes);
@@ -1034,12 +1089,12 @@ mod test {
         for j in 0..src.jobs() {
             let n = src.n(j);
             let q = src.quant(j);
-            let rb = row_bytes(q, k);
             let use_simd = simd::row_dot_enabled(q, requested);
             for r in 0..m {
-                let row = &src.packed(j)[r * rb..];
+                let (row, srow) = row_slices(q, src.packed(j), m, k, r);
                 for t in 0..n {
-                    out[base + r * n + t] = dot_row_simd(q, row, k, &src.xs_row(j, t)[..k], use_simd);
+                    out[base + r * n + t] =
+                        dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
                 }
             }
             base += m * n;
@@ -1646,7 +1701,7 @@ mod test {
 /// `crate::testfix` (`pub(crate)`).
 ///
 /// Why exact equality is the right claim: every output element is produced by
-/// the same `dot_row_simd(q, row, k, x_token, use_simd)` call regardless of how
+/// the same `dot_row_simd(q, row, scales_row, k, x_token, use_simd)` call regardless of how
 /// the (token, row) pairs are batched or partitioned, so any difference is a
 /// stride/offset bug, never rounding.
 #[cfg(test)]
@@ -1724,6 +1779,14 @@ mod prop_tests {
             | CpuQuant::Q8F16
             | CpuQuant::Mq4G128V2
             | CpuQuant::Mfp4G32E8 => {}
+            // Planar formats (qt 131/132/135/136): excluded from `ALL` because
+            // their rows are not byte-sliceable (the scale plane is separate, so
+            // `prop_output_row_split_invariant` does not apply); their
+            // gemv/gemm/shared-job bit-identity lives in `simd::tests`.
+            CpuQuant::Mq3I4G128R256
+            | CpuQuant::Mq3I4G128R128
+            | CpuQuant::E8pI4G128R256
+            | CpuQuant::E8pI4G128R128 => {}
         }
     }
 

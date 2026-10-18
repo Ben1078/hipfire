@@ -436,6 +436,10 @@ pub const CPU_EXECUTED_DTYPES: &[DType] = &[
     DType::F16,
     DType::F32,
     DType::BF16,
+    DType::MQ3I4G128R256,
+    DType::MQ3I4G128R128,
+    DType::E8PI4G128R256,
+    DType::E8PI4G128R128,
 ];
 
 pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
@@ -470,8 +474,29 @@ pub fn cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
         DType::F16 => Some(CpuQuant::F16),
         DType::F32 => Some(CpuQuant::F32),
         DType::BF16 => Some(CpuQuant::Bf16),
+        // Planar expert-slab payloads (codes plane, then scales plane): routed
+        // experts only, never a row-addressed dense step ([`dense_cpu_quant_for`]).
+        DType::MQ3I4G128R256 => Some(CpuQuant::Mq3I4G128R256),
+        DType::MQ3I4G128R128 => Some(CpuQuant::Mq3I4G128R128),
+        DType::E8PI4G128R256 => Some(CpuQuant::E8pI4G128R256),
+        DType::E8PI4G128R128 => Some(CpuQuant::E8pI4G128R128),
         _ => None,
     }
+}
+
+/// [`cpu_quant_for`] restricted to the row-addressed formats a dense host step
+/// can execute: the dense paths slice `w.buf` into `m` equal row strides, which
+/// a planar expert-slab payload (all code rows, then all scale rows) does not
+/// have, so its dtypes stay on the GPU there.
+pub fn dense_cpu_quant_for(dtype: DType) -> Option<CpuQuant> {
+    cpu_quant_for(dtype).filter(|q| !q.is_planar())
+}
+
+/// The CPU row-dot kernel this host runs for `dtype`
+/// ([`hipfire_cpu::simd::row_dot_kernel`]: `avx2-fma-f16c`, `avx2-fma` or
+/// `scalar`); `None` for a dtype without a CPU decoder.
+pub fn cpu_kernel_for(dtype: DType) -> Option<&'static str> {
+    cpu_quant_for(dtype).map(hipfire_cpu::simd::row_dot_kernel)
 }
 
 /// Whether a `Raw` input of this dtype is rotated by the launcher — i.e. the
@@ -779,9 +804,10 @@ pub fn run_host_mapped_gemv_residual(
 /// / MQ4 mid / MQ3-Lloyd cold) resolve per expert, and an expert whose two
 /// projections differ is expressible too. The slices are the expert's *own*
 /// extents — no stride padding: `gate_up` is exactly
-/// `row_bytes(gate_up_quant, dim) * 2 * mi` bytes and `down` exactly
-/// `row_bytes(down_quant, mi) * dim`. The engine validates and refuses a short
-/// slice rather than reading past it.
+/// `tensor_bytes(gate_up_quant, 2 * mi, dim)` bytes and `down` exactly
+/// `tensor_bytes(down_quant, dim, mi)` (`hipfire_cpu::gemv::tensor_bytes`,
+/// which covers the planar expert-slab payloads too). The engine validates and
+/// refuses a short slice rather than reading past it.
 ///
 /// Owns nothing, so the splice can hold a whole window's resolved slots in a
 /// fixed-capacity stack array instead of a heap `Vec` (`Copy` is what makes
@@ -868,18 +894,24 @@ fn bf16_rt(x: f32) -> f32 {
     f32::from_bits(rounded & 0xffff_0000)
 }
 
-/// `gate_up` extent of one expert: `row_bytes * 2 * mi`, checked.
+/// `gate_up` extent of one expert: `[2 * mi, dim]` in its format, checked.
 fn expert_gu_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
-    hipfire_cpu::gemv::row_bytes(q, dim)
-        .checked_mul(2 * mi)
+    let rows = mi
+        .checked_mul(2)
+        .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))?;
+    tensor_extent(q, rows, dim)
         .ok_or_else(|| cpu_err("moe cpu expert splice: gate_up extent overflows"))
 }
 
-/// `down` extent of one expert: `row_bytes * dim`, checked.
+/// `down` extent of one expert: `[dim, mi]` in its format, checked.
 fn expert_down_bytes(q: CpuQuant, dim: usize, mi: usize) -> Result<usize, DispatchError> {
-    hipfire_cpu::gemv::row_bytes(q, mi)
-        .checked_mul(dim)
-        .ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))
+    tensor_extent(q, dim, mi).ok_or_else(|| cpu_err("moe cpu expert splice: down extent overflows"))
+}
+
+/// `hipfire_cpu::gemv::tensor_bytes(q, m, k)` with the multiplication checked:
+/// one row's bytes (codes plus, for a planar format, its scales) times `m`.
+fn tensor_extent(q: CpuQuant, m: usize, k: usize) -> Option<usize> {
+    hipfire_cpu::gemv::tensor_bytes(q, 1, k).checked_mul(m)
 }
 
 /// Cap on the slots (`rows × top_k`) [`moe_cpu_experts`] resolves into a stack
@@ -2091,7 +2123,7 @@ struct MoeStepTiming {
 /// Whether [`run_host_mapped_gemv`] / [`run_host_mapped_gemv_residual`] can drive
 /// this weight: host-mapped *and* a decodable format.
 pub fn host_mapped_cpu_capable(gpu: &Gpu, w: &WeightRef) -> bool {
-    cpu_exec_enabled() && gpu.host_located(w.buf) && cpu_quant_for(w.dtype).is_some()
+    cpu_exec_enabled() && gpu.host_located(w.buf) && dense_cpu_quant_for(w.dtype).is_some()
 }
 
 /// `HIPFIRE_MOE_CPU_ORACLE=1`: run the same host-mapped expert bytes that fed the
@@ -2151,8 +2183,8 @@ pub fn moe_cpu_oracle_report(
     let blobs = hipfire_cpu::moe::ExpertBlobs {
         gate_up: gu,
         down: dn,
-        gate_up_stride: hipfire_cpu::gemv::row_bytes(quant, dim) * 2 * mi,
-        down_stride: hipfire_cpu::gemv::row_bytes(quant, mi) * dim,
+        gate_up_stride: hipfire_cpu::gemv::tensor_bytes(quant, 2 * mi, dim),
+        down_stride: hipfire_cpu::gemv::tensor_bytes(quant, dim, mi),
         quant,
         dim,
         mi,
@@ -2241,7 +2273,7 @@ fn host_mapped_quant(gpu: &Gpu, w: &WeightRef) -> Result<CpuQuant, DispatchError
     if !gpu.host_located(w.buf) {
         return Err(cpu_err("weight tensor is not host-mapped"));
     }
-    cpu_quant_for(w.dtype).ok_or_else(|| {
+    dense_cpu_quant_for(w.dtype).ok_or_else(|| {
         cpu_err(&format!(
             "no CPU decoder for dtype {:?}; this step must stay on the GPU",
             w.dtype
@@ -2282,7 +2314,7 @@ pub(crate) fn plan_step<'a>(gpu: &Gpu, step: &'a Step<'a>) -> Option<CpuStep<'a>
         } => (*w, input, *out, Some(*residual)),
         _ => return None,
     };
-    if !gpu.host_located(w.buf) || cpu_quant_for(w.dtype).is_none() {
+    if !gpu.host_located(w.buf) || dense_cpu_quant_for(w.dtype).is_none() {
         return None;
     }
     // Mirror `GemvFamily::run_input`: a `Raw` input is rotated by the launcher

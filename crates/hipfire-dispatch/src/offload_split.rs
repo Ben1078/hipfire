@@ -187,16 +187,20 @@ pub fn enabled() -> bool {
     cpu_exec::passback_enabled()
 }
 
-/// Whether `dtype` can be *split*: a CPU decoder exists **and** its vector row dot
-/// is available. With the scalar decoder the CPU rate (~10 GMAC/s) is well below
-/// the GPU's PCIe read rate, so the best share is all-GPU — which plain `pcie`
-/// does better. The load-time coverage line counts a splittable layer with this.
+/// Whether `dtype` can be *split*: a row-addressed CPU decoder exists **and** its
+/// vector row dot is available. With the scalar decoder the CPU rate (~10
+/// GMAC/s) is well below the GPU's PCIe read rate, so the best share is
+/// all-GPU — which plain `pcie` does better. The load-time coverage line counts a
+/// splittable layer with this. A planar expert-slab payload has no row stride to
+/// split at, so it never qualifies.
 pub fn passback_capable_format(dtype: DType) -> bool {
-    cpu_exec::cpu_quant_for(dtype).is_some_and(|q| hipfire_cpu::simd::row_dot_enabled(q, None))
+    cpu_exec::dense_cpu_quant_for(dtype)
+        .is_some_and(|q| hipfire_cpu::simd::row_dot_enabled(q, None))
 }
 
-/// Bytes per weight row for `dtype` at `k`, or `None` when there is no CPU
-/// decoder for it.
+/// Bytes per weight row for `dtype` at `k`, or `None` when there is no
+/// row-addressed CPU decoder for it (a planar expert-slab payload keeps its
+/// scales in a separate plane, so it has no per-row stride).
 ///
 /// Re-exported for callers that size a probe without depending on `hipfire-cpu`
 /// (the CLI's `hipfire offload-bench` route reaches this through
@@ -204,7 +208,7 @@ pub fn passback_capable_format(dtype: DType) -> bool {
 /// stride, which is also the invariant the feasibility gate checks the weight's
 /// byte length against.
 pub fn row_bytes_for(dtype: DType, k: usize) -> Option<usize> {
-    cpu_exec::cpu_quant_for(dtype).map(|q| hipfire_cpu::gemv::row_bytes(q, k))
+    cpu_exec::dense_cpu_quant_for(dtype).map(|q| hipfire_cpu::gemv::row_bytes(q, k))
 }
 
 /// The share of a step's rows the GPU takes, chosen from `(m, row_bytes, share)`.

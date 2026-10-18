@@ -122,6 +122,22 @@ pub enum CpuQuant {
     /// qt 34 — FWHT-256 E8 lattice weights: one 16 B row header,
     /// then eight 17 B blocks per 256 values.
     Mfp4G32E8,
+    /// qt 131 — MQ3-I4 planar slab, FWHT-256 (gate_up). Codes plane of 3-bit
+    /// codes (`M*K*3/8` B; eight codes in three bytes, LSB first), then an f16
+    /// scale plane (`M*(K/128)`); `w = f32(d) * (2c - 7)`. **Planar**: see
+    /// [`Self::is_planar`]. Wire source: `hipfire_runtime::mq_i4`.
+    Mq3I4G128R256,
+    /// qt 132 — MQ3-I4 planar slab, FWHT-128 (down; the qt 53 rotation). As
+    /// [`Self::Mq3I4G128R256`].
+    Mq3I4G128R128,
+    /// qt 135 — E8P-I4 planar slab, FWHT-256 (gate_up). Codes plane of
+    /// little-endian u16 words (`idx | sign7 << 8 | shift << 15`, eight weights
+    /// each; `M*K/4` B), then an f16 scale plane (`M*(K/128)`);
+    /// `w = (f32(d) * 0.25) * v`, `v` from [`e8p_decode_word`]. **Planar**: see
+    /// [`Self::is_planar`]. Wire source: `hipfire_runtime::e8p_i4_reference`.
+    E8pI4G128R256,
+    /// qt 136 — E8P-I4 planar slab, FWHT-128 (down). As [`Self::E8pI4G128R256`].
+    E8pI4G128R128,
 }
 
 /// Which forward rotation a format's activation needs before the stored codes
@@ -173,6 +189,10 @@ impl CpuQuant {
             17 => Some(Self::Mq3G256),
             20 => Some(Self::Mq3G256Lloyd),
             44 => Some(Self::Mq4G256V2), // central entries above; see FORMATS in tests
+            131 => Some(Self::Mq3I4G128R256),
+            132 => Some(Self::Mq3I4G128R128),
+            135 => Some(Self::E8pI4G128R256),
+            136 => Some(Self::E8pI4G128R128),
             _ => None,
         }
     }
@@ -188,7 +208,11 @@ impl CpuQuant {
             | Self::Hfq2G128
             | Self::Tq2G128
             | Self::Bq1G128
-            | Self::Mq4G128V2 => 128,
+            | Self::Mq4G128V2
+            | Self::Mq3I4G128R256
+            | Self::Mq3I4G128R128
+            | Self::E8pI4G128R256
+            | Self::E8pI4G128R128 => 128,
             _ => 256,
         }
     }
@@ -216,6 +240,10 @@ impl CpuQuant {
             Self::Q8F16 => 34,
             Self::F16 | Self::Bf16 => 512,
             Self::F32 => 1024,
+            // Planar formats: code bytes of one 128-group only; the f16 scale
+            // lives in a separate plane (see `is_planar`).
+            Self::Mq3I4G128R256 | Self::Mq3I4G128R128 => 48,
+            Self::E8pI4G128R256 | Self::E8pI4G128R128 => 32,
             Self::Mfp4G32E8 => 136,
         }
     }
@@ -252,6 +280,8 @@ impl CpuQuant {
                 | Self::Mq2G256Lloyd
                 | Self::Mq4G256Lloyd
                 | Self::Mfp4G32E8
+                | Self::Mq3I4G128R256
+                | Self::E8pI4G128R256
         )
         // NOT here, deliberately: `Mq2G256LloydU` (unrotated sibling — rotating
         // it would destroy the native-ternary structure it exists to preserve),
@@ -264,7 +294,10 @@ impl CpuQuant {
     /// `Mq4G128V2`), i.e. its activation needs [`rotate_x_128_v2`]. Disjoint
     /// from [`Self::is_fwht_g256`].
     pub fn is_fwht_g128(self) -> bool {
-        matches!(self, Self::Mq4G128V2)
+        matches!(
+            self,
+            Self::Mq4G128V2 | Self::Mq3I4G128R128 | Self::E8pI4G128R128
+        )
     }
 
     /// The forward activation rotation this format's codes are dotted against.
@@ -283,11 +316,228 @@ impl CpuQuant {
     /// 128-element-group formats take any multiple of 128 (Flash-Next's down
     /// projection is `k = 640`), everything else needs a multiple of 256.
     pub fn k_multiple(self) -> usize {
-        if self.group_elems() == 128 {
-            128
-        } else {
-            256
+        match self {
+            // Planar R256 profiles rotate in 256-wide blocks (`k % 256`); the
+            // R128 ones need only the 128-wide scale group.
+            Self::Mq3I4G128R256 | Self::E8pI4G128R256 => 256,
+            _ if self.group_elems() == 128 => 128,
+            _ => 256,
         }
+    }
+
+    /// Whether the tensor is *planar*: `[codes plane][f16 scale plane]` over the
+    /// whole `[M, K]` tensor instead of self-contained per-row groups (qt 131,
+    /// 132, 135, 136). Planar rows are not contiguous with their scales, so a
+    /// row is addressed as a `(codes_row, scales_row)` pair (see
+    /// `crate::gemv::tensor_bytes`), the bytes of one row are not
+    /// `row_bytes`, and [`decode_group_codes`] / [`dequant_group`] do not apply
+    /// (use [`decode_planar_row`]).
+    pub fn is_planar(self) -> bool {
+        matches!(
+            self,
+            Self::Mq3I4G128R256 | Self::Mq3I4G128R128 | Self::E8pI4G128R256 | Self::E8pI4G128R128
+        )
+    }
+}
+
+// ---- planar expert-slab codecs (qt 131/132/135/136) --------------------------
+
+/// Scale-group width of the planar formats, in columns.
+pub const PLANAR_GROUP: usize = 128;
+
+/// `2|g|` of the 256 QuIP# E8P abs-grid rows, in `vq_books.json` order (`idx` =
+/// row); every entry is 1, 3 or 5. Verbatim transcription of
+/// `hipfire_runtime::e8p_i4_reference::E8P_ABS2` (this crate cannot depend on
+/// it); `crates/hipfire-runtime/tests/cpu_quant_cross_check.rs` asserts equality.
+#[rustfmt::skip]
+pub const E8P_ABS2: [[u8; 8]; 256] = [
+    [1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 3], [1, 1, 1, 1, 1, 1, 1, 5], [1, 1, 1, 1, 1, 1, 3, 1],
+    [1, 1, 1, 1, 1, 1, 3, 3], [1, 1, 1, 1, 1, 1, 3, 5], [1, 1, 1, 1, 1, 1, 5, 1], [1, 1, 1, 1, 1, 1, 5, 3],
+    [1, 1, 1, 1, 1, 3, 1, 1], [1, 1, 1, 1, 1, 3, 1, 3], [1, 1, 1, 1, 1, 3, 1, 5], [1, 1, 1, 1, 1, 3, 3, 1],
+    [1, 1, 1, 1, 1, 3, 3, 3], [1, 1, 1, 1, 1, 3, 5, 1], [1, 1, 1, 1, 1, 5, 1, 1], [1, 1, 1, 1, 1, 5, 1, 3],
+    [1, 1, 1, 1, 1, 5, 3, 1], [1, 1, 1, 1, 3, 1, 1, 1], [1, 1, 1, 1, 3, 1, 1, 3], [1, 1, 1, 1, 3, 1, 1, 5],
+    [1, 1, 1, 1, 3, 1, 3, 1], [1, 1, 1, 1, 3, 1, 3, 3], [1, 1, 1, 1, 3, 1, 5, 1], [1, 1, 1, 1, 3, 3, 1, 1],
+    [1, 1, 1, 1, 3, 3, 1, 3], [1, 1, 1, 1, 3, 3, 3, 1], [1, 1, 1, 1, 3, 3, 3, 3], [1, 1, 1, 1, 3, 5, 1, 1],
+    [1, 1, 1, 1, 5, 1, 1, 1], [1, 1, 1, 1, 5, 1, 1, 3], [1, 1, 1, 1, 5, 1, 3, 1], [1, 1, 1, 1, 5, 3, 1, 1],
+    [1, 1, 1, 3, 1, 1, 1, 1], [1, 1, 1, 3, 1, 1, 1, 3], [1, 1, 1, 3, 1, 1, 1, 5], [1, 1, 1, 3, 1, 1, 3, 1],
+    [1, 1, 1, 3, 1, 1, 3, 3], [1, 1, 1, 3, 1, 1, 5, 1], [1, 1, 1, 3, 1, 3, 1, 1], [1, 1, 1, 3, 1, 3, 1, 3],
+    [1, 1, 1, 3, 1, 3, 3, 1], [1, 1, 1, 3, 1, 3, 3, 3], [1, 1, 1, 3, 1, 5, 1, 1], [1, 1, 1, 3, 3, 1, 1, 1],
+    [1, 1, 1, 3, 3, 1, 1, 3], [1, 1, 1, 3, 3, 1, 3, 1], [1, 1, 1, 3, 3, 1, 3, 3], [1, 1, 1, 3, 3, 3, 1, 1],
+    [1, 1, 1, 3, 3, 3, 1, 3], [1, 1, 1, 3, 3, 3, 3, 1], [1, 1, 1, 3, 5, 1, 1, 1], [1, 1, 1, 5, 1, 1, 1, 1],
+    [1, 1, 1, 5, 1, 1, 1, 3], [1, 1, 1, 5, 1, 1, 3, 1], [1, 1, 1, 5, 1, 3, 1, 1], [1, 1, 1, 5, 3, 1, 1, 1],
+    [1, 1, 3, 1, 1, 1, 1, 1], [1, 1, 3, 1, 1, 1, 1, 3], [1, 1, 3, 1, 1, 1, 1, 5], [1, 1, 3, 1, 1, 1, 3, 1],
+    [1, 1, 3, 1, 1, 1, 3, 3], [1, 1, 3, 1, 1, 1, 5, 1], [1, 1, 3, 1, 1, 3, 1, 1], [1, 1, 3, 1, 1, 3, 1, 3],
+    [1, 1, 3, 1, 1, 3, 3, 1], [1, 1, 3, 1, 1, 3, 3, 3], [1, 1, 3, 1, 1, 5, 1, 1], [1, 1, 3, 1, 3, 1, 1, 1],
+    [1, 1, 3, 1, 3, 1, 1, 3], [1, 1, 3, 1, 3, 1, 3, 1], [1, 1, 3, 1, 3, 1, 3, 3], [1, 1, 3, 1, 3, 3, 1, 1],
+    [1, 1, 3, 1, 3, 3, 1, 3], [1, 1, 3, 1, 3, 3, 3, 1], [1, 1, 3, 1, 5, 1, 1, 1], [1, 1, 3, 3, 1, 1, 1, 1],
+    [1, 1, 3, 3, 1, 1, 1, 3], [1, 1, 3, 3, 1, 1, 3, 1], [1, 1, 3, 3, 1, 1, 3, 3], [1, 1, 3, 3, 1, 3, 1, 1],
+    [1, 1, 3, 3, 1, 3, 1, 3], [1, 1, 3, 3, 1, 3, 3, 1], [1, 1, 3, 3, 3, 1, 1, 1], [1, 1, 3, 3, 3, 1, 1, 3],
+    [1, 1, 3, 3, 3, 1, 3, 1], [1, 1, 3, 3, 3, 3, 1, 1], [1, 1, 3, 5, 1, 1, 1, 1], [1, 1, 5, 1, 1, 1, 1, 1],
+    [1, 1, 5, 1, 1, 1, 1, 3], [1, 1, 5, 1, 1, 1, 3, 1], [1, 1, 5, 1, 1, 3, 1, 1], [1, 1, 5, 1, 3, 1, 1, 1],
+    [1, 1, 5, 3, 1, 1, 1, 1], [1, 3, 1, 1, 1, 1, 1, 1], [1, 3, 1, 1, 1, 1, 1, 3], [1, 3, 1, 1, 1, 1, 1, 5],
+    [1, 3, 1, 1, 1, 1, 3, 1], [1, 3, 1, 1, 1, 1, 3, 3], [1, 3, 1, 1, 1, 1, 5, 1], [1, 3, 1, 1, 1, 3, 1, 1],
+    [1, 3, 1, 1, 1, 3, 1, 3], [1, 3, 1, 1, 1, 3, 3, 1], [1, 3, 1, 1, 1, 3, 3, 3], [1, 3, 1, 1, 1, 5, 1, 1],
+    [1, 3, 1, 1, 3, 1, 1, 1], [1, 3, 1, 1, 3, 1, 1, 3], [1, 3, 1, 1, 3, 1, 3, 1], [1, 3, 1, 1, 3, 1, 3, 3],
+    [1, 3, 1, 1, 3, 3, 1, 1], [1, 3, 1, 1, 3, 3, 1, 3], [1, 3, 1, 1, 3, 3, 3, 1], [1, 3, 1, 1, 5, 1, 1, 1],
+    [1, 3, 1, 3, 1, 1, 1, 1], [1, 3, 1, 3, 1, 1, 1, 3], [1, 3, 1, 3, 1, 1, 3, 1], [1, 3, 1, 3, 1, 1, 3, 3],
+    [1, 3, 1, 3, 1, 3, 1, 1], [1, 3, 1, 3, 1, 3, 1, 3], [1, 3, 1, 3, 1, 3, 3, 1], [1, 3, 1, 3, 3, 1, 1, 1],
+    [1, 3, 1, 3, 3, 1, 1, 3], [1, 3, 1, 3, 3, 1, 3, 1], [1, 3, 1, 3, 3, 3, 1, 1], [1, 3, 1, 5, 1, 1, 1, 1],
+    [1, 3, 3, 1, 1, 1, 1, 1], [1, 3, 3, 1, 1, 1, 1, 3], [1, 3, 3, 1, 1, 1, 3, 1], [1, 3, 3, 1, 1, 1, 3, 3],
+    [1, 3, 3, 1, 1, 3, 1, 1], [1, 3, 3, 1, 1, 3, 1, 3], [1, 3, 3, 1, 1, 3, 3, 1], [1, 3, 3, 1, 3, 1, 1, 1],
+    [1, 3, 3, 1, 3, 1, 1, 3], [1, 3, 3, 1, 3, 1, 3, 1], [1, 3, 3, 1, 3, 3, 1, 1], [1, 3, 3, 3, 1, 1, 1, 1],
+    [1, 3, 3, 3, 1, 1, 1, 3], [1, 3, 3, 3, 1, 1, 3, 1], [1, 3, 3, 3, 1, 3, 1, 1], [1, 3, 3, 3, 3, 1, 1, 1],
+    [1, 3, 5, 1, 1, 1, 1, 1], [1, 5, 1, 1, 1, 1, 1, 1], [1, 5, 1, 1, 1, 1, 1, 3], [1, 5, 1, 1, 1, 1, 3, 1],
+    [1, 5, 1, 1, 1, 3, 1, 1], [1, 5, 1, 1, 3, 1, 1, 1], [1, 5, 1, 3, 1, 1, 1, 1], [1, 5, 3, 1, 1, 1, 1, 1],
+    [3, 1, 1, 1, 1, 1, 1, 1], [3, 1, 1, 1, 1, 1, 1, 3], [3, 1, 1, 1, 1, 1, 1, 5], [3, 1, 1, 1, 1, 1, 3, 1],
+    [3, 1, 1, 1, 1, 1, 3, 3], [3, 1, 1, 1, 1, 1, 5, 1], [3, 1, 1, 1, 1, 3, 1, 1], [3, 1, 1, 1, 1, 3, 1, 3],
+    [3, 1, 1, 1, 1, 3, 3, 1], [3, 1, 1, 1, 1, 3, 3, 3], [3, 1, 1, 1, 1, 5, 1, 1], [3, 1, 1, 1, 3, 1, 1, 1],
+    [3, 1, 1, 1, 3, 1, 1, 3], [3, 1, 1, 1, 3, 1, 3, 1], [3, 1, 1, 1, 3, 1, 3, 3], [3, 1, 1, 1, 3, 3, 1, 1],
+    [3, 1, 1, 1, 3, 3, 1, 3], [3, 1, 1, 1, 3, 3, 3, 1], [3, 1, 1, 1, 5, 1, 1, 1], [3, 1, 1, 3, 1, 1, 1, 1],
+    [3, 1, 1, 3, 1, 1, 1, 3], [3, 1, 1, 3, 1, 1, 3, 1], [3, 1, 1, 3, 1, 1, 3, 3], [3, 1, 1, 3, 1, 3, 1, 1],
+    [3, 1, 1, 3, 1, 3, 1, 3], [3, 1, 1, 3, 1, 3, 3, 1], [3, 1, 1, 3, 3, 1, 1, 1], [3, 1, 1, 3, 3, 1, 1, 3],
+    [3, 1, 1, 3, 3, 1, 3, 1], [3, 1, 1, 3, 3, 3, 1, 1], [3, 1, 1, 5, 1, 1, 1, 1], [3, 1, 3, 1, 1, 1, 1, 1],
+    [3, 1, 3, 1, 1, 1, 1, 3], [3, 1, 3, 1, 1, 1, 3, 1], [3, 1, 3, 1, 1, 1, 3, 3], [3, 1, 3, 1, 1, 3, 1, 1],
+    [3, 1, 3, 1, 1, 3, 1, 3], [3, 1, 3, 1, 1, 3, 3, 1], [3, 1, 3, 1, 3, 1, 1, 1], [3, 1, 3, 1, 3, 1, 1, 3],
+    [3, 1, 3, 1, 3, 1, 3, 1], [3, 1, 3, 1, 3, 3, 1, 1], [3, 1, 3, 3, 1, 1, 1, 1], [3, 1, 3, 3, 1, 1, 1, 3],
+    [3, 1, 3, 3, 1, 1, 3, 1], [3, 1, 3, 3, 1, 3, 1, 1], [3, 1, 3, 3, 3, 1, 1, 1], [3, 1, 5, 1, 1, 1, 1, 1],
+    [3, 3, 1, 1, 1, 1, 1, 1], [3, 3, 1, 1, 1, 1, 1, 3], [3, 3, 1, 1, 1, 1, 3, 1], [3, 3, 1, 1, 1, 1, 3, 3],
+    [3, 3, 1, 1, 1, 3, 1, 1], [3, 3, 1, 1, 1, 3, 1, 3], [3, 3, 1, 1, 1, 3, 3, 1], [3, 3, 1, 1, 3, 1, 1, 1],
+    [3, 3, 1, 1, 3, 1, 1, 3], [3, 3, 1, 1, 3, 1, 3, 1], [3, 3, 1, 1, 3, 3, 1, 1], [3, 3, 1, 3, 1, 1, 1, 1],
+    [3, 3, 1, 3, 1, 1, 1, 3], [3, 3, 1, 3, 1, 1, 3, 1], [3, 3, 1, 3, 1, 3, 1, 1], [3, 3, 1, 3, 3, 1, 1, 1],
+    [3, 3, 3, 1, 1, 1, 1, 1], [3, 3, 3, 1, 1, 1, 1, 3], [3, 3, 3, 1, 1, 1, 3, 1], [3, 3, 3, 1, 1, 3, 1, 1],
+    [3, 3, 3, 1, 3, 1, 1, 1], [3, 3, 3, 3, 1, 1, 1, 1], [3, 5, 1, 1, 1, 1, 1, 1], [5, 1, 1, 1, 1, 1, 1, 1],
+    [5, 1, 1, 1, 1, 1, 1, 3], [5, 1, 1, 1, 1, 1, 3, 1], [5, 1, 1, 1, 1, 3, 1, 1], [5, 1, 1, 1, 3, 1, 1, 1],
+    [5, 1, 1, 3, 1, 1, 1, 1], [5, 1, 3, 1, 1, 1, 1, 1], [5, 3, 1, 1, 1, 1, 1, 1], [3, 1, 1, 1, 3, 3, 3, 3],
+    [1, 3, 1, 1, 3, 3, 3, 3], [1, 1, 3, 1, 3, 3, 3, 3], [1, 1, 1, 3, 3, 3, 3, 3], [3, 3, 3, 1, 3, 3, 1, 1],
+    [3, 3, 3, 1, 3, 1, 3, 1], [3, 3, 3, 1, 1, 3, 3, 1], [3, 3, 3, 1, 3, 1, 1, 3], [3, 3, 3, 1, 1, 3, 1, 3],
+    [3, 3, 3, 1, 1, 1, 3, 3], [3, 3, 1, 3, 3, 3, 1, 1], [3, 3, 1, 3, 3, 1, 3, 1], [3, 3, 1, 3, 1, 3, 3, 1],
+    [3, 3, 1, 3, 3, 1, 1, 3], [3, 3, 1, 3, 1, 3, 1, 3], [3, 3, 1, 3, 1, 1, 3, 3], [3, 1, 3, 3, 3, 3, 1, 1],
+    [3, 1, 3, 3, 3, 1, 3, 1], [3, 1, 3, 3, 1, 3, 3, 1], [3, 1, 3, 3, 3, 1, 1, 3], [3, 1, 3, 3, 1, 3, 1, 3],
+    [1, 3, 3, 3, 1, 1, 3, 3], [1, 3, 3, 3, 3, 3, 1, 1], [1, 3, 3, 3, 3, 1, 3, 1], [1, 3, 3, 3, 1, 3, 3, 1],
+    [1, 3, 3, 3, 3, 1, 1, 3], [1, 3, 3, 3, 1, 3, 1, 3], [1, 1, 3, 3, 1, 3, 3, 3], [3, 3, 1, 1, 3, 3, 3, 1],
+];
+
+/// Parity of `Σ|g|` for each abs row (1 = "odd row", 149 of 256); transcribes
+/// `e8p_i4_reference::abs_row_parity`. `Σ2|g|` is always even, so the rule is
+/// on `Σ|g| = Σ2|g| / 2`.
+pub(crate) const E8P_ROW_PARITY: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut s = 0u32;
+        let mut k = 0;
+        while k < 8 {
+            s += E8P_ABS2[i][k] as u32;
+            k += 1;
+        }
+        t[i] = ((s / 2) & 1) as u8;
+        i += 1;
+    }
+    t
+};
+
+/// `4·codeword` of one E8P wire word: eight odd integers in `[-11, 11]`.
+///
+/// Transcribes `e8p_i4_reference::decode8` over the wire word
+/// `idx | sign7 << 8 | shift << 15`: lane `k` is
+/// `2·(±E8P_ABS2[idx][k]) + (shift ? -1 : +1)`; the sign of lane `k < 7` is
+/// bit `k` of `sign7`, lane 7 is negative iff
+/// `popcount(sign7) + E8P_ROW_PARITY[idx]` is odd.
+#[inline]
+pub fn e8p_decode_word(word: u16) -> [i8; 8] {
+    let idx = (word & 0xFF) as usize;
+    let sign7 = ((word >> 8) & 0x7F) as u8;
+    let off: i8 = if word >> 15 == 1 { -1 } else { 1 };
+    let neg7 = (sign7.count_ones() as u8 + E8P_ROW_PARITY[idx]) & 1;
+    let a2 = &E8P_ABS2[idx];
+    let mut v = [0i8; 8];
+    for k in 0..8 {
+        let neg = (if k < 7 { (sign7 >> k) & 1 } else { neg7 }) == 1;
+        let n = a2[k] as i8;
+        v[k] = 2 * (if neg { -n } else { n }) + off;
+    }
+    v
+}
+
+/// One 128-group of a planar format, scale applied: `out[0..128]` are the exact
+/// f32 weights. `codes` is the group's code bytes (`q.group_bytes()` of them),
+/// `scale_bits` its f16 scale.
+///
+/// W3: `f32(d) * (2c - 7)`. E8P: `(f32(d) * 0.25) * v` (exact in f32 for every
+/// finite f16 `d`).
+pub(crate) fn decode_planar_group(q: CpuQuant, codes: &[u8], scale_bits: u16, out: &mut [f32]) {
+    debug_assert!(q.is_planar());
+    let d = half_f16_to_f32(scale_bits);
+    match q {
+        CpuQuant::Mq3I4G128R256 | CpuQuant::Mq3I4G128R128 => {
+            for (chunk, dst) in codes[..48]
+                .chunks_exact(3)
+                .zip(out[..128].chunks_exact_mut(8))
+            {
+                let acc = chunk[0] as u32 | (chunk[1] as u32) << 8 | (chunk[2] as u32) << 16;
+                for (j, o) in dst.iter_mut().enumerate() {
+                    let c = ((acc >> (3 * j)) & 7) as i32;
+                    *o = d * (2 * c - 7) as f32;
+                }
+            }
+        }
+        CpuQuant::E8pI4G128R256 | CpuQuant::E8pI4G128R128 => {
+            let scale = d * 0.25;
+            for (word, dst) in codes[..32]
+                .chunks_exact(2)
+                .zip(out[..128].chunks_exact_mut(8))
+            {
+                let v = e8p_decode_word(u16::from_le_bytes([word[0], word[1]]));
+                for (o, &lane) in dst.iter_mut().zip(v.iter()) {
+                    *o = scale * lane as f32;
+                }
+            }
+        }
+        _ => unreachable!("decode_planar_group({q:?}): not a planar format"),
+    }
+}
+
+/// Scalar reference decoder of one planar row: `out[0..k]` are the exact f32
+/// weights (in the rotated basis, like [`decode_group_codes`]).
+///
+/// `codes_row` is the row's slice of the codes plane
+/// (`crate::gemv::row_bytes(q, k)` bytes), `scales_row` its `k / 128`
+/// little-endian f16 scales. Panics for a non-planar `q`, a `k` that is not a
+/// multiple of 128, or short slices.
+pub fn decode_planar_row(
+    q: CpuQuant,
+    codes_row: &[u8],
+    scales_row: &[u8],
+    k: usize,
+    out: &mut [f32],
+) {
+    assert!(
+        q.is_planar(),
+        "decode_planar_row({q:?}): not a planar format"
+    );
+    assert!(
+        k % PLANAR_GROUP == 0,
+        "decode_planar_row({q:?}): k={k} is not a multiple of {PLANAR_GROUP}"
+    );
+    let groups = k / PLANAR_GROUP;
+    let gb = q.group_bytes();
+    assert!(
+        codes_row.len() >= groups * gb && scales_row.len() >= 2 * groups && out.len() >= k,
+        "decode_planar_row({q:?}): codes {} (need {}), scales {} (need {}), out {} (need {k})",
+        codes_row.len(),
+        groups * gb,
+        scales_row.len(),
+        2 * groups,
+        out.len()
+    );
+    for g in 0..groups {
+        let d = u16::from_le_bytes([scales_row[2 * g], scales_row[2 * g + 1]]);
+        decode_planar_group(
+            q,
+            &codes_row[g * gb..(g + 1) * gb],
+            d,
+            &mut out[g * PLANAR_GROUP..(g + 1) * PLANAR_GROUP],
+        );
     }
 }
 
@@ -681,6 +931,11 @@ pub(crate) fn decode_mfp4_e8_group(blocks: &[u8], row_scale: f32, out: &mut [f32
 /// against a forward-rotated activation (see the module docs).
 /// For E8, `packed` includes the row header followed by this group's blocks.
 pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
+    assert!(
+        !q.is_planar(),
+        "decode_group_codes({q:?}): planar format (codes and scales are separate planes); \
+         use decode_planar_row"
+    );
     let ge = q.group_elems();
     assert!(
         out.len() >= ge,
@@ -694,6 +949,12 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
         q.row_header_bytes() + q.group_bytes()
     );
     match q {
+        CpuQuant::Mq3I4G128R256
+        | CpuQuant::Mq3I4G128R128
+        | CpuQuant::E8pI4G128R256
+        | CpuQuant::E8pI4G128R128 => {
+            unreachable!("decode_group_codes({q:?}): planar format, rejected above")
+        }
         CpuQuant::Mfp4G32E8 => {
             decode_mfp4_e8_group(&packed[16..], f16_at(packed, 0), out);
         }
@@ -942,6 +1203,10 @@ fn f16_at_u16(bytes: &[u8], off: usize) -> u16 {
 /// activation — see the module docs); it exists for the cross-check against the
 /// canonical decoder and for any future host-side weight materialization.
 pub fn dequant_group(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
+    assert!(
+        !q.is_planar(),
+        "dequant_group({q:?}): planar format has no per-group bytes; use decode_planar_row"
+    );
     decode_group_codes(q, packed, out);
     if q.is_fwht_g256() {
         let group: &mut [f32; FWHT_N] = (&mut out[..FWHT_N]).try_into().expect("group is 256");
@@ -1841,6 +2106,95 @@ mod test {
         ] {
             assert_eq!(CpuQuant::from_quant_type(qt), None, "qt {qt}");
         }
+    }
+
+    /// `e8p_decode_word` on words worked out by hand from the wire rule
+    /// (`v_k = 2·(±abs2) + (shift ? -1 : +1)`, lane 7 negative iff
+    /// `popcount(sign7) + parity(idx)` is odd).
+    #[test]
+    fn e8p_decode_word_matches_hand_computed_words() {
+        // idx 0: abs2 = [1; 8], Σ|g| = 4 (even row).
+        assert_eq!(e8p_decode_word(0x0000), [3; 8]);
+        assert_eq!(e8p_decode_word(0x8000), [1; 8]);
+        // sign7 = 1: lane 0 negative, popcount 1 makes lane 7 negative too.
+        assert_eq!(e8p_decode_word(0x0100), [-1, 3, 3, 3, 3, 3, 3, -1]);
+        // idx 1: abs2 = [1,1,1,1,1,1,1,3], Σ|g| = 5 (odd row): with no stored
+        // sign the odd parity alone negates lane 7.
+        assert_eq!(E8P_ROW_PARITY[1], 1);
+        assert_eq!(e8p_decode_word(0x0001), [3, 3, 3, 3, 3, 3, 3, -5]);
+        // ...and sign7 = 1 (popcount 1) cancels it again.
+        assert_eq!(e8p_decode_word(0x0101), [-1, 3, 3, 3, 3, 3, 3, 7]);
+        // Every lane of every word is odd and in [-11, 11].
+        for word in 0..=u16::MAX {
+            for v in e8p_decode_word(word) {
+                assert!(
+                    v % 2 != 0 && (-11..=11).contains(&v),
+                    "word {word:#06x}: {v}"
+                );
+            }
+        }
+        assert_eq!(E8P_ROW_PARITY.iter().filter(|&&p| p == 1).count(), 149);
+    }
+
+    /// `decode_planar_row` on a hand-built W3 row: codes `0..=7` in the first
+    /// chunk (LSB-first bit stream), all-zero codes elsewhere, one scale per
+    /// group.
+    #[test]
+    fn decode_planar_row_w3_matches_hand_computed_weights() {
+        let k = 256;
+        let mut codes = vec![0u8; k * 3 / 8];
+        let acc: u32 = (0..8).map(|j| (j as u32) << (3 * j)).sum();
+        codes[..3].copy_from_slice(&acc.to_le_bytes()[..3]);
+        // Second group: chunk 0 holds all-ones codes (7).
+        codes[48..51].copy_from_slice(&0x00ff_ffffu32.to_le_bytes()[..3]);
+        // Scales: 1.0 (0x3c00) and 0.5 (0x3800).
+        let scales = [0x00u8, 0x3c, 0x00, 0x38];
+        let mut out = vec![f32::NAN; k];
+        decode_planar_row(CpuQuant::Mq3I4G128R256, &codes, &scales, k, &mut out);
+        let want_first = [-7.0f32, -5.0, -3.0, -1.0, 1.0, 3.0, 5.0, 7.0];
+        assert_eq!(&out[..8], &want_first);
+        assert!(out[8..128].iter().all(|&w| w == -7.0));
+        assert!(out[128..136].iter().all(|&w| w == 7.0 * 0.5));
+        assert!(out[136..].iter().all(|&w| w == -7.0 * 0.5));
+    }
+
+    /// `decode_planar_row` on a hand-built E8P row: `(f32(d)·0.25)·v`.
+    #[test]
+    fn decode_planar_row_e8p_matches_hand_computed_weights() {
+        let k = 128;
+        let mut codes = vec![0u8; k / 4];
+        // Word 0 = 0x0001 (v = [3,3,3,3,3,3,3,-5]), word 1 = 0x8000 (v = [1; 8]).
+        codes[0..2].copy_from_slice(&0x0001u16.to_le_bytes());
+        codes[2..4].copy_from_slice(&0x8000u16.to_le_bytes());
+        // d = 2.0 (0x4000) -> scale 0.5.
+        let scales = 0x4000u16.to_le_bytes();
+        let mut out = vec![f32::NAN; k];
+        decode_planar_row(CpuQuant::E8pI4G128R128, &codes, &scales, k, &mut out);
+        assert_eq!(&out[..8], &[1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, -2.5]);
+        assert_eq!(&out[8..16], &[0.5; 8]);
+        // The remaining words are 0x0000 -> v = 3 everywhere.
+        assert!(out[16..].iter().all(|&w| w == 1.5));
+    }
+
+    #[test]
+    #[should_panic(expected = "planar format")]
+    fn decode_group_codes_rejects_planar_formats() {
+        let mut out = vec![0.0f32; 128];
+        decode_group_codes(CpuQuant::E8pI4G128R256, &[0u8; 64], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "planar format")]
+    fn dequant_group_rejects_planar_formats() {
+        let mut out = vec![0.0f32; 256];
+        dequant_group(CpuQuant::Mq3I4G128R128, &[0u8; 64], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a planar format")]
+    fn decode_planar_row_rejects_row_formats() {
+        let mut out = vec![0.0f32; 256];
+        decode_planar_row(CpuQuant::Mq4G256, &[0u8; 136], &[], 256, &mut out);
     }
 
     #[test]

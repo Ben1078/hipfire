@@ -4,8 +4,10 @@
 //! SIMD dispatch and vector-vs-scalar agreement.
 
 use super::*;
-use crate::gemv::{gemv_with_simd, row_bytes};
-use crate::quant::CpuQuant;
+use crate::gemv::{
+    gemm_with_simd, gemv_shared_sourced, gemv_with_simd, row_bytes, tensor_bytes, SharedJobSource,
+};
+use crate::quant::{decode_planar_row, CpuQuant, InputRotation};
 use crate::testfix;
 
 /// The dispatch predicate is a pure function of `(available, requested)`: a
@@ -59,6 +61,11 @@ fn kernel_formats() -> Vec<(CpuQuant, bool)> {
         (CpuQuant::Mq3G256V2, true),
         (CpuQuant::Mq2G256V2, true),
         (CpuQuant::Mq4G128V2, true),
+        // Planar slab formats: codes plane + f16 scale plane (qt 131/132/135/136).
+        (CpuQuant::Mq3I4G128R256, true),
+        (CpuQuant::Mq3I4G128R128, true),
+        (CpuQuant::E8pI4G128R256, true),
+        (CpuQuant::E8pI4G128R128, true),
         // Per-group fp16 codebook.
         (CpuQuant::Mq2G256Lloyd, true),
         (CpuQuant::Mq2G256LloydU, true),
@@ -120,7 +127,9 @@ fn every_cpu_decodable_format_has_a_kernel() {
 /// The per-format dispatch is a pure function of `(format, available,
 /// requested)`: a format's gate is exactly the features its kernel needs, a
 /// forced `Some(true)` must fall back to scalar — not fault — on hardware
-/// without them, and a forced `Some(false)` must always lose.
+/// without them, and a forced `Some(false)` must always lose. The logged kernel
+/// name ([`row_dot_kernel`]) is the unforced decision, spelled by those
+/// features.
 #[test]
 fn row_dot_enabled_matches_each_kernels_feature_gate() {
     for (q, needs_f16c) in kernel_formats() {
@@ -136,6 +145,12 @@ fn row_dot_enabled_matches_each_kernels_feature_gate() {
             "{q:?}: forced on"
         );
         assert!(!row_dot_enabled(q, Some(false)), "{q:?}: forced off");
+        let expected = match (available, needs_f16c) {
+            (false, _) => "scalar",
+            (true, true) => "avx2-fma-f16c",
+            (true, false) => "avx2-fma",
+        };
+        assert_eq!(row_dot_kernel(q), expected, "{q:?}: logged kernel name");
     }
 }
 
@@ -155,6 +170,17 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
         for row in 0..m {
             packed[row * rb..row * rb + 2]
                 .copy_from_slice(&F16X4[row % F16X4.len()].to_le_bytes());
+        }
+        return;
+    }
+    if q.is_planar() {
+        // The scales are their own plane after all `m` code rows: one f16 per
+        // (row, group), at `codes_bytes + 2 * (row * groups + group)`. Clear
+        // sign bits keep them finite and positive, as the writer guarantees.
+        let scales_at = m * row_bytes(q, k);
+        for i in 0..m * groups {
+            let bits = AWKWARD_F16[i % AWKWARD_F16.len()] & 0x7fff;
+            packed[scales_at + 2 * i..scales_at + 2 * i + 2].copy_from_slice(&bits.to_le_bytes());
         }
         return;
     }
@@ -226,6 +252,10 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
                     packed[at..at + 2].copy_from_slice(&AWKWARD_F16[0].to_le_bytes())
                 }
                 CpuQuant::Mfp4G32E8 => unreachable!("row-header format handled above"),
+                CpuQuant::Mq3I4G128R256
+                | CpuQuant::Mq3I4G128R128
+                | CpuQuant::E8pI4G128R256
+                | CpuQuant::E8pI4G128R128 => unreachable!("planar scale plane handled above"),
             }
         }
     }
@@ -305,8 +335,9 @@ fn avx2_and_scalar_agree_within_tolerance() {
             let mut scalar = vec![0.0f32; m];
             gemv_with_simd(q, &packed, m, k, &x, &mut simd, Some(true));
             gemv_with_simd(q, &packed, m, k, &x, &mut scalar, Some(false));
+            let floor = cancellation_floor(q, &packed, m, k, &x);
             for row in 0..m {
-                let scale = scalar[row].abs().max(1e-6);
+                let scale = scalar[row].abs().max(1e-6).max(floor[row]);
                 let rel = (simd[row] - scalar[row]).abs() / scale;
                 assert!(
                     rel <= 1e-4,
@@ -317,6 +348,37 @@ fn avx2_and_scalar_agree_within_tolerance() {
             }
         }
     }
+}
+
+/// Per-row slack for rows whose dot is a random-sign sum that cancels almost
+/// completely: `0.05 * sqrt(Σ (w·x)²)` for the planar formats, `0` for the rest
+/// (their fixtures keep the original normalisation).
+///
+/// The planar fixtures use uniformly random codes, so a row's value is a
+/// zero-mean sum whose magnitude `|S|` is occasionally far below its terms'
+/// scale `σ`, while the f32 difference between two summation orders stays near
+/// `5e-7·σ`. Normalising by `|S|` alone then fails a few rows per thousand for
+/// reasons that are not decode errors. A decode error is a whole weight off
+/// (`~σ/sqrt(k)` ≫ `1e-5·σ`), so this floor still catches it.
+fn cancellation_floor(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32]) -> Vec<f32> {
+    if !q.is_planar() {
+        return vec![0.0; m];
+    }
+    let (rb, spr) = (row_bytes(q, k), 2 * (k / 128));
+    let mut weights = vec![0.0f32; k];
+    (0..m)
+        .map(|r| {
+            let codes = &packed[r * rb..(r + 1) * rb];
+            let at = m * rb + r * spr;
+            decode_planar_row(q, codes, &packed[at..at + spr], k, &mut weights);
+            let ss: f64 = weights
+                .iter()
+                .zip(x)
+                .map(|(&w, &xi)| (w as f64 * xi as f64).powi(2))
+                .sum();
+            (0.05 * ss.sqrt()) as f32
+        })
+        .collect()
 }
 
 /// The forced-scalar path must be *exactly* `gemv`'s historical arithmetic, so
@@ -371,7 +433,7 @@ fn cached_and_uncached_agree_on_awkward_inputs() {
                 prepare_activation_sums(activation_sum_kind(q).unwrap(), &x, &mut sums);
                 for row in 0..m {
                     let weights = &packed[row * row_bytes(q, k)..];
-                    let uncached = row_dot_avx2(q, weights, k, &x);
+                    let uncached = row_dot_avx2(q, weights, &[], k, &x);
                     let cached = row_dot_with_activation_sums(q, weights, k, &x, &sums);
                     assert_eq!(
                         cached.to_bits(),
@@ -425,5 +487,275 @@ fn mq4g128v2_avx2_and_scalar_agree_on_128_granular_shapes() {
             .collect();
         let encoded = testfix::encode_mq4g128v2_ref(&w, m, k);
         check(&encoded, m, k, "encoder output");
+    }
+}
+
+// ---- planar slab formats (qt 131/132/135/136) ------------------------------------
+
+/// The four planar slab formats.
+fn planar_formats() -> [CpuQuant; 4] {
+    [
+        CpuQuant::Mq3I4G128R256,
+        CpuQuant::Mq3I4G128R128,
+        CpuQuant::E8pI4G128R256,
+        CpuQuant::E8pI4G128R128,
+    ]
+}
+
+fn planar_x(k: usize, salt: usize) -> Vec<f32> {
+    (0..k)
+        .map(|i| (((i + salt * 131) as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
+        .collect()
+}
+
+/// `(dot, Σ|w·x|)` of each row in `f64` over the crate's exact scalar decode
+/// ([`decode_planar_row`]): an oracle whose error budget does not depend on how
+/// much a random-sign row cancels.
+fn planar_oracle(q: CpuQuant, packed: &[u8], m: usize, k: usize, x: &[f32]) -> Vec<(f64, f64)> {
+    let (rb, spr) = (row_bytes(q, k), 2 * (k / 128));
+    let mut weights = vec![0.0f32; k];
+    (0..m)
+        .map(|r| {
+            let at = m * rb + r * spr;
+            decode_planar_row(
+                q,
+                &packed[r * rb..(r + 1) * rb],
+                &packed[at..at + spr],
+                k,
+                &mut weights,
+            );
+            weights
+                .iter()
+                .zip(x)
+                .fold((0.0f64, 0.0f64), |(d, l1), (&w, &xi)| {
+                    let t = w as f64 * xi as f64;
+                    (d + t, l1 + t.abs())
+                })
+        })
+        .collect()
+}
+
+/// Format metadata is the wire contract: qt map, planar flag, 128-groups, code
+/// bytes per group, no row header, and the rotation / `k` granularity per profile.
+#[test]
+fn planar_metadata_matches_the_wire_contract() {
+    let table = [
+        (131u8, CpuQuant::Mq3I4G128R256, 48usize, true),
+        (132, CpuQuant::Mq3I4G128R128, 48, false),
+        (135, CpuQuant::E8pI4G128R256, 32, true),
+        (136, CpuQuant::E8pI4G128R128, 32, false),
+    ];
+    for (qt, q, gb, r256) in table {
+        assert_eq!(CpuQuant::from_quant_type(qt), Some(q), "qt {qt}");
+        assert!(q.is_planar(), "{q:?}");
+        assert_eq!((q.group_elems(), q.group_bytes()), (128, gb), "{q:?}");
+        assert_eq!(q.row_header_bytes(), 0, "{q:?}");
+        assert_eq!(q.is_fwht_g256(), r256, "{q:?} g256");
+        assert_eq!(q.is_fwht_g128(), !r256, "{q:?} g128");
+        assert_eq!(
+            q.input_rotation(),
+            if r256 {
+                InputRotation::FwhtG256
+            } else {
+                InputRotation::FwhtG128V2
+            },
+            "{q:?}"
+        );
+        assert_eq!(q.k_multiple(), if r256 { 256 } else { 128 }, "{q:?}");
+    }
+    for q in all_formats() {
+        assert_eq!(q.is_planar(), planar_formats().contains(&q), "{q:?}");
+    }
+}
+
+/// Whole-tensor sizes of the real Flash-Next expert shapes (gate_up
+/// `[1280, 2560]`, down `[2560, 640]`) and the planar `row_bytes` meaning (codes
+/// plane stride only).
+#[test]
+fn planar_tensor_bytes_match_the_wire_sizes() {
+    // E8P: codes M*K/4 + scales 2*M*(K/128).
+    assert_eq!(tensor_bytes(CpuQuant::E8pI4G128R256, 1280, 2560), 870_400);
+    assert_eq!(tensor_bytes(CpuQuant::E8pI4G128R128, 2560, 640), 435_200);
+    // W3: codes M*K*3/8 + scales 2*M*(K/128).
+    assert_eq!(
+        tensor_bytes(CpuQuant::Mq3I4G128R256, 1280, 2560),
+        1280 * 2560 * 3 / 8 + 51_200
+    );
+    assert_eq!(tensor_bytes(CpuQuant::Mq3I4G128R256, 1280, 2560), 1_280_000);
+    assert_eq!(
+        tensor_bytes(CpuQuant::Mq3I4G128R128, 2560, 640),
+        2560 * 640 * 3 / 8 + 2560 * 5 * 2
+    );
+    assert_eq!(tensor_bytes(CpuQuant::Mq3I4G128R128, 2560, 640), 640_000);
+    // `row_bytes` is the codes-plane row stride, not tensor_bytes / m.
+    assert_eq!(row_bytes(CpuQuant::Mq3I4G128R256, 2560), 2560 * 3 / 8);
+    assert_eq!(row_bytes(CpuQuant::E8pI4G128R256, 2560), 2560 / 4);
+    assert_eq!(row_bytes(CpuQuant::E8pI4G128R128, 640), 640 / 4);
+    // Row formats keep `m * row_bytes`.
+    assert_eq!(
+        tensor_bytes(CpuQuant::Mq4G128V2, 7, 640),
+        7 * row_bytes(CpuQuant::Mq4G128V2, 640)
+    );
+    assert_eq!(tensor_bytes(CpuQuant::Mq4G256, 3, 512), 3 * 2 * 136);
+}
+
+/// The planar kernels against the forced-scalar path on the real expert shapes
+/// and the small ones, on random codes (every 16-bit E8P word and every 3-bit W3
+/// code is legal) with finite positive f16 scales from subnormal to `2^15`.
+/// Two checks: the same relative contract as
+/// [`avx2_and_scalar_agree_within_tolerance`] (with the cancellation floor, see
+/// [`cancellation_floor`]) and an absolute `1e-5·Σ|w·x|` bound against the exact
+/// `f64` decode, for both the vector and the scalar path.
+#[test]
+fn planar_avx2_and_scalar_agree_within_tolerance() {
+    for q in planar_formats() {
+        if !row_dot_enabled(q, Some(true)) {
+            eprintln!("skip {q:?}: AVX2/F16C absent on this runner");
+            continue;
+        }
+        for (m, k) in [(1280usize, 2560usize), (2560, 640), (8, 256), (3, 128)] {
+            // R256 profiles need k % 256 (640 and 128 are R128-only shapes).
+            if k % q.k_multiple() != 0 {
+                continue;
+            }
+            let packed = testfix::planar_tensor(q, m, k, 0xC0DE_0000 ^ (m * k) as u64);
+            assert_eq!(packed.len(), tensor_bytes(q, m, k), "{q:?} {m}x{k}");
+            let x = planar_x(k, 0);
+            let mut simd = vec![0.0f32; m];
+            let mut scalar = vec![0.0f32; m];
+            gemv_with_simd(q, &packed, m, k, &x, &mut simd, Some(true));
+            gemv_with_simd(q, &packed, m, k, &x, &mut scalar, Some(false));
+            let floor = cancellation_floor(q, &packed, m, k, &x);
+            let oracle = planar_oracle(q, &packed, m, k, &x);
+            for row in 0..m {
+                let scale = scalar[row].abs().max(1e-6).max(floor[row]);
+                let rel = (simd[row] - scalar[row]).abs() / scale;
+                assert!(
+                    rel <= 1e-4,
+                    "{q:?} {m}x{k} row {row}: simd {} vs scalar {} (rel {rel:.3e})",
+                    simd[row],
+                    scalar[row]
+                );
+                let (dot, l1) = oracle[row];
+                for (what, got) in [("simd", simd[row]), ("scalar", scalar[row])] {
+                    let err = (got as f64 - dot).abs();
+                    assert!(
+                        err <= 1e-5 * l1,
+                        "{q:?} {m}x{k} row {row}: {what} {got} vs f64 oracle {dot} \
+                         (err {err:.3e}, Σ|wx| {l1:.3e})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A batch of planar jobs over plain slices (the CPU MoE splice's shape).
+struct PlanarBatch<'a> {
+    q: CpuQuant,
+    packs: Vec<&'a [u8]>,
+    xs: Vec<Vec<&'a [f32]>>,
+}
+
+impl SharedJobSource for PlanarBatch<'_> {
+    fn jobs(&self) -> usize {
+        self.packs.len()
+    }
+    fn n(&self, j: usize) -> usize {
+        self.xs[j].len()
+    }
+    fn quant(&self, _j: usize) -> CpuQuant {
+        self.q
+    }
+    fn packed(&self, j: usize) -> &[u8] {
+        self.packs[j]
+    }
+    fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+        self.xs[j][t]
+    }
+}
+
+/// The D2 AR == MTP contract for the planar formats: a job with `n = 1..=4`
+/// activation rows through `gemv_shared_sourced` (alone and with other jobs in
+/// one batch) and through `gemm` is bit-identical to `n` single-row `gemv` calls,
+/// on the vector path, the runtime-detected path and the forced-scalar path.
+/// Every planar format, at one gate_up-like (`k % 256`) and one down-like
+/// (`k = 640`) shape.
+#[test]
+fn planar_shared_sourced_is_bit_identical_to_per_row_gemv() {
+    for q in planar_formats() {
+        let (m, k) = if q.k_multiple() == 256 {
+            (40usize, 512usize)
+        } else {
+            (40, 640)
+        };
+        let tensors: Vec<Vec<u8>> = (0..2)
+            .map(|s| testfix::planar_tensor(q, m, k, 0xFEED_0000 + s))
+            .collect();
+        // Job `j` has `j + 1` activation rows over weight tensor `j % 2`.
+        let rows: Vec<Vec<Vec<f32>>> = (0..4)
+            .map(|j| (0..=j).map(|t| planar_x(k, 10 * j + t)).collect())
+            .collect();
+        let x_refs: Vec<Vec<&[f32]>> = rows
+            .iter()
+            .map(|r| r.iter().map(|v| v.as_slice()).collect())
+            .collect();
+        for requested in [Some(true), None, Some(false)] {
+            // Per-row `gemv` reference: `want[j][t][r]`.
+            let want: Vec<Vec<Vec<f32>>> = (0..4)
+                .map(|j| {
+                    rows[j]
+                        .iter()
+                        .map(|x| {
+                            let mut y = vec![0.0f32; m];
+                            gemv_with_simd(q, &tensors[j % 2], m, k, x, &mut y, requested);
+                            y
+                        })
+                        .collect()
+                })
+                .collect();
+            // One batch of all four jobs, then each job alone.
+            let mut selections: Vec<Vec<usize>> = vec![vec![0, 1, 2, 3]];
+            selections.extend((0..4).map(|j| vec![j]));
+            for sel in selections {
+                let batch = PlanarBatch {
+                    q,
+                    packs: sel.iter().map(|&j| tensors[j % 2].as_slice()).collect(),
+                    xs: sel.iter().map(|&j| x_refs[j].clone()).collect(),
+                };
+                let total: usize = sel.iter().map(|&j| m * (j + 1)).sum();
+                let mut out = vec![f32::NAN; total];
+                gemv_shared_sourced(m, k, &mut out, &batch, requested);
+                let mut base = 0usize;
+                for &j in &sel {
+                    let n = j + 1;
+                    for r in 0..m {
+                        for t in 0..n {
+                            assert_eq!(
+                                out[base + r * n + t].to_bits(),
+                                want[j][t][r].to_bits(),
+                                "{q:?} {requested:?} job {j} n={n} row {r} token {t}"
+                            );
+                        }
+                    }
+                    base += m * n;
+                }
+            }
+            for j in 0..4 {
+                let n = j + 1;
+                let flat: Vec<f32> = rows[j].iter().flatten().copied().collect();
+                let mut out = vec![0.0f32; n * m];
+                gemm_with_simd(q, &tensors[j % 2], m, k, &flat, n, &mut out, requested);
+                for t in 0..n {
+                    for r in 0..m {
+                        assert_eq!(
+                            out[t * m + r].to_bits(),
+                            want[j][t][r].to_bits(),
+                            "{q:?} {requested:?} gemm n={n} token {t} row {r}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

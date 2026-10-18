@@ -54,16 +54,14 @@ pub fn avx2_f16c_available() -> bool {
     false
 }
 
-/// Whether `q` has a vector kernel on this CPU.
-///
-/// Every kernel needs AVX2 + FMA; the ones over an `fp16` header, `fp16`
-/// weights or an `fp16` codebook need F16C on top (see
+/// Whether `q`'s vector kernel widens `fp16` metadata, weights or codebook
+/// values with `vcvtph2ps`, i.e. needs F16C on top of AVX2 + FMA (see
 /// [`avx2_f16c_available`]).
 ///
 /// The match is deliberately exhaustive — the lists below name every
 /// [`CpuQuant`] — so a new variant does not compile until its kernel's feature
 /// requirement is stated here, next to the kernel arm in [`row_dot_avx2`].
-fn features_for(q: CpuQuant) -> bool {
+fn needs_f16c(q: CpuQuant) -> bool {
     match q {
         // Kernels that widen fp16 metadata with `vcvtph2ps`.
         CpuQuant::Mq4G256V2
@@ -81,7 +79,12 @@ fn features_for(q: CpuQuant) -> bool {
         | CpuQuant::Mq4G256Lloyd
         | CpuQuant::Q8F16
         | CpuQuant::F16
-        | CpuQuant::Mfp4G32E8 => avx2_f16c_available(),
+        | CpuQuant::Mfp4G32E8
+        // Planar slab formats widen their f16 scale plane with `vcvtph2ps`.
+        | CpuQuant::Mq3I4G128R256
+        | CpuQuant::Mq3I4G128R128
+        | CpuQuant::E8pI4G128R256
+        | CpuQuant::E8pI4G128R128 => true,
         // Kernels over a plain f32 header, or over weights that need no fp16
         // step at all.
         CpuQuant::Mq4G256
@@ -97,7 +100,29 @@ fn features_for(q: CpuQuant) -> bool {
         | CpuQuant::Hfq3G128
         | CpuQuant::Hfq2G128
         | CpuQuant::F32
-        | CpuQuant::Bf16 => avx2_available(),
+        | CpuQuant::Bf16 => false,
+    }
+}
+
+/// Whether `q` has a vector kernel on this CPU: AVX2 + FMA, plus F16C for the
+/// kernels [`needs_f16c`] names.
+fn features_for(q: CpuQuant) -> bool {
+    if needs_f16c(q) {
+        avx2_f16c_available()
+    } else {
+        avx2_available()
+    }
+}
+
+/// The row-dot kernel an unforced GEMV runs for `q` on this CPU, named by the
+/// instruction sets it uses: `"avx2-fma-f16c"` or `"avx2-fma"` for the vector
+/// kernel, `"scalar"` for the fallback. Load logs print it so every run states
+/// which CPU arithmetic path its host-executed experts took.
+pub fn row_dot_kernel(q: CpuQuant) -> &'static str {
+    match (row_dot_enabled(q, None), needs_f16c(q)) {
+        (false, _) => "scalar",
+        (true, true) => "avx2-fma-f16c",
+        (true, false) => "avx2-fma",
     }
 }
 
@@ -214,12 +239,21 @@ pub(crate) fn row_dot_with_activation_sums(
 /// so `row` must be at least `(k / q.group_elems()) * q.group_bytes()` bytes and
 /// `x.len() >= k`. Rotation is the caller's business, exactly as in
 /// [`crate::quant::decode_group_codes`].
+///
+/// `scales_row` is the row's f16 scale bytes for the planar formats
+/// ([`CpuQuant::is_planar`]; `2 * (k / 128)` of them, `row` is then exactly the
+/// row's codes) and empty for every other format. The planar kernels read only
+/// within the two slices.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 {
+pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], scales_row: &[u8], k: usize, x: &[f32]) -> f32 {
     debug_assert!(features_for(q), "row_dot_avx2({q:?}): features absent");
     debug_assert!(
         row.len() >= crate::gemv::row_bytes(q, k) && x.len() >= k,
         "row_dot_avx2({q:?}): row or activation shorter than the shape"
+    );
+    debug_assert!(
+        !q.is_planar() || scales_row.len() >= 2 * (k / crate::quant::PLANAR_GROUP),
+        "row_dot_avx2({q:?}): scales row shorter than the shape"
     );
     let (p, xp) = (row.as_ptr(), x.as_ptr());
     // SAFETY: the caller established this format's CPU features through
@@ -249,6 +283,13 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 
         CpuQuant::Mq4G256V2 => unsafe { x86::mq4g256v2_row_dot(p, k, xp) },
         // Per-128 fp16 header over a 128-element row-local group.
         CpuQuant::Mq4G128V2 => unsafe { x86::mq4g128v2_row_dot(p, k, xp) },
+        // Planar slab formats: codes plane row + f16 scale plane row.
+        CpuQuant::Mq3I4G128R256 | CpuQuant::Mq3I4G128R128 => unsafe {
+            x86::w3_row_dot(p, scales_row.as_ptr(), k, xp)
+        },
+        CpuQuant::E8pI4G128R256 | CpuQuant::E8pI4G128R128 => unsafe {
+            x86::e8p_row_dot(p, scales_row.as_ptr(), k, xp)
+        },
         CpuQuant::Mq6G256V2 => unsafe { x86::mq6g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq5G256V2 => unsafe { x86::mq5g256v2_row_dot(p, k, xp) },
         CpuQuant::Mq3G256V2 => unsafe { x86::mq3g256v2_row_dot(p, k, xp) },
@@ -270,7 +311,13 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], k: usize, x: &[f32]) -> f32 
 /// ([`avx2_available`] is `false`), so [`row_dot_enabled`] never lets a caller
 /// reach this.
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn row_dot_avx2(_q: CpuQuant, _row: &[u8], _k: usize, _x: &[f32]) -> f32 {
+pub(crate) fn row_dot_avx2(
+    _q: CpuQuant,
+    _row: &[u8],
+    _scales_row: &[u8],
+    _k: usize,
+    _x: &[f32],
+) -> f32 {
     unreachable!("row_dot_avx2 is reachable only where AVX2 was detected")
 }
 

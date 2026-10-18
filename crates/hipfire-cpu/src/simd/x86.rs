@@ -1054,3 +1054,243 @@ pub(super) unsafe fn mfp4g32_e8_row_dot(row: *const u8, k: usize, x: *const f32)
     }
     acc
 }
+
+// ---- planar slab formats (qt 131/132/135/136) ----------------------------------
+//
+// Planar tensors keep a row's codes and its f16 scales in separate planes, so
+// these kernels take two pointers: the row's codes (exactly `row_bytes` of them)
+// and the row's `k / 128` little-endian f16 scales (`2 * (k / 128)` bytes). Both
+// stay inside those ranges: every load below is exactly the bytes it consumes,
+// and the one W3 load that would otherwise run one byte past a row's codes is
+// read as three scalar bytes.
+
+use crate::quant::{E8P_ABS2, E8P_ROW_PARITY};
+
+/// 32-byte alignment wrapper: each 8 x f32 table row is then one aligned half
+/// cache line (`vmovaps` / memory-operand legal).
+#[repr(C, align(32))]
+struct Aligned32<T>(T);
+
+/// E8P magnitude table, 8 KiB: row `idx`, lane `k` is `2·E8P_ABS2[idx][k]`, with
+/// lane 7 pre-negated on odd-parity rows (the stored half of lane 7's sign
+/// rule, as in `e8p_i4_reference::build_lut`). Built at compile time.
+static E8P_MAGNITUDE: Aligned32<[[f32; 8]; 256]> = Aligned32({
+    let mut t = [[0.0f32; 8]; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut k = 0;
+        while k < 8 {
+            let m = 2.0 * E8P_ABS2[i][k] as f32;
+            t[i][k] = if k == 7 && E8P_ROW_PARITY[i] == 1 {
+                -m
+            } else {
+                m
+            };
+            k += 1;
+        }
+        i += 1;
+    }
+    t
+});
+
+/// E8P sign-flip table, 4 KiB: row `sign7`, lane `k` is `-0.0` (a pure sign-bit
+/// XOR mask) iff the lane is flipped — bit `k` of `sign7` for `k < 7`, and for
+/// lane 7 iff `popcount(sign7)` is odd (the other half of the parity rule, as in
+/// `e8p_i4_reference::build_mask`). XOR with [`E8P_MAGNITUDE`] yields the signed
+/// lane `±2|g|`.
+static E8P_SIGN: Aligned32<[[f32; 8]; 128]> = Aligned32({
+    let mut t = [[0.0f32; 8]; 128];
+    let mut s = 0usize;
+    while s < 128 {
+        let mut k = 0;
+        while k < 8 {
+            let flip = if k < 7 {
+                (s >> k) & 1 == 1
+            } else {
+                (s as u32).count_ones() & 1 == 1
+            };
+            t[s][k] = if flip { -0.0 } else { 0.0 };
+            k += 1;
+        }
+        s += 1;
+    }
+    t
+});
+
+/// `+1.0` / `-1.0` indexed by the E8P shift bit (`true` = `-1/4`, i.e. `-1` in `v`).
+static E8P_SHIFT_OFFSET: [f32; 2] = [1.0, -1.0];
+
+/// One eight-lane `f32` vector of an E8P wire word's `v` values (odd integers in
+/// `[-11, 11]`): `(magnitude[idx] ^ sign[sign7]) + (shift ? -1 : +1)`.
+///
+/// # Safety
+///
+/// Requires AVX2 and the two word bytes at `p` (`idx`, then `sign7 | shift << 7`).
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn e8p_word(p: *const u8) -> __m256 {
+    let idx = *p as usize;
+    let hi = *p.add(1) as usize;
+    let mag = _mm256_load_ps(E8P_MAGNITUDE.0[idx].as_ptr());
+    let sign = _mm256_load_ps(E8P_SIGN.0[hi & 0x7f].as_ptr());
+    let offset = _mm256_broadcast_ss(&E8P_SHIFT_OFFSET[hi >> 7]);
+    _mm256_add_ps(_mm256_xor_ps(mag, sign), offset)
+}
+
+/// The f16 at `p` widened to f32 and broadcast to all eight lanes.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn f16_broadcast(p: *const u8) -> __m256 {
+    let bits = (p as *const u16).read_unaligned();
+    _mm256_cvtph_ps(_mm_set1_epi16(bits as i16))
+}
+
+/// E8P-I4 planar row (qt 135 / 136): `Σ_g (0.25·f32(d_g)) · Σ_w v_w · x_w`.
+///
+/// Per 128-group: 16 words, each one table decode ([`e8p_word`]) FMA'd into one
+/// of four independent accumulators (breaking the FMA latency chain), folded at
+/// the group end into the row accumulator with the group's `0.25·f32(d)` — one
+/// fold per 128 weights, one horizontal sum per row. `0.25·f32(d)` is exact, so
+/// this is the scalar decode's `(f32(d)·0.25)·v` weight up to summation order.
+///
+/// # Safety
+///
+/// Requires AVX2, FMA and F16C; `k % 128 == 0`; `k / 4` readable bytes at
+/// `codes`, `2 * (k / 128)` at `scales`, and `k` readable `f32` at `x`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn e8p_row_dot(
+    codes: *const u8,
+    scales: *const u8,
+    k: usize,
+    x: *const f32,
+) -> f32 {
+    let quarter = _mm256_set1_ps(0.25);
+    let mut row = _mm256_setzero_ps();
+    for g in 0..k / 128 {
+        let cp = codes.add(g * 32);
+        let xp = x.add(g * 128);
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        for w in 0..4 {
+            let c = cp.add(w * 8);
+            let xw = xp.add(w * 32);
+            a0 = _mm256_fmadd_ps(e8p_word(c), _mm256_loadu_ps(xw), a0);
+            a1 = _mm256_fmadd_ps(e8p_word(c.add(2)), _mm256_loadu_ps(xw.add(8)), a1);
+            a2 = _mm256_fmadd_ps(e8p_word(c.add(4)), _mm256_loadu_ps(xw.add(16)), a2);
+            a3 = _mm256_fmadd_ps(e8p_word(c.add(6)), _mm256_loadu_ps(xw.add(24)), a3);
+        }
+        let group = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let scale = _mm256_mul_ps(f16_broadcast(scales.add(2 * g)), quarter);
+        row = _mm256_fmadd_ps(group, scale, row);
+    }
+    hsum256(row)
+}
+
+/// Eight W3 codes centered by `3.5` as `f32` lanes: `c - 3.5 = (2c - 7) / 2`
+/// (exact), in element order.
+///
+/// One broadcast of a 32-bit read at the chunk start plus one variable shift
+/// per code. The 4-byte read straddles one byte into the next chunk, which the
+/// shifts (at most 21) and the 3-bit mask discard. `SAFE` reads exactly the
+/// chunk's three bytes instead, for the last chunk of a row, whose fourth byte
+/// would lie outside the row's codes slice.
+///
+/// # Safety
+///
+/// Requires AVX2 and 3 readable bytes at `p` (4 when `!SAFE`).
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn w3_centered<const SAFE: bool>(p: *const u8) -> __m256 {
+    let word = if SAFE {
+        *p as i32 | (*p.add(1) as i32) << 8 | (*p.add(2) as i32) << 16
+    } else {
+        (p as *const i32).read_unaligned()
+    };
+    let shifts = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21);
+    let codes = _mm256_and_si256(
+        _mm256_srlv_epi32(_mm256_set1_epi32(word), shifts),
+        _mm256_set1_epi32(7),
+    );
+    _mm256_sub_ps(_mm256_cvtepi32_ps(codes), _mm256_set1_ps(3.5))
+}
+
+/// `Σ (c - 3.5)·x` over one W3 128-group (48 code bytes at `cp`, 16 chunks), as
+/// an eight-lane vector over two accumulator chains. `LAST` marks the row's last
+/// group, whose last chunk is read without the extra fourth byte.
+///
+/// # Safety
+///
+/// Requires AVX2 and FMA; 48 readable bytes at `cp` (when `!LAST` the last chunk
+/// also reads `cp + 48`, the next group's first byte, which exists because this
+/// is not the row's last group), and 128 readable `f32` at `xp`.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn w3_group_dot<const LAST: bool>(cp: *const u8, xp: *const f32) -> __m256 {
+    let mut a0 = _mm256_setzero_ps();
+    let mut a1 = _mm256_setzero_ps();
+    for c in 0..7 {
+        a0 = _mm256_fmadd_ps(
+            w3_centered::<false>(cp.add(6 * c)),
+            _mm256_loadu_ps(xp.add(16 * c)),
+            a0,
+        );
+        a1 = _mm256_fmadd_ps(
+            w3_centered::<false>(cp.add(6 * c + 3)),
+            _mm256_loadu_ps(xp.add(16 * c + 8)),
+            a1,
+        );
+    }
+    a0 = _mm256_fmadd_ps(
+        w3_centered::<false>(cp.add(42)),
+        _mm256_loadu_ps(xp.add(112)),
+        a0,
+    );
+    a1 = _mm256_fmadd_ps(
+        w3_centered::<LAST>(cp.add(45)),
+        _mm256_loadu_ps(xp.add(120)),
+        a1,
+    );
+    _mm256_add_ps(a0, a1)
+}
+
+/// MQ3-I4 (W3) planar row (qt 131 / 132): `Σ_g 2·f32(d_g) · Σ (c - 3.5)·x`, i.e.
+/// the scalar decode's `f32(d)·(2c - 7)` weight up to summation order (both
+/// `c - 3.5` and `2·f32(d)` are exact). One scale fold per 128 weights, one
+/// horizontal sum per row.
+///
+/// # Safety
+///
+/// Requires AVX2, FMA and F16C; `k % 128 == 0`; `3k/8` readable bytes at
+/// `codes`, `2 * (k / 128)` at `scales`, and `k` readable `f32` at `x`. Reads
+/// stay within those ranges (see [`w3_centered`]).
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn w3_row_dot(
+    codes: *const u8,
+    scales: *const u8,
+    k: usize,
+    x: *const f32,
+) -> f32 {
+    let groups = k / 128;
+    if groups == 0 {
+        return 0.0;
+    }
+    let mut row = _mm256_setzero_ps();
+    for g in 0..groups - 1 {
+        let d = f16_broadcast(scales.add(2 * g));
+        row = _mm256_fmadd_ps(
+            w3_group_dot::<false>(codes.add(g * 48), x.add(g * 128)),
+            _mm256_add_ps(d, d),
+            row,
+        );
+    }
+    let g = groups - 1;
+    let d = f16_broadcast(scales.add(2 * g));
+    row = _mm256_fmadd_ps(
+        w3_group_dot::<true>(codes.add(g * 48), x.add(g * 128)),
+        _mm256_add_ps(d, d),
+        row,
+    );
+    hsum256(row)
+}

@@ -92,6 +92,13 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
             // fp16 [scale][zero], then the 64 B nibble payload.
             bytes[..4].copy_from_slice(&f16x4(F16_QUAD)[..4]);
         }
+        // Planar formats have no per-group header: `group_bytes` is just the
+        // group's code bytes, and the scales live in a separate plane that
+        // `weight_bytes` / `planar_tensor` build.
+        CpuQuant::Mq3I4G128R256
+        | CpuQuant::Mq3I4G128R128
+        | CpuQuant::E8pI4G128R256
+        | CpuQuant::E8pI4G128R128 => {}
         CpuQuant::Hfq3G256
         | CpuQuant::Hfq2G256
         | CpuQuant::Hfq4G128
@@ -140,8 +147,53 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
     bytes
 }
 
-/// A `[m, k]` weight tensor's bytes, group by group.
+/// SplitMix64 byte/word stream for the planar fixtures (the `(i*37+11)` payload
+/// of the row formats would only ever produce odd E8P `idx` bytes).
+pub struct SplitMix(pub u64);
+
+impl SplitMix {
+    pub fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// A finite, strictly positive f16 bit pattern with its exponent field drawn
+/// uniformly from `0..=30` (subnormal through `2^15`), so a tensor's groups span
+/// tiny and huge scales.
+pub fn random_scale_bits(rng: &mut SplitMix) -> u16 {
+    let exp = (rng.next() % 31) as u16;
+    let man = (rng.next() % 1024) as u16;
+    // Exponent 0 is subnormal: keep the mantissa nonzero so the scale is > 0.
+    let man = if exp == 0 { man | 1 } else { man };
+    (exp << 10) | man
+}
+
+/// A planar `[m, k]` tensor (`[codes plane][f16 scale plane]`): uniformly random
+/// code bytes — every bit pattern is a legal E8P word and every 3-bit code is
+/// legal — and [`random_scale_bits`] scales. Exactly `tensor_bytes(q, m, k)`
+/// long.
+pub fn planar_tensor(q: CpuQuant, m: usize, k: usize, seed: u64) -> Vec<u8> {
+    assert!(q.is_planar() && k % 128 == 0);
+    let mut rng = SplitMix(seed);
+    let codes = m * crate::gemv::row_bytes(q, k);
+    let mut out = Vec::with_capacity(crate::gemv::tensor_bytes(q, m, k));
+    out.extend((0..codes).map(|_| rng.next() as u8));
+    for _ in 0..m * (k / 128) {
+        out.extend_from_slice(&random_scale_bits(&mut rng).to_le_bytes());
+    }
+    out
+}
+
+/// A `[m, k]` weight tensor's bytes, group by group (planar formats: the
+/// [`planar_tensor`] layout with a fixed seed).
 pub fn weight_bytes(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
+    if q.is_planar() {
+        return planar_tensor(q, m, k, 0x5EED_0000 + (m * k) as u64);
+    }
     let groups = k / q.group_elems();
     let mut out = Vec::with_capacity(m * crate::gemv::row_bytes(q, k));
     for row in 0..m {

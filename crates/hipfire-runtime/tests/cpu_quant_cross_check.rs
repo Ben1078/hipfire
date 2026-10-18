@@ -319,3 +319,298 @@ fn dequantize_v2_family_matches_cpu_transcription_on_synthetic_groups() {
         }
     }
 }
+
+// ---- planar expert-slab codecs (qt 131/132/135/136) --------------------------------
+//
+// `hipfire-cpu` transcribes the E8P grid / `decode8` and the W3 bit layout so it
+// stays a rayon-only leaf. These tests hold the transcription to the runtime's
+// oracles (`e8p_i4_reference`, `mq_i4`, `mq_i4_reference`), which are the single
+// source of truth for the wire formats.
+
+use hipfire_cpu::gemv::{gemv_with_simd, row_bytes, tensor_bytes};
+use hipfire_cpu::quant::{decode_planar_row, e8p_decode_word};
+use hipfire_runtime::e8p_i4_reference as e8p;
+use hipfire_runtime::mq_i4::{self, MqI4Profile, MqI4Rotation};
+use hipfire_runtime::mq_i4_reference;
+
+/// xorshift64* — deterministic fixtures.
+struct Xs(u64);
+
+impl Xs {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+/// A finite, strictly positive, normal f16 bit pattern (exponent field 1..=30):
+/// legal for both writers' scale guards (`>= 2^-14`, finite, sign clear).
+fn random_scale_bits(rng: &mut Xs) -> u16 {
+    let exp = 1 + (rng.next() % 30) as u16;
+    let man = (rng.next() % 1024) as u16;
+    (exp << 10) | man
+}
+
+fn random_x(rng: &mut Xs, k: usize) -> Vec<f32> {
+    (0..k)
+        .map(|_| ((rng.next() % 4096) as f32 - 2048.0) / 1024.0)
+        .collect()
+}
+
+/// Planar E8P tensor bytes: the words plane (little-endian u16) then the scales.
+fn e8p_tensor_bytes(words: &[u16], scale_bits: &[u16]) -> Vec<u8> {
+    words
+        .iter()
+        .chain(scale_bits)
+        .flat_map(|w| w.to_le_bytes())
+        .collect()
+}
+
+/// Every row of a planar `[m, k]` tensor through `hipfire_cpu`'s scalar decoder.
+fn cpu_decode_rows(q: CpuQuant, bytes: &[u8], m: usize, k: usize) -> Vec<f32> {
+    let (rb, spr) = (row_bytes(q, k), 2 * (k / 128));
+    let mut out = vec![0.0f32; m * k];
+    for r in 0..m {
+        let at = m * rb + r * spr;
+        decode_planar_row(
+            q,
+            &bytes[r * rb..(r + 1) * rb],
+            &bytes[at..at + spr],
+            k,
+            &mut out[r * k..(r + 1) * k],
+        );
+    }
+    out
+}
+
+/// (a) The transcribed E8P grid equals `E8P_ABS2`, and the transcribed decode
+/// equals `decode8` for **every** 16-bit wire word — both `e8p_decode_word`
+/// directly and through `decode_planar_row` (k = 128 rows, 16 words each, scale
+/// `d = 4.0` so the decoded weight is exactly `v`).
+#[test]
+fn e8p_grid_and_decode_match_the_runtime_oracle_for_every_word() {
+    for idx in 0..256usize {
+        assert_eq!(
+            hipfire_cpu::quant::E8P_ABS2[idx],
+            e8p::E8P_ABS2[idx],
+            "grid row {idx}"
+        );
+    }
+    let q = CpuQuant::E8pI4G128R128;
+    let scales = 0x4400u16.to_le_bytes(); // f16 4.0 -> (4.0 * 0.25) = 1.0
+    let mut out = vec![0.0f32; 128];
+    for base in (0..65536u32).step_by(16) {
+        let mut codes = [0u8; 32];
+        for w in 0..16u32 {
+            let word = (base + w) as u16;
+            codes[2 * w as usize..2 * w as usize + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        decode_planar_row(q, &codes, &scales, 128, &mut out);
+        for w in 0..16usize {
+            let word = (base as usize + w) as u16;
+            let (idx, sign7, shift) = e8p::unpack_word_fields(word);
+            let want = e8p::decode8(idx, sign7, shift);
+            let direct = e8p_decode_word(word);
+            for lane in 0..8 {
+                assert_eq!(
+                    direct[lane], want[lane],
+                    "word {word:#06x} lane {lane}: e8p_decode_word"
+                );
+                assert_eq!(
+                    out[8 * w + lane],
+                    want[lane] as f32,
+                    "word {word:#06x} lane {lane}: decode_planar_row"
+                );
+            }
+        }
+    }
+}
+
+/// (b) `decode_planar_row` over random planar tensors equals the runtime's decoded
+/// weights bit for bit: E8P vs `decode_weights_f32`, W3 vs `mq_i4::decode_tensor`'s
+/// `f16(d) * (2c - 7)`. Also pins `tensor_bytes` to the runtime's byte contract.
+#[test]
+fn planar_row_decode_matches_the_runtime_decoders_bit_for_bit() {
+    let mut rng = Xs(0x1234_5678_9abc_def1);
+
+    // E8P (both rotations' shapes, incl. the down k = 640 and a lone group).
+    for (q, m, k) in [
+        (CpuQuant::E8pI4G128R256, 5usize, 512usize),
+        (CpuQuant::E8pI4G128R256, 2, 2560),
+        (CpuQuant::E8pI4G128R128, 4, 640),
+        (CpuQuant::E8pI4G128R128, 3, 128),
+    ] {
+        let words: Vec<u16> = (0..m * k / 8).map(|_| rng.next() as u16).collect();
+        let scale_bits: Vec<u16> = (0..m * k / 128)
+            .map(|_| random_scale_bits(&mut rng))
+            .collect();
+        let want = e8p::decode_weights_f32(m, k, &words, &scale_bits);
+        let bytes = e8p_tensor_bytes(&words, &scale_bits);
+        assert_eq!(bytes.len(), tensor_bytes(q, m, k), "{q:?} {m}x{k} bytes");
+        let got = cpu_decode_rows(q, &bytes, m, k);
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{q:?} {m}x{k} element {i}: {a} != {b}"
+            );
+        }
+    }
+
+    // W3.
+    for (q, profile, m, k) in [
+        (
+            CpuQuant::Mq3I4G128R256,
+            MqI4Profile::MQ3_R256,
+            5usize,
+            512usize,
+        ),
+        (CpuQuant::Mq3I4G128R256, MqI4Profile::MQ3_R256, 2, 2560),
+        (CpuQuant::Mq3I4G128R128, MqI4Profile::MQ3_R128, 4, 640),
+        (CpuQuant::Mq3I4G128R128, MqI4Profile::MQ3_R128, 3, 128),
+    ] {
+        let codes: Vec<u8> = (0..m * k).map(|_| (rng.next() % 8) as u8).collect();
+        let scale_bits: Vec<u16> = (0..m * k / 128)
+            .map(|_| random_scale_bits(&mut rng))
+            .collect();
+        let bytes =
+            mq_i4::encode_tensor(profile, m, k, &codes, &scale_bits).expect("encode W3 tensor");
+        let total = mq_i4::tensor_bytes(profile, m, k).expect("tensor_bytes");
+        assert_eq!(bytes.len(), total);
+        assert_eq!(tensor_bytes(q, m, k), total, "{q:?} {m}x{k} tensor_bytes");
+        let t = mq_i4::decode_tensor(profile, m, k, &bytes).expect("decode W3 tensor");
+        let want: Vec<f32> = (0..m * k)
+            .map(|i| {
+                ::half::f16::from_bits(t.scale_bits[i / 128]).to_f32()
+                    * (2 * t.codes[i] as i32 - 7) as f32
+            })
+            .collect();
+        let got = cpu_decode_rows(q, &bytes, m, k);
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{q:?} {m}x{k} element {i}: {a} != {b}"
+            );
+        }
+    }
+
+    // The planar byte contract at the real Flash-Next expert shapes: E8P is the
+    // 2-bit plane, so it has the W2 profiles' sizes.
+    for (profile, q3, qe, m, k) in [
+        (
+            MqI4Profile::MQ2_R256,
+            CpuQuant::Mq3I4G128R256,
+            CpuQuant::E8pI4G128R256,
+            1280usize,
+            2560usize,
+        ),
+        (
+            MqI4Profile::MQ2_R128,
+            CpuQuant::Mq3I4G128R128,
+            CpuQuant::E8pI4G128R128,
+            2560,
+            640,
+        ),
+    ] {
+        assert_eq!(
+            tensor_bytes(qe, m, k),
+            mq_i4::tensor_bytes(profile, m, k).unwrap()
+        );
+        let w3 = MqI4Profile {
+            codec: mq_i4::MqI4Codec::W3,
+            rotation: profile.rotation,
+        };
+        assert_eq!(
+            tensor_bytes(q3, m, k),
+            mq_i4::tensor_bytes(w3, m, k).unwrap()
+        );
+    }
+}
+
+/// (c) `hipfire-cpu` GEMV (forced scalar and runtime-detected AVX2) against the
+/// runtime's GEMV twins — `decode_gemv_f32_lanepair` for E8P, `decode_gemv_f32`
+/// for W3 — at both rotations' shapes.
+///
+/// The two sides are different f32 summation orders (the twins use the frozen F4
+/// tree), and the rows are random-sign sums that can cancel almost entirely, so
+/// the `1e-5` relative bound is taken against `Σ|w·x|`, the scale f32
+/// accumulation error is proportional to, rather than against `|y|` — which
+/// would fail a few rows per hundred for reasons that are not decode errors.
+/// A decode error moves a row by a whole weight (`~Σ|w·x| / k`) and is orders of
+/// magnitude over the bound.
+#[test]
+fn planar_gemv_matches_the_runtime_gemv_twins() {
+    let mut rng = Xs(0x0bad_cafe_f00d_1234);
+    let check = |q: CpuQuant,
+                 m: usize,
+                 k: usize,
+                 bytes: &[u8],
+                 weights: &[f32],
+                 x: &[f32],
+                 twin: &[f32]| {
+        for requested in [Some(false), None] {
+            let mut y = vec![0.0f32; m];
+            gemv_with_simd(q, bytes, m, k, x, &mut y, requested);
+            for r in 0..m {
+                let l1: f64 = (0..k)
+                    .map(|i| (weights[r * k + i] as f64 * x[i] as f64).abs())
+                    .sum();
+                let err = (y[r] as f64 - twin[r] as f64).abs();
+                assert!(
+                    err <= 1e-5 * l1,
+                    "{q:?} {m}x{k} {requested:?} row {r}: cpu {} vs twin {} (err {err:.3e}, Σ|wx| {l1:.3e})",
+                    y[r],
+                    twin[r]
+                );
+            }
+        }
+    };
+
+    for (q, rotation, m, k) in [
+        (
+            CpuQuant::E8pI4G128R256,
+            MqI4Rotation::R256,
+            3usize,
+            256usize,
+        ),
+        (CpuQuant::E8pI4G128R256, MqI4Rotation::R256, 40, 2560),
+        (CpuQuant::E8pI4G128R128, MqI4Rotation::R128, 3, 128),
+        (CpuQuant::E8pI4G128R128, MqI4Rotation::R128, 40, 640),
+    ] {
+        let words: Vec<u16> = (0..m * k / 8).map(|_| rng.next() as u16).collect();
+        let scale_bits: Vec<u16> = (0..m * k / 128)
+            .map(|_| random_scale_bits(&mut rng))
+            .collect();
+        let x = random_x(&mut rng, k);
+        let weights = e8p::decode_weights_f32(m, k, &words, &scale_bits);
+        let twin = e8p::decode_gemv_f32_lanepair(rotation, m, k, &words, &scale_bits, &x);
+        let bytes = e8p_tensor_bytes(&words, &scale_bits);
+        check(q, m, k, &bytes, &weights, &x, &twin);
+    }
+
+    for (q, profile, m, k) in [
+        (
+            CpuQuant::Mq3I4G128R256,
+            MqI4Profile::MQ3_R256,
+            3usize,
+            256usize,
+        ),
+        (CpuQuant::Mq3I4G128R256, MqI4Profile::MQ3_R256, 40, 2560),
+        (CpuQuant::Mq3I4G128R128, MqI4Profile::MQ3_R128, 3, 128),
+        (CpuQuant::Mq3I4G128R128, MqI4Profile::MQ3_R128, 40, 640),
+    ] {
+        let codes: Vec<u8> = (0..m * k).map(|_| (rng.next() % 8) as u8).collect();
+        let scale_bits: Vec<u16> = (0..m * k / 128)
+            .map(|_| random_scale_bits(&mut rng))
+            .collect();
+        let x = random_x(&mut rng, k);
+        let bytes =
+            mq_i4::encode_tensor(profile, m, k, &codes, &scale_bits).expect("encode W3 tensor");
+        let weights = cpu_decode_rows(q, &bytes, m, k);
+        let twin = mq_i4_reference::decode_gemv_f32(profile, m, k, &bytes, &x);
+        check(q, m, k, &bytes, &weights, &x, &twin);
+    }
+}

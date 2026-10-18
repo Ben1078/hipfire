@@ -20,7 +20,7 @@
 //! *selection* is not an input this module can vary.
 
 use crate::epilogue::silu_mul;
-use crate::gemv::{gemv, row_bytes};
+use crate::gemv::{gemv, tensor_bytes};
 use crate::quant::CpuQuant;
 
 /// The packed expert weight blobs of one MoE layer, laid out as the on-disk
@@ -28,7 +28,7 @@ use crate::quant::CpuQuant;
 ///
 /// `gate_up` holds `n_exp * gate_up_stride` bytes and `down` holds
 /// `n_exp * down_stride`; expert `slot`'s weight bytes are
-/// `[slot*stride .. slot*stride + row_bytes*m]`. A `stride` larger than the
+/// `[slot*stride .. slot*stride + tensor_bytes(quant, m, k)]`. A `stride` larger than the
 /// expert's own bytes is legal (a padded or interleaved layout); smaller is not,
 /// and is reported rather than read out of range.
 pub struct ExpertBlobs<'a> {
@@ -75,8 +75,8 @@ pub fn run_experts(
             out.len()
         ));
     }
-    let gu_bytes = row_bytes(blobs.quant, dim) * 2 * mi;
-    let down_bytes = row_bytes(blobs.quant, mi) * dim;
+    let gu_bytes = tensor_bytes(blobs.quant, 2 * mi, dim);
+    let down_bytes = tensor_bytes(blobs.quant, dim, mi);
     let mut gate_up_out = vec![0.0f32; 2 * mi];
     let mut hidden = vec![0.0f32; mi];
     let mut down_out = vec![0.0f32; dim];
@@ -164,8 +164,8 @@ mod test {
         ExpertBlobs {
             gate_up,
             down,
-            gate_up_stride: row_bytes(Q, DIM) * 2 * MI,
-            down_stride: row_bytes(Q, MI) * DIM,
+            gate_up_stride: tensor_bytes(Q, 2 * MI, DIM),
+            down_stride: tensor_bytes(Q, DIM, MI),
             quant: Q,
             dim: DIM,
             mi: MI,
@@ -259,9 +259,9 @@ mod test {
         // vacuous.
         {
             use crate::epilogue::silu_mul;
-            use crate::gemv::{gemv, row_bytes};
-            let gu_bytes = row_bytes(Q, DIM) * 2 * MI;
-            let down_bytes = row_bytes(Q, MI) * DIM;
+            use crate::gemv::{gemv, tensor_bytes};
+            let gu_bytes = tensor_bytes(Q, 2 * MI, DIM);
+            let down_bytes = tensor_bytes(Q, DIM, MI);
             let mut gate_up_out = vec![0.0f32; 2 * MI];
             let mut hidden = vec![0.0f32; MI];
             let mut down_out = vec![0.0f32; DIM];
@@ -280,12 +280,12 @@ mod test {
         // Mq2G256LloydU must equal the manual no-rotate recompute exactly.
         {
             use crate::epilogue::silu_mul;
-            use crate::gemv::{gemv, row_bytes};
+            use crate::gemv::{gemv, tensor_bytes};
             use crate::quant::CpuQuant;
             let qu = CpuQuant::Mq2G256LloydU;
             assert!(!qu.is_fwht_g256());
-            let gu_bytes = row_bytes(qu, DIM) * 2 * MI;
-            let down_bytes = row_bytes(qu, MI) * DIM;
+            let gu_bytes = tensor_bytes(qu, 2 * MI, DIM);
+            let down_bytes = tensor_bytes(qu, DIM, MI);
             let gu = crate::testfix::weight_bytes(qu, 2 * MI, DIM);
             let dn = crate::testfix::weight_bytes(qu, DIM, MI);
             let bu = ExpertBlobs {

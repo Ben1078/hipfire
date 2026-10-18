@@ -211,6 +211,14 @@ fn synth_weights(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                 // The element formats are covered bit-exactly by the fixture
                 // tables in `hipfire-cpu` and by the cross-check over real norms.
                 CpuQuant::F16 | CpuQuant::F32 | CpuQuant::Bf16 => unreachable!("not in SYNTH"),
+                // The planar slab formats (qt 131/132/135/136) keep their scales in
+                // a separate plane after all code rows, so this per-row group
+                // synthesis cannot build them; they are covered by the planar
+                // tests in `hipfire-cpu` and the runtime cross-check.
+                CpuQuant::Mq3I4G128R256
+                | CpuQuant::Mq3I4G128R128
+                | CpuQuant::E8pI4G128R256
+                | CpuQuant::E8pI4G128R128 => unreachable!("planar: not in SYNTH"),
             }
             out.extend_from_slice(&bytes);
         }
@@ -801,6 +809,10 @@ fn q_format_name(q: CpuQuant) -> &'static str {
         CpuQuant::Bf16 => "Bf16",
         CpuQuant::Q8F16 => "Q8F16",
         CpuQuant::Mfp4G32E8 => "Mfp4G32E8",
+        CpuQuant::Mq3I4G128R256 => "Mq3I4G128R256",
+        CpuQuant::Mq3I4G128R128 => "Mq3I4G128R128",
+        CpuQuant::E8pI4G128R256 => "E8pI4G128R256",
+        CpuQuant::E8pI4G128R128 => "E8pI4G128R128",
     }
 }
 
