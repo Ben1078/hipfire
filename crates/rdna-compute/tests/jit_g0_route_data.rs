@@ -72,7 +72,15 @@ fn six_header_specific_recipes_match_baseline_factories() {
                     let required = strings(&entry["symbols"]);
                     let missing: BTreeSet<_> = required.iter().copied()
                         .filter(|s| !oracle.symbols.contains(s)).collect();
-                    assert_eq!(missing, strings(&entry["registry_missing_symbols"]).into_iter().collect());
+                    // `registry_missing_symbols` is the immutable G0 measurement of the
+                    // legacy registry (the Q8 gap of HOLD1-R2-REVIEW section 3). It stays
+                    // as data; the live registry must now close every measured symbol.
+                    assert!(missing.is_empty(),
+                        "{name}:{module}: required symbols missing from the live registry: {missing:?}");
+                    let historical: BTreeSet<_> =
+                        strings(&entry["registry_missing_symbols"]).into_iter().collect();
+                    assert!(historical.iter().all(|s| required.contains(s)),
+                        "{name}:{module}: historical gap names a symbol the route never required");
                     assert_eq!(entry["export_receipt"]["sha256"].as_str().unwrap().len(), 64);
                     for symbol in required {
                         assert!(strings(&entry["exports"]).contains(&symbol), "{name}:{module}:{symbol}");
@@ -191,4 +199,32 @@ fn g0_pass_is_not_an_a3_ready_plan_or_an_inadmissible_fixture_guarantee() {
     let missing = strings(&tensor_ops["registry_missing_symbols"]);
     assert!(missing.contains(&"indexed_attention_cache_append_q8_batched"));
     assert!(missing.contains(&"indexed_attention_decode_prologue_q8"));
+    let live = kernel_registry::lookup("gfx1201", "tensor_ops", "-DIU4_A4_CANDIDATES=2").unwrap();
+    for symbol in missing {
+        assert!(live.symbols.contains(&symbol), "live registry still omits {symbol}");
+    }
+}
+
+/// Every Q8 symbol a measured flash-next route (state, prefill, decode and
+/// KV paths) requests of `tensor_ops` is in the packaged index of its arch,
+/// not only in the JIT corpus: the sealed gfx1100 package omitted nine.
+#[test]
+fn measured_q8_route_symbols_are_in_the_packaged_index() {
+    for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        let m = fixture(&format!("flash-next-{arch}.routes.json"));
+        let packaged = kernel_registry::entries(arch, "-DIU4_A4_CANDIDATES=2").unwrap();
+        let tensor_ops = packaged.iter().find(|e| e.module == "tensor_ops").unwrap();
+        let arms = std::iter::once(&m["default_entries"]).chain(
+            m["alternate_arms"].as_array().unwrap().iter().filter_map(|arm| arm.get("entries")));
+        let mut q8 = BTreeSet::new();
+        for entries in arms {
+            for entry in entries.as_array().unwrap().iter().filter(|e| e["module"] == "tensor_ops") {
+                q8.extend(strings(&entry["symbols"]).into_iter().filter(|s| s.contains("q8")));
+            }
+        }
+        assert!(q8.len() >= 4, "{arch}: no Q8 tensor_ops route symbols in the fixture");
+        for symbol in q8 {
+            assert!(tensor_ops.symbols.contains(&symbol), "{arch}: packaged index omits {symbol}");
+        }
+    }
 }

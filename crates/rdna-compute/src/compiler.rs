@@ -1001,20 +1001,55 @@ impl KernelCompiler {
         let bytes = std::fs::read(&index_path).map_err(|e| fail(&e.to_string()))?;
         let index: PackIndex = serde_json::from_slice(&bytes).map_err(|e| fail(&e.to_string()))?;
         let recipe = Self::recipe_for_source(arch, module, source, extra_flags);
-        if index.version != PACK_INDEX_VERSION
-            || index.module != module
-            || index.arch != arch
-            || !symbols.iter().all(|symbol| index.symbols.iter().any(|entry| entry == symbol))
-            || index.source_sha256 != sha256_hex(source.as_bytes())
-            || index.flags != recipe.flags
-            || index.scheduler_profile != recipe.scheduler_profile.unwrap_or_default()
-            || index.cache_abi != KERNEL_CACHE_ABI
-            || index.packaging_key != packaging_key
-            || index.toolchain_id.is_empty()
-            || index.toolchain_sha256 != sha256_hex(index.toolchain_id.as_bytes())
-            || (!local_toolchain_id.is_empty() && index.toolchain_id != local_toolchain_id)
-        {
-            return Err(fail("index identity, symbol, source, flags, profile, ABI or toolchain mismatch"));
+        // Every check still runs and any failure rejects; the failed fields
+        // are only named, so a symbol the packager never indexed is reported
+        // by name instead of as a blanket identity mismatch.
+        let mut failed: Vec<String> = Vec::new();
+        if index.version != PACK_INDEX_VERSION {
+            failed.push(format!("index version {} (expected {PACK_INDEX_VERSION})", index.version));
+        }
+        if index.module != module {
+            failed.push(format!("module `{}` (requested `{module}`)", index.module));
+        }
+        if index.arch != arch {
+            failed.push(format!("arch `{}` (requested `{arch}`)", index.arch));
+        }
+        let unindexed: Vec<&str> = symbols
+            .iter()
+            .copied()
+            .filter(|symbol| !index.symbols.iter().any(|entry| entry == symbol))
+            .collect();
+        if !unindexed.is_empty() {
+            failed.push(format!("symbol not in the module index: {}", unindexed.join(", ")));
+        }
+        if index.source_sha256 != sha256_hex(source.as_bytes()) {
+            failed.push("source sha256 differs".to_owned());
+        }
+        if index.flags != recipe.flags {
+            failed.push("flags differ".to_owned());
+        }
+        if index.scheduler_profile != recipe.scheduler_profile.unwrap_or_default() {
+            failed.push("scheduler profile differs".to_owned());
+        }
+        if index.cache_abi != KERNEL_CACHE_ABI {
+            failed.push(format!("cache ABI {} (expected {KERNEL_CACHE_ABI})", index.cache_abi));
+        }
+        if index.packaging_key != packaging_key {
+            failed.push("packaging key differs".to_owned());
+        }
+        if index.toolchain_id.is_empty() {
+            failed.push("toolchain missing".to_owned());
+        } else if index.toolchain_sha256 != sha256_hex(index.toolchain_id.as_bytes()) {
+            failed.push("toolchain digest differs".to_owned());
+        }
+        if !local_toolchain_id.is_empty() && index.toolchain_id != local_toolchain_id {
+            failed.push(format!(
+                "toolchain mismatch (indexed `{}`, local `{local_toolchain_id}`)",
+                index.toolchain_id
+            ));
+        }
+        if !failed.is_empty() {
+            return Err(fail(&format!("index mismatch: {}", failed.join("; "))));
         }
         let object = dir.join(format!("{module}.hsaco"));
         if !pair_valid(&object, &dir.join(format!("{module}.hash")), &index.packaging_key) {
@@ -1025,6 +1060,17 @@ impl KernelCompiler {
             return Err(fail("object SHA-256 mismatch"));
         }
         Ok(Some((object, index.toolchain_id)))
+    }
+
+    /// The symbols the installed index of `module` advertises, read without
+    /// admitting the object (pack verification checks them against the
+    /// compiled object's exports).
+    pub(crate) fn indexed_symbols(dir: &Path, module: &str) -> Result<Vec<String>, String> {
+        let path = dir.join(format!("{module}.index.json"));
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_slice::<PackIndex>(&bytes)
+            .map(|index| index.symbols)
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
 
     fn writeback_package(&self, module: &str, source: &str, symbol: &str, object: &Path, force: bool) {
@@ -3185,6 +3231,68 @@ mod tests {
                     compiler.indexed_object(&dir, entry.module, entry.source(), symbol).unwrap(),
                     Some(object.clone()), "{arch}: {symbol}",
                 );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The sealed Hold 1 / j1778 gfx1100 `tensor_ops` index omitted nine
+    /// supported Q8 exports. The old inventory is rejected naming the symbol;
+    /// the repaired per-arch inventory is accepted for every supported symbol.
+    #[test]
+    fn indexed_package_names_unindexed_symbol_and_accepts_repaired_arch_inventory() {
+        const SEALED: &str =
+            include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
+        const REPAIRED: [&str; 9] = [
+            "gated_delta_step_halves_state128_persistent256_canon_q8",
+            "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+            "indexed_attention_attention_q8",
+            "indexed_attention_attention_q8_batched",
+            "indexed_attention_attention_q8_batched_hg4",
+            "indexed_attention_attention_q8_batched_serial",
+            "indexed_attention_attention_q8_serial",
+            "indexed_attention_cache_append_q8_batched",
+            "indexed_attention_decode_prologue_q8",
+        ];
+        let sealed: std::collections::BTreeSet<&str> =
+            SEALED.lines().filter_map(|line| line.strip_prefix("index ")).collect();
+        let root = temp_root("sealed_index_closure");
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let entry = crate::kernel_registry::lookup(arch, "tensor_ops", "").unwrap();
+            let old: Vec<&str> =
+                entry.symbols.iter().copied().filter(|s| !REPAIRED.contains(s)).collect();
+            if arch == "gfx1100" {
+                // The pre-repair registry is exactly the sealed index.
+                assert_eq!(old.iter().copied().collect::<std::collections::BTreeSet<_>>(), sealed);
+            }
+            let mut compiler = test_compiler("", "hipcc 7.16");
+            compiler.arch = arch.to_owned();
+            let dir = root.join(arch);
+            std::fs::create_dir_all(&dir).unwrap();
+            let object = dir.join("tensor_ops.hsaco");
+            std::fs::write(&object, b"INDEX CLOSURE TEST").unwrap();
+            let publish = |symbols: &[&str]| {
+                let symbols = symbols.iter().map(|s| (*s).to_owned()).collect();
+                let index = compiler.pack_index(entry.module, entry.source(), symbols, &object).unwrap();
+                std::fs::write(dir.join("tensor_ops.hash"), &index.packaging_key).unwrap();
+                publish_index(&dir, &index).unwrap();
+            };
+            let load = |symbol: &str| compiler.indexed_object(&dir, entry.module, entry.source(), symbol);
+
+            publish(&old);
+            for symbol in &old {
+                assert_eq!(load(symbol).unwrap(), Some(object.clone()), "{arch}: {symbol}");
+            }
+            for symbol in REPAIRED {
+                let error = load(symbol).unwrap_err();
+                assert!(error.contains("symbol not in the module index"), "{arch}: {error}");
+                assert!(error.contains(symbol), "{arch}: {error}");
+                assert!(!error.contains("source sha256") && !error.contains("flags differ"), "{arch}: {error}");
+            }
+
+            publish(entry.symbols);
+            for symbol in entry.symbols {
+                assert_eq!(load(symbol).unwrap(), Some(object.clone()), "{arch}: {symbol}");
             }
         }
         let _ = std::fs::remove_dir_all(root);

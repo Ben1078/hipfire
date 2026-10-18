@@ -2530,6 +2530,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_step_gate_norm128_gfx1151",
                 "gated_delta_step_gate_norm128_q8",
                 "gated_delta_step_gate_norm128_q8ef",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
                 "gated_delta_step_halves_state128_persistent256_capture_f32",
                 "gated_delta_step_halves_state128_persistent256_capture_q8",
                 "gated_delta_step_halves_state128_persistent256_capture_q8ef",
@@ -2562,9 +2564,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_f32_batched_hg4",
                 "indexed_attention_attention_f32_batched_serial",
                 "indexed_attention_attention_f32_serial",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_f32",
                 "indexed_attention_cache_append_f32_batched",
+                "indexed_attention_cache_append_q8_batched",
                 "indexed_attention_decode_prologue_f32",
+                "indexed_attention_decode_prologue_q8",
                 "indexed_attention_index_key_append_bf16_batched",
                 "indexed_attention_norm_rope_f32",
                 "indexed_attention_norm_rope_f32_batched",
@@ -2680,6 +2689,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_step_gate_norm128_gfx1151",
                 "gated_delta_step_gate_norm128_q8",
                 "gated_delta_step_gate_norm128_q8ef",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
                 "gated_delta_step_halves_state128_persistent256_capture_f32",
                 "gated_delta_step_halves_state128_persistent256_capture_q8",
                 "gated_delta_step_halves_state128_persistent256_capture_q8ef",
@@ -2720,11 +2731,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_attention_fp8_batched_hg4",
                 "indexed_attention_attention_fp8_batched_serial",
                 "indexed_attention_attention_fp8_serial",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
                 "indexed_attention_cache_append_f32",
                 "indexed_attention_cache_append_f32_batched",
                 "indexed_attention_cache_append_fp8_batched",
+                "indexed_attention_cache_append_q8_batched",
                 "indexed_attention_decode_prologue_f32",
                 "indexed_attention_decode_prologue_fp8",
+                "indexed_attention_decode_prologue_q8",
                 "indexed_attention_index_key_append_bf16_batched",
                 "indexed_attention_norm_rope_f32",
                 "indexed_attention_norm_rope_f32_batched",
@@ -6946,6 +6964,286 @@ mod tests {
         let plain_arena = lookup("gfx1151", "gated_delta_chunk_q8_wmma_arena", "").unwrap();
         assert!(!plain.source().contains("q8ef"));
         assert!(!plain_arena.source().contains("q8ef"));
+    }
+
+    /// Kernels `kernels/src/tensor_ops.hip` (as the registry compiles it) exports
+    /// on `arch`, read from the source's own preprocessor guards: `__GFX11__`
+    /// (gfx1100, gfx1151), `__GFX12__` (gfx1201), `__gfx942__`, and the
+    /// `QSA_HAS_*` capability macros the source defines from them. Covers the
+    /// plain `extern "C" __global__` kernels and the QSA kernel macros.
+    fn tensor_ops_source_exports(arch: &str) -> std::collections::BTreeSet<String> {
+        let mut defined: HashSet<String> = HashSet::new();
+        match arch {
+            "gfx1100" | "gfx1151" => {
+                defined.insert("__GFX11__".to_owned());
+            }
+            "gfx1201" => {
+                defined.insert("__GFX12__".to_owned());
+            }
+            "gfx942" => {
+                defined.insert("__gfx942__".to_owned());
+            }
+            _ => {}
+        }
+        let eval = |condition: &str, defined: &HashSet<String>| -> bool {
+            condition.split("||").any(|term| {
+                let term = term.trim();
+                let (negate, term) = match term.strip_prefix('!') {
+                    Some(inner) => (true, inner.trim()),
+                    None => (false, term),
+                };
+                let name = term
+                    .strip_prefix("defined(")
+                    .and_then(|inner| inner.strip_suffix(')'))
+                    .unwrap_or_else(|| panic!("unsupported preprocessor condition {condition:?}"));
+                defined.contains(name.trim()) != negate
+            })
+        };
+        let lines: Vec<&str> = crate::tensor_ops::TENSOR_OPS_SRC.lines().collect();
+        // (this branch is live, some branch of the group was taken)
+        let mut stack: Vec<(bool, bool)> = Vec::new();
+        let mut active_text = String::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            index += 1;
+            let Some(directive) = line.trim().strip_prefix('#') else {
+                if stack.iter().all(|(live, _)| *live) {
+                    active_text.push_str(line);
+                    active_text.push('\n');
+                }
+                continue;
+            };
+            let mut directive = directive.trim_start().to_owned();
+            while directive.ends_with('\\') {
+                directive.pop();
+                directive.push_str(lines[index].trim());
+                index += 1;
+            }
+            let (keyword, rest) =
+                directive.split_once(char::is_whitespace).unwrap_or((directive.as_str(), ""));
+            let rest = rest.split("//").next().unwrap_or("").trim();
+            let live = stack.iter().all(|(live, _)| *live);
+            match keyword {
+                "if" => {
+                    let value = eval(rest, &defined);
+                    stack.push((value, value));
+                }
+                "ifdef" => {
+                    let value = defined.contains(rest);
+                    stack.push((value, value));
+                }
+                "ifndef" => {
+                    let value = !defined.contains(rest);
+                    stack.push((value, value));
+                }
+                "elif" => {
+                    let (_, taken) = stack.pop().expect("#elif without #if");
+                    let value = !taken && eval(rest, &defined);
+                    stack.push((value, taken || value));
+                }
+                "else" => {
+                    let (_, taken) = stack.pop().expect("#else without #if");
+                    stack.push((!taken, true));
+                }
+                "endif" => {
+                    stack.pop().expect("#endif without #if");
+                }
+                "define" if live => {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if name.starts_with("QSA_HAS_") {
+                        defined.insert(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(stack.is_empty(), "unbalanced preprocessor conditionals");
+
+        let mut names = std::collections::BTreeSet::new();
+        let identifier = |text: &str| -> String {
+            text.trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        };
+        let mut rest = active_text.as_str();
+        while let Some(at) = rest.find("extern \"C\" __global__") {
+            let mut tail = rest[at + "extern \"C\" __global__".len()..].trim_start();
+            rest = tail;
+            if let Some(after) = tail.strip_prefix("__launch_bounds__") {
+                let close = after.find(')').expect("unterminated __launch_bounds__");
+                tail = after[close + 1..].trim_start();
+            }
+            if let Some(after) = tail.strip_prefix("void") {
+                names.insert(identifier(after));
+            }
+        }
+        for line in active_text.lines() {
+            let line = line.trim();
+            for prefix in ["QSA_SELECT_SERIAL(", "QSA_SELECT_PARALLEL(", "QSA_DECODE_PROLOGUE("] {
+                if let Some(args) = line.strip_prefix(prefix) {
+                    names.insert(identifier(args));
+                }
+            }
+            if let Some(args) = line.strip_prefix("QSA_ATTENTION_KERNELS(") {
+                let tag = identifier(args);
+                for suffix in ["_batched_serial", "_batched", "_batched_hg4", "_serial", ""] {
+                    names.insert(format!("indexed_attention_attention_{tag}{suffix}"));
+                }
+            }
+        }
+        names
+    }
+
+    const SEALED_J1778_GFX1100: &str =
+        include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt");
+
+    /// The evaluator reproduces the measured sealed gfx1100 object exactly, so
+    /// it is a valid closure oracle for the arches no object was measured for.
+    /// The sealed index (the pre-repair registry) omitted nine of its exports.
+    #[test]
+    fn source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap() {
+        use std::collections::BTreeSet;
+        let rows = |tag: &str| -> BTreeSet<String> {
+            SEALED_J1778_GFX1100
+                .lines()
+                .filter_map(|line| line.strip_prefix(tag))
+                .map(str::to_owned)
+                .collect()
+        };
+        let (index, elf) = (rows("index "), rows("export "));
+        assert_eq!((index.len(), elf.len()), (74, 83));
+        assert!(index.is_subset(&elf), "the sealed index named a symbol its object lacks");
+        assert_eq!(tensor_ops_source_exports("gfx1100"), elf);
+        let omitted: Vec<&str> = elf.difference(&index).map(String::as_str).collect();
+        assert_eq!(
+            omitted,
+            [
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_q8",
+            ]
+        );
+        // The repaired registry (shared by gfx1100 and gfx1151) indexes every measured export.
+        for arch in ["gfx1100", "gfx1151"] {
+            let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
+                .unwrap()
+                .symbols
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            assert_eq!(registered, elf, "{arch}");
+        }
+    }
+
+    /// Every supported arch's `tensor_ops` index is exactly the source's
+    /// export set under that arch's capability macros: no supported export
+    /// (Q8 KV, canonical Q8 prefill, ...) is missing from the index, and no
+    /// export another arch's guards define (gfx12 FP8 KV, pipe128) is
+    /// declared where the source does not compile it.
+    #[test]
+    fn tensor_ops_index_is_the_source_export_closure_per_arch() {
+        use std::collections::BTreeSet;
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let exported = tensor_ops_source_exports(arch);
+            let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
+                .unwrap()
+                .symbols
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            let omitted: Vec<_> = exported.difference(&registered).collect();
+            let phantom: Vec<_> = registered.difference(&exported).collect();
+            assert!(omitted.is_empty(), "{arch}: exports missing from the index: {omitted:?}");
+            assert!(phantom.is_empty(), "{arch}: indexed but not compiled: {phantom:?}");
+        }
+        let has = |arch: &str, symbol: &str| tensor_ops_source_exports(arch).contains(symbol);
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for q8 in [
+                "indexed_attention_decode_prologue_q8",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_attention_q8_batched",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+            ] {
+                assert!(has(arch, q8), "{arch}: {q8}");
+            }
+        }
+        for (symbol, gfx11, gfx12) in [
+            ("indexed_attention_decode_prologue_fp8", false, true),
+            ("gated_delta_step_pipe128_q8", false, true),
+        ] {
+            assert_eq!(has("gfx1100", symbol), gfx11, "gfx1100 {symbol}");
+            assert_eq!(has("gfx1151", symbol), gfx11, "gfx1151 {symbol}");
+            assert_eq!(has("gfx1201", symbol), gfx12, "gfx1201 {symbol}");
+        }
+        // gfx942 compiles no Q8 KV (and the registry packages no `tensor_ops` there).
+        assert!(!has("gfx942", "indexed_attention_decode_prologue_q8"));
+        for arch in ["gfx906", "gfx942"] {
+            assert!(lookup(arch, "tensor_ops", "").is_err(), "{arch}");
+        }
+    }
+
+    /// Every symbol a closed route plan can request of a HIP module is in that
+    /// module's index on its arch: the 27B plan tables (corpus) and every
+    /// walked plan (installer inventory, which is the packaged index).
+    #[test]
+    fn closed_route_plan_symbols_are_registry_indexed() {
+        let flags = default_feature_flags("gfx1201").unwrap().hipcc_extra_flags;
+        let corpus = route_corpus("gfx1201", &flags).unwrap();
+        let tables: [(&str, &[RouteHip]); 10] = [
+            ("AR", QWEN36_27B_GFX1201_AR_HIP),
+            ("MTP", QWEN36_27B_GFX1201_MTP_HIP),
+            ("ROWS_TWINS", QWEN36_27B_GFX1201_ROWS_TWINS_HIP),
+            ("VMM_EXACT", QWEN36_27B_GFX1201_VMM_EXACT_HIP),
+            ("XBATCH", QWEN36_27B_GFX1201_XBATCH_HIP),
+            ("SPEC_CB", QWEN36_27B_GFX1201_SPEC_CB_HIP),
+            ("PLAIN_RMSNORM", QWEN36_27B_GFX1201_PLAIN_RMSNORM_HIP),
+            ("PLAIN_SILU", QWEN36_27B_GFX1201_PLAIN_SILU_HIP),
+            ("PLAIN_GATED_NORM", QWEN36_27B_GFX1201_PLAIN_GATED_NORM_HIP),
+            ("PLAIN_ROTATE", QWEN36_27B_GFX1201_PLAIN_ROTATE_HIP),
+        ];
+        for (label, table) in tables {
+            for &(module, symbols) in table {
+                let entry = corpus
+                    .iter()
+                    .find(|e| e.module == module)
+                    .unwrap_or_else(|| panic!("{label}: {module} is not in the gfx1201 registry"));
+                for symbol in symbols {
+                    assert!(
+                        entry.symbols.contains(symbol),
+                        "{label}: {module} plans {symbol}, which its index omits"
+                    );
+                }
+            }
+        }
+        for plan in walked_route_plans().unwrap() {
+            let flags = default_feature_flags(plan.arch).unwrap().hipcc_extra_flags;
+            let inventory = entries(plan.arch, &flags).unwrap();
+            for row in plan.rows.iter().filter(|row| !row.embedded) {
+                let entry = inventory
+                    .iter()
+                    .find(|e| e.module == row.module)
+                    .unwrap_or_else(|| panic!("{}: {} is not packaged", plan.family, row.module));
+                for symbol in &row.symbols {
+                    assert!(
+                        entry.symbols.contains(symbol),
+                        "{}: {} walks {symbol}, which its index omits",
+                        plan.family,
+                        row.module
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn dense_dflash_cold_helpers_preserve_runtime_identity() {

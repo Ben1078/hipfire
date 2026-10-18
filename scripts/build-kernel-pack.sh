@@ -7,7 +7,7 @@
 # Build release kernel packs from one exact commit. For each architecture the
 # commit's own scripts/compile-kernels.sh packages the exact Rust registry into
 # kernels/compiled/<arch>, then hipfire-kernel-manifest re-verifies every index
-# against the sources and the build compiler and records the provenance.
+# against the sources, the build compiler and each object's kernel exports, and records the provenance.
 #
 # Outputs, per arch, in --out:
 #   hipfire-kernels-<tag>-<arch>.tar.gz         manifest.json + <arch>/*.{hsaco,hash,index.json}
