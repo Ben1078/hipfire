@@ -3226,7 +3226,15 @@ impl Qwen4Bundle {
 
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
     /// then restores and captures whole-chunk snapshots through it.
-    pub fn attach_session_cache(&mut self, cache: SessionCache) {
+    pub fn attach_session_cache(&mut self, mut cache: SessionCache) {
+        if let Some(policy) = crate::session_pair::pressure_host_snapshot_policy(
+            self.slowlink
+                .profile
+                .map(|profile| profile.device_snapshot_budget_bytes),
+            || cache.usage().budget_bytes,
+        ) {
+            cache.enable_pressure_host_snapshots(policy);
+        }
         self.session = Some(SessionDriver::new(cache));
     }
 

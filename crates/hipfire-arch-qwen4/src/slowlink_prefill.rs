@@ -3940,6 +3940,7 @@ mod slowlink_prompt {
             pending_save_bytes: 4 * 2560 * 4,
             diagnostic_bytes,
             base_runtime_reserved_bytes,
+            granule: crate::slowlink_admission::GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,

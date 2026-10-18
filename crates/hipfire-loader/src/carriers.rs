@@ -2526,6 +2526,12 @@ fn load_qwen4_rank_scoped(
                 // (`AutoReserve::placement_bytes`); the safety margin and
                 // (slab only) the dedicated long-prefill stage buffers are
                 // charged on top.
+                let placement_layer_bytes = match &slowlink_profile {
+                    Some(profile) => profile
+                        .placement_layer_bytes(layer_experts)
+                        .map_err(|error| format!("qwen4: {error}"))?,
+                    None => layer_experts,
+                };
                 let charges = placement_charges(layer_experts, true)?;
                 let charged = charges
                     .reserve(auto.placement_bytes(slowlink_profile.is_some()))
@@ -2538,7 +2544,7 @@ fn load_qwen4_rank_scoped(
                         auto.describe(),
                         mtp_bytes.unwrap_or(0) / MIB,
                         charges.describe(),
-                        layer_experts / MIB
+                        placement_layer_bytes / MIB
                     );
                 // With every routed expert in host RAM the load would
                 // still leave less than the reserve, and fail later at
@@ -2548,7 +2554,7 @@ fn load_qwen4_rank_scoped(
                     let plan = residency::WholeFirstPlan::auto(
                         free,
                         non_expert,
-                        layer_experts,
+                        placement_layer_bytes,
                         config.num_hidden_layers,
                         moe_layers,
                         auto.placement_bytes(slowlink_profile.is_some()),
@@ -2563,7 +2569,7 @@ fn load_qwen4_rank_scoped(
                     residency::auto_placement_layers(
                         free,
                         non_expert,
-                        layer_experts,
+                        placement_layer_bytes,
                         config.num_hidden_layers,
                         auto.placement_bytes(slowlink_profile.is_some()),
                         &charges,
@@ -7576,6 +7582,7 @@ mod qwen4_slowlink_tests {
             pending_save_bytes: PENDING_SAVE,
             diagnostic_bytes: 0,
             base_runtime_reserved_bytes: 0,
+            granule: s1::GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
             window_rows: s1::S1_WINDOW_ROWS,
             link_gbps,

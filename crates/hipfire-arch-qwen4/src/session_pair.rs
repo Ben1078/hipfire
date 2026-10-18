@@ -503,6 +503,21 @@ pub(crate) fn session_cadence(
     }
 }
 
+/// A cache may use only the admitted profile's discretionary device slack,
+/// never its safety margin or the free memory of an idle compute phase.
+/// Without a profile the cache keeps its existing storage policy unchanged.
+pub(crate) fn pressure_host_snapshot_policy(
+    device_budget: Option<u64>,
+    host_budget: impl FnOnce() -> u64,
+) -> Option<hipfire_runtime::session_cache::PressureHostSnapshotPolicy> {
+    device_budget.map(|device_budget_bytes| {
+        hipfire_runtime::session_cache::PressureHostSnapshotPolicy {
+            host_budget_bytes: host_budget(),
+            device_budget_bytes,
+        }
+    })
+}
+
 /// Identity suffix of a slow-link load's session scope: its mixer tile AND
 /// its checkpoint cadence. Empty for every other load, so their scopes are
 /// byte-for-byte unchanged and a slow-link scope can never alias an explicit
@@ -827,6 +842,14 @@ impl Qwen4Bundle {
     /// [`Self::attach_forward`]); present on no other load.
     pub fn attach_slowlink_profile(&mut self, profile: crate::slowlink_admission::SlowlinkProfile) {
         self.slowlink.profile = Some(profile);
+        if let Some(session) = self.session.as_mut() {
+            if let Some(policy) = pressure_host_snapshot_policy(
+                Some(profile.device_snapshot_budget_bytes),
+                || session.cache().usage().budget_bytes,
+            ) {
+                session.enable_pressure_host_snapshots(policy);
+            }
+        }
     }
 
     pub fn slowlink_profile(&self) -> Option<&crate::slowlink_admission::SlowlinkProfile> {
@@ -2629,6 +2652,28 @@ mod slowlink_txn_tests {
             }
         }
         assert_eq!(slowlink_scope_tag(None), "");
+    }
+
+    #[test]
+    fn session_pair_host_snapshot_policy_uses_only_admitted_slack() {
+        for host_budget in [0, 1, 2 << 30, u64::MAX] {
+            // Every incumbent/fast/UMA load lacks an S1 profile: no new policy.
+            assert!(pressure_host_snapshot_policy(None, || {
+                panic!("an incumbent load must not inspect the new cache policy")
+            })
+            .is_none());
+            for device_budget in [0, 1, 156_567_700, u64::MAX] {
+                let policy =
+                    pressure_host_snapshot_policy(Some(device_budget), || host_budget).unwrap();
+                assert_eq!(policy.device_budget_bytes, device_budget);
+                assert_eq!(policy.host_budget_bytes, host_budget);
+            }
+        }
+        // A zero device residue still permits direct bounded host capture;
+        // no 512 MiB safety credit is added to the cache's device budget.
+        let policy = pressure_host_snapshot_policy(Some(0), || 2 << 30).unwrap();
+        assert_eq!(policy.device_budget_bytes, 0);
+        assert_eq!(policy.host_budget_bytes, 2 << 30);
     }
 
     #[test]
