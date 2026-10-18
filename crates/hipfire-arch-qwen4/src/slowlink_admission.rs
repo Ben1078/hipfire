@@ -3172,8 +3172,8 @@ mod tests {
     /// incumbent's reserve policy (`max(historical floor, census)`) is
     /// unchanged.
     #[test]
-    fn slowlink_residency_real_fixture_1536_counterfactual_admits_nine_with_the_preferred_deficit(
-    ) {
+    fn slowlink_residency_real_fixture_1536_counterfactual_admits_nine_with_the_preferred_deficit()
+    {
         let reserve = j1778_reserve_at(S1_TILE_ROWS);
         assert_eq!(reserve.census.f16_shadows, J1778_SHADOWS);
         assert_eq!(reserve.census_total, 2_237_111_724 + J1778_SHADOWS);
@@ -3334,7 +3334,10 @@ mod tests {
                 let profile = admit_at_tile(&inputs, S1_TILE_ROWS)
                     .unwrap_or_else(|decline| panic!("{route:?} {label}: {decline}"));
                 assert_eq!(profile.resident_layers, 9, "{route:?} {label}");
-                assert_eq!(profile.placement.reserve_bytes, charged, "{route:?} {label}");
+                assert_eq!(
+                    profile.placement.reserve_bytes, charged,
+                    "{route:?} {label}"
+                );
                 let tenth = 10 * LAYER + J1778_NON_EXPERT + charged;
                 let deficit = profile.placement.preferred_deficit_bytes();
                 assert_eq!(deficit, tenth - J1778_PRELOAD_FREE, "{route:?} {label}");
@@ -3500,7 +3503,10 @@ mod tests {
             .find(|point| point.tile_rows == S1_PRIMITIVE_TILE_ROWS)
             .unwrap();
         assert!(finer.admits(), "512 would fit: report only");
-        assert_eq!(finer.resident_layers, 10, "512 would keep the preferred ten");
+        assert_eq!(
+            finer.resident_layers, 10,
+            "512 would keep the preferred ten"
+        );
         assert!(!finer.selected);
 
         // The primitive purpose at the product's 768 tile: the diagnostic
@@ -5203,8 +5209,7 @@ mod tests {
             );
             assert_eq!(
                 profile.placement.preferred_deficit_bytes(),
-                10 * (LAYER + inputs_layer_slack) + J1778_NON_EXPERT + reserve
-                    - J1778_PRELOAD_FREE,
+                10 * (LAYER + inputs_layer_slack) + J1778_NON_EXPERT + reserve - J1778_PRELOAD_FREE,
                 "tile {tile}"
             );
         }
@@ -5278,7 +5283,11 @@ mod tests {
     /// Every figure is read from the SAME [`project_at_tile`] quote that
     /// [`admit_at_tile`] and [`tile_frontier`] judge on; nothing is
     /// recomputed by hand.
-    fn quote_r5(observation: &str, inputs: &AdmissionInputs, tile_rows: usize) -> serde_json::Value {
+    fn quote_r5(
+        observation: &str,
+        inputs: &AdmissionInputs,
+        tile_rows: usize,
+    ) -> serde_json::Value {
         let signed = |value: i128| i64::try_from(value).expect("a byte figure fits i64");
         let unsigned = |value: u128| u64::try_from(value).expect("a byte figure fits u64");
         let terms = |terms: &[(&str, u64)]| {
@@ -5292,7 +5301,10 @@ mod tests {
         let verdict = projection.verdict();
         let profile = admit_at_tile(inputs, tile_rows);
         if let Ok(profile) = &profile {
-            assert_eq!(profile.placement, budget, "the profile carries the one quote");
+            assert_eq!(
+                profile.placement, budget,
+                "the profile carries the one quote"
+            );
             assert_eq!(Ok(profile.resident_layers), verdict);
         }
         let memory = budget.memory;
@@ -5562,13 +5574,18 @@ mod tests {
                             memory,
                             ..j1778_inputs_at(route, purpose, J1811_PRE_LOAD_FREE, point.tile_rows)
                         };
-                        let label = format!("{route:?} {purpose:?} {memory:?} tile {}", point.tile_rows);
+                        let label =
+                            format!("{route:?} {purpose:?} {memory:?} tile {}", point.tile_rows);
                         let projection = project_at_tile(&at, point.tile_rows).unwrap();
                         assert_eq!(point.budget, projection.budget, "{label}");
                         assert_eq!(point.census, projection.census, "{label}");
                         assert_eq!(point.granule, projection.granule, "{label}");
                         assert_eq!(point.reserve, projection.budget.reserve_bytes, "{label}");
-                        assert_eq!(point.resident_layers, projection.resident_layers(), "{label}");
+                        assert_eq!(
+                            point.resident_layers,
+                            projection.resident_layers(),
+                            "{label}"
+                        );
                         assert_eq!(point.verdict, projection.verdict().map(|_| ()), "{label}");
                         assert_eq!(
                             point.needed_bytes_for(10),
@@ -5577,7 +5594,11 @@ mod tests {
                         );
                         match admit_at_tile(&at, point.tile_rows) {
                             Ok(profile) => {
-                                assert_eq!(Ok(profile.resident_layers), projection.verdict(), "{label}");
+                                assert_eq!(
+                                    Ok(profile.resident_layers),
+                                    projection.verdict(),
+                                    "{label}"
+                                );
                                 assert_eq!(profile.placement, projection.budget, "{label}");
                                 assert_eq!(profile.census, projection.census, "{label}");
                                 assert_eq!(
@@ -5586,7 +5607,9 @@ mod tests {
                                     "{label}"
                                 );
                             }
-                            Err(decline) => assert_eq!(Err(decline), projection.verdict(), "{label}"),
+                            Err(decline) => {
+                                assert_eq!(Err(decline), projection.verdict(), "{label}")
+                            }
                         }
                         if point.selected {
                             assert_eq!(point.verdict, admit(&inputs).map(|_| ()), "{label}");
@@ -6119,21 +6142,30 @@ mod tests {
             // the per-entry pad), for `resident_layers` resident trunk layers.
             assert_eq!(fixture.experts.len() % 2, 0);
             let expert_layers = fixture.experts.len() / 2;
-            assert_eq!(expert_layers, layers + 1, "trunk plus the weight-only MTP layer");
+            assert_eq!(
+                expert_layers,
+                layers + 1,
+                "trunk plus the weight-only MTP layer"
+            );
             let host_owner_bytes = |resident_layers: usize| -> (usize, u64, u64) {
                 let mut weights = fixture.weights.clone();
                 residency::place_routed_experts(&mut weights, resident_layers);
                 let entries = weights
                     .iter()
                     .filter(|entry| {
-                        entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped
+                        entry.residency
+                            == hipfire_runtime::weight_manifest::WeightResidency::HostMapped
                     })
                     .count();
                 let total = residency::host_mapped_bytes(&weights, fixture.bytes_of()).unwrap();
                 let pad = entries as u64 * residency::HOST_MAPPED_PAD_BYTES;
                 let host_layers = expert_layers - resident_layers;
                 assert_eq!(entries, 2 * host_layers, "{resident_layers} resident");
-                assert_eq!(total - pad, host_layers as u64 * LAYER, "{resident_layers} resident");
+                assert_eq!(
+                    total - pad,
+                    host_layers as u64 * LAYER,
+                    "{resident_layers} resident"
+                );
                 (entries, total - pad, pad)
             };
             let host_owners = |resident_layers: usize| {
@@ -6198,7 +6230,10 @@ mod tests {
                     actual_quote.budget.resident_layer_bytes
                 );
                 assert_eq!(
-                    reference_quote.budget.memory.observed_initialization_bytes(),
+                    reference_quote
+                        .budget
+                        .memory
+                        .observed_initialization_bytes(),
                     Some(0)
                 );
                 assert_eq!(
@@ -6270,7 +6305,9 @@ mod tests {
                         // The pre-initialization-domain equation is the same
                         // slack plus the measured interval: one charge only.
                         assert_eq!(
-                            quote["pre_init_domain_slack_at_selected_bytes"].as_i64().unwrap(),
+                            quote["pre_init_domain_slack_at_selected_bytes"]
+                                .as_i64()
+                                .unwrap(),
                             quote["slack_bytes"].as_i64().unwrap() + i64::try_from(init).unwrap()
                         );
                     }
