@@ -800,8 +800,12 @@ fn arena_evidence(
 /// load builds none.
 fn arena_presence_problems(present: bool, s1_profile: bool) -> Vec<String> {
     match (s1_profile, present) {
-        (true, false) => vec!["the S1 profile was admitted without a model weight arena plan".into()],
-        (false, true) => vec!["a load without the S1 profile carries a model weight arena plan".into()],
+        (true, false) => {
+            vec!["the S1 profile was admitted without a model weight arena plan".into()]
+        }
+        (false, true) => {
+            vec!["a load without the S1 profile carries a model weight arena plan".into()]
+        }
         _ => Vec::new(),
     }
 }
@@ -3838,7 +3842,8 @@ mod slowlink_receipt_tests {
 
     #[test]
     fn slowlink_receipt_cache_usage_evidence_reports_the_actual_eviction_delta() {
-        let usage = |pool: u64, evictions: u64| usage_value(&usage_literal(pool, evictions, 0, [0; 4]));
+        let usage =
+            |pool: u64, evictions: u64| usage_value(&usage_literal(pool, evictions, 0, [0; 4]));
         let before = usage(4096, 3);
         // Occupancy fell by two snapshots but exactly one eviction ran: the
         // delta is the counter's, not derived from the occupancy change.
@@ -3901,7 +3906,10 @@ mod slowlink_receipt_tests {
         let empty = usage_value(&usage_literal(0, 0, 0, [0; 4]));
         let problems = stored_snapshot_problems(&empty);
         assert_eq!(problems.len(), 1);
-        assert!(problems[0].contains("no snapshot was published"), "{problems:?}");
+        assert!(
+            problems[0].contains("no snapshot was published"),
+            "{problems:?}"
+        );
         // Counters alone are not storage: a capture that was evicted again, or
         // skipped under pressure, leaves nothing to restore.
         let evicted = usage_value(&usage_literal(0, 2, 0, [3, 0, 3, 7]));
@@ -3997,7 +4005,10 @@ mod slowlink_receipt_tests {
         let mut detail = json!({"cache_usage_before_plan": before, "cache_usage_after": after});
         attach_case_cache_evidence(&mut detail);
         assert_eq!(detail["cache_evidence"]["host_captures_delta"], json!(5));
-        assert_eq!(detail["cache_evidence"]["after"]["host_pool_bytes"], json!(8192));
+        assert_eq!(
+            detail["cache_evidence"]["after"]["host_pool_bytes"],
+            json!(8192)
+        );
     }
 
     #[test]
@@ -4033,19 +4044,46 @@ mod slowlink_receipt_tests {
         let evidence = granule_evidence(&census, &granule, 10, 12345, Ok(reserve));
         // Logical stays payload: the seven owned terms and two budget terms are
         // exactly the census's, with no padding folded in.
-        assert_eq!(evidence["logical_payload"]["owned_bytes"], json!(logical_owned));
+        assert_eq!(
+            evidence["logical_payload"]["owned_bytes"],
+            json!(logical_owned)
+        );
         assert_eq!(evidence["logical_payload"]["budget_bytes"], json!(110));
-        assert_eq!(evidence["logical_payload"]["reserve_bytes"], json!(logical_reserve));
-        assert_eq!(evidence["logical_payload"]["owned_terms"].as_array().unwrap().len(), 7);
-        assert_eq!(evidence["logical_payload"]["budget_terms"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            evidence["logical_payload"]["reserve_bytes"],
+            json!(logical_reserve)
+        );
+        assert_eq!(
+            evidence["logical_payload"]["owned_terms"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(
+            evidence["logical_payload"]["budget_terms"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         // Physical is logical + padding, each once, and matches the profile's reserve.
         assert_eq!(evidence["allocation_granule_bytes"], json!(2u64 << 20));
-        assert_eq!(evidence["physical"]["owned_s1_bytes"], json!(logical_owned + s1_padding));
+        assert_eq!(
+            evidence["physical"]["owned_s1_bytes"],
+            json!(logical_owned + s1_padding)
+        );
         assert_eq!(evidence["physical"]["reserved_s1_bytes"], json!(reserve));
-        assert_eq!(evidence["physical"]["profile_reserve_bytes"], json!(reserve));
+        assert_eq!(
+            evidence["physical"]["profile_reserve_bytes"],
+            json!(reserve)
+        );
         assert_eq!(evidence["physical"]["reserve_consistent"], json!(true));
         // The scope is the S1 increment, never total model-owned bytes.
-        assert!(evidence["physical"]["scope"].as_str().unwrap().contains("S1 increment"));
+        assert!(evidence["physical"]["scope"]
+            .as_str()
+            .unwrap()
+            .contains("S1 increment"));
         assert!(evidence["physical"].get("owned_bytes").is_none());
         // Every S1 owner term (including window scratch) is listed by name and
         // the list closes onto the derived total, so none can silently vanish.
@@ -4061,18 +4099,28 @@ mod slowlink_receipt_tests {
         // The padding terms sum to the fixed total once; the base owners are
         // reported apart from the S1 owners and the per-layer slack is not a fixed term.
         let padding = &evidence["backing_padding"];
-        assert_eq!(padding["fixed_total_bytes"], json!(granule.total().unwrap()));
+        assert_eq!(
+            padding["fixed_total_bytes"],
+            json!(granule.total().unwrap())
+        );
         assert_eq!(padding["base_reserve_bytes"], json!(1_100));
         assert_eq!(padding["s1_owner_bytes"], json!(s1_padding));
         assert_eq!(
-            padding["base_reserve_bytes"].as_u64().unwrap() + padding["s1_owner_bytes"].as_u64().unwrap(),
+            padding["base_reserve_bytes"].as_u64().unwrap()
+                + padding["s1_owner_bytes"].as_u64().unwrap(),
             padding["fixed_total_bytes"].as_u64().unwrap()
         );
         assert_eq!(padding["per_resident_layer_bytes"], json!(44));
         assert_eq!(padding["resident_layers_bytes"], json!(440));
         assert_eq!(evidence["device_snapshot_budget_bytes"], json!(12345));
         assert_eq!(evidence["arena_claim"], json!(false));
-        for key in ["units", "allocation_granule_bytes", "logical_payload", "backing_padding", "physical"] {
+        for key in [
+            "units",
+            "allocation_granule_bytes",
+            "logical_payload",
+            "backing_padding",
+            "physical",
+        ] {
             assert!(!evidence[key].is_null(), "{key}");
         }
         // A profile reserve that is not logical + padding is flagged, not hidden.
@@ -4082,13 +4130,25 @@ mod slowlink_receipt_tests {
         assert_eq!(err["physical"]["reserve_consistent"], json!(false));
         assert_eq!(err["physical"]["profile_reserve_error"], json!("overflow"));
         // No granule model (payload-only accounting): padding is zero and physical == logical.
-        let none = granule_evidence(&census, &GranuleCharge::default(), 10, 0, Ok(logical_reserve));
+        let none = granule_evidence(
+            &census,
+            &GranuleCharge::default(),
+            10,
+            0,
+            Ok(logical_reserve),
+        );
         assert_eq!(none["backing_padding"]["fixed_total_bytes"], json!(0));
         assert_eq!(none["physical"]["owned_s1_bytes"], json!(logical_owned));
-        assert_eq!(none["physical"]["reserved_s1_bytes"], json!(logical_reserve));
+        assert_eq!(
+            none["physical"]["reserved_s1_bytes"],
+            json!(logical_reserve)
+        );
         // The cache's device usage fields stay labelled payload, never physical backing.
         let usage = usage_value(&usage_literal(1, 0, 0, [0; 4]));
-        assert!(usage["byte_units"].as_str().unwrap().starts_with("payload bytes"));
+        assert!(usage["byte_units"]
+            .as_str()
+            .unwrap()
+            .starts_with("payload bytes"));
     }
 
     /// Fixture plans: nine weight roots and two shadow roots at granule 4096.
@@ -4127,7 +4187,10 @@ mod slowlink_receipt_tests {
         let (evidence, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &[]);
         assert!(problems.is_empty(), "{problems:?}");
         // Counts are the plan's, and the fixture shape is reported, not required.
-        assert_eq!(evidence["weights"]["roots"], json!(plan.weights.roots.len()));
+        assert_eq!(
+            evidence["weights"]["roots"],
+            json!(plan.weights.roots.len())
+        );
         assert_eq!(evidence["weights"]["roots"], json!(9));
         assert_eq!(evidence["f16_shadows"]["roots"], json!(2));
         assert_eq!(evidence["weights"]["members"], json!(9));
@@ -4162,12 +4225,21 @@ mod slowlink_receipt_tests {
         assert_eq!(shadows["actual"]["capacity_observed"], json!(false));
         assert_eq!(shadows["actual"]["capacity_observed_roots"], json!(0));
         for family in ["weights", "f16_shadows"] {
-            assert_eq!(evidence[family]["actual"]["physical_backing_measured"], json!(false));
-            assert!(evidence[family]["actual"]["backing_model"].as_str().unwrap().contains("not a per-allocation physical"));
+            assert_eq!(
+                evidence[family]["actual"]["physical_backing_measured"],
+                json!(false)
+            );
+            assert!(evidence[family]["actual"]["backing_model"]
+                .as_str()
+                .unwrap()
+                .contains("not a per-allocation physical"));
         }
         assert_eq!(evidence["physical_backing_measured"], json!(false));
         assert_eq!(evidence["recovery_measured"], json!(false));
-        assert!(evidence["backing_model"].as_str().unwrap().contains("minimum-free"));
+        assert!(evidence["backing_model"]
+            .as_str()
+            .unwrap()
+            .contains("minimum-free"));
         let (none, _) = arena_evidence(None, &[], &[]);
         assert_eq!(none["capacity_observed"], json!(false));
         assert_eq!(none["physical_backing_measured"], json!(false));
@@ -4189,15 +4261,24 @@ mod slowlink_receipt_tests {
         let one = [Some(plan.f16_shadows.roots[0]), None];
         let (partial, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &one);
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(partial["f16_shadows"]["actual"]["state"], json!("partial_lazy"));
+        assert_eq!(
+            partial["f16_shadows"]["actual"]["state"],
+            json!("partial_lazy")
+        );
         assert_eq!(partial["f16_shadows"]["capacity_proof"], json!("partial"));
         assert_eq!(partial["f16_shadows"]["actual"]["live_roots"], json!(1));
         // Every shadow root live and exact closes the proof.
-        let (full, problems) =
-            arena_evidence(Some(&plan), &exact(&plan.weights), &exact(&plan.f16_shadows));
+        let (full, problems) = arena_evidence(
+            Some(&plan),
+            &exact(&plan.weights),
+            &exact(&plan.f16_shadows),
+        );
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(full["f16_shadows"]["capacity_proof"], json!("exact"));
-        assert_eq!(full["f16_shadows"]["actual"]["state"], json!("fully_allocated"));
+        assert_eq!(
+            full["f16_shadows"]["actual"]["state"],
+            json!("fully_allocated")
+        );
     }
 
     #[test]
@@ -4223,7 +4304,9 @@ mod slowlink_receipt_tests {
         let shadows = [None, Some(plan.f16_shadows.roots[1] - 1)];
         let (evidence, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &shadows);
         assert!(
-            problems.iter().any(|p| p.contains("f16 shadow arena root 1")),
+            problems
+                .iter()
+                .any(|p| p.contains("f16 shadow arena root 1")),
             "{problems:?}"
         );
         assert_eq!(evidence["f16_shadows"]["capacity_proof"], json!("mismatch"));
@@ -4235,8 +4318,14 @@ mod slowlink_receipt_tests {
         // Fewer observed capacities than planned roots.
         let short: Vec<Option<usize>> = exact(&plan.weights).into_iter().take(8).collect();
         let (evidence, problems) = arena_evidence(Some(&plan), &short, &[]);
-        assert!(problems.iter().any(|p| p.contains("census mismatch")), "{problems:?}");
-        assert_eq!(evidence["weights"]["capacity_proof"], json!("census_mismatch"));
+        assert!(
+            problems.iter().any(|p| p.contains("census mismatch")),
+            "{problems:?}"
+        );
+        assert_eq!(
+            evidence["weights"]["capacity_proof"],
+            json!("census_mismatch")
+        );
         assert_eq!(evidence["weights"]["actual"]["capacity_bytes"], json!(0));
         // More shadow capacities than planned shadow roots.
         let long = [Some(1024usize); 3];
@@ -4251,10 +4340,15 @@ mod slowlink_receipt_tests {
         for none_live in [Vec::new(), vec![None; 9]] {
             let (evidence, problems) = arena_evidence(Some(&plan), &none_live, &[]);
             assert!(
-                problems.iter().any(|p| p.contains("not live after the load")),
+                problems
+                    .iter()
+                    .any(|p| p.contains("not live after the load")),
                 "{problems:?}"
             );
-            assert_eq!(evidence["weights"]["actual"]["state"], json!("planned_only"));
+            assert_eq!(
+                evidence["weights"]["actual"]["state"],
+                json!("planned_only")
+            );
             assert_eq!(evidence["weights"]["actual"]["capacity_bytes"], json!(0));
             assert_ne!(evidence["weights"]["capacity_proof"], json!("exact"));
         }
@@ -4269,7 +4363,10 @@ mod slowlink_receipt_tests {
         // Observed capacities with no plan cannot be attributed to any arena.
         let (evidence, problems) = arena_evidence(None, &exact(&plan.weights), &[]);
         assert_eq!(evidence["present"], json!(false));
-        assert!(problems.iter().any(|p| p.contains("no arena plan")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("no arena plan")),
+            "{problems:?}"
+        );
         let (_, problems) = arena_evidence(None, &[], &[]);
         assert!(problems.is_empty());
         // The plan's presence follows the S1 profile, never the card or the model.
@@ -4290,8 +4387,14 @@ mod slowlink_receipt_tests {
                 &exact(&plan.f16_shadows),
             );
             assert!(problems.is_empty(), "{weights}+{shadows}: {problems:?}");
-            assert_eq!(evidence["weights"]["roots"], json!(plan.weights.roots.len()));
-            assert_eq!(evidence["f16_shadows"]["roots"], json!(plan.f16_shadows.roots.len()));
+            assert_eq!(
+                evidence["weights"]["roots"],
+                json!(plan.weights.roots.len())
+            );
+            assert_eq!(
+                evidence["f16_shadows"]["roots"],
+                json!(plan.f16_shadows.roots.len())
+            );
             assert_eq!(evidence["weights"]["members"], json!(weights));
             assert_eq!(evidence["f16_shadows"]["members"], json!(shadows));
         }
@@ -4310,7 +4413,8 @@ mod slowlink_receipt_tests {
             for route in [Expect::LayerMajor, Expect::Incumbent] {
                 let ids = required_check_ids(mode, &fixture, route);
                 assert!(
-                    !ids.iter().any(|n| n.contains("arena") || n.contains("residual")),
+                    !ids.iter()
+                        .any(|n| n.contains("arena") || n.contains("residual")),
                     "{mode:?}: {ids:?}"
                 );
             }
