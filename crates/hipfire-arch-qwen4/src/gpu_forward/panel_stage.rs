@@ -2386,7 +2386,115 @@ fn selftest_epoch_summary(seen: &HashMap<usize, Vec<u64>>) -> PrimitiveSelftestR
     }
 }
 
-const SELFTEST_DELAY_BYTES: usize = 64 << 20;
+pub(crate) const SELFTEST_DELAY_BYTES: usize = 64 << 20;
+pub(crate) const SELFTEST_DELAY_BUFFERS: usize = 2;
+
+/// Device bytes [`primitive_selftest`] allocates for its duration: one scratch
+/// holding a page image plus both pointer tables, and two delay buffers. The
+/// ONE authority: the allocation and every census charge read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelftestReserve {
+    /// `page_bytes + 2 * num_experts * 8`.
+    pub(crate) scratch_bytes: usize,
+    pub(crate) delay_buffers: usize,
+    pub(crate) delay_bytes_each: usize,
+    pub(crate) total_device_bytes: usize,
+}
+
+impl PanelPoolSpec {
+    /// The diagnostic's exact device allocation for this pool geometry,
+    /// `None` on overflow. Charged only on the diagnostic path.
+    pub(crate) fn selftest_reserve(&self) -> Option<SelftestReserve> {
+        let tables = self
+            .num_experts
+            .checked_mul(std::mem::size_of::<u64>())?
+            .checked_mul(2)?;
+        let scratch_bytes = self.page_bytes()?.checked_add(tables)?;
+        let delay_total = SELFTEST_DELAY_BYTES.checked_mul(SELFTEST_DELAY_BUFFERS)?;
+        Some(SelftestReserve {
+            scratch_bytes,
+            delay_buffers: SELFTEST_DELAY_BUFFERS,
+            delay_bytes_each: SELFTEST_DELAY_BYTES,
+            total_device_bytes: scratch_bytes.checked_add(delay_total)?,
+        })
+    }
+}
+
+/// Allocator of the diagnostic buffers: HIP in production, a counting model in
+/// CPU tests.
+trait DiagMem {
+    type Buf;
+    fn alloc(&mut self, bytes: usize) -> R<Self::Buf>;
+    fn free(&mut self, buf: Self::Buf) -> R<()>;
+}
+
+/// Plain device allocations, outside the shared `GpuPool`: charged equals
+/// allocated, nothing is cached after release. `DeviceBuffer` has no `Drop`,
+/// so [`release_diag_after_drain`] is the only thing that frees them.
+struct HipDiagMem<'a>(&'a Gpu);
+
+impl DiagMem for HipDiagMem<'_> {
+    type Buf = hip_bridge::DeviceBuffer;
+
+    fn alloc(&mut self, bytes: usize) -> R<Self::Buf> {
+        self.0.bind_thread()?;
+        Ok(self.0.hip.malloc(bytes)?)
+    }
+
+    fn free(&mut self, buf: Self::Buf) -> R<()> {
+        self.0.bind_thread()?;
+        Ok(self.0.hip.free(buf)?)
+    }
+}
+
+struct DiagBuffers<B> {
+    scratch: B,
+    delay: Vec<B>,
+}
+
+/// Allocate exactly the reserve's buffers (scratch, then the delay buffers). A
+/// failure frees whatever this call already allocated.
+fn alloc_diag<M: DiagMem>(mem: &mut M, reserve: &SelftestReserve) -> R<DiagBuffers<M::Buf>> {
+    let scratch = mem.alloc(reserve.scratch_bytes)?;
+    let mut delay = Vec::with_capacity(reserve.delay_buffers);
+    for _ in 0..reserve.delay_buffers {
+        match mem.alloc(reserve.delay_bytes_each) {
+            Ok(buffer) => delay.push(buffer),
+            Err(error) => {
+                let _ = mem.free(scratch);
+                for buffer in delay {
+                    let _ = mem.free(buffer);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(DiagBuffers { scratch, delay })
+}
+
+/// Release the diagnostic buffers only if the streams are proven idle
+/// (`drained` succeeded). A failed drain returns its error and LEAKS the
+/// buffers: the device may still read or write them. Every buffer is freed even
+/// when an earlier free failed; the first free error is returned.
+fn release_diag_after_drain<M: DiagMem>(
+    mem: &mut M,
+    buffers: DiagBuffers<M::Buf>,
+    drained: R<()>,
+) -> R<()> {
+    if let Err(error) = drained {
+        std::mem::forget(buffers);
+        return Err(error);
+    }
+    let mut first: R<()> = Ok(());
+    for buffer in std::iter::once(buffers.scratch).chain(buffers.delay) {
+        if let Err(error) = mem.free(buffer) {
+            if first.is_ok() {
+                first = Err(error);
+            }
+        }
+    }
+    first
+}
 
 struct PendingReader {
     layer_index: usize,
@@ -2442,44 +2550,28 @@ pub(crate) fn primitive_selftest(
             2 * reserve.pages
         )));
     }
+    let diag = spec
+        .selftest_reserve()
+        .ok_or_else(|| invalid("panel selftest: diagnostic reserve overflows"))?;
     let table_bytes = spec.num_experts * std::mem::size_of::<u64>();
-    let scratch_bytes = reserve.page_bytes + 2 * table_bytes;
-    let scratch = gpu.alloc_tensor(&[scratch_bytes], DType::Raw)?;
-    let mut delay = Vec::with_capacity(2);
-    for _ in 0..2 {
-        match gpu.alloc_tensor(&[SELFTEST_DELAY_BYTES], DType::Raw) {
-            Ok(buffer) => delay.push(buffer),
-            Err(error) => {
-                let _ = gpu.free_tensor(scratch);
-                for buffer in delay {
-                    let _ = gpu.free_tensor(buffer);
-                }
-                return Err(error.into());
-            }
-        }
-    }
+    let buffers = alloc_diag(&mut HipDiagMem(&*gpu), &diag)?;
     let result = run_selftest(
         gpu,
         ring,
         schedule,
         layers,
         delay_repeats,
-        &scratch,
-        &delay,
+        &buffers.scratch,
+        &buffers.delay,
         table_bytes,
         reserve.page_bytes,
     );
-    // Streams must be idle before the scratch/delay buffers are freed.
+    // Streams must be idle before the diagnostic buffers are released; a
+    // failed drain leaks them (the device may still be using them).
     let drained = ring.drain(&*gpu);
-    let mut freed: R<()> = Ok(());
-    for tensor in std::iter::once(scratch).chain(delay) {
-        if let Err(error) = gpu.free_tensor(tensor) {
-            freed = freed.and(Err(error.into()));
-        }
-    }
+    let released = release_diag_after_drain(&mut HipDiagMem(&*gpu), buffers, drained);
     let report = result?;
-    drained?;
-    freed?;
+    released?;
     Ok(report)
 }
 
@@ -2490,8 +2582,8 @@ fn run_selftest(
     schedule: &mut PanelSchedule,
     layers: usize,
     delay_repeats: usize,
-    scratch: &GpuTensor,
-    delay: &[GpuTensor],
+    scratch: &hip_bridge::DeviceBuffer,
+    delay: &[hip_bridge::DeviceBuffer],
     table_bytes: usize,
     page_bytes: usize,
 ) -> R<PrimitiveSelftestReport> {
@@ -2511,7 +2603,7 @@ fn run_selftest(
                   reader: PendingReader|
      -> R<()> {
         ring.core.backend.drain(gpu)?;
-        gpu.hip.memcpy_dtoh(image.as_mut_slice(), &scratch.buf)?;
+        gpu.hip.memcpy_dtoh(image.as_mut_slice(), scratch)?;
         let decode = |bytes: &[u8]| -> Vec<u64> {
             bytes
                 .chunks_exact(std::mem::size_of::<u64>())
@@ -2555,17 +2647,17 @@ fn run_selftest(
                 let compute = compute_stream(gpu)?;
                 for _ in 0..delay_repeats {
                     gpu.hip.memcpy_dtod_async_at(
-                        &delay[1].buf,
+                        &delay[1],
                         0,
-                        &delay[0].buf,
+                        &delay[0],
                         0,
                         SELFTEST_DELAY_BYTES,
                         compute,
                     )?;
                     gpu.hip.memcpy_dtod_async_at(
-                        &delay[0].buf,
+                        &delay[0],
                         0,
-                        &delay[1].buf,
+                        &delay[1],
                         0,
                         SELFTEST_DELAY_BYTES,
                         compute,
@@ -2573,7 +2665,7 @@ fn run_selftest(
                 }
                 let image_bytes = parts.payload_used + ARENA_TAIL_PAD_BYTES;
                 gpu.hip.memcpy_dtod_async_at(
-                    &scratch.buf,
+                    scratch,
                     0,
                     &parts.payload.buf,
                     0,
@@ -2581,7 +2673,7 @@ fn run_selftest(
                     compute,
                 )?;
                 gpu.hip.memcpy_dtod_async_at(
-                    &scratch.buf,
+                    scratch,
                     page_bytes,
                     &parts.gate_up_table.buf,
                     0,
@@ -2589,7 +2681,7 @@ fn run_selftest(
                     compute,
                 )?;
                 gpu.hip.memcpy_dtod_async_at(
-                    &scratch.buf,
+                    scratch,
                     page_bytes + table_bytes,
                     &parts.down_table.buf,
                     0,
@@ -2771,6 +2863,169 @@ mod slowlink_ring {
             1,
             "the new owner drops it exactly once"
         );
+    }
+
+    /// Counting model of the diagnostic allocator: every live allocation is
+    /// tracked by id, so a leak (never freed) is observable.
+    #[derive(Default)]
+    struct DiagModel {
+        next: u64,
+        live: Vec<(u64, usize)>,
+        peak: usize,
+        allocs: Vec<usize>,
+        frees: usize,
+        fail_alloc_at: Option<usize>,
+        fail_free_at: Option<usize>,
+    }
+
+    struct ModelBuf(u64);
+
+    impl DiagMem for DiagModel {
+        type Buf = ModelBuf;
+
+        fn alloc(&mut self, bytes: usize) -> R<ModelBuf> {
+            if self.fail_alloc_at == Some(self.allocs.len()) {
+                self.fail_alloc_at = None;
+                return Err(invalid("injected hipMalloc failure"));
+            }
+            self.next += 1;
+            self.live.push((self.next, bytes));
+            self.allocs.push(bytes);
+            self.peak = self.peak.max(self.live.iter().map(|(_, b)| b).sum());
+            Ok(ModelBuf(self.next))
+        }
+
+        fn free(&mut self, buf: ModelBuf) -> R<()> {
+            if self.fail_free_at == Some(self.frees) {
+                self.fail_free_at = None;
+                self.frees += 1;
+                self.live.retain(|(id, _)| *id != buf.0);
+                return Err(invalid("injected hipFree failure"));
+            }
+            self.frees += 1;
+            let before = self.live.len();
+            self.live.retain(|(id, _)| *id != buf.0);
+            assert_eq!(self.live.len() + 1, before, "double free");
+            Ok(())
+        }
+    }
+
+    fn mq4_spec() -> PanelPoolSpec {
+        PanelPoolSpec::uniform(2, 16, 32, 512, 1_740_800, 870_400, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn slowlink_ring_selftest_reserve_is_the_single_authority_for_the_diagnostic_bytes() {
+        let spec = mq4_spec();
+        let reserve = spec.selftest_reserve().unwrap();
+        let page = spec.reserve().unwrap().page_bytes;
+        assert_eq!(page, 83_595_264);
+        // Scratch holds the page image plus BOTH 512-entry pointer tables.
+        assert_eq!(reserve.scratch_bytes, page + 2 * 512 * 8);
+        assert_eq!(reserve.scratch_bytes, 83_603_456);
+        assert_eq!(
+            (reserve.delay_buffers, reserve.delay_bytes_each),
+            (2, 64 << 20)
+        );
+        assert_eq!(reserve.total_device_bytes, 217_821_184);
+        // The allocation is exactly the reserve: same sizes, same total.
+        let mut model = DiagModel::default();
+        let buffers = alloc_diag(&mut model, &reserve).unwrap();
+        assert_eq!(
+            model.allocs,
+            vec![reserve.scratch_bytes, 64 << 20, 64 << 20]
+        );
+        assert_eq!(model.allocs.iter().sum::<usize>(), reserve.total_device_bytes);
+        assert_eq!(model.peak, reserve.total_device_bytes);
+        assert_eq!(buffers.delay.len(), reserve.delay_buffers);
+        release_diag_after_drain(&mut model, buffers, Ok(())).unwrap();
+        // A small geometry and an overflowing one.
+        let small = spec_small_for_reserve();
+        let r = small.selftest_reserve().unwrap();
+        assert_eq!(
+            r.total_device_bytes,
+            small.page_bytes().unwrap() + 2 * small.num_experts * 8 + 2 * (64 << 20)
+        );
+        let overflow = PanelPoolSpec {
+            num_experts: usize::MAX / 8,
+            ..small
+        };
+        assert_eq!(overflow.selftest_reserve(), None);
+        let huge = PanelPoolSpec {
+            payload_bytes: usize::MAX - 8,
+            ..small
+        };
+        assert_eq!(huge.selftest_reserve(), None);
+    }
+
+    fn spec_small_for_reserve() -> PanelPoolSpec {
+        spec(2, 3)
+    }
+
+    #[test]
+    fn slowlink_ring_selftest_three_back_to_back_cases_never_retain_or_exceed_the_reserve() {
+        let reserve = mq4_spec().selftest_reserve().unwrap();
+        let mut model = DiagModel::default();
+        for run in 1..=3usize {
+            let buffers = alloc_diag(&mut model, &reserve).unwrap();
+            assert_eq!(
+                model.live.iter().map(|(_, b)| b).sum::<usize>(),
+                reserve.total_device_bytes,
+                "run {run}: exactly the reserve is live"
+            );
+            release_diag_after_drain(&mut model, buffers, Ok(())).unwrap();
+            assert!(model.live.is_empty(), "run {run}: nothing retained");
+        }
+        assert_eq!(model.peak, reserve.total_device_bytes, "peak is 1x, not 3x");
+        assert_eq!(model.allocs.len(), 9);
+        assert_eq!(model.frees, 9);
+    }
+
+    #[test]
+    fn slowlink_ring_selftest_partial_allocation_failure_frees_what_it_allocated() {
+        let reserve = mq4_spec().selftest_reserve().unwrap();
+        for fail_at in [0usize, 1, 2] {
+            let mut model = DiagModel {
+                fail_alloc_at: Some(fail_at),
+                ..DiagModel::default()
+            };
+            assert!(alloc_diag(&mut model, &reserve).is_err());
+            assert!(model.live.is_empty(), "failure at allocation {fail_at} leaked");
+            assert_eq!(model.frees, fail_at);
+            // The next attempt starts clean and succeeds.
+            let buffers = alloc_diag(&mut model, &reserve).unwrap();
+            release_diag_after_drain(&mut model, buffers, Ok(())).unwrap();
+            assert!(model.live.is_empty());
+        }
+    }
+
+    #[test]
+    fn slowlink_ring_selftest_failed_drain_leaks_the_buffers_instead_of_freeing_them() {
+        let reserve = mq4_spec().selftest_reserve().unwrap();
+        let mut model = DiagModel::default();
+        let buffers = alloc_diag(&mut model, &reserve).unwrap();
+        let error = release_diag_after_drain(&mut model, buffers, Err(invalid("drain failed")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("drain failed"), "{error}");
+        assert_eq!(model.frees, 0, "nothing is freed while the device may use it");
+        assert_eq!(model.live.len(), 3, "all three buffers stay owned (leaked)");
+    }
+
+    #[test]
+    fn slowlink_ring_selftest_free_failure_still_frees_every_other_buffer() {
+        let reserve = mq4_spec().selftest_reserve().unwrap();
+        let mut model = DiagModel {
+            fail_free_at: Some(0),
+            ..DiagModel::default()
+        };
+        let buffers = alloc_diag(&mut model, &reserve).unwrap();
+        let error = release_diag_after_drain(&mut model, buffers, Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hipFree"), "{error}");
+        assert_eq!(model.frees, 3, "all three frees were attempted");
+        assert!(model.live.is_empty());
     }
 
     #[test]
