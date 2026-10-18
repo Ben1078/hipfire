@@ -402,8 +402,9 @@ narrowed or relaxed.
 The replacement hold (j1761) **failed**: identity and load passed (11 resident
 layers; 76 host-mapped entries as the load receipt records them), then the
 first payload primitive hit a real `hipMalloc` out-of-memory after about 110 s.
-All seven primitive cases report that one shared initialization error (they are
-not seven arithmetic mismatches), every later check was skipped, and no product
+The aggregate primitive report then carried that one initialization error on all
+seven cases (they are not seven arithmetic mismatches), every later check was
+skipped, and no product
 state cell ran, so the product headroom criterion below was not exercised. The
 primitive cell's external minimum free VRAM (21,327,872 B) and the in-process
 `hipMemGetInfo` end figure (75,497,472 B) are informational; the residual is
@@ -411,7 +412,13 @@ non-gating. This is a finding about the primitive self-test's allocation, not a
 correctness, quality or speed result. The loader therefore takes an explicit
 admission purpose: the primitive self-test (`PrimitiveSelftest`) and the product
 route (`Product`) are admitted separately, with the product load keeping the
-512 MiB headroom rule. Another hold is approved only after the admission proof
+512 MiB headroom rule. The aggregate report is also corrected: each primitive
+runs and reports independently, a case that cannot run is reported as
+`status:"error"` with `mismatches:null` and its own `detail.error` (never a
+fabricated mismatch count), the batch continues past it, and the gate fails
+only that case with its own reason. A global start refusal is one
+`primitive.init` failure that leaves the seven cases unproved (missing), not
+seven cloned failures. Another hold is approved only after the admission proof
 passes on the CPU. The route stays default OFF.
 
 Memory acceptance for that hold (product state cells): the minimum observed

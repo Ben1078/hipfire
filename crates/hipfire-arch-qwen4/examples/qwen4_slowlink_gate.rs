@@ -577,36 +577,66 @@ fn greedy(ctx: &mut Ctx, count: usize) -> Result<(Vec<u32>, &'static str), Strin
 // ── primitives ─────────────────────────────────────────────────────────
 
 fn run_primitives(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String, Value>) {
-    match ctx
+    let result = ctx
         .bundle
         .slowlink_primitive_selftest(&mut ctx.gpu, &PRIMITIVE_CASES)
-    {
+        .map_err(|error| error.to_string());
+    record_primitives(checks, out, result);
+}
+
+/// Records a self-test result without ever cloning one failure onto several cases.
+/// A global `Err` (no admitted profile, a refused request, a bundle that cannot
+/// run it) happens before any case ran: ONE `primitive.init` failure is recorded
+/// and every required `primitive.*` stays missing (unproved, the cell is
+/// incomplete). Otherwise each case is judged alone from its own report:
+/// `status:"pass"` with `mismatches == 0` passes; `status:"error"`
+/// (`mismatches:null`, `detail.error` the reason) fails only that case with its
+/// own error text and no invented mismatch count; `status:"fail"` or anything
+/// else fails only that case; a case absent from the report stays missing.
+fn record_primitives(
+    checks: &mut Checks,
+    out: &mut serde_json::Map<String, Value>,
+    result: Result<Value, String>,
+) {
+    let report = match result {
         Err(error) => {
-            // No admitted profile or a refused self-test: nothing was proved.
-            out.insert("selftest_error".into(), json!(error.to_string()));
-            for name in PRIMITIVE_CASES {
-                checks.fail(
-                    &format!("primitive.{name}"),
-                    format!("self-test refused: {error}"),
-                    Value::Null,
-                );
-            }
+            out.insert("selftest_error".into(), json!(error));
+            checks.fail(
+                "primitive.init",
+                format!("self-test could not start: {error}"),
+                Value::Null,
+            );
+            return;
         }
-        Ok(report) => {
-            out.insert("selftest".into(), report.clone());
-            let cases = report["cases"].as_array().cloned().unwrap_or_default();
-            for name in PRIMITIVE_CASES {
-                let key = format!("primitive.{name}");
-                match cases.iter().find(|c| c["name"] == name) {
-                    None => {} // missing stays missing: the run is incomplete
-                    Some(c) if c["status"] == "pass" && c["mismatches"].as_u64() == Some(0) => {
-                        checks.pass(&key, c.clone())
-                    }
-                    Some(c) => {
-                        checks.fail(&key, "case did not pass with zero mismatches", c.clone())
-                    }
-                }
+        Ok(report) => report,
+    };
+    out.insert("selftest".into(), report.clone());
+    let cases = report["cases"].as_array().cloned().unwrap_or_default();
+    for name in PRIMITIVE_CASES {
+        let key = format!("primitive.{name}");
+        let Some(case) = cases.iter().find(|c| c["name"] == name) else {
+            continue; // missing stays missing: the run is incomplete
+        };
+        match case["status"].as_str() {
+            Some("pass") if case["mismatches"].as_u64() == Some(0) => {
+                checks.pass(&key, case.clone())
             }
+            Some("error") => {
+                let reason = match case["detail"]["error"].as_str() {
+                    Some(error) => format!("case error: {error}"),
+                    None => "case error with no detail.error text".to_string(),
+                };
+                checks.fail(&key, reason, case.clone())
+            }
+            status => checks.fail(
+                &key,
+                format!(
+                    "case did not pass with zero mismatches (status {}, mismatches {})",
+                    status.unwrap_or("absent"),
+                    case["mismatches"]
+                ),
+                case.clone(),
+            ),
         }
     }
 }
@@ -1936,6 +1966,134 @@ mod slowlink_receipt_tests {
                 mode.name()
             );
         }
+    }
+
+    fn case_report(name: &str, status: &str) -> Value {
+        match status {
+            "pass" => json!({"name": name, "status": "pass", "mismatches": 0, "detail": {}}),
+            "error" => json!({
+                "name": name, "status": "error", "mismatches": null,
+                "detail": {"error": format!("{name}: hipMalloc failed")}
+            }),
+            _ => json!({"name": name, "status": "fail", "mismatches": 3, "detail": {}}),
+        }
+    }
+
+    fn primitive_rows(
+        statuses: &[&str],
+    ) -> (Checks, serde_json::Map<String, Value>, Vec<String>) {
+        let ids: Vec<String> = PRIMITIVE_CASES
+            .iter()
+            .map(|case| format!("primitive.{case}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut checks = Checks::new(&refs);
+        let mut out = serde_json::Map::new();
+        let cases: Vec<Value> = PRIMITIVE_CASES
+            .iter()
+            .zip(statuses)
+            .map(|(name, status)| case_report(name, status))
+            .collect();
+        record_primitives(&mut checks, &mut out, Ok(json!({"cases": cases})));
+        (checks, out, ids)
+    }
+
+    fn rows(checks: &Checks) -> Vec<Value> {
+        checks.json()["checks"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn row(checks: &Checks, name: &str) -> Value {
+        rows(checks)
+            .into_iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no row {name}"))
+    }
+
+    #[test]
+    fn slowlink_receipt_first_or_middle_primitive_error_does_not_stop_the_rest() {
+        for bad in [0usize, 3] {
+            let mut statuses = vec!["pass"; PRIMITIVE_CASES.len()];
+            statuses[bad] = "error";
+            let (checks, _, ids) = primitive_rows(&statuses);
+            assert_eq!(checks.status(), "fail");
+            assert!(checks.missing().is_empty(), "every case was judged alone");
+            for (index, id) in ids.iter().enumerate() {
+                let r = row(&checks, id);
+                if index == bad {
+                    assert_eq!(r["status"], "fail", "{id}");
+                    let reason = r["reason"].as_str().unwrap();
+                    assert!(reason.contains("case error:"), "{reason}");
+                    assert!(reason.contains("hipMalloc failed"), "{reason}");
+                    assert!(
+                        r["detail"]["mismatches"].is_null(),
+                        "an error is not an arithmetic mismatch count"
+                    );
+                } else {
+                    assert_eq!(r["status"], "pass", "{id} must still be proved");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_receipt_primitive_fail_keeps_its_own_mismatch_count() {
+        let mut statuses = vec!["pass"; PRIMITIVE_CASES.len()];
+        statuses[1] = "fail";
+        let (checks, _, ids) = primitive_rows(&statuses);
+        assert_eq!(checks.status(), "fail");
+        let r = row(&checks, &ids[1]);
+        assert!(r["reason"].as_str().unwrap().contains("mismatches 3"));
+        assert_eq!(
+            ids.iter()
+                .filter(|id| row(&checks, id)["status"] == "fail")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn slowlink_receipt_global_selftest_error_is_one_failure_and_leaves_cases_missing() {
+        let ids: Vec<String> = PRIMITIVE_CASES
+            .iter()
+            .map(|case| format!("primitive.{case}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut checks = Checks::new(&refs);
+        let mut out = serde_json::Map::new();
+        record_primitives(
+            &mut checks,
+            &mut out,
+            Err("slow-link primitive check needs an admitted slow-link profile".to_string()),
+        );
+        assert_eq!(checks.status(), "fail");
+        let all = rows(&checks);
+        let fails: Vec<&Value> = all.iter().filter(|r| r["status"] == "fail").collect();
+        assert_eq!(fails.len(), 1, "one initialization failure, not one per case");
+        assert_eq!(fails[0]["name"], "primitive.init");
+        assert_eq!(
+            checks.missing().len(),
+            PRIMITIVE_CASES.len(),
+            "every case stays unproved"
+        );
+        assert!(out.contains_key("selftest_error"));
+    }
+
+    #[test]
+    fn slowlink_receipt_absent_primitive_case_stays_missing_not_pass() {
+        let ids: Vec<String> = PRIMITIVE_CASES
+            .iter()
+            .map(|case| format!("primitive.{case}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut checks = Checks::new(&refs);
+        let mut out = serde_json::Map::new();
+        let cases: Vec<Value> = PRIMITIVE_CASES[..2]
+            .iter()
+            .map(|n| case_report(n, "pass"))
+            .collect();
+        record_primitives(&mut checks, &mut out, Ok(json!({"cases": cases})));
+        assert_eq!(checks.status(), "incomplete");
+        assert_eq!(checks.missing().len(), PRIMITIVE_CASES.len() - 2);
     }
 
     fn receipt() -> Value {
