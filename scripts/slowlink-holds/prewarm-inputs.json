@@ -1,0 +1,73 @@
+{
+  "schema": "s1.prewarm_inputs.v1",
+  "runtime_tip": "40a4e3bee206a2bd96867b8fbcdec770fa2f0ce5",
+  "runtime_tree": "c8321cbd114cba12dae66445ecf7157471568647",
+  "purpose": "CPU page-cache preparation outside the H1a GPU hold; same frozen125GB artifact, no substitution, payload hash, copy or locking",
+  "metadata_observation": {
+    "utc": "2026-10-18T22:03:16Z",
+    "host": "hipx",
+    "boot_id": "1c19cb86-a1db-47ec-9437-8b847b505fea",
+    "source": "PREWARM-R6-LIVE-METADATA.json",
+    "source_sha256": "bcef22cc648e1c45b608cca7a9c1d343ea4cc1d3dd51fe10bb371ffe09d8ac1e"
+  },
+  "policy": {
+    "invocation": [
+      "nice",
+      "-n19",
+      "ionice",
+      "-c3",
+      "python3",
+      "prewarm_files.py"
+    ],
+    "page_locking": false,
+    "payload_hashing": false,
+    "payload_copying": false,
+    "cache_residency_guaranteed": false
+  },
+  "files": [
+    {
+      "role": "model",
+      "path": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4",
+      "size_bytes": 125288544792,
+      "inode": 8292918,
+      "mtime_ns": "1790928378750535607",
+      "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+      "sha256_provenance": "cached model-identity.json; live stat identity matches; payload not rehashed"
+    },
+    {
+      "role": "ple_rows",
+      "path": "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4.ple-q4",
+      "size_bytes": 29120146432,
+      "inode": 11562837,
+      "mtime_ns": "1791684308379843506",
+      "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+      "sha256_provenance": "cached model-identity.json; live stat identity matches; payload not rehashed"
+    }
+  ],
+  "not_configured_roles": [
+    {
+      "role": "trunk_overlay",
+      "checked_paths": [
+        "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4.trunk-overlay"
+      ],
+      "exists": false,
+      "reason": "Exact resolver candidate absent in live stat; trunk_overlay.rs192-205 only probes this exact model path. No file consumed by this artifact; not a skipped required prewarm input."
+    },
+    {
+      "role": "expert_hotset",
+      "checked_paths": [
+        "/home/kaden/pm-wave/fngptq/models/qwen3.8-flash-next-gptq3.mq4.expert-hotset"
+      ],
+      "exists": false,
+      "reason": "Default candidate absent in live stat; no explicit hotset override in j1892 spawn-env.json; validation loader declares no hotset_sidecar. Do not borrow XtxDecode50 different artifact hotset."
+    }
+  ],
+  "excluded_legacy_auxiliaries": {
+    "reason": "Current observed route explicitly has HIPFIRE_PLE_FORMAT=q4 and serves the q4 sidecar table. Load disables q4 derivation; no PLE_HOT_STORE_BYTES override recorded. Unrelated plehot/plehotrows are not declared H1a inputs and are not read speculatively."
+  },
+  "source_evidence": {
+    "review": "HOLD1-R5-J1892-REVIEW.md",
+    "spawn_env": "collected/j1892-hold1a-r5/OUT/prim/spawn-env.json",
+    "load_source": "slowlink_load.rs116-150,~245;ple_sidecar.rs846-858,868-935;trunk_overlay.rs192-205;expert_hotset.rs37-69,180-185"
+  }
+}
