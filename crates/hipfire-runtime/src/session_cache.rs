@@ -71,7 +71,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hip_bridge::{DeviceBuffer, HostAllocOwner};
 use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
@@ -245,23 +246,65 @@ impl Drop for FakeHost {
     }
 }
 
+/// Pinned host allocations whose last transfer could not be drained. They are
+/// never freed while a GPU access may still target them, and they stay
+/// counted as pinned host owners (against the host budget) until a later
+/// successful drain proves them idle ([`Self::release`]).
+#[derive(Default)]
+struct Quarantine {
+    held: Mutex<Vec<HostMem>>,
+    bytes: AtomicU64,
+}
+
+impl Quarantine {
+    /// Pinned bytes held.
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    fn hold(&self, mem: HostMem, bytes: usize) {
+        self.held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(mem);
+        self.bytes.fetch_add(bytes as u64, Ordering::AcqRel);
+    }
+
+    /// Free everything held, returning how many allocations. The caller has
+    /// just drained every GPU access that could target them.
+    fn release(&self) -> usize {
+        let freed = std::mem::take(
+            &mut *self
+                .held
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        self.bytes.store(0, Ordering::Release);
+        freed.len()
+    }
+}
+
 /// Sole owner of one pinned host allocation of `bytes`. Every transfer that
 /// touches it drains the stream it was queued on before returning; a drain
-/// that fails flags the block `undrained`, and an undrained block is leaked
-/// (quarantined for the process lifetime) instead of freed, so memory with an
-/// outstanding GPU user is never released.
+/// that fails flags the block `undrained`, and an undrained block is never
+/// freed on drop: it moves into its cache's [`Quarantine`] (counted against
+/// the host budget) until a later drain succeeds, so memory with an
+/// outstanding GPU user is never released. A block without a quarantine
+/// (never the case for a cache's own) is leaked instead.
 struct HostBlock {
     mem: Option<HostMem>,
     bytes: usize,
     undrained: AtomicBool,
+    quarantine: Option<Arc<Quarantine>>,
 }
 
 impl HostBlock {
-    fn new(mem: HostMem, bytes: usize) -> Self {
+    fn new(mem: HostMem, bytes: usize, quarantine: Option<Arc<Quarantine>>) -> Self {
         Self {
             mem: Some(mem),
             bytes,
             undrained: AtomicBool::new(false),
+            quarantine,
         }
     }
 
@@ -284,7 +327,10 @@ impl Drop for HostBlock {
     fn drop(&mut self) {
         if self.undrained.load(Ordering::Acquire) {
             if let Some(mem) = self.mem.take() {
-                std::mem::forget(mem);
+                match &self.quarantine {
+                    Some(quarantine) => quarantine.hold(mem, self.bytes),
+                    None => std::mem::forget(mem),
+                }
             }
         }
     }
@@ -692,6 +738,15 @@ pub struct SessionCache {
     host_restores_total: u64,
     host_evictions_total: u64,
     host_skips_total: u64,
+    /// Physical allocation unit of a device buffer (a capability query,
+    /// cached on first need under the pressure policy): every device owner
+    /// consumes its payload rounded up to it. `None` until known; then, or
+    /// when the query fails, no capture is placed on the device.
+    backing_granule: Option<u64>,
+    /// Pinned host memory whose last transfer could not be drained, kept
+    /// accounted (and unfreed) until a later drain succeeds; armed with the
+    /// pressure policy, absent (no allocation) without it.
+    quarantine: Option<Arc<Quarantine>>,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -790,7 +845,11 @@ impl From<Store> for SnapshotLocation {
 /// Allocate one pinned host block of `bytes` and adopt it into a
 /// [`HostAllocOwner`], which holds the HIP library (and the emu pinned-host
 /// charge) alive until its last drop frees it.
-fn alloc_host(gpu: &mut Gpu, bytes: usize) -> Result<HostBlock, String> {
+fn alloc_host(
+    gpu: &mut Gpu,
+    bytes: usize,
+    quarantine: Option<&Arc<Quarantine>>,
+) -> Result<HostBlock, String> {
     if bytes == 0 {
         return Err("session cache: empty host snapshot".to_string());
     }
@@ -803,7 +862,11 @@ fn alloc_host(gpu: &mut Gpu, bytes: usize) -> Result<HostBlock, String> {
     // freed, and is adopted exactly once; from here only the returned owner
     // frees it.
     match unsafe { gpu.hip.adopt_host_allocation(ptr) } {
-        Ok(owner) => Ok(HostBlock::new(HostMem::Pinned(owner), bytes)),
+        Ok(owner) => Ok(HostBlock::new(
+            HostMem::Pinned(owner),
+            bytes,
+            quarantine.cloned(),
+        )),
         Err(error) => {
             let _ = gpu.hip.host_free(ptr);
             Err(error.to_string())
@@ -812,14 +875,19 @@ fn alloc_host(gpu: &mut Gpu, bytes: usize) -> Result<HostBlock, String> {
 }
 
 /// Allocate `bytes` on `tier`.
-fn alloc_store(gpu: &mut Gpu, tier: Tier, bytes: usize) -> Result<Store, String> {
+fn alloc_store(
+    gpu: &mut Gpu,
+    tier: Tier,
+    bytes: usize,
+    quarantine: Option<&Arc<Quarantine>>,
+) -> Result<Store, String> {
     match tier {
         Tier::Device => gpu
             .bind_thread()
             .and_then(|()| gpu.hip.malloc(bytes))
             .map(Store::Device)
             .map_err(|e| e.to_string()),
-        Tier::Host => alloc_host(gpu, bytes).map(Store::Host),
+        Tier::Host => alloc_host(gpu, bytes, quarantine).map(Store::Host),
     }
 }
 
@@ -833,7 +901,9 @@ enum Tier {
 /// Bytes the cache owns right now, for one placement decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Owned {
-    /// Every device owner (pool, pending, resident, deferred, parked).
+    /// Every device owner (pool, pending, resident, deferred, parked), as
+    /// PHYSICAL backing (each rounded up to the allocation granule; the
+    /// pool's published snapshots bounded above), not payload.
     device: u64,
     /// Every pinned host owner.
     host: u64,
@@ -841,22 +911,35 @@ struct Owned {
     host_pool: u64,
 }
 
+/// Physical bytes a `payload`-byte device buffer consumes: rounded up to the
+/// allocation `granule`. A snapshot is charged what it occupies, so padding
+/// can never spend the product safety margin.
+fn backing(payload: u64, granule: u64) -> u64 {
+    let granule = granule.max(1);
+    payload.div_ceil(granule).saturating_mul(granule)
+}
+
 /// Tier of a `need`-byte capture under `policy`: the device only when the
-/// pool has room (`pool_room`), the policy's TOTAL device budget holds
-/// `need` more and the real memory guard (`guard`, evaluated last and only
-/// then) passes; else the host when every pinned owner but the evictable
-/// published pool leaves `need` bytes of the host budget; else a refusal.
+/// pool has room (`pool_room`), the allocation `granule` is known, the
+/// policy's TOTAL device budget holds `need`'s physical backing beside the
+/// owners' (`owned.device`), and the real memory guard (`guard`, evaluated
+/// last and only then) passes; else the host when every pinned owner but the
+/// evictable published pool leaves `need` bytes of the host budget; else a
+/// refusal.
 fn plan_placement(
     policy: &PressureHostSnapshotPolicy,
     need: u64,
     owned: Owned,
+    granule: Option<u64>,
     pool_room: bool,
     guard: impl FnOnce() -> Option<bool>,
 ) -> Result<Tier, &'static str> {
-    let in_budget = owned
-        .device
-        .checked_add(need)
-        .is_some_and(|total| total <= policy.device_budget_bytes);
+    let in_budget = granule.is_some_and(|granule| {
+        owned
+            .device
+            .checked_add(backing(need, granule))
+            .is_some_and(|total| total <= policy.device_budget_bytes)
+    });
     if pool_room && in_budget && guard() == Some(true) {
         return Ok(Tier::Device);
     }
@@ -888,6 +971,7 @@ fn resident_plan(
     previous: Option<usize>,
     total: usize,
     owned: Owned,
+    granule: Option<u64>,
     guard: impl FnOnce() -> Option<bool>,
 ) -> ResidentPlan {
     if previous == Some(total) {
@@ -901,7 +985,7 @@ fn resident_plan(
                 ResidentPlan::Skip("memory guard")
             }
         }
-        Some(policy) => match plan_placement(policy, total as u64, owned, true, guard) {
+        Some(policy) => match plan_placement(policy, total as u64, owned, granule, true, guard) {
             Ok(tier) => ResidentPlan::Allocate(tier),
             Err(reason) => ResidentPlan::Skip(reason),
         },
@@ -1322,6 +1406,8 @@ impl SessionCache {
             host_restores_total: 0,
             host_evictions_total: 0,
             host_skips_total: 0,
+            backing_granule: None,
+            quarantine: None,
         }
     }
 
@@ -1506,10 +1592,7 @@ impl SessionCache {
         self.note_device_eviction(&snapshot);
         // The disk tier's parents are on the device or on disk (I2): a child
         // of a host snapshot cannot be demoted.
-        let host_parent = snapshot
-            .parent
-            .as_ref()
-            .is_some_and(|parent| self.host_pool.contains(&parent.0, parent.1, parent.2));
+        let host_parent = !self.demotable(&snapshot);
         if let Some(disk) = &mut self.disk {
             let demoted = if host_parent {
                 Err("its parent is on the host tier".to_string())
@@ -1565,6 +1648,39 @@ impl SessionCache {
     /// where FUTURE captures land.
     pub fn enable_pressure_host_snapshots(&mut self, policy: PressureHostSnapshotPolicy) {
         self.pressure = Some(policy);
+        if self.quarantine.is_none() {
+            self.quarantine = Some(Arc::new(Quarantine::default()));
+        }
+    }
+
+    /// Whether a device snapshot leaving the device may be demoted to disk.
+    /// The disk tier's parents are on the device or on disk (I2), so a child
+    /// of a host-resident snapshot is dropped instead: demoting it would
+    /// write a disk chain whose parent is on neither.
+    fn demotable(&self, snapshot: &StoredSnapshot) -> bool {
+        !snapshot
+            .parent
+            .as_ref()
+            .is_some_and(|parent| self.host_pool.contains(&parent.0, parent.1, parent.2))
+    }
+
+    /// Free the quarantined host memory once a device-wide drain proves no
+    /// GPU access can still target it; until then it stays counted against
+    /// the host budget. Between requests only (it waits on the device).
+    fn retry_quarantine(&self, gpu: &Gpu) {
+        let Some(quarantine) = &self.quarantine else {
+            return;
+        };
+        if quarantine.bytes() == 0 {
+            return;
+        }
+        if gpu
+            .bind_thread()
+            .and_then(|()| gpu.hip.device_synchronize())
+            .is_ok()
+        {
+            quarantine.release();
+        }
     }
 
     /// Free device bytes a cache allocation leaves beyond the guard's own
@@ -1582,14 +1698,74 @@ impl SessionCache {
         memory_fits_floor(gpu, need, growth, self.device_floor())
     }
 
-    /// Every owner's bytes right now.
+    /// Every owner's bytes right now (device owners as physical backing once
+    /// the granule is known).
     fn owned(&self) -> Owned {
         let usage = self.usage();
         Owned {
-            device: usage.device_total_bytes(),
+            device: self
+                .backing_granule
+                .map_or(usage.device_total_bytes(), |granule| {
+                    self.device_backing(granule)
+                }),
             host: usage.host_total_bytes(),
             host_pool: usage.host_pool_bytes,
         }
+    }
+
+    /// Physical backing of every device owner at allocation `granule`: each
+    /// non-pool buffer rounded up on its own, the published pool as payload
+    /// plus at most `granule - 1` of padding per snapshot (it cannot be
+    /// iterated), an upper bound.
+    fn device_backing(&self, granule: u64) -> u64 {
+        let round = |bytes: u64| if bytes == 0 { 0 } else { backing(bytes, granule) };
+        let resident = |slot: &Option<Resident>| {
+            slot.as_ref().map_or(0, |r| round(r.buf.device_bytes()))
+        };
+        let pool = self
+            .pool
+            .total_bytes()
+            .saturating_add((self.pool.len() as u64).saturating_mul(granule.max(1) - 1));
+        let parked = self.parked.as_ref().map_or(0, |parked| {
+            saturating_total([
+                round(parked.buf.device_bytes()),
+                resident(&parked.resident),
+                resident(&parked.tail),
+            ])
+        });
+        saturating_total(
+            [pool, parked]
+                .into_iter()
+                .chain(self.pending.iter().map(|entry| round(device_bytes(&entry.1))))
+                .chain(self.release.iter().map(|s| round(device_bytes(s))))
+                .chain(self.release_bufs.iter().map(|s| round(s.device_bytes())))
+                .chain([
+                    resident(&self.resident),
+                    resident(&self.resident_pending),
+                    resident(&self.tail),
+                    resident(&self.tail_pending),
+                ]),
+        )
+    }
+
+    /// Learn the device's allocation granule (the existing capability
+    /// query) the first time a pressure-policy decision needs it.
+    fn ensure_granule(&mut self, gpu: &Gpu) {
+        if self.pressure.is_some() && self.backing_granule.is_none() {
+            self.backing_granule = gpu
+                .vmm_recommended_granularity()
+                .ok()
+                .map(|granule| granule as u64)
+                .filter(|&granule| granule > 0);
+        }
+    }
+
+    /// What a `need`-byte device allocation physically consumes (the
+    /// payload while the granule is unknown, when no device placement is
+    /// made anyway).
+    fn physical_need(&self, need: u64) -> u64 {
+        self.backing_granule
+            .map_or(need, |granule| backing(need, granule))
     }
 
     /// Whether the device pool's own budget holds `need` more bytes beside
@@ -1614,7 +1790,14 @@ impl SessionCache {
     ) -> Result<Tier, &'static str> {
         let policy = self.pressure.as_ref().ok_or("no pressure policy")?;
         let room = !pooled || self.pool_room(need);
-        plan_placement(policy, need, self.owned(), room, guard)
+        plan_placement(
+            policy,
+            need,
+            self.owned(),
+            self.backing_granule,
+            room,
+            guard,
+        )
     }
 
     /// [`Self::pick_tier`] with the real memory guard, and the host budget
@@ -1626,7 +1809,9 @@ impl SessionCache {
         growth: u64,
         pooled: bool,
     ) -> Result<Tier, &'static str> {
-        let tier = self.pick_tier(need, pooled, || self.device_fits(gpu, need, growth))?;
+        self.ensure_granule(gpu);
+        let physical = self.physical_need(need);
+        let tier = self.pick_tier(need, pooled, || self.device_fits(gpu, physical, growth))?;
         if tier == Tier::Host {
             self.make_host_room(gpu, need)?;
         }
@@ -1716,6 +1901,7 @@ impl SessionCache {
     /// Bookkeeping head of every turn: free displaced buffers and drop the
     /// previous turn's uncommitted captures.
     fn start_turn(&mut self, gpu: &mut Gpu) {
+        self.retry_quarantine(gpu);
         for store in self.take_turn_head() {
             free_store(gpu, store);
         }
@@ -2231,7 +2417,13 @@ impl SessionCache {
         // Under the pressure policy a promotion is a device owner like any
         // other: it must fit the TOTAL device budget.
         if let Some(policy) = self.pressure {
-            if self.owned().device.saturating_add(bytes) > policy.device_budget_bytes {
+            self.ensure_granule(gpu);
+            let fits = self.backing_granule.is_some_and(|granule| {
+                self.device_backing(granule)
+                    .saturating_add(backing(bytes, granule))
+                    <= policy.device_budget_bytes
+            });
+            if !fits {
                 return Ok(false);
             }
         }
@@ -2471,7 +2663,10 @@ impl SessionCache {
             Some(_) => self.place(gpu, bytes, growth, true),
         };
         let dst = placed
-            .and_then(|tier| alloc_store(gpu, tier, plan.total).map_err(|_| "allocation"));
+            .and_then(|tier| {
+                alloc_store(gpu, tier, plan.total, self.quarantine.as_ref())
+                    .map_err(|_| "allocation")
+            });
         let dst = match dst {
             Ok(dst) => dst,
             Err(reason) => {
@@ -2571,12 +2766,24 @@ impl SessionCache {
             ParkPlan::new(&fixed, &[], &[]).expect("a fixed-only plan has no streams to mismatch");
         let total = plan.total;
         let fixed_offsets: Vec<usize> = live.fixed.iter().map(|part| part.offset).collect();
+        self.ensure_granule(gpu);
         let owned = self.owned();
         let previous_size = self.pending_slot(lineage).as_ref().map(|r| r.buf.size());
         let floor = self.device_floor();
-        let action = resident_plan(self.pressure.as_ref(), previous_size, total, owned, || {
-            memory_fits_floor(gpu, total as u64, growth, floor)
-        });
+        let physical = if self.pressure.is_some() {
+            self.physical_need(total as u64)
+        } else {
+            total as u64
+        };
+        let granule = self.backing_granule;
+        let action = resident_plan(
+            self.pressure.as_ref(),
+            previous_size,
+            total,
+            owned,
+            granule,
+            || memory_fits_floor(gpu, physical, growth, floor),
+        );
         let skip = |this: &mut Self, reason: &str| {
             eprintln!(
                 "  session cache: skipped {}-token resident snapshot ({reason})",
@@ -2613,7 +2820,7 @@ impl SessionCache {
                     skip(self, "host budget");
                     return Ok(());
                 }
-                match alloc_store(gpu, tier, total) {
+                match alloc_store(gpu, tier, total, self.quarantine.as_ref()) {
                     Ok(store) => {
                         if let Some(previous) = self.pending_slot(lineage).take() {
                             free_store(gpu, previous.buf);
@@ -2747,7 +2954,8 @@ impl SessionCache {
                 self.release
                     .iter()
                     .map(host_bytes)
-                    .chain(self.release_bufs.iter().map(Store::host_bytes)),
+                    .chain(self.release_bufs.iter().map(Store::host_bytes))
+                    .chain([self.quarantine.as_ref().map_or(0, |q| q.bytes())]),
             ),
             host_parked_bytes: self.parked.as_ref().map_or(0, |parked| {
                 saturating_total([
@@ -2781,6 +2989,9 @@ impl SessionCache {
         for store in self.take_all_stores() {
             free_store(gpu, store);
         }
+        // After the final frees: anything still quarantined is released only
+        // if a drain now proves it idle, else it stays counted.
+        self.retry_quarantine(gpu);
     }
 
     /// The bookkeeping of the final half of [`Self::clear`], no GPU: empty
@@ -2995,7 +3206,10 @@ impl SessionCache {
             }
         };
         let buf = match placed
-            .and_then(|tier| alloc_store(gpu, tier, plan.total).map_err(|_| "allocation"))
+            .and_then(|tier| {
+                alloc_store(gpu, tier, plan.total, self.quarantine.as_ref())
+                    .map_err(|_| "allocation")
+            })
         {
             Ok(buf) => buf,
             Err(reason) => {
@@ -6605,7 +6819,7 @@ mod tests {
             bytes: Vec::new(),
             drops: Arc::clone(drops),
         });
-        Store::Host(HostBlock::new(mem, bytes))
+        Store::Host(HostBlock::new(mem, bytes, None))
     }
 
     fn host_snapshot(bytes: u64, parent: Option<Key>, drops: &Arc<AtomicUsize>) -> StoredSnapshot {
@@ -6653,6 +6867,8 @@ mod tests {
 
     fn policy_cache(host: u64, device: u64) -> SessionCache {
         let mut cache = SessionCache::new(domain(), 1 << 40);
+        // Payload accounting (granule 1) unless a test pins a real granule.
+        cache.backing_granule = Some(1);
         cache.enable_pressure_host_snapshots(PressureHostSnapshotPolicy {
             host_budget_bytes: host,
             device_budget_bytes: device,
@@ -6749,26 +6965,26 @@ mod tests {
         };
         // 100 owned + 500 = the 600 total budget exactly.
         assert_eq!(
-            plan_placement(&policy, 500, owned, true, || Some(true)),
+            plan_placement(&policy, 500, owned, Some(1), true, || Some(true)),
             Ok(Tier::Device)
         );
         // One byte over the TOTAL device budget goes to the host.
         assert_eq!(
-            plan_placement(&policy, 501, owned, true, || Some(true)),
+            plan_placement(&policy, 501, owned, Some(1), true, || Some(true)),
             Ok(Tier::Host)
         );
         // The real guard refusing, or failing to answer, picks the host.
         assert_eq!(
-            plan_placement(&policy, 500, owned, true, || Some(false)),
+            plan_placement(&policy, 500, owned, Some(1), true, || Some(false)),
             Ok(Tier::Host)
         );
         assert_eq!(
-            plan_placement(&policy, 500, owned, true, || None),
+            plan_placement(&policy, 500, owned, Some(1), true, || None),
             Ok(Tier::Host)
         );
         // No room in the device pool's own budget.
         assert_eq!(
-            plan_placement(&policy, 500, owned, false, || Some(true)),
+            plan_placement(&policy, 500, owned, Some(1), false, || Some(true)),
             Ok(Tier::Host)
         );
         // The guard is only consulted once the budgets already permit.
@@ -6778,7 +6994,7 @@ mod tests {
             Some(true)
         };
         assert_eq!(
-            plan_placement(&policy, 501, owned, true, counted),
+            plan_placement(&policy, 501, owned, Some(1), true, counted),
             Ok(Tier::Host)
         );
         assert_eq!(calls.get(), 0);
@@ -6789,18 +7005,120 @@ mod tests {
             device_budget_bytes: 0,
         };
         assert_eq!(
-            plan_placement(&none, 1, Owned::default(), true, || Some(true)),
+            plan_placement(&none, 1, Owned::default(), Some(1), true, || Some(true)),
             Ok(Tier::Host)
         );
         // Neither tier: refused.
         assert_eq!(
-            plan_placement(&none, 1001, Owned::default(), true, || Some(true)),
+            plan_placement(&none, 1001, Owned::default(), Some(1), true, || Some(true)),
             Err("host budget")
         );
         assert_eq!(
-            plan_placement(&policy, u64::MAX, owned, true, || Some(true)),
+            plan_placement(&policy, u64::MAX, owned, Some(1), true, || Some(true)),
             Err("host budget")
         );
+    }
+
+    #[test]
+    fn slowlink_session_cache_device_budget_is_charged_physical_backing_not_payload() {
+        const GRANULE: u64 = 2 << 20;
+        let (resident, pool) = (34_130_944u64, 34_183_168u64);
+        // A fixed resident and a pool snapshot each occupy whole granules.
+        assert_eq!(backing(resident, GRANULE), 35_651_584);
+        assert_eq!(backing(pool, GRANULE), 35_651_584);
+        assert_eq!(backing(0, GRANULE), 0);
+        assert_eq!(backing(1, GRANULE), GRANULE);
+        assert_eq!(backing(GRANULE, GRANULE), GRANULE);
+        assert_eq!(backing(5, 0), 5, "a degenerate granule charges payload");
+
+        let policy = PressureHostSnapshotPolicy {
+            host_budget_bytes: 1 << 30,
+            device_budget_bytes: resident + pool,
+        };
+        let owned = Owned {
+            device: backing(resident, GRANULE),
+            host: 0,
+            host_pool: 0,
+        };
+        // Payload accounting would let the second owner in; physical backing
+        // does not, so padding cannot spend the safety margin.
+        assert_eq!(
+            plan_placement(&policy, pool, owned, Some(1), true, || Some(true)),
+            Ok(Tier::Device)
+        );
+        assert_eq!(
+            plan_placement(&policy, pool, owned, Some(GRANULE), true, || Some(true)),
+            Ok(Tier::Host)
+        );
+        // The bound is exact in physical bytes.
+        let exact = PressureHostSnapshotPolicy {
+            device_budget_bytes: 2 * 35_651_584,
+            ..policy
+        };
+        let short = PressureHostSnapshotPolicy {
+            device_budget_bytes: 2 * 35_651_584 - 1,
+            ..policy
+        };
+        assert_eq!(
+            plan_placement(&exact, pool, owned, Some(GRANULE), true, || Some(true)),
+            Ok(Tier::Device)
+        );
+        assert_eq!(
+            plan_placement(&short, pool, owned, Some(GRANULE), true, || Some(true)),
+            Ok(Tier::Host)
+        );
+        // An unknown granule (a failed capability query) never places on the device.
+        assert_eq!(
+            plan_placement(&exact, 1, Owned::default(), None, true, || Some(true)),
+            Ok(Tier::Host)
+        );
+
+        // Through the cache: every device owner is counted rounded up, while
+        // `usage()` keeps reporting payload.
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, 2 * 35_651_584);
+        cache.backing_granule = Some(GRANULE);
+        cache.resident = Some(resident_of(Store::Device(fake_buf(resident as usize))));
+        let key = cut_key(&cache, &hist, 3);
+        cache.pending.push((
+            key,
+            StoredSnapshot {
+                location: SnapshotLocation::Device(fake_buf(pool as usize)),
+                bytes: pool,
+                ..host_snapshot(0, None, &counter())
+            },
+        ));
+        assert_eq!(cache.usage().device_total_bytes(), resident + pool);
+        assert_eq!(cache.owned().device, 2 * 35_651_584);
+        assert_eq!(cache.physical_need(resident), 35_651_584);
+        // Nothing more fits the device budget exactly spent; a byte goes to the host.
+        assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(Tier::Host));
+        cache.enable_pressure_host_snapshots(PressureHostSnapshotPolicy {
+            host_budget_bytes: HUGE,
+            device_budget_bytes: 2 * 35_651_584 + GRANULE,
+        });
+        assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(Tier::Device));
+        assert_eq!(cache.pick_tier(GRANULE + 1, true, || Some(true)), Ok(Tier::Host));
+        // A published pool snapshot is bounded above by payload plus one
+        // granule of padding, never below its true backing.
+        cache.pending.clear();
+        let key = cut_key(&cache, &hist, 4);
+        cache.pending.push((
+            key,
+            StoredSnapshot {
+                location: SnapshotLocation::Device(fake_buf(pool as usize)),
+                bytes: pool,
+                ..host_snapshot(0, None, &counter())
+            },
+        ));
+        cache.commit();
+        assert!(cache.device_backing(GRANULE) >= backing(pool, GRANULE));
+        assert!(cache.device_backing(GRANULE) <= pool + GRANULE + backing(resident, GRANULE));
+        // Granule unknown: payload is reported and no device placement is made.
+        cache.backing_granule = None;
+        assert_eq!(cache.owned().device, cache.usage().device_total_bytes());
+        assert_eq!(cache.physical_need(7), 7);
+        assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(Tier::Host));
     }
 
     #[test]
@@ -7202,28 +7520,30 @@ mod tests {
         // guard, no allocation, on either tier and with or without the policy.
         for policy in [Some(&policy), None] {
             assert_eq!(
-                resident_plan(policy, Some(32), 32, owned, || panic!("no guard to reuse")),
+                resident_plan(policy, Some(32), 32, owned, Some(1), || {
+                    panic!("no guard to reuse")
+                }),
                 ResidentPlan::Reuse
             );
         }
         // A new size under pressure lands on the host while it fits...
         assert_eq!(
-            resident_plan(Some(&policy), Some(32), 60, owned, || Some(false)),
+            resident_plan(Some(&policy), Some(32), 60, owned, Some(1), || Some(false)),
             ResidentPlan::Allocate(Tier::Host)
         );
         // ...and is skipped, keeping the previous pending capture, when it does not.
         assert_eq!(
-            resident_plan(Some(&policy), Some(32), 61, owned, || Some(false)),
+            resident_plan(Some(&policy), Some(32), 61, owned, Some(1), || Some(false)),
             ResidentPlan::Skip("host budget")
         );
         // Without the policy only the guard decides, as before.
         assert_eq!(
-            resident_plan(None, Some(32), 60, owned, || Some(true)),
+            resident_plan(None, Some(32), 60, owned, None, || Some(true)),
             ResidentPlan::Allocate(Tier::Device)
         );
         for guard in [Some(false), None] {
             assert_eq!(
-                resident_plan(None, None, 60, owned, || guard),
+                resident_plan(None, None, 60, owned, None, || guard),
                 ResidentPlan::Skip("memory guard")
             );
         }
@@ -7421,11 +7741,11 @@ mod tests {
         assert_eq!(cache.owned(), Owned::default());
         // The resident plan is the old guard-or-skip rule.
         assert_eq!(
-            resident_plan(None, None, 8, Owned::default(), || Some(true)),
+            resident_plan(None, None, 8, Owned::default(), None, || Some(true)),
             ResidentPlan::Allocate(Tier::Device)
         );
         assert_eq!(
-            resident_plan(None, Some(8), 16, Owned::default(), || None),
+            resident_plan(None, Some(8), 16, Owned::default(), None, || None),
             ResidentPlan::Skip("memory guard")
         );
         // Pool captures still pack and pin exactly as before.
@@ -7494,5 +7814,121 @@ mod tests {
         assert!(!driver.cache.host_pool.is_pinned(&key.0, key.1, key.2));
         // A driver holding host state is no longer fresh for a load epoch.
         assert!(driver.bind_load_epoch(9).is_err());
+    }
+
+    /// A host store attached to `quarantine`, as a policy cache's own are.
+    fn quarantined_store(
+        bytes: usize,
+        drops: &Arc<AtomicUsize>,
+        quarantine: &Arc<Quarantine>,
+    ) -> Store {
+        let mem = HostMem::Fake(FakeHost {
+            bytes: Vec::new(),
+            drops: Arc::clone(drops),
+        });
+        Store::Host(HostBlock::new(mem, bytes, Some(Arc::clone(quarantine))))
+    }
+
+    #[test]
+    fn slowlink_session_cache_undrained_host_memory_stays_accounted_until_a_drain_proves_it_idle() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(1000, 0);
+        let quarantine = cache
+            .quarantine
+            .clone()
+            .expect("the policy arms the quarantine");
+        // No policy, no quarantine, no allocation.
+        assert!(SessionCache::new(domain(), 1 << 20).quarantine.is_none());
+
+        // A failed capture: its copy could not be drained, so the snapshot
+        // is dropped with GPU access possibly outstanding.
+        let snapshot = StoredSnapshot {
+            location: quarantined_store(300, &drops, &quarantine).into(),
+            bytes: 300,
+            ..host_snapshot(0, None, &counter())
+        };
+        if let SnapshotLocation::Host(block) = &snapshot.location {
+            block.mark_undrained();
+        }
+        cache.pending.push((cut_key(&cache, &hist, 2), snapshot));
+        drop(cache.take_turn_head());
+        // Dropping it freed nothing: the memory is quarantined and counted.
+        assert_eq!(released(&drops), 0);
+        assert_eq!(quarantine.bytes(), 300);
+        let usage = cache.usage();
+        assert_eq!(usage.host_deferred_release_bytes, 300);
+        assert_eq!(usage.host_total_bytes(), 300);
+        assert!(cache.host_pool.is_empty() && cache.pending.is_empty());
+
+        // The skipped capture cannot let a new allocation exceed the cap:
+        // 300 of the 1000 are still pinned, and quarantine is not evictable.
+        assert_eq!(cache.pick_tier(700, true, || Some(false)), Ok(Tier::Host));
+        assert_eq!(
+            cache.pick_tier(701, true, || Some(false)),
+            Err("host budget")
+        );
+        let (evicted, fits) = cache.evict_host_for(701);
+        assert!(evicted.is_empty() && !fits);
+
+        // A drain failure on a resident is quarantined the same way, and the
+        // totals add up across both.
+        let resident = quarantined_store(200, &drops, &quarantine);
+        if let Store::Host(block) = &resident {
+            block.mark_undrained();
+        }
+        drop(resident);
+        assert_eq!(cache.usage().host_total_bytes(), 500);
+        assert_eq!(
+            cache.pick_tier(501, true, || Some(false)),
+            Err("host budget")
+        );
+
+        // A copy that failed but DID drain is freed normally.
+        drop(quarantined_store(64, &drops, &quarantine));
+        assert_eq!(released(&drops), 1);
+        assert_eq!(quarantine.bytes(), 500);
+
+        // Once a device drain succeeds the quarantine is released and the
+        // budget is whole again.
+        assert_eq!(quarantine.release(), 2);
+        assert_eq!(released(&drops), 3);
+        assert_eq!(quarantine.bytes(), 0);
+        assert_eq!(cache.usage().host_total_bytes(), 0);
+        assert_eq!(cache.pick_tier(1000, true, || Some(false)), Ok(Tier::Host));
+    }
+
+    #[test]
+    fn slowlink_session_cache_a_device_child_of_a_host_parent_is_never_demoted_to_disk() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, HUGE);
+        let (host_parent, device_parent) =
+            (cut_key(&cache, &hist, 2), cut_key(&cache, &hist, 3));
+        cache
+            .pending
+            .push((host_parent.clone(), host_snapshot(100, None, &drops)));
+        cache.commit();
+        cache
+            .pending
+            .push((device_parent.clone(), fake_snapshot(3)));
+        cache.commit();
+        assert!(cache.host_pool.contains(&host_parent.0, host_parent.1, host_parent.2));
+        assert!(cache.pool.contains(&device_parent.0, device_parent.1, device_parent.2));
+
+        // The disk tier's parent invariant names the device and disk only, so
+        // a device child whose parent lives on the host is dropped on
+        // eviction (`evict_device` consults exactly this rule).
+        let child = |parent: Option<Key>| StoredSnapshot {
+            parent,
+            ..fake_snapshot(4)
+        };
+        assert!(!cache.demotable(&child(Some(host_parent))));
+        assert!(cache.demotable(&child(Some(device_parent))));
+        assert!(cache.demotable(&child(None)));
+        // Without the policy there is no host pool, so every device snapshot
+        // keeps its old demotion rule.
+        let plain = SessionCache::new(domain(), 1 << 20);
+        assert!(plain.demotable(&child(Some(cut_key(&plain, &hist, 2)))));
     }
 }
