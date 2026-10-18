@@ -985,9 +985,7 @@ impl Qwen4Bundle {
     /// Actual live owning capacities, in the shared weight plan's root order.
     /// These are allocation capacities, not the planned requests.
     pub fn weight_arena_root_capacities(&self) -> Vec<usize> {
-        self.weight_store
-            .transaction
-            .weight_arena_root_capacities()
+        self.weight_store.transaction.weight_arena_root_capacities()
     }
 
     /// Actual live shadow-root capacities, in plan order. An unallocated

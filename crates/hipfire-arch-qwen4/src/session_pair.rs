@@ -843,10 +843,11 @@ impl Qwen4Bundle {
     pub fn attach_slowlink_profile(&mut self, profile: crate::slowlink_admission::SlowlinkProfile) {
         self.slowlink.profile = Some(profile);
         if let Some(session) = self.session.as_mut() {
-            if let Some(policy) = pressure_host_snapshot_policy(
-                Some(profile.device_snapshot_budget_bytes),
-                || session.cache().usage().budget_bytes,
-            ) {
+            if let Some(policy) =
+                pressure_host_snapshot_policy(Some(profile.device_snapshot_budget_bytes), || {
+                    session.cache().usage().budget_bytes
+                })
+            {
                 session.enable_pressure_host_snapshots(policy);
             }
         }
