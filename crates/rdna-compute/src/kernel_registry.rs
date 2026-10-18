@@ -6751,7 +6751,9 @@ mod tests {
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");
             assert!(
-                !expected.lines().any(|l| l.split('\t').next() == Some(module)),
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
                 "{module} must not be a P0 module"
             );
         }
