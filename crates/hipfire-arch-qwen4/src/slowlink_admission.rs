@@ -2894,7 +2894,7 @@ mod tests {
             top_k: config.num_experts_per_tok,
             hc_count: config.hc_count,
             hc_lowrank: config.hc_lowrank,
-            dense_gdn: false,
+            gdn_format: None,
             routed_i4: true,
             include_short_tails: true,
         };
