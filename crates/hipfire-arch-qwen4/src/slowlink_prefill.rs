@@ -3029,6 +3029,7 @@ mod slowlink_prompt {
             baseline_layers: 10,
             fixed_state_bytes: 64 * MIB,
             pending_save_bytes: 4 * 2560 * 4,
+            diagnostic_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
