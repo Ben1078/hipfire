@@ -774,6 +774,18 @@ fn dsp_err(
     move |error| Qwen4GpuForwardError::Dispatch(format!("slow-link {what}: {error:?}"))
 }
 
+/// The route storage layout of one window of `rows` rows: the admitted route
+/// dimensions at the actual window rows, with the admitted K1 tail bound
+/// ([`S1_K1_TAIL_ROWS`]) clamped to them (a window shorter than the bound
+/// cannot hold more K1 rows than it has rows). The runtime region is sized for
+/// the full admitted window, so no layout built here exceeds it.
+fn window_route_layout(profile: &SlowlinkProfile, rows: usize) -> R<dsp::PromptRouteLayout> {
+    let mut dims = profile.route_dims();
+    dims.rows = rows;
+    dims.k1_rows = dims.k1_rows.min(rows);
+    dsp::PromptRouteLayout::new(&dims).map_err(dsp_err("route layout"))
+}
+
 // ── runtime ──────────────────────────────────────────────────────────
 
 /// What a forward holds of S1: the admitted profile (set before attach, never
@@ -1846,9 +1858,7 @@ impl Run<'_, '_> {
             ));
         }
         let wall = Instant::now();
-        let mut dims = self.profile.route_dims();
-        dims.rows = w.window.rows;
-        let layout = dsp::PromptRouteLayout::new(&dims).map_err(dsp_err("route layout"))?;
+        let layout = window_route_layout(&self.profile, w.window.rows)?;
         let mut routes = dsp::PromptRouteStorage::from_region(&self.rt.route_region, &layout)
             .map_err(dsp_err("route storage"))?;
         let mut report = WindowReport::default();
@@ -3030,7 +3040,23 @@ mod slowlink_prompt {
         diagnostic_bytes: u64,
         base_runtime_reserved_bytes: u64,
     ) -> SlowlinkProfile {
-        let geometry = ModelGeometry::from_config(&crate::config::compact_test_config()).unwrap();
+        profile_on(
+            dsp::WindowRoute::SlabIu4,
+            diagnostic_bytes,
+            base_runtime_reserved_bytes,
+        )
+    }
+
+    /// [`profile_with_budgets`] admitted FRESH on the artifact route `route`: the
+    /// geometry names the route before the census is computed, so every
+    /// route-dependent byte is that route's own layout.
+    pub(super) fn profile_on(
+        route: dsp::WindowRoute,
+        diagnostic_bytes: u64,
+        base_runtime_reserved_bytes: u64,
+    ) -> SlowlinkProfile {
+        let geometry =
+            ModelGeometry::from_config(&crate::config::compact_test_config(), route).unwrap();
         admit(&AdmissionInputs {
             geometry,
             free: 40 << 30,
@@ -3563,6 +3589,125 @@ mod slowlink_prompt {
             "the admitted arena holds the window's tagged spans plus one tile of view slack"
         );
         assert!(census.total().is_some());
+    }
+
+    /// The window route layout the runtime builds for each window, for BOTH
+    /// artifact route kinds, is valid at every window row count: the K1 bound
+    /// is clamped to the window, no owned span exceeds the full admitted
+    /// window's, and an empty window is still refused. CPU layout arithmetic
+    /// only; no kernel or GPU arithmetic is exercised.
+    #[test]
+    fn slowlink_prompt_window_route_layout_is_valid_for_every_row_count_on_both_routes() {
+        for route in [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::AggregateWmma] {
+            let profile = profile_on(route, 0, 0);
+            assert_eq!(profile.geometry.route, route);
+            let full = profile.census.route_storage;
+            for rows in [1usize, 3, 4, 47, 48, 49, 512, 1536, 16384] {
+                let layout = window_route_layout(&profile, rows)
+                    .unwrap_or_else(|error| panic!("{route:?} rows {rows}: {error:?}"));
+                let dims = layout.dims();
+                assert_eq!(dims.rows, rows, "{route:?}");
+                assert_eq!(layout.route(), route, "{route:?} rows {rows}");
+                assert_eq!(
+                    dims.k1_rows,
+                    S1_K1_TAIL_ROWS.min(rows),
+                    "{route:?} rows {rows}: the admitted K1 bound clamped to the window"
+                );
+                assert!(dims.k1_rows > 0 && dims.k1_rows <= dims.rows);
+                assert!(layout.total_bytes() > 0, "{route:?} rows {rows}");
+                assert!(
+                    layout.total_bytes() as u64 <= full,
+                    "{route:?} rows {rows}: {} bytes exceed the admitted {full}",
+                    layout.total_bytes()
+                );
+                if rows == S1_WINDOW_ROWS {
+                    assert_eq!(layout.total_bytes() as u64, full, "{route:?}");
+                }
+            }
+            assert!(
+                window_route_layout(&profile, 0).is_err(),
+                "{route:?}: a zero-row window is refused"
+            );
+        }
+    }
+
+    /// The census of each route kind is the layout of a profile admitted FRESH
+    /// on that route (never the slab census with the route field flipped).
+    #[test]
+    fn slowlink_prompt_census_of_each_route_is_its_own_fresh_admission() {
+        let slab = profile_on(dsp::WindowRoute::SlabIu4, 0, 0);
+        let aggregate = profile_on(dsp::WindowRoute::AggregateWmma, 0, 0);
+        for profile in [&slab, &aggregate] {
+            let plan = plan_prompt_verdict(&PromptPlanInputs {
+                profile,
+                entry_pos: 0,
+                rows: 16384,
+                cuts: &[],
+                routing: &gfx1100_routing,
+                few_row_limit: 8,
+            })
+            .unwrap()
+            .expect("a qualified request plans");
+            let layout = dsp::PromptRouteLayout::new(&profile.route_dims()).unwrap();
+            assert_eq!(layout.route(), profile.geometry.route);
+            assert_eq!(profile.census.route_storage, layout.total_bytes() as u64);
+            let census = prompt_bytes(&plan).unwrap();
+            assert_eq!(census.route_storage, profile.census.route_storage);
+            assert_eq!(
+                census.total().unwrap(),
+                profile.census.owned_total().unwrap()
+            );
+        }
+        let wide = aggregate.route_dims();
+        assert_eq!(wide.route, dsp::WindowRoute::AggregateWmma);
+        assert_eq!(wide.k1_rows, S1_K1_TAIL_ROWS);
+        assert!(
+            aggregate.census.route_storage > slab.census.route_storage,
+            "the aggregate census carries its own F16 activations and scratch"
+        );
+    }
+
+    /// A request whose last window holds only 3 rows (16384 rows, then the
+    /// 3-row tail the fifth cut separates): the production per-window layout
+    /// is valid for it on both route kinds, the K1 bound is 3 there, and the
+    /// plan's tile manifest is the same before and after the layouts are built.
+    #[test]
+    fn slowlink_prompt_three_row_last_window_builds_a_valid_layout_on_both_routes() {
+        let cuts = [1536, 3072, 4608, 6144, 16384];
+        let plan = plan(0, 16387, &cuts);
+        assert_chronology(&plan);
+        assert_eq!(plan.windows.len(), 2);
+        assert_eq!(plan.windows[0].rows, 16384);
+        let last = &plan.windows[1];
+        assert_eq!(last.rows, 3);
+        assert_eq!(last.position, 16384);
+        assert_eq!(last.end_position(), 16387);
+        assert_eq!(last.tiles.len(), 1);
+        assert_eq!(plan.tiles[last.tiles.start].rows, 3);
+        assert_eq!(plan.k1_rows_max, 3, "the 3-row remainder is the K1 tile");
+        let manifest = plan.tiles.clone();
+        let windows = plan.windows.clone();
+        for route in [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::AggregateWmma] {
+            let profile = profile_on(route, 0, 0);
+            let dims_before = profile.route_dims();
+            for window in &plan.windows {
+                let layout = window_route_layout(&profile, window.rows)
+                    .unwrap_or_else(|error| panic!("{route:?} window {}: {error:?}", window.index));
+                assert_eq!(layout.dims().rows, window.rows);
+                assert_eq!(layout.dims().k1_rows, S1_K1_TAIL_ROWS.min(window.rows));
+                assert!(layout.total_bytes() as u64 <= profile.census.route_storage);
+            }
+            assert_eq!(
+                window_route_layout(&profile, last.rows)
+                    .unwrap()
+                    .dims()
+                    .k1_rows,
+                3
+            );
+            assert_eq!(profile.route_dims(), dims_before, "{route:?}");
+        }
+        assert_eq!(plan.tiles, manifest, "the tile manifest is untouched");
+        assert_eq!(plan.windows, windows);
     }
 
     /// The physical prompt census is the allocation layouts' total whatever
