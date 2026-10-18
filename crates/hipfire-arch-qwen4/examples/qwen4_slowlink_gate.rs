@@ -65,6 +65,10 @@
 //!   prefill.
 //! * `product` — greedy generation with decoded text for review (attractor
 //!   heuristics reject degenerate output; a human still reads the text).
+//!   For every prompt with >= 512 prefill rows the final prefill-row logits
+//!   (full vocab, f32 LE `.npy`) are written to `product-logits/<id>.npy`
+//!   next to `--output` after the prompt's checks, and described by the
+//!   record's `product_logits` entry (informational, never a check).
 //! * `perf` — fresh-process timing of the 16384-row prefill plus the
 //!   pp512/pp8192 guards and decode, with the span attribution and the
 //!   cross-layer event-overlap evidence.
@@ -1243,6 +1247,16 @@ fn window_summary(receipts: &[Option<Value>]) -> Value {
 
 fn greedy(ctx: &mut Ctx, count: usize) -> Result<(Vec<u32>, &'static str), String> {
     let row = gpu_error(ctx.gpu.download_f32(&ctx.logits), "download prompt logits")?;
+    greedy_from_row(ctx, &row, count)
+}
+
+/// [`greedy`] over an already downloaded prefill row: the product cell keeps
+/// that row, because the first decode step overwrites the device buffer.
+fn greedy_from_row(
+    ctx: &mut Ctx,
+    row: &[f32],
+    count: usize,
+) -> Result<(Vec<u32>, &'static str), String> {
     if row.iter().any(|v| !v.is_finite()) {
         return Err("non-finite prefill logits".into());
     }
@@ -2544,16 +2558,108 @@ fn run_state(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<Strin
 
 // ── product ────────────────────────────────────────────────────────────
 
-fn run_product(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String, Value>) {
+/// Prompts with at least this many prefill rows keep their final prefill-row
+/// logits (H2b informational cell: S1 product flag 1 vs flag 0).
+const PRODUCT_LOGITS_MIN_ROWS: usize = 512;
+/// Directory next to `--output` holding `<prompt-id>.npy`.
+const PRODUCT_LOGITS_DIR: &str = "product-logits";
+
+/// `.npy` v1.0 bytes of a 1-D little-endian f32 array: magic, version, header
+/// length (u16 LE), a header dict padded with spaces and a final newline so
+/// the data start is a multiple of 64.
+fn npy_f32_bytes(values: &[f32]) -> Vec<u8> {
+    let dict = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}",
+        values.len()
+    );
+    let unpadded = 10 + dict.len() + 1;
+    let pad = (64 - unpadded % 64) % 64;
+    let header_len = dict.len() + pad + 1;
+    let mut bytes = Vec::with_capacity(10 + header_len + values.len() * 4);
+    bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
+    bytes.extend_from_slice(&(header_len as u16).to_le_bytes());
+    bytes.extend_from_slice(dict.as_bytes());
+    bytes.extend(std::iter::repeat(b' ').take(pad));
+    bytes.push(b'\n');
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// A prompt id as a file stem: anything outside `[A-Za-z0-9._-]` becomes `_`.
+fn logits_file_stem(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Writes one prompt's final prefill-row logits as `<dir>/<id>.npy` and
+/// returns the report entry. Never part of a check: a write error is
+/// reported in the entry, not as a gate failure.
+fn write_product_logits(
+    dir: &Path,
+    id: &str,
+    row: &[f32],
+    prompt_rows: usize,
+    vocab: usize,
+    token_ids: &Value,
+    moe_iu4_env: Option<&str>,
+    moe_iu4_requested: bool,
+) -> Value {
+    let file = format!("{}.npy", logits_file_stem(id));
+    let mut entry = json!({
+        "file": format!("{PRODUCT_LOGITS_DIR}/{file}"), "prompt_rows": prompt_rows, "vocab": vocab,
+        "token_ids": token_ids,
+        "HIPFIRE_QWEN4_MOE_SYM_IU4": moe_iu4_env, "moe_iu4_requested": moe_iu4_requested,
+    });
+    if row.len() != vocab {
+        entry["error"] = json!(format!(
+            "final row has {} values, vocab is {vocab}",
+            row.len()
+        ));
+        return entry;
+    }
+    let path = dir.join(&file);
+    let written = std::fs::create_dir_all(dir)
+        .map_err(|e| format!("create {}: {e}", dir.display()))
+        .and_then(|()| write_atomic(&path, &npy_f32_bytes(row)))
+        .and_then(|()| file_sha256(&path));
+    match written {
+        Ok(sha) => entry["sha256"] = json!(sha),
+        Err(e) => entry["error"] = json!(e),
+    }
+    entry
+}
+
+fn run_product(
+    ctx: &mut Ctx,
+    checks: &mut Checks,
+    out: &mut serde_json::Map<String, Value>,
+    output: &Path,
+    moe_iu4_env: Option<&str>,
+) {
+    let logits_dir = output
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PRODUCT_LOGITS_DIR);
     let mut records = Vec::new();
     for index in 0..ctx.fixture.prompts.len() {
         let prompt = ctx.fixture.prompts[index].clone();
         let id = prompt.id.clone();
         let name = format!("product.{id}");
         ctx.progress.record("case_start", json!({"case": name}));
-        let result = (|| -> Result<(Vec<String>, Value), String> {
+        let result = (|| -> Result<(Vec<String>, Value, Vec<f32>), String> {
             let obs = observe(ctx, &prompt.prompt_ids, prompt.entry, &prompt.launch_cuts)?;
-            let (ids, finish) = greedy(ctx, ctx.fixture.decode_tokens)?;
+            // The first decode step overwrites the device row: keep it.
+            let row = gpu_error(ctx.gpu.download_f32(&ctx.logits), "download prompt logits")?;
+            let (ids, finish) = greedy_from_row(ctx, &row, ctx.fixture.decode_tokens)?;
             let mut bad = Vec::new();
             let single = prompt.kind == "rows"
                 && prompt.launch_cuts.is_empty()
@@ -2582,10 +2688,11 @@ fn run_product(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<Str
                     "first_logit_digest": obs.logits["combined"], "state_digest": obs.state["combined"],
                     "receipts": receipts_json(&obs.receipts),
                 }),
+                row,
             ))
         })();
         match result {
-            Ok((bad, record)) => {
+            Ok((bad, record, row)) => {
                 ctx.progress.record(
                     "case_end",
                     json!({
@@ -2593,8 +2700,23 @@ fn run_product(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<Str
                         "cache_usage": ctx.cache_usage(),
                     }),
                 );
-                records.push(record.clone());
                 checks.push(&name, bad, json!({"id": id}));
+                // After the checked region, never inside it: the informational
+                // S1 product logits row (a write error never changes a check).
+                let mut record = record;
+                if prompt.prompt_ids.len() >= PRODUCT_LOGITS_MIN_ROWS {
+                    record["product_logits"] = write_product_logits(
+                        &logits_dir,
+                        &id,
+                        &row,
+                        prompt.prompt_ids.len(),
+                        ctx.vocab,
+                        &record["token_ids"].clone(),
+                        moe_iu4_env,
+                        ctx.moe_iu4_requested,
+                    );
+                }
+                records.push(record);
             }
             Err(e) => {
                 ctx.progress.record(
@@ -3067,7 +3189,13 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         match args.mode {
             Mode::Primitives => run_primitives(&mut ctx, &mut checks, &mut out, sampler.as_ref()),
             Mode::State => run_state(&mut ctx, &mut checks, &mut out),
-            Mode::Product => run_product(&mut ctx, &mut checks, &mut out),
+            Mode::Product => run_product(
+                &mut ctx,
+                &mut checks,
+                &mut out,
+                &args.output,
+                moe_iu4_value.as_deref(),
+            ),
             Mode::Perf => run_perf(&mut ctx, &mut checks, &mut out),
         }
         progress.record(
@@ -5977,6 +6105,54 @@ mod slowlink_receipt_tests {
         names.sort();
         assert_eq!(names, ["blocked", "report.json"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn product_logits_npy_header_and_round_trip() {
+        for n in [0usize, 1, 7, 248_320] {
+            let values: Vec<f32> = (0..n)
+                .map(|i| (i as f32) * 0.37 - 5.0)
+                .chain((n > 3).then_some(f32::MIN_POSITIVE))
+                .collect();
+            let bytes = npy_f32_bytes(&values);
+            assert_eq!(&bytes[..8], b"\x93NUMPY\x01\x00");
+            let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+            assert_eq!((10 + header_len) % 64, 0, "data start is 64-aligned");
+            let header = std::str::from_utf8(&bytes[10..10 + header_len]).unwrap();
+            assert!(header.ends_with('\n'));
+            assert!(header.starts_with("{'descr': '<f4', 'fortran_order': False, 'shape': ("));
+            assert!(header.contains(&format!("({},)", values.len())), "{header}");
+            let data = &bytes[10 + header_len..];
+            assert_eq!(data.len(), values.len() * 4);
+            let back: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(back, values);
+        }
+    }
+
+    #[test]
+    fn product_logits_write_records_sha_and_refuses_a_wrong_sized_row() {
+        let dir = scratch_dir("plogits").join(PRODUCT_LOGITS_DIR);
+        let row = vec![1.0f32, -2.5, 3.25, 0.0];
+        let ids = json!([5, 6, 7]);
+        let entry = write_product_logits(&dir, "p/512 x", &row, 512, 4, &ids, Some("1"), true);
+        assert_eq!(entry["file"], "product-logits/p_512_x.npy");
+        assert_eq!(entry["vocab"], 4);
+        assert_eq!(entry["prompt_rows"], 512);
+        assert_eq!(entry["token_ids"], ids);
+        assert_eq!(entry["HIPFIRE_QWEN4_MOE_SYM_IU4"], "1");
+        assert_eq!(entry["moe_iu4_requested"], true);
+        assert!(entry.get("error").is_none(), "{entry}");
+        let path = dir.join("p_512_x.npy");
+        assert_eq!(std::fs::read(&path).unwrap(), npy_f32_bytes(&row));
+        assert_eq!(entry["sha256"], file_sha256(&path).unwrap());
+        let wrong = write_product_logits(&dir, "q", &row, 512, 5, &ids, None, false);
+        assert!(wrong["error"].as_str().unwrap().contains("vocab is 5"));
+        assert!(wrong["HIPFIRE_QWEN4_MOE_SYM_IU4"].is_null());
+        assert!(!dir.join("q.npy").exists());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
