@@ -83,6 +83,7 @@ use hipfire_arch_qwen4::state_parity::{
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::session_cache::{SessionCache, SessionCacheUsage, SessionRoute};
 use hipfire_runtime::tokenizer::Tokenizer;
+use rdna_compute::byte_arena::{ModelWeightArenaPlan, NamedByteArenaPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -576,6 +577,239 @@ fn profile_granule_evidence(profile: &SlowlinkProfile) -> Value {
         profile.resident_layers,
         profile.device_snapshot_budget_bytes,
         profile.reserve_bytes(),
+    )
+}
+
+/// `bytes` rounded UP to a whole number of `granule` bytes, checked.
+fn round_up_to_granule(bytes: usize, granule: usize) -> Option<u64> {
+    if granule == 0 {
+        return None;
+    }
+    let granule = granule as u64;
+    (bytes as u64)
+        .checked_add(granule - 1)
+        .map(|padded| padded / granule * granule)
+}
+
+/// One arena family's plan scope and observed capacity.
+///
+/// PLANNED figures (`payload_bytes`, `root_request_bytes`, `backing_bytes`)
+/// come only from the plan the load built; ACTUAL figures (`actual.*`) come
+/// only from the capacities the allocator reports for roots that are live
+/// (`observed[i] = Some(capacity)`, `None` = a lazily planned root that has
+/// not been allocated yet). A planned root is never reported as actual: an
+/// unallocated root contributes nothing to `actual.capacity_bytes` and the
+/// exact-capacity proof is `exact` only when EVERY planned root is live with
+/// `capacity == request` and the plan's own `validate_capacities` returns the
+/// planned backing. An empty `observed` means no root of the family is live.
+/// `lazy` families (the F16 shadow roots) may legitimately be unallocated;
+/// an eager family (the load-lifetime weight roots) with a planned root that
+/// is not live after the load is a problem. Nothing here measures recovery.
+fn arena_family_evidence(
+    scope: &str,
+    plan: &NamedByteArenaPlan,
+    granule: usize,
+    observed: &[Option<usize>],
+    lazy: bool,
+) -> (Value, Vec<String>) {
+    let mut problems = Vec::new();
+    let roots = plan.roots.len();
+    let payload = plan.logical_bytes();
+    let backing = plan.backing_bytes(granule);
+    let request_total = checked_sum(&plan.roots.iter().map(|r| *r as u64).collect::<Vec<_>>());
+    for result in [&payload, &backing] {
+        if let Err(error) = result {
+            problems.push(format!("{scope}: plan is unusable: {error}"));
+        }
+    }
+    if request_total.is_none() {
+        problems.push(format!("{scope}: planned root requests overflow"));
+    }
+    let census_ok = observed.is_empty() || observed.len() == roots;
+    if !census_ok {
+        problems.push(format!(
+            "{scope}: {} observed root capacities for {roots} planned roots (census mismatch)",
+            observed.len()
+        ));
+    }
+    let live: Vec<Option<usize>> = if census_ok && !observed.is_empty() {
+        observed.to_vec()
+    } else {
+        vec![None; roots]
+    };
+    let allocated = live.iter().flatten().count();
+    let mut mismatches = Vec::new();
+    for (index, (request, capacity)) in plan.roots.iter().zip(&live).enumerate() {
+        if let Some(capacity) = capacity {
+            if capacity != request {
+                mismatches.push(json!({
+                    "root": index, "requested_bytes": request, "actual_capacity_bytes": capacity,
+                }));
+                problems.push(format!(
+                    "{scope} root {index}: actual capacity {capacity} != planned request {request} \
+                     (an oversized or reused buffer is not an exact arena root)"
+                ));
+            }
+        }
+    }
+    let capacity_total = checked_sum(&live.iter().flatten().map(|c| *c as u64).collect::<Vec<_>>());
+    let actual_backing = live
+        .iter()
+        .flatten()
+        .map(|c| round_up_to_granule(*c, granule))
+        .try_fold(0u64, |sum, part| part.and_then(|p| sum.checked_add(p)));
+    if !lazy && census_ok && roots > 0 && allocated < roots {
+        problems.push(format!(
+            "{scope}: {} of {roots} planned roots are not live after the load \
+             (planned bytes are not actual capacity)",
+            roots - allocated
+        ));
+    }
+    let proof = if !census_ok {
+        "census_mismatch"
+    } else if !mismatches.is_empty() {
+        "mismatch"
+    } else if roots == 0 || allocated == 0 {
+        "none"
+    } else if allocated < roots {
+        "partial"
+    } else {
+        let capacities: Vec<usize> = live.iter().flatten().copied().collect();
+        match (plan.validate_capacities(&capacities, granule), &backing) {
+            (Ok(proved), Ok(planned)) if proved == *planned && Some(proved) == actual_backing => {
+                "exact"
+            }
+            (Ok(_), _) => {
+                problems.push(format!(
+                    "{scope}: actual backing does not equal the planned backing"
+                ));
+                "mismatch"
+            }
+            (Err(error), _) => {
+                problems.push(format!("{scope}: capacity validation failed: {error}"));
+                "mismatch"
+            }
+        }
+    };
+    let state = if roots == 0 {
+        "empty"
+    } else if allocated == 0 {
+        "planned_only"
+    } else if allocated < roots {
+        "partial_lazy"
+    } else {
+        "fully_allocated"
+    };
+    let member_padding = request_total
+        .zip(payload.as_ref().ok().copied())
+        .and_then(|(request, payload)| request.checked_sub(payload));
+    let granule_padding = request_total
+        .zip(backing.as_ref().ok().copied())
+        .and_then(|(request, backing)| backing.checked_sub(request));
+    let evidence = json!({
+        "members": plan.members.len(),
+        "roots": roots,
+        "alignment_bytes": plan.alignment,
+        "max_root_bytes": plan.max_root_bytes,
+        "lazy": lazy,
+        "planned": {
+            "payload_bytes": payload.as_ref().ok(),
+            "root_request_bytes": request_total,
+            "member_alignment_padding_bytes": member_padding,
+            "backing_bytes": backing.as_ref().ok(),
+            "granule_padding_bytes": granule_padding,
+        },
+        "actual": {
+            "state": state,
+            "live_roots": allocated,
+            "unallocated_roots": roots.saturating_sub(allocated),
+            "capacity_bytes": capacity_total,
+            "backing_bytes": actual_backing,
+            "capacity_mismatches": mismatches,
+        },
+        "capacity_proof": proof,
+    });
+    (evidence, problems)
+}
+
+/// The S1 model arena census: the weight family and the F16-shadow family of
+/// the plan the load built, beside what the allocator actually holds.
+/// `weights` / `shadows` are the observed per-root capacities (empty = no
+/// live root). Additive receipt evidence: the second return is the list of
+/// capacity/census problems (a root whose actual capacity is not its planned
+/// request, a census of the wrong length, capacities with no plan, planned
+/// eager roots that are not live); it never inspects the residual.
+fn arena_evidence(
+    plan: Option<&ModelWeightArenaPlan>,
+    weights: &[Option<usize>],
+    shadows: &[Option<usize>],
+) -> (Value, Vec<String>) {
+    let Some(plan) = plan else {
+        let mut problems = Vec::new();
+        if !weights.is_empty() || !shadows.is_empty() {
+            problems.push(
+                "arena capacities were observed but the load carries no arena plan".to_string(),
+            );
+        }
+        return (
+            json!({"present": false, "planned_is_actual": false, "arena_claim": false}),
+            problems,
+        );
+    };
+    let (weight_evidence, mut problems) = arena_family_evidence(
+        "weight arena",
+        &plan.weights,
+        plan.granule_bytes,
+        weights,
+        false,
+    );
+    let (shadow_evidence, shadow_problems) = arena_family_evidence(
+        "f16 shadow arena",
+        &plan.f16_shadows,
+        plan.granule_bytes,
+        shadows,
+        true,
+    );
+    problems.extend(shadow_problems);
+    let evidence = json!({
+        "units": "bytes; planned.* are the plan's payload, root requests and granule-rounded \
+                  backing; actual.* are the capacities of roots that are live now (a lazily \
+                  planned root that is not allocated is NOT actual); the exact-capacity proof \
+                  needs every root live with capacity == request",
+        "scope": "S1 load-lifetime exact roots: the non-expert resident weights and their F16 \
+                  shadows; a per-model census, not a product constant; non-S1 loads carry no plan",
+        "present": true,
+        "allocation_granule_bytes": plan.granule_bytes,
+        "weights": weight_evidence,
+        "f16_shadows": shadow_evidence,
+        "planned_is_actual": false,
+        "arena_claim": false,
+    });
+    (evidence, problems)
+}
+
+/// A load that selected the S1 profile builds the model arena plan; any other
+/// load builds none.
+fn arena_presence_problems(present: bool, s1_profile: bool) -> Vec<String> {
+    match (s1_profile, present) {
+        (true, false) => vec!["the S1 profile was admitted without a model weight arena plan".into()],
+        (false, true) => vec!["a load without the S1 profile carries a model weight arena plan".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Observe the bundle's plan and the capacities its owners report right now.
+fn arena_observation(bundle: &Qwen4Bundle, gpu: &Gpu) -> (Value, Vec<String>) {
+    let weights: Vec<Option<usize>> = bundle
+        .weight_arena_root_capacities()
+        .into_iter()
+        .map(Some)
+        .collect();
+    let shadows = bundle.f16_shadow_arena_root_capacities(gpu);
+    arena_evidence(
+        bundle.slowlink_weight_arena_plan().map(|plan| &**plan),
+        &weights,
+        &shadows,
     )
 }
 
@@ -2496,6 +2730,12 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                 }
             }
         }
+        let (arena_census, arena_problems) = arena_observation(&loaded.bundle, &gpu);
+        placement_problems.extend(arena_presence_problems(
+            arena_census["present"].as_bool() == Some(true),
+            loaded.slowlink_profile,
+        ));
+        placement_problems.extend(arena_problems);
         checks.push(
             "load.placement",
             placement_problems,
@@ -2506,6 +2746,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                    "admitted_tile_rows": admitted_tile,
                    "admitted_device_snapshot_budget_bytes": profile_now.map(|p| p.device_snapshot_budget_bytes),
                    "granule_census": profile_now.map_or(Value::Null, profile_granule_evidence),
+                   "arena_census": arena_census,
                    "pressure_host_policy": usage_json(loaded.bundle.session_cache())["pressure_host_policy"].clone()}),
         );
         progress.checks(&checks);
@@ -2569,6 +2810,19 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             json!({"stage": args.mode.name(), "cache_usage": ctx.cache_usage()}),
         );
         progress.checks(&checks);
+        // The lazy shadow roots are allocated by now: the same census again.
+        // A failure row is recorded only when a root's capacity breaks the
+        // exact proof; a clean census adds no check row and no new verdict.
+        let (arena_end, arena_end_problems) = arena_observation(&ctx.bundle, &ctx.gpu);
+        progress.record("arena_census_end", arena_end.clone());
+        out.insert("arena_census_end".into(), arena_end);
+        if !arena_end_problems.is_empty() {
+            checks.fail(
+                "load.arena_capacity",
+                arena_end_problems.join("; "),
+                Value::Null,
+            );
+        }
         if let Some(sampler) = sampler {
             // The primitive cell (Hold 1's first cell) only: the heavy sampler.
             // Its census residual is recorded as a non-gating diagnostic.
@@ -3827,6 +4081,228 @@ mod slowlink_receipt_tests {
         // The cache's device usage fields stay labelled payload, never physical backing.
         let usage = usage_value(&usage_literal(1, 0, 0, [0; 4]));
         assert!(usage["byte_units"].as_str().unwrap().starts_with("payload bytes"));
+    }
+
+    /// Fixture plans: nine weight roots and two shadow roots at granule 4096.
+    /// The 9+2 shape is only a fixture the tests build; no check selects on it.
+    fn arena_plan(weight_members: usize, shadow_members: usize) -> ModelWeightArenaPlan {
+        let weights = NamedByteArenaPlan::new(
+            (0..weight_members)
+                .map(|i| (format!("w{i:02}"), 768usize))
+                .collect(),
+            256,
+            1024,
+        )
+        .unwrap();
+        let f16_shadows = NamedByteArenaPlan::new(
+            (0..shadow_members)
+                .map(|i| (format!("w{i:02}"), 1024usize))
+                .collect(),
+            256,
+            1024,
+        )
+        .unwrap();
+        ModelWeightArenaPlan {
+            weights,
+            f16_shadows,
+            granule_bytes: 4096,
+        }
+    }
+
+    fn exact(plan: &NamedByteArenaPlan) -> Vec<Option<usize>> {
+        plan.roots.iter().copied().map(Some).collect()
+    }
+
+    #[test]
+    fn slowlink_receipt_arena_planned_lazy_roots_are_never_reported_as_actual() {
+        let plan = arena_plan(9, 2);
+        let (evidence, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &[]);
+        assert!(problems.is_empty(), "{problems:?}");
+        // Counts are the plan's, and the fixture shape is reported, not required.
+        assert_eq!(evidence["weights"]["roots"], json!(plan.weights.roots.len()));
+        assert_eq!(evidence["weights"]["roots"], json!(9));
+        assert_eq!(evidence["f16_shadows"]["roots"], json!(2));
+        assert_eq!(evidence["weights"]["members"], json!(9));
+        assert_eq!(evidence["f16_shadows"]["members"], json!(2));
+        assert_eq!(evidence["allocation_granule_bytes"], json!(4096));
+        // The weight roots are live and exact; the shadow roots are planned only.
+        let weights = &evidence["weights"];
+        assert_eq!(weights["capacity_proof"], json!("exact"));
+        assert_eq!(weights["actual"]["state"], json!("fully_allocated"));
+        assert_eq!(weights["actual"]["live_roots"], json!(9));
+        assert_eq!(
+            weights["actual"]["backing_bytes"],
+            weights["planned"]["backing_bytes"]
+        );
+        assert_eq!(
+            weights["planned"]["backing_bytes"],
+            json!(plan.weights.backing_bytes(4096).unwrap())
+        );
+        let shadows = &evidence["f16_shadows"];
+        assert_eq!(shadows["actual"]["state"], json!("planned_only"));
+        assert_eq!(shadows["actual"]["live_roots"], json!(0));
+        assert_eq!(shadows["actual"]["unallocated_roots"], json!(2));
+        assert_eq!(shadows["actual"]["capacity_bytes"], json!(0));
+        assert_eq!(shadows["actual"]["backing_bytes"], json!(0));
+        assert_eq!(shadows["capacity_proof"], json!("none"));
+        assert_ne!(shadows["planned"]["backing_bytes"], json!(0));
+        assert_eq!(evidence["planned_is_actual"], json!(false));
+        assert_eq!(evidence["arena_claim"], json!(false));
+        // Additive payload / request / padding / backing chain for each family.
+        for family in ["weights", "f16_shadows"] {
+            let planned = &evidence[family]["planned"];
+            let payload = planned["payload_bytes"].as_u64().unwrap();
+            let request = planned["root_request_bytes"].as_u64().unwrap();
+            let backing = planned["backing_bytes"].as_u64().unwrap();
+            assert!(payload <= request && request <= backing, "{family}");
+            assert_eq!(
+                planned["member_alignment_padding_bytes"],
+                json!(request - payload)
+            );
+            assert_eq!(planned["granule_padding_bytes"], json!(backing - request));
+            assert_eq!(backing % 4096, 0);
+        }
+        // A lazy shadow root allocated one at a time is partial, still exact per root.
+        let one = [Some(plan.f16_shadows.roots[0]), None];
+        let (partial, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &one);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(partial["f16_shadows"]["actual"]["state"], json!("partial_lazy"));
+        assert_eq!(partial["f16_shadows"]["capacity_proof"], json!("partial"));
+        assert_eq!(partial["f16_shadows"]["actual"]["live_roots"], json!(1));
+        // Every shadow root live and exact closes the proof.
+        let (full, problems) =
+            arena_evidence(Some(&plan), &exact(&plan.weights), &exact(&plan.f16_shadows));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(full["f16_shadows"]["capacity_proof"], json!("exact"));
+        assert_eq!(full["f16_shadows"]["actual"]["state"], json!("fully_allocated"));
+    }
+
+    #[test]
+    fn slowlink_receipt_arena_rejects_an_actual_capacity_that_is_not_the_planned_request() {
+        let plan = arena_plan(9, 2);
+        // An oversized (reused pool) weight buffer is not an exact root.
+        let mut weights = exact(&plan.weights);
+        weights[3] = Some(plan.weights.roots[3] + 4096);
+        let (evidence, problems) = arena_evidence(Some(&plan), &weights, &[]);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("weight arena root 3") && p.contains("oversized")),
+            "{problems:?}"
+        );
+        assert_eq!(evidence["weights"]["capacity_proof"], json!("mismatch"));
+        let mismatches = evidence["weights"]["actual"]["capacity_mismatches"]
+            .as_array()
+            .unwrap();
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0]["root"], json!(3));
+        // An undersized shadow root is rejected the same way, even when partial.
+        let shadows = [None, Some(plan.f16_shadows.roots[1] - 1)];
+        let (evidence, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &shadows);
+        assert!(
+            problems.iter().any(|p| p.contains("f16 shadow arena root 1")),
+            "{problems:?}"
+        );
+        assert_eq!(evidence["f16_shadows"]["capacity_proof"], json!("mismatch"));
+    }
+
+    #[test]
+    fn slowlink_receipt_arena_rejects_census_count_mismatch_and_planned_roots_claimed_live() {
+        let plan = arena_plan(9, 2);
+        // Fewer observed capacities than planned roots.
+        let short: Vec<Option<usize>> = exact(&plan.weights).into_iter().take(8).collect();
+        let (evidence, problems) = arena_evidence(Some(&plan), &short, &[]);
+        assert!(problems.iter().any(|p| p.contains("census mismatch")), "{problems:?}");
+        assert_eq!(evidence["weights"]["capacity_proof"], json!("census_mismatch"));
+        assert_eq!(evidence["weights"]["actual"]["capacity_bytes"], json!(0));
+        // More shadow capacities than planned shadow roots.
+        let long = [Some(1024usize); 3];
+        let (_, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &long);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("f16 shadow arena") && p.contains("census mismatch")),
+            "{problems:?}"
+        );
+        // A planned eager weight root that is not live is planned, not actual.
+        for none_live in [Vec::new(), vec![None; 9]] {
+            let (evidence, problems) = arena_evidence(Some(&plan), &none_live, &[]);
+            assert!(
+                problems.iter().any(|p| p.contains("not live after the load")),
+                "{problems:?}"
+            );
+            assert_eq!(evidence["weights"]["actual"]["state"], json!("planned_only"));
+            assert_eq!(evidence["weights"]["actual"]["capacity_bytes"], json!(0));
+            assert_ne!(evidence["weights"]["capacity_proof"], json!("exact"));
+        }
+        let mut partial = exact(&plan.weights);
+        partial[8] = None;
+        let (evidence, problems) = arena_evidence(Some(&plan), &partial, &[]);
+        assert!(
+            problems.iter().any(|p| p.contains("1 of 9 planned roots")),
+            "{problems:?}"
+        );
+        assert_eq!(evidence["weights"]["capacity_proof"], json!("partial"));
+        // Observed capacities with no plan cannot be attributed to any arena.
+        let (evidence, problems) = arena_evidence(None, &exact(&plan.weights), &[]);
+        assert_eq!(evidence["present"], json!(false));
+        assert!(problems.iter().any(|p| p.contains("no arena plan")), "{problems:?}");
+        let (_, problems) = arena_evidence(None, &[], &[]);
+        assert!(problems.is_empty());
+        // The plan's presence follows the S1 profile, never the card or the model.
+        assert!(arena_presence_problems(true, true).is_empty());
+        assert!(arena_presence_problems(false, false).is_empty());
+        assert!(arena_presence_problems(false, true)[0].contains("without a model weight arena"));
+        assert!(arena_presence_problems(true, false)[0].contains("without the S1 profile"));
+    }
+
+    #[test]
+    fn slowlink_receipt_arena_counts_are_reported_never_selected_on() {
+        // The 9+2 fixture shape is not a gate: other model shapes pass untouched.
+        for (weights, shadows) in [(3usize, 1usize), (9, 2), (12, 5), (1, 0)] {
+            let plan = arena_plan(weights, shadows);
+            let (evidence, problems) = arena_evidence(
+                Some(&plan),
+                &exact(&plan.weights),
+                &exact(&plan.f16_shadows),
+            );
+            assert!(problems.is_empty(), "{weights}+{shadows}: {problems:?}");
+            assert_eq!(evidence["weights"]["roots"], json!(plan.weights.roots.len()));
+            assert_eq!(evidence["f16_shadows"]["roots"], json!(plan.f16_shadows.roots.len()));
+            assert_eq!(evidence["weights"]["members"], json!(weights));
+            assert_eq!(evidence["f16_shadows"]["members"], json!(shadows));
+        }
+        // An empty family has no roots, no proof to make and no problem.
+        let plan = arena_plan(2, 0);
+        let (evidence, problems) = arena_evidence(Some(&plan), &exact(&plan.weights), &[]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(evidence["f16_shadows"]["actual"]["state"], json!("empty"));
+        assert_eq!(evidence["f16_shadows"]["capacity_proof"], json!("none"));
+    }
+
+    #[test]
+    fn slowlink_receipt_arena_keeps_residual_nongating_and_the_ledger_margin_strict() {
+        let fixture = Fixture::parse(&fixture()).unwrap();
+        for mode in [Mode::Primitives, Mode::State, Mode::Product, Mode::Perf] {
+            for route in [Expect::LayerMajor, Expect::Incumbent] {
+                let ids = required_check_ids(mode, &fixture, route);
+                assert!(
+                    !ids.iter().any(|n| n.contains("arena") || n.contains("residual")),
+                    "{mode:?}: {ids:?}"
+                );
+            }
+        }
+        // Still seven primitives plus identity, placement and durability.
+        assert_eq!(PRIMITIVE_CASES.len(), 7);
+        let ids = required_check_ids(Mode::Primitives, &fixture, Expect::LayerMajor);
+        assert_eq!(ids.len(), 7 + 3);
+        // The census residual stays a non-gating diagnostic beside the arena evidence.
+        let diag = memory_diagnostic(&good_memory(), Ok(ledger()));
+        assert_eq!(diag["gating"], json!(false));
+        assert_eq!(diag["required"], json!(false));
+        // The 512 MiB safety margin of the ledger is unchanged by arenas.
+        assert_eq!(decomposition().safety_margin, 512 << 20);
+        assert_eq!(decomposition().allowed_non_weight(), Some(12 * GIB));
     }
 
     #[test]
