@@ -3037,6 +3037,352 @@ mod slowlink_ring {
         assert!(model.live.is_empty());
     }
 
+    // ── real E512 physical kinds (CPU logical binding proof) ─────────────
+    //
+    // Scalar metadata of the real artifact (`d2-default-gates/layout-proof.json`,
+    // header sha256 7a23ec6f0b4aa8347b1efea289519f6d0a030f1197a28ecd18f3f65f45407162:
+    // 512 experts, 48 aggregate gate/up (QT44) + 48 aggregate down (QT53) tensors, no
+    // arena or slab tensors) and of the slab layout: per-expert gate/up G, down D,
+    // interleaved stride P = G + D. No memory is allocated: every address below is
+    // a fabricated 64-bit value that the layout and tables only do arithmetic on.
+    const REAL_E: usize = 512;
+    const REAL_G: usize = 1_740_800;
+    const REAL_D: usize = 870_400;
+    const REAL_P: usize = 2_611_200;
+    /// 32 experts x P: the payload bound of one group page.
+    const REAL_GROUP_PAYLOAD: usize = 83_558_400;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Proj {
+        GateUp,
+        Down,
+    }
+
+    /// The two physical placements of the same logical experts.
+    #[derive(Clone, Copy)]
+    enum RealKind {
+        /// Two independent allocations: gate/up `A_G + e*G`, down `A_D + e*D`.
+        Aggregate {
+            cpu_g: usize,
+            alias_g: usize,
+            cpu_d: usize,
+            alias_d: usize,
+        },
+        /// One interleaved arena: gate/up `S + e*P`, down `S + e*P + G`.
+        Slab { cpu: usize, alias: usize },
+    }
+
+    impl RealKind {
+        fn aggregate() -> Self {
+            Self::Aggregate {
+                cpu_g: 0x7000_0000_0000,
+                alias_g: 0x7a00_0000_0000,
+                cpu_d: 0x7200_0000_1000,
+                alias_d: 0x7c00_0000_1000,
+            }
+        }
+
+        fn slab() -> Self {
+            Self::Slab {
+                cpu: 0x7000_0000_0000,
+                alias: 0x7a00_0000_0000,
+            }
+        }
+
+        /// The alias (device-visible) expert table the loader would hand over.
+        fn alias_experts(&self) -> Vec<Option<AliasExpert>> {
+            (0..REAL_E)
+                .map(|e| {
+                    let (gate_up_addr, down_addr) = match *self {
+                        Self::Aggregate {
+                            alias_g, alias_d, ..
+                        } => (alias_g + e * REAL_G, alias_d + e * REAL_D),
+                        Self::Slab { alias, .. } => {
+                            (alias + e * REAL_P, alias + e * REAL_P + REAL_G)
+                        }
+                    };
+                    Some(AliasExpert {
+                        codec: PanelCodec(1),
+                        gate_up_addr,
+                        gate_up_len: REAL_G,
+                        down_addr,
+                        down_len: REAL_D,
+                    })
+                })
+                .collect()
+        }
+
+        fn sources(&self, owner: Arc<dyn Any + Send + Sync>) -> R<LayerExpertSources> {
+            let experts = self.alias_experts();
+            // SAFETY: the sources are only used for address arithmetic here; the
+            // mock backend (and these tests) never dereference a source address.
+            unsafe {
+                match *self {
+                    Self::Aggregate {
+                        cpu_g,
+                        alias_g,
+                        cpu_d,
+                        alias_d,
+                    } => LayerExpertSources::from_alias_split(
+                        7,
+                        (cpu_g, alias_g, REAL_E * REAL_G),
+                        (cpu_d, alias_d, REAL_E * REAL_D),
+                        &experts,
+                        owner,
+                    ),
+                    Self::Slab { cpu, alias } => LayerExpertSources::from_alias(
+                        7,
+                        cpu,
+                        alias,
+                        REAL_E * REAL_P,
+                        &experts,
+                        owner,
+                    ),
+                }
+            }
+        }
+
+        /// Decode a CPU source address to `(expert, projection, byte offset in
+        /// the projection)` from the scalar metadata alone: independent of every
+        /// table the layout code consumes.
+        fn decode(&self, addr: usize) -> Option<(usize, Proj, usize)> {
+            let within = |base: usize, bytes: usize| {
+                addr.checked_sub(base).filter(|rel| *rel < bytes)
+            };
+            match *self {
+                Self::Aggregate { cpu_g, cpu_d, .. } => {
+                    if let Some(rel) = within(cpu_g, REAL_E * REAL_G) {
+                        Some((rel / REAL_G, Proj::GateUp, rel % REAL_G))
+                    } else {
+                        within(cpu_d, REAL_E * REAL_D)
+                            .map(|rel| (rel / REAL_D, Proj::Down, rel % REAL_D))
+                    }
+                }
+                Self::Slab { cpu, .. } => within(cpu, REAL_E * REAL_P).map(|rel| {
+                    let (e, r) = (rel / REAL_P, rel % REAL_P);
+                    if r < REAL_G {
+                        (e, Proj::GateUp, r)
+                    } else {
+                        (e, Proj::Down, r - REAL_G)
+                    }
+                }),
+            }
+        }
+    }
+
+    /// Prove, for the real E512 geometry of `kind`, that the page layout and the
+    /// rebased tables bind every pointer to the same logical
+    /// `(expert, projection, byte offset)` the source metadata names, for the first,
+    /// second and last 32-expert groups. Physical pointers are never compared.
+    fn prove_real_kind(kind: RealKind, expected_runs: usize) {
+        let owner = Arc::new(0u8);
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let sources = kind.sources(any).unwrap();
+        assert_eq!(Arc::strong_count(&owner), 2, "the sources retain the owner");
+        assert_eq!(sources.num_experts(), REAL_E);
+        assert_eq!(
+            sources.host_ranges().len(),
+            if matches!(kind, RealKind::Aggregate { .. }) { 2 } else { 1 }
+        );
+
+        let spec = PanelPoolSpec::uniform(2, 16, 32, REAL_E, REAL_G, REAL_D, 0, 0).unwrap();
+        let page_bytes = spec.page_bytes().unwrap();
+        assert_eq!(page_bytes, 83_595_264);
+        // Every page allocation is ~84 MB: nothing near the 1.3 GB slab range.
+        assert!(page_bytes < 100 << 20);
+        assert_eq!(32 * REAL_P, REAL_GROUP_PAYLOAD);
+        assert_eq!(REAL_P, REAL_G + REAL_D);
+
+        let groups = ExpertGroupPlan::partition(&sources, 32).unwrap();
+        assert_eq!(groups.len(), 16);
+        let page_base = 0x2_0000_0000usize;
+        for index in [0usize, 1, 15] {
+            let group = &groups[index];
+            let first = index * 32;
+            assert_eq!(
+                group.experts.as_slice(),
+                (first..first + 32).collect::<Vec<_>>().as_slice(),
+                "group {index} is [{first}, {})",
+                first + 32
+            );
+            let layout = plan_group_layout(&group.experts, &sources).unwrap();
+            // Payload bound: exactly 32 experts of G + D, no holes, no padding.
+            assert_eq!(layout.extent_bytes, REAL_GROUP_PAYLOAD);
+            assert_eq!(layout.submitted_bytes(), REAL_GROUP_PAYLOAD);
+            assert_eq!(layout.used, REAL_GROUP_PAYLOAD);
+            assert!(layout.used + ARENA_TAIL_PAD_BYTES <= page_bytes);
+            assert_eq!(layout.runs.len(), expected_runs, "group {index} runs");
+            // Alignment guard: every run starts 256-aligned at both ends, and
+            // each run's first and last byte decode inside the source ranges.
+            for run in &layout.runs {
+                assert_eq!(run.src % EXTENT_ALIGN, 0);
+                assert_eq!(run.dst % EXTENT_ALIGN, 0);
+                assert!(kind.decode(run.src).is_some(), "run start outside the sources");
+                assert!(
+                    kind.decode(run.src + run.len - 1).is_some(),
+                    "run end outside the sources"
+                );
+            }
+            // Poisoned tables: every outside entry must come out zero, every group
+            // entry must be a real (non-poison, non-zero) pointer.
+            let mut gate_up = vec![u64::MAX; REAL_E];
+            let mut down = vec![u64::MAX; REAL_E];
+            fill_tables(&layout, &group.experts, page_base, &mut gate_up, &mut down).unwrap();
+            for id in 0..REAL_E {
+                let inside = (first..first + 32).contains(&id);
+                for (name, table) in [("gate_up", &gate_up), ("down", &down)] {
+                    if inside {
+                        assert!(
+                            table[id] != 0 && table[id] != u64::MAX,
+                            "{name} entry {id} of group {index} was not filled"
+                        );
+                    } else {
+                        assert_eq!(table[id], 0, "{name} entry {id} outside group {index}");
+                    }
+                }
+            }
+            // Every pointer resolves, through the page layout, to the same logical
+            // (expert, projection, byte offset): first and last byte of each extent.
+            let resolve = |offset: usize| -> Option<(usize, Proj, usize)> {
+                let run = layout
+                    .runs
+                    .iter()
+                    .find(|r| r.dst <= offset && offset < r.dst + r.len)?;
+                kind.decode(run.src + (offset - run.dst))
+            };
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for &id in &group.experts {
+                for (proj, table, len) in [
+                    (Proj::GateUp, &gate_up, REAL_G),
+                    (Proj::Down, &down, REAL_D),
+                ] {
+                    let entry = usize::try_from(table[id]).unwrap();
+                    let offset = entry.checked_sub(page_base).expect("entry below the page");
+                    assert_eq!(offset % EXTENT_ALIGN, 0, "expert {id} {proj:?} unaligned");
+                    assert!(offset + len <= layout.used, "expert {id} {proj:?} past the payload");
+                    assert_eq!(resolve(offset), Some((id, proj, 0)), "expert {id} {proj:?} start");
+                    assert_eq!(
+                        resolve(offset + len - 1),
+                        Some((id, proj, len - 1)),
+                        "expert {id} {proj:?} end"
+                    );
+                    spans.push((offset, len));
+                }
+            }
+            // Extents are disjoint in the page and tile the payload exactly.
+            spans.sort_unstable();
+            assert_eq!(spans.len(), 64);
+            for pair in spans.windows(2) {
+                assert!(pair[0].0 + pair[0].1 <= pair[1].0, "overlapping extents");
+            }
+            let last = spans.last().unwrap();
+            assert_eq!(last.0 + last.1, layout.used);
+            assert_eq!(spans.iter().map(|s| s.1).sum::<usize>(), layout.used);
+        }
+        // The sources' own range guard: an extent running one byte past its
+        // range, or an alias outside every range, is refused.
+        let mut experts = kind.alias_experts();
+        if let Some(Some(last)) = experts.last_mut() {
+            last.down_len += 1;
+        }
+        // SAFETY: construction must fail before anything is used.
+        let overrun = unsafe {
+            match kind {
+                RealKind::Aggregate {
+                    cpu_g,
+                    alias_g,
+                    cpu_d,
+                    alias_d,
+                } => LayerExpertSources::from_alias_split(
+                    7,
+                    (cpu_g, alias_g, REAL_E * REAL_G),
+                    (cpu_d, alias_d, REAL_E * REAL_D),
+                    &experts,
+                    Arc::new(0u8),
+                ),
+                RealKind::Slab { cpu, alias } => LayerExpertSources::from_alias(
+                    7,
+                    cpu,
+                    alias,
+                    REAL_E * REAL_P,
+                    &experts,
+                    Arc::new(0u8),
+                ),
+            }
+        };
+        assert!(overrun.is_err(), "an extent past its range was accepted");
+        drop(sources);
+        assert_eq!(Arc::strong_count(&owner), 1, "the owner is released with the sources");
+    }
+
+    #[test]
+    fn slowlink_ring_real_e512_aggregate_binds_every_pointer_to_its_logical_extent() {
+        // Independent allocations: gate/up run then down run, never merged.
+        prove_real_kind(RealKind::aggregate(), 2);
+    }
+
+    #[test]
+    fn slowlink_ring_real_e512_interleaved_slab_binds_every_pointer_to_its_logical_extent() {
+        // One interleaved arena: gate/up and down of consecutive experts touch,
+        // so a whole group is one contiguous run.
+        prove_real_kind(RealKind::slab(), 1);
+    }
+
+    #[test]
+    fn slowlink_ring_real_e512_kinds_agree_on_logical_bindings_and_cross_kind_aliases_fail() {
+        // The same group decodes to the same logical triples under both kinds,
+        // although their physical runs, sizes and pointers differ.
+        let (agg, slab) = (RealKind::aggregate(), RealKind::slab());
+        let (sa, ss) = (
+            agg.sources(Arc::new(0u8)).unwrap(),
+            slab.sources(Arc::new(0u8)).unwrap(),
+        );
+        let ids: Vec<usize> = (480..512).collect();
+        let (la, ls) = (
+            plan_group_layout(&ids, &sa).unwrap(),
+            plan_group_layout(&ids, &ss).unwrap(),
+        );
+        assert_eq!((la.runs.len(), ls.runs.len()), (2, 1));
+        assert_eq!(la.used, ls.used);
+        for (index, &id) in ids.iter().enumerate() {
+            for (proj, len, a_off, s_off) in [
+                (Proj::GateUp, REAL_G, la.gate_up[index], ls.gate_up[index]),
+                (Proj::Down, REAL_D, la.down[index], ls.down[index]),
+            ] {
+                let find = |runs: &[CopyRun], off: usize| {
+                    runs.iter()
+                        .find(|r| r.dst <= off && off < r.dst + r.len)
+                        .map(|r| r.src + (off - r.dst))
+                        .unwrap()
+                };
+                let a = agg
+                    .decode(find(la.runs.as_slice(), a_off + len - 1))
+                    .unwrap();
+                let s = slab
+                    .decode(find(ls.runs.as_slice(), s_off + len - 1))
+                    .unwrap();
+                assert_eq!(a, (id, proj, len - 1));
+                assert_eq!(a, s, "expert {id} {proj:?} binds differently per kind");
+            }
+        }
+        // An aggregate alias table handed to the slab constructor (and the
+        // converse) falls outside the declared range and is refused.
+        let RealKind::Aggregate { alias_g, .. } = agg else { unreachable!() };
+        let RealKind::Slab { cpu, .. } = slab else { unreachable!() };
+        // SAFETY: construction must fail.
+        let wrong = unsafe {
+            LayerExpertSources::from_alias(
+                7,
+                cpu,
+                alias_g + REAL_E * REAL_G,
+                REAL_E * REAL_P,
+                &agg.alias_experts(),
+                Arc::new(0u8),
+            )
+        };
+        assert!(wrong.is_err());
+    }
+
     #[test]
     fn slowlink_ring_transport_owners_are_send() {
         fn assert_send<T: Send>() {}
