@@ -162,7 +162,9 @@ impl Mode {
     }
 }
 
-use hipfire_arch_qwen4::slowlink_admission::{purpose_tile_rows, AdmissionPurpose};
+use hipfire_arch_qwen4::slowlink_admission::{
+    purpose_tile_rows, AdmissionPurpose, GranuleCharge, SlowlinkCensus, SlowlinkProfile,
+};
 
 /// The admission purpose of a mode's load. Only the primitive cell is the Hold 1
 /// self-test (its diagnostics are charged inside the admitted reserve); every
@@ -396,6 +398,7 @@ fn usage_value(usage: &SessionCacheUsage) -> Value {
         "host_evictions_total": usage.host_evictions_total,
         "host_skips_total": usage.host_skips_total,
         "host_total_bytes": host_total,
+        "byte_units": "payload bytes (requested allocation sizes), not physical granule backing; the cache applies its own physical-budget check at admission",
         "pressure_host_policy": {
             "armed": usage.host_budget_bytes > 0,
             "host_budget_bytes": usage.host_budget_bytes,
@@ -459,6 +462,106 @@ fn attach_case_cache_evidence(detail: &mut Value) {
         &detail["cache_usage_after"],
     );
     detail["cache_evidence"] = evidence;
+}
+
+fn term_rows(terms: &[(&'static str, u64)]) -> Value {
+    Value::Array(
+        terms
+            .iter()
+            .map(|(name, bytes)| json!({"name": name, "bytes": bytes}))
+            .collect(),
+    )
+}
+
+fn checked_sum(parts: &[u64]) -> Option<u64> {
+    parts
+        .iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(*bytes))
+}
+
+/// The admitted profile's allocation-granule census, additive and separate
+/// from the sealed LOGICAL ledger. The census terms (seven owned, two budget)
+/// stay logical payload; the granule backing padding is reported per owner
+/// beside them and is never folded into a logical figure. `physical_*` are
+/// the logical bytes plus that padding, each counted once:
+/// `physical_owned = logical owned + S1 owner padding` and
+/// `physical_reserved = census total + (base + S1 owner) padding`, which must
+/// equal the profile's own `reserve_bytes()` (`profile_reserve_bytes`).
+/// Resident-layer padding is per admitted layer and reported on its own.
+/// Diagnostic evidence only: nothing here gates a verdict, and it is a
+/// source commitment, not a live allocation or an arena claim.
+fn granule_evidence(
+    census: &SlowlinkCensus,
+    granule: &GranuleCharge,
+    resident_layers: usize,
+    device_snapshot_budget_bytes: u64,
+    profile_reserve_bytes: Result<u64, String>,
+) -> Value {
+    let owned = census.owned_terms();
+    let budget = census.budget_terms();
+    let base = granule.base.terms();
+    let fixed = granule.terms();
+    let s1_padding = &fixed[base.len()..];
+    let owned_total = census.owned_total().ok();
+    let budget_total = checked_sum(&budget.map(|(_, bytes)| bytes));
+    let logical_reserve = census.total().ok();
+    let s1_padding_total = checked_sum(&s1_padding.iter().map(|(_, b)| *b).collect::<Vec<_>>());
+    let base_padding_total = granule.base.total().ok();
+    let padding_total = granule.total().ok();
+    let physical_owned = owned_total
+        .zip(s1_padding_total)
+        .and_then(|(logical, padding)| logical.checked_add(padding));
+    let physical_reserved = logical_reserve
+        .zip(padding_total)
+        .and_then(|(logical, padding)| logical.checked_add(padding));
+    let layers_padding = granule.layer.checked_mul(resident_layers as u64);
+    let (profile_reserve, profile_reserve_error) = match profile_reserve_bytes {
+        Ok(bytes) => (json!(bytes), Value::Null),
+        Err(error) => (Value::Null, json!(error)),
+    };
+    json!({
+        "units": "bytes; logical_* are payload (requested allocation sizes), backing_padding_* are the \
+                  allocation-granule rounding of the same owners' real allocations, physical_* are \
+                  logical + padding, counted once; a source commitment, not a live allocation",
+        "allocation_granule_bytes": granule.granule_bytes,
+        "logical_payload": {
+            "owned_bytes": owned_total,
+            "owned_terms": term_rows(&owned),
+            "budget_bytes": budget_total,
+            "budget_terms": term_rows(&budget),
+            "reserve_bytes": logical_reserve,
+        },
+        "backing_padding": {
+            "s1_owner_bytes": s1_padding_total,
+            "s1_owner_terms": term_rows(s1_padding),
+            "base_reserve_bytes": base_padding_total,
+            "base_reserve_terms": term_rows(&base),
+            "fixed_total_bytes": padding_total,
+            "per_resident_layer_bytes": granule.layer,
+            "resident_layers": resident_layers,
+            "resident_layers_bytes": layers_padding,
+        },
+        "physical": {
+            "owned_bytes": physical_owned,
+            "reserved_bytes": physical_reserved,
+            "profile_reserve_bytes": profile_reserve,
+            "profile_reserve_error": profile_reserve_error,
+            "reserve_consistent": physical_reserved.is_some()
+                && profile_reserve.as_u64() == physical_reserved,
+        },
+        "device_snapshot_budget_bytes": device_snapshot_budget_bytes,
+        "arena_claim": false,
+    })
+}
+
+fn profile_granule_evidence(profile: &SlowlinkProfile) -> Value {
+    granule_evidence(
+        &profile.census,
+        &profile.granule,
+        profile.resident_layers,
+        profile.device_snapshot_budget_bytes,
+        profile.reserve_bytes(),
+    )
 }
 
 /// How the gate's phase samples are taken, recorded in every sample.
@@ -2387,6 +2490,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                    "admitted_purpose": admitted_from(profile_now).map(|a| a.0),
                    "admitted_tile_rows": admitted_tile,
                    "admitted_device_snapshot_budget_bytes": profile_now.map(|p| p.device_snapshot_budget_bytes),
+                   "granule_census": profile_now.map_or(Value::Null, profile_granule_evidence),
                    "pressure_host_policy": usage_json(loaded.bundle.session_cache())["pressure_host_policy"].clone()}),
         );
         progress.checks(&checks);
@@ -3617,6 +3721,81 @@ mod slowlink_receipt_tests {
         attach_case_cache_evidence(&mut detail);
         assert_eq!(detail["cache_evidence"]["host_captures_delta"], json!(5));
         assert_eq!(detail["cache_evidence"]["after"]["host_pool_bytes"], json!(8192));
+    }
+
+    #[test]
+    fn slowlink_receipt_granule_census_is_additive_and_physical_is_logical_plus_padding() {
+        let census = SlowlinkCensus {
+            ring: 1_000,
+            lookahead: 2_000,
+            route_storage: 3_000,
+            a4_sidecars: 4_000,
+            group_scatter: 5_000,
+            arena: 6_000,
+            boundary_state: 7_000,
+            runtime_overhead: 100,
+            diagnostic: 10,
+        };
+        let mut granule = GranuleCharge {
+            granule_bytes: 2 << 20,
+            expert_pages: 11,
+            route_region: 22,
+            hc_arena: 33,
+            layer: 44,
+            ..GranuleCharge::default()
+        };
+        granule.base.weights = 500;
+        granule.base.state = 600;
+        let logical_owned = 1_000 + 2_000 + 3_000 + 4_000 + 5_000 + 6_000 + 7_000;
+        let logical_reserve = logical_owned + 100 + 10;
+        let s1_padding = granule.total().unwrap() - granule.base.total().unwrap();
+        assert!(s1_padding >= 11 + 22 + 33);
+        let reserve = logical_reserve + granule.total().unwrap();
+        let evidence = granule_evidence(&census, &granule, 10, 12345, Ok(reserve));
+        // Logical stays payload: the seven owned terms and two budget terms are
+        // exactly the census's, with no padding folded in.
+        assert_eq!(evidence["logical_payload"]["owned_bytes"], json!(logical_owned));
+        assert_eq!(evidence["logical_payload"]["budget_bytes"], json!(110));
+        assert_eq!(evidence["logical_payload"]["reserve_bytes"], json!(logical_reserve));
+        assert_eq!(evidence["logical_payload"]["owned_terms"].as_array().unwrap().len(), 7);
+        assert_eq!(evidence["logical_payload"]["budget_terms"].as_array().unwrap().len(), 2);
+        // Physical is logical + padding, each once, and matches the profile's reserve.
+        assert_eq!(evidence["allocation_granule_bytes"], json!(2u64 << 20));
+        assert_eq!(evidence["physical"]["owned_bytes"], json!(logical_owned + s1_padding));
+        assert_eq!(evidence["physical"]["reserved_bytes"], json!(reserve));
+        assert_eq!(evidence["physical"]["profile_reserve_bytes"], json!(reserve));
+        assert_eq!(evidence["physical"]["reserve_consistent"], json!(true));
+        // The padding terms sum to the fixed total once; the base owners are
+        // reported apart from the S1 owners and the per-layer slack is not a fixed term.
+        let padding = &evidence["backing_padding"];
+        assert_eq!(padding["fixed_total_bytes"], json!(granule.total().unwrap()));
+        assert_eq!(padding["base_reserve_bytes"], json!(1_100));
+        assert_eq!(padding["s1_owner_bytes"], json!(s1_padding));
+        assert_eq!(
+            padding["base_reserve_bytes"].as_u64().unwrap() + padding["s1_owner_bytes"].as_u64().unwrap(),
+            padding["fixed_total_bytes"].as_u64().unwrap()
+        );
+        assert_eq!(padding["per_resident_layer_bytes"], json!(44));
+        assert_eq!(padding["resident_layers_bytes"], json!(440));
+        assert_eq!(evidence["device_snapshot_budget_bytes"], json!(12345));
+        assert_eq!(evidence["arena_claim"], json!(false));
+        for key in ["units", "allocation_granule_bytes", "logical_payload", "backing_padding", "physical"] {
+            assert!(!evidence[key].is_null(), "{key}");
+        }
+        // A profile reserve that is not logical + padding is flagged, not hidden.
+        let off = granule_evidence(&census, &granule, 10, 0, Ok(reserve + 1));
+        assert_eq!(off["physical"]["reserve_consistent"], json!(false));
+        let err = granule_evidence(&census, &granule, 10, 0, Err("overflow".into()));
+        assert_eq!(err["physical"]["reserve_consistent"], json!(false));
+        assert_eq!(err["physical"]["profile_reserve_error"], json!("overflow"));
+        // No granule model (payload-only accounting): padding is zero and physical == logical.
+        let none = granule_evidence(&census, &GranuleCharge::default(), 10, 0, Ok(logical_reserve));
+        assert_eq!(none["backing_padding"]["fixed_total_bytes"], json!(0));
+        assert_eq!(none["physical"]["owned_bytes"], json!(logical_owned));
+        assert_eq!(none["physical"]["reserved_bytes"], json!(logical_reserve));
+        // The cache's device usage fields stay labelled payload, never physical backing.
+        let usage = usage_value(&usage_literal(1, 0, 0, [0; 4]));
+        assert!(usage["byte_units"].as_str().unwrap().starts_with("payload bytes"));
     }
 
     #[test]
