@@ -2096,9 +2096,10 @@ fn load_qwen4_rank_scoped(
     // S1 slow-link layer-major prefill (`HIPFIRE_QWEN4_SLOWLINK_PREFILL`, default
     // off until promoted). Selected here, before any placement is sized and
     // before any allocation: the probe-free checks first, the host link only
-    // for a load that passes them, then the joint placement (1536-row tile,
-    // prompt arena, expert page store, panel scratch, boundary state) which must
-    // still keep ten layers resident. Every other load keeps today's placement,
+    // for a load that passes them, then the joint placement at the purpose's
+    // tile (`AdmissionPurpose::Product`: the 768-row tile, prompt arena, expert
+    // page store, panel scratch, boundary state) which must still keep ten
+    // layers resident. Every other load keeps today's placement,
     // reserve and log byte for byte (zero S1 charge).
     let slowlink_mode = hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env();
     let slowlink_profile = {
@@ -2159,8 +2160,9 @@ fn load_qwen4_rank_scoped(
             },
         )?
     };
-    // The S1 profile sizes its placement from its own 1536-row tile, never the
-    // incumbent chunk; every other load keeps the incumbent placement chunk.
+    // The S1 profile sizes its placement from its own purpose tile (product:
+    // 768 rows), never the incumbent chunk; every other load keeps the
+    // incumbent placement chunk.
     let placement_chunk = slowlink_profile
         .as_ref()
         .map_or(placement_chunk, |profile| profile.tile_rows);
@@ -7577,6 +7579,9 @@ mod qwen4_slowlink_tests {
             checkpoint_stride_rows: 8192,
             window_rows: s1::S1_WINDOW_ROWS,
             link_gbps,
+            // The product loader's own purpose (never inferred from the
+            // diagnostic bytes): it admits the product tile.
+            purpose: s1::AdmissionPurpose::Product,
         }
     }
 
@@ -7653,7 +7658,8 @@ mod qwen4_slowlink_tests {
             assert_eq!(profile.is_some(), selected, "{link:?}");
             if let Some(profile) = profile {
                 assert_eq!(profile.resident_layers, 10);
-                assert_eq!(profile.tile_rows, 1536);
+                assert_eq!(profile.tile_rows, s1::S1_PRODUCT_TILE_ROWS);
+                assert_eq!(profile.purpose, s1::AdmissionPurpose::Product);
             }
         }
     }
