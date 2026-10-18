@@ -1330,9 +1330,10 @@ const F16_SHADOW_ROOT: &str =
 /// [`F16_SHADOW_ROOT`] or a [`F16_SHADOW_LAYER_SUFFIXES`] tensor of a trunk
 /// layer `0..num_layers`, the whole F16 matrix (`2 * rows * cols`, the full
 /// payload). A conservative cold bound: the shadows exist only when the F16
-/// WMMA arms run (exact gfx1201, long prefill, K a multiple of 64), but they
-/// are charged whenever the manifest owns the weights, never from the
-/// current warm cache. Entries are the manifest's own, so a profile or dtype
+/// WMMA arms run (shadow-capable device, `route_rows >= 512`, K a multiple
+/// of 64), but they are charged whenever the manifest owns the weights,
+/// never from the current warm cache. Callers gate it with
+/// [`f16_shadow_charge`]. Entries are the manifest's own, so a profile or dtype
 /// without them (an MQ-quantized trunk) charges nothing.
 pub fn f16_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
     f16_shadow_bytes_owned(weights, num_layers, |_| true, true)
@@ -1353,6 +1354,76 @@ pub fn f16_shadow_bytes_scope(
         |layer| scope.owns_layer(layer),
         scope.output,
     )
+}
+
+/// Largest `route_rows` ([`rdna_compute::Gpu::route_rows`]) any prefill
+/// forward of at most `chunk_rows` rows reaches on `arch`: the chunk itself,
+/// or the canonical prefill rows when the forward runs under the canonical
+/// routing scope (gfx1151's agent-turn append route for 48..511-row tiles
+/// and its opt-in batch-invariant profile, exactly
+/// `Qwen4Forward::route_scopes`). The F16 WMMA route and its lazy shadows are
+/// gated on THIS count, so the census must read it, not the raw chunk.
+pub fn f16_shadow_route_rows(arch: &str, chunk_rows: usize) -> usize {
+    use rdna_compute::prefill_invariant as invariant;
+    f16_shadow_route_rows_with(
+        arch,
+        chunk_rows,
+        invariant::qwen4_append_wmma_enabled(),
+        invariant::qwen4_append_wmma_min_rows(),
+        invariant::prefill_pm_invariant_enabled(),
+    )
+}
+
+/// [`f16_shadow_route_rows`] over explicit knob values (the process snapshot
+/// of `HIPFIRE_QWEN4_APPEND_WMMA`, its `_MIN_ROWS` and
+/// `HIPFIRE_PREFILL_PM_INVARIANT`), so the CPU proof does not depend on the
+/// environment.
+pub fn f16_shadow_route_rows_with(
+    arch: &str,
+    chunk_rows: usize,
+    append_enabled: bool,
+    append_min_rows: usize,
+    pm_invariant_opt_in: bool,
+) -> usize {
+    use rdna_compute::prefill_invariant as invariant;
+    // The batch-invariant profile is gfx1151's opt-in; gfx942 pins it but has
+    // no WMMA capability to shadow.
+    let pm_invariant = arch == "gfx1151" && pm_invariant_opt_in;
+    // Some prefill forward of at most `chunk_rows` rows takes the append route
+    // iff its largest sub-512-row size does (`qwen4_append_wmma_route`).
+    let append_rows = chunk_rows.min(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1);
+    let scoped = pm_invariant
+        || invariant::qwen4_append_wmma_route(
+            append_enabled,
+            true,
+            arch,
+            append_rows,
+            append_min_rows,
+            false,
+        );
+    if scoped {
+        chunk_rows.max(invariant::QWEN4_PREFILL_CANON_ROWS)
+    } else {
+        chunk_rows
+    }
+}
+
+/// The F16 weight shadow bytes a load of `weights` charges: the cold bound
+/// [`f16_shadow_bytes`] when the device is shadow-capable
+/// (`rdna_compute::gemm::qwen4_f16_shadow_capable`, shared with the runtime
+/// predicate) and `route_rows` reaches the route's threshold
+/// ([`rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]); 0 otherwise.
+pub fn f16_shadow_charge(
+    capable: bool,
+    route_rows: usize,
+    weights: &[WeightEntry],
+    num_layers: usize,
+) -> Result<u64, String> {
+    if capable && route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+        f16_shadow_bytes(weights, num_layers)
+    } else {
+        Ok(0)
+    }
 }
 
 fn f16_shadow_bytes_owned(
@@ -2713,21 +2784,19 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         scratch_mode,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
-    // Lazy F16 weight shadows of the BF16 owners the long-prefill F16 WMMA
-    // arms read (exact gfx1201): the cold bound from the manifest, not the
-    // warm cache.
-    // The F16 WMMA arms run only at `route_rows >= 512`
-    // (`gemm.rs` `qwen4_f16_wmma_applies`); no forward has more rows than the
-    // chunk and gfx1201 has no canonical-row routing scope, so a smaller chunk
-    // never creates a shadow.
-    let f16_shadows = if gpu.qwen4_f16_wmma_gfx1201()
-        && chunk_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-    {
-        f16_shadow_bytes(weights, config.num_hidden_layers)
-            .map_err(|error| format!("qwen4: {error}"))?
-    } else {
-        0
-    };
+    // Lazy BF16 -> F16 weight shadows of the owners the long-prefill F16 WMMA
+    // arms read: the cold bound from the manifest, never the warm cache. The
+    // capability is the runtime's own predicate (`Gpu::qwen4_f16_shadow_capable`,
+    // the half of `qwen4_f16_wmma_applies` that does not depend on a call) and
+    // the rows are the largest `route_rows` a prefill forward of this chunk can
+    // reach ([`f16_shadow_route_rows`]), so census and runtime cannot disagree.
+    let f16_shadows = f16_shadow_charge(
+        gpu.qwen4_f16_shadow_capable(),
+        f16_shadow_route_rows(&gpu.arch, chunk_rows),
+        weights,
+        config.num_hidden_layers,
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
@@ -2794,6 +2863,29 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         mtp_bytes,
         gather_bytes,
     })
+}
+
+/// The real artifact's rank-2 BF16 tensors (name, rows, cols) from its
+/// model-index metadata, no payload: the fixture every shadow-census test
+/// reads. 547 tensors, 291 of them F16-shadow owners.
+#[cfg(test)]
+pub(crate) fn j1778_bf16_manifest() -> Vec<WeightEntry> {
+    include_str!("../tests/fixtures/j1778_bf16_owners.tsv")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next().expect("tensor name");
+            let rows: usize = fields.next().expect("rows").parse().expect("rows");
+            let cols: usize = fields.next().expect("cols").parse().expect("cols");
+            WeightEntry::model(
+                name,
+                vec![rows, cols],
+                rdna_compute::DType::BF16,
+                hipfire_runtime::weight_manifest::ShardPolicy::Replicate,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3556,7 +3648,17 @@ mod tests {
         .unwrap();
         // The logged reserve of the shipped runs.
         assert_eq!(historical >> 20, 12150);
-        // Census: gfx1151 has no dense GDN scan, F16 shadow or split selector.
+        // Census: gfx1151 (shadow-capable, 8192-row chunk) holds the F16
+        // weight shadows of the real artifact's BF16 owners; no dense GDN scan
+        // or split selector.
+        let shadows = f16_shadow_charge(
+            true,
+            f16_shadow_route_rows_with("gfx1151", chunk, true, 48, false),
+            &j1778_bf16_manifest(),
+            config.num_hidden_layers,
+        )
+        .unwrap();
+        assert_eq!(shadows, 1_298_923_520);
         let state = state_census(&config, format, &full, chunk, Full).unwrap();
         let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
             hidden_size: config.hidden_size,
@@ -3580,10 +3682,21 @@ mod tests {
             gather: gather(full.tokens),
             runtime: 0,
         };
-        let reserve = AutoReserve::new(Some(historical), census).unwrap();
+        let without = AutoReserve::new(Some(historical), census).unwrap();
+        let reserve = AutoReserve::new(
+            Some(historical),
+            ReserveCensus {
+                f16_shadows: shadows,
+                ..census
+            },
+        )
+        .unwrap();
         // Both Halo artifacts fit fully resident under whichever formula wins
-        // (exact non-expert bytes 5,364,055,296 = 5,115.6 MiB).
-        assert_eq!(reserve.census_total >> 20, 9854, "{}", reserve.describe());
+        // (exact non-expert bytes 5,364,055,296 = 5,115.6 MiB). The census
+        // without the shadow bound is the pinned 9,854 MiB; the corrected
+        // census adds exactly the cold bound.
+        assert_eq!(without.census_total >> 20, 9854, "{}", without.describe());
+        assert_eq!(reserve.census_total, without.census_total + shadows);
         for (free, routed) in [
             (118_441u64 << 20, 62_475u64 << 20),
             (118_415 << 20, 51_375 << 20),
@@ -3689,6 +3802,286 @@ mod tests {
 
     fn bf16(name: &str, shape: &[usize]) -> WeightEntry {
         WeightEntry::model(name, shape.to_vec(), DType::BF16, ShardPolicy::Replicate)
+    }
+
+    /// Count and F16 bytes of the shadow owners of `weights`, by role: the
+    /// per-layer suffix, or `final_hc_down` for the mixer's root tensor.
+    fn shadow_owners_by_role(
+        weights: &[WeightEntry],
+    ) -> std::collections::BTreeMap<String, (usize, u64)> {
+        let mut roles = std::collections::BTreeMap::new();
+        for entry in weights {
+            let bytes = f16_shadow_bytes(std::slice::from_ref(entry), 48).unwrap();
+            if bytes == 0 {
+                continue;
+            }
+            let role = if entry.name == F16_SHADOW_ROOT {
+                "final_hc_down".to_string()
+            } else {
+                entry
+                    .name
+                    .strip_prefix("model.language_model.layers.")
+                    .and_then(|rest| rest.split_once('.'))
+                    .map(|(_, suffix)| suffix.to_string())
+                    .expect("a shadow owner is the root or a trunk layer tensor")
+            };
+            let slot: &mut (usize, u64) = roles.entry(role).or_default();
+            slot.0 += 1;
+            slot.1 += bytes;
+        }
+        roles
+    }
+
+    /// The real j1778 artifact (model-index metadata, no payload): 547 rank-2
+    /// BF16 tensors, 291 of which are lazily shadowed in F16, 1,298,923,520 B.
+    #[test]
+    fn the_real_j1778_artifact_has_291_f16_shadow_owners_of_1298923520_bytes() {
+        let weights = j1778_bf16_manifest();
+        assert_eq!(weights.len(), 547);
+        assert!(weights.iter().all(|entry| entry.dtype == DType::BF16));
+        assert!(weights.iter().all(|entry| entry.logical_shape.len() == 2));
+        let roles = shadow_owners_by_role(&weights);
+        let expected: [(&str, usize, u64); 9] = [
+            (
+                "attn_hyper_connection.input_mix_weight_down.weight",
+                48,
+                314_572_800,
+            ),
+            (
+                "mlp_hyper_connection.input_mix_weight_down.weight",
+                48,
+                314_572_800,
+            ),
+            ("mlp.gate.weight", 48, 125_829_120),
+            ("mlp.shared_expert.gate_proj.weight", 48, 157_286_400),
+            ("mlp.shared_expert.up_proj.weight", 48, 157_286_400),
+            ("mlp.shared_expert.down_proj.weight", 48, 157_286_400),
+            ("ple.key_proj.weight", 1, 52_428_800),
+            ("ple.value_proj.weight", 1, 13_107_200),
+            ("final_hc_down", 1, 6_553_600),
+        ];
+        assert_eq!(roles.len(), expected.len(), "{roles:?}");
+        for (role, owners, bytes) in expected {
+            assert_eq!(roles.get(role), Some(&(owners, bytes)), "{role}");
+        }
+        let owners: usize = roles.values().map(|(count, _)| count).sum();
+        assert_eq!(owners, 291);
+        assert_eq!(f16_shadow_bytes(&weights, 48), Ok(1_298_923_520));
+        // The other BF16 tensors (the direct `input_mix_weight_up` / shared
+        // gate readers, block-inject mixes, the MTP head) are not shadowed.
+        assert_eq!(weights.len() - owners, 256);
+        // Layers past the trunk own nothing; only the root mix is left.
+        assert_eq!(f16_shadow_bytes(&weights, 0), Ok(6_553_600));
+    }
+
+    /// The census charges exactly when the runtime predicate can hold: every
+    /// capability family, the 511/512-row threshold, the gfx1201 opt-in and
+    /// the canonical routing scopes that lift sub-512-row forwards to
+    /// `route_rows >= 512`. The expectations are written independently of the
+    /// predicates under test.
+    #[test]
+    fn shadow_census_agrees_with_the_runtime_route_predicate_across_capability_families() {
+        use rdna_compute::arch_caps::ArchCaps;
+        use rdna_compute::feature_flags::FeatureFlags;
+        use rdna_compute::gemm::{qwen4_f16_shadow_capable, qwen4_f16_wmma_applies_for};
+        let weights = j1778_bf16_manifest();
+        let bound = 1_298_923_520u64;
+        assert_eq!(f16_shadow_bytes(&weights, 48), Ok(bound));
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx1200", "gfx1030", "gfx942",
+        ] {
+            let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
+            for optin in [true, false] {
+                for chunk in [47usize, 48, 256, 511, 512, 1536, 8192] {
+                    for (append, pm_invariant) in [(true, false), (false, false), (true, true)] {
+                        let route_rows =
+                            f16_shadow_route_rows_with(arch, chunk, append, 48, pm_invariant);
+                        let charge = f16_shadow_charge(
+                            qwen4_f16_shadow_capable(&caps, optin),
+                            route_rows,
+                            &weights,
+                            48,
+                        )
+                        .unwrap();
+                        // Independent spec: WMMA-w32 parts, or gfx1201 with its
+                        // opt-in; rows reach 512 raw or through gfx1151's scope.
+                        let capable = matches!(arch, "gfx1100" | "gfx1101" | "gfx1151")
+                            || (arch == "gfx1201" && optin);
+                        let scoped =
+                            arch == "gfx1151" && (pm_invariant || (append && chunk >= 48));
+                        let reaches = chunk >= 512 || scoped;
+                        let label = format!(
+                            "{arch} optin {optin} chunk {chunk} append {append} pm {pm_invariant}"
+                        );
+                        assert_eq!(charge, if capable && reaches { bound } else { 0 }, "{label}");
+                        // The runtime predicate over the shadowed owners' K
+                        // values agrees: it holds for some owner iff the census
+                        // charges.
+                        let runtime = [2560usize, 640, 10240].into_iter().any(|k| {
+                            qwen4_f16_wmma_applies_for(&caps, optin, true, route_rows, k, true, true)
+                        });
+                        assert_eq!(runtime, charge > 0, "{label}");
+                    }
+                }
+            }
+        }
+        // The guards the census inherits stay in the runtime predicate: a
+        // non-BF16 weight, K not a multiple of 64, a recorder/capture and the
+        // opt-out never apply.
+        let caps = ArchCaps::new(
+            "gfx1100",
+            std::sync::Arc::new(FeatureFlags::for_test("gfx1100")),
+        );
+        assert!(qwen4_f16_wmma_applies_for(&caps, true, true, 512, 640, true, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, false, 512, 640, true, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 512, 8, true, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 511, 640, true, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 512, 640, false, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, true, 512, 640, true, false));
+    }
+
+    /// The shadows are physical owners DUPLICATING the original BF16 weights:
+    /// the weights base (`resident_split`'s non-expert bytes) already holds the
+    /// originals once; the cold bound adds only the F16 copies, once, in the
+    /// census.
+    #[test]
+    fn shadow_charge_adds_the_f16_copies_once_and_never_the_original_bf16_weights() {
+        let weights = j1778_bf16_manifest();
+        let original_bytes =
+            |entry: &WeightEntry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2);
+        let (non_expert, layer_experts) = resident_split(&weights, original_bytes).unwrap();
+        // No routed experts in this metadata slice: every original BF16 byte
+        // is a non-expert byte, counted once.
+        assert_eq!(layer_experts, 0);
+        assert_eq!(non_expert, 2_020_889_600);
+        let shadows = f16_shadow_bytes(&weights, 48).unwrap();
+        let shadowed_originals: u64 = weights
+            .iter()
+            .filter(|entry| f16_shadow_bytes(std::slice::from_ref(entry), 48).unwrap() > 0)
+            .map(|entry| original_bytes(entry).unwrap())
+            .sum();
+        // BF16 and F16 are both 2 bytes per element: the copy is as large as
+        // the original it shadows, and charged separately.
+        assert_eq!(shadows, shadowed_originals);
+        // Adding the entries to a manifest moves the weights base by the
+        // originals only; the reserve census moves by the F16 copies only,
+        // through its one shadow term.
+        let before = AutoReserve::new(None, census_with(0, 0, 0, 0, 0)).unwrap();
+        let after = AutoReserve::new(None, census_with(0, 0, 0, shadows, 0)).unwrap();
+        assert_eq!(
+            after.census_total - before.census_total,
+            shadows,
+            "the census moves by the shadow term alone"
+        );
+        assert_eq!(after.placement_bytes(true), after.census_total);
+    }
+
+    /// The corrected census does not change the incumbent's reserve-selection
+    /// POLICY (`max(historical floor, census)`; floor retired where the census
+    /// carries the runtime): it only feeds the census the capability the
+    /// runtime already has. Prints the actual reserve impact per chunk on the
+    /// real artifact's gfx1100 discrete (Legacy KV) load.
+    #[test]
+    fn shadow_census_keeps_the_incumbent_reserve_policy_and_reports_its_impact() {
+        let config = crate::config::compact_test_config();
+        // The gate's actual state formats: Q8 QSA K/V and Q8 GDN.
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let weights = j1778_bf16_manifest();
+        let max_seq = 16_640usize;
+        let mut rows = Vec::new();
+        for chunk in [1536usize, 4096, 8192] {
+            let context =
+                crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Legacy, max_seq, max_seq, 1);
+            let reserve_context = crate::Qwen4ContextCommit::for_expert_reserve(
+                crate::Qwen4KvBackend::Legacy,
+                false,
+                max_seq,
+                chunk,
+                1,
+            );
+            let historical = auto_vram_reserve(
+                &config,
+                &reserve_context,
+                chunk,
+                Full,
+                format.layout(),
+                None,
+                None,
+            )
+            .unwrap();
+            let state = state_census(&config, format, &context, chunk, Full).unwrap();
+            let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+                hidden_size: config.hidden_size,
+                moe_intermediate_size: config.moe_intermediate_size,
+                num_experts: config.num_experts,
+                top_k: config.num_experts_per_tok,
+                hc_count: config.hc_count,
+                hc_lowrank: config.hc_lowrank,
+                gdn_format: None,
+                routed_i4: true,
+                include_short_tails: true,
+            };
+            let census = |f16_shadows: u64| ReserveCensus {
+                qsa_context: state.qsa_context,
+                state: state.state,
+                forward: state.forward,
+                f16_shadows,
+                workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims)
+                    .unwrap(),
+                qsa_selector: 0,
+                mtp: 0,
+                gather: 0,
+                runtime: 0,
+            };
+            let shadows = f16_shadow_charge(
+                true,
+                f16_shadow_route_rows_with("gfx1100", chunk, true, 48, false),
+                &weights,
+                config.num_hidden_layers,
+            )
+            .unwrap();
+            assert_eq!(shadows, 1_298_923_520);
+            let old = AutoReserve::new(Some(historical), census(0)).unwrap();
+            let new = AutoReserve::new(Some(historical), census(shadows)).unwrap();
+            // The policy is unchanged: max(historical, census) wherever the
+            // floor lives, the census alone for S1 (`placement_bytes(true)`).
+            assert_eq!(new.bytes(), historical.max(new.census_total));
+            assert_eq!(new.placement_bytes(false), new.bytes());
+            assert_eq!(new.placement_bytes(true), new.census_total);
+            assert_eq!(new.census_total - old.census_total, shadows);
+            if chunk == 1536 {
+                // The 1,536-row incumbent: the measured census base and the
+                // historical floor still win by a wide margin.
+                assert_eq!(old.census_total, 2_237_111_724);
+                assert_eq!(
+                    new.bytes(),
+                    old.bytes(),
+                    "incumbent reserve unchanged at 1536"
+                );
+                assert_eq!(new.winner(), "historical floor");
+            }
+            rows.push(serde_json::json!({
+                "chunk_rows": chunk,
+                "historical_floor_bytes": historical,
+                "census_without_shadows_bytes": old.census_total,
+                "census_with_shadows_bytes": new.census_total,
+                "f16_shadow_bytes": shadows,
+                "incumbent_reserve_before_bytes": old.bytes(),
+                "incumbent_reserve_after_bytes": new.bytes(),
+                "incumbent_reserve_delta_bytes": new.bytes() - old.bytes(),
+                "winner_before": old.winner(),
+                "winner_after": new.winner(),
+            }));
+        }
+        println!(
+            "SLOWLINK_SHADOW_RESERVE_IMPACT {}",
+            serde_json::to_string(&rows).unwrap()
+        );
     }
 
     #[test]

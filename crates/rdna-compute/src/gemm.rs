@@ -429,6 +429,40 @@ static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> =
 /// arm is slower below ~450; the others break even or win).
 pub const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
 
+/// The capability half of the Qwen4 F16 WMMA route, the ONE predicate behind
+/// both the runtime ([`Gpu::qwen4_f16_wmma_applies`]) and the placement census
+/// of the model-lifetime BF16 -> F16 weight shadows
+/// (`Gpu::ensure_bf16_f16_shadow`): gfx11 wave32 WMMA, or the gfx1201 opt-in
+/// (`gfx1201_optin`, the knob behind [`Gpu::qwen4_f16_wmma_gfx1201`]).
+/// Capability, never an arch name: every part with `has_wmma_w32` runs the
+/// route.
+pub fn qwen4_f16_shadow_capable(caps: &crate::arch_caps::ArchCaps, gfx1201_optin: bool) -> bool {
+    caps.has_wmma_w32() || (caps.is_gfx1201() && gfx1201_optin)
+}
+
+/// The whole route predicate of [`Gpu::qwen4_f16_wmma_applies`] over explicit
+/// facts, so a CPU proof can compare the runtime against the placement census
+/// without a device: capability ([`qwen4_f16_shadow_capable`]), a BF16
+/// weight, `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`, `K % 64 == 0`, no
+/// recorder or capture active (`route_open`) and not opted out
+/// (`f16_wmma_enabled`).
+pub fn qwen4_f16_wmma_applies_for(
+    caps: &crate::arch_caps::ArchCaps,
+    gfx1201_optin: bool,
+    weight_is_bf16: bool,
+    route_rows: usize,
+    k: usize,
+    route_open: bool,
+    f16_wmma_enabled: bool,
+) -> bool {
+    qwen4_f16_shadow_capable(caps, gfx1201_optin)
+        && weight_is_bf16
+        && route_rows >= QWEN4_F16_WMMA_MIN_TOKENS
+        && k % 64 == 0
+        && route_open
+        && f16_wmma_enabled
+}
+
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
 ///
@@ -28823,17 +28857,29 @@ impl Gpu {
     }
 
     /// Whether the Qwen4 F16 WMMA route applies to a `[M × K]` BF16 weight at
-    /// `batch_size` rows: gfx11 WMMA or gfx1201 ([`Gpu::qwen4_f16_wmma_gfx1201`]),
+    /// `batch_size` rows: gfx11 WMMA or gfx1201 ([`qwen4_f16_shadow_capable`]),
     /// >= QWEN4_F16_WMMA_MIN_TOKENS rows, K % 64 == 0, no recorder/capture
-    /// active, not opted out.
+    /// active, not opted out. The placement census charges the lazy F16
+    /// shadows this route creates from the same capability predicate
+    /// ([`Gpu::qwen4_f16_shadow_capable`]).
     pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
-        (self.arch_caps.has_wmma_w32() || self.qwen4_f16_wmma_gfx1201())
-            && weight.dtype == DType::BF16
-            && self.route_rows(batch_size) >= QWEN4_F16_WMMA_MIN_TOKENS
-            && k % 64 == 0
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-            && *QWEN4_F16_WMMA
+        qwen4_f16_wmma_applies_for(
+            &self.arch_caps,
+            *QWEN4_F16_WMMA_GFX1201,
+            weight.dtype == DType::BF16,
+            self.route_rows(batch_size),
+            k,
+            !self.replay.is_recording() && !self.graphs.capture_mode,
+            *QWEN4_F16_WMMA,
+        )
+    }
+
+    /// The device's capability half of [`Self::qwen4_f16_wmma_applies`]
+    /// ([`qwen4_f16_shadow_capable`] with the gfx1201 opt-in knob): whether
+    /// this device can ever create the model-lifetime BF16 -> F16 weight
+    /// shadows. The placement census reads exactly this.
+    pub fn qwen4_f16_shadow_capable(&self) -> bool {
+        qwen4_f16_shadow_capable(&self.arch_caps, *QWEN4_F16_WMMA_GFX1201)
     }
 
     /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
