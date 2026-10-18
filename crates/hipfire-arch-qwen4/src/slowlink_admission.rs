@@ -856,7 +856,14 @@ pub fn diagnostic_budget_bytes(
         n_exp: geometry.num_experts,
         mi: geometry.moe_intermediate,
         binding_experts: limits.experts_per_slot.min(geometry.num_experts),
-        k1_rows: 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
+        // Slab: the few-row K1 arm (3 rows). Aggregate: the F32-tail calls
+        // the k1_tail_cohort runs, up to the largest 2..511-row F32 tile
+        // (one 9..511-row call beside the 3-row arm), so the budget is never
+        // understated.
+        k1_rows: match geometry.route {
+            WindowRoute::SlabIu4 => 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
+            WindowRoute::Aggregate => S1_F32_TILE_ROWS_MAX,
+        },
         shared_intermediate: geometry.shared_intermediate,
         route: geometry.route,
     };
@@ -2146,7 +2153,7 @@ mod tests {
         assert_eq!(GATE_UP_LAYER + DOWN_LAYER, 1_336_934_400);
         // The S1 extras on the real fixture (no MTP) and the safety margin.
         let (_, _, extras) = census_of(&inputs(0)).unwrap();
-        assert_eq!(extras.owned_total().unwrap(), 2_543_092_544);
+        assert_eq!(extras.owned_total().unwrap(), 2_543_094_592);
         assert_eq!(
             crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
             536_870_912
@@ -2196,7 +2203,7 @@ mod tests {
     /// load, the S1 allocations and the self-test peak is at least the 512 MiB
     /// safety margin (1,352,367,296 B before the diagnostics, 1,134,546,112 B
     /// after them); without it the same inputs admit eleven layers and only
-    /// 15,432,896 B of free remain.
+    /// 15,430,848 B of free remain.
     #[test]
     fn slowlink_residency_j1761_admission_keeps_ten_layers_and_projects_the_margin() {
         use crate::expert_residency::{
@@ -2308,7 +2315,7 @@ mod tests {
             assert_eq!(profile.tile_rows, 1536, "{label}");
             assert_eq!(profile.pages.total_pages(), 18, "{label}");
             let owned = profile.census.owned_total().unwrap();
-            assert_eq!(owned, 2_543_092_544, "{label}");
+            assert_eq!(owned, 2_543_094_592, "{label}");
             assert_eq!(profile.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
             assert_eq!(profile.census.diagnostic, diagnostic);
             // Projected free after the load (weights, tile census and the
@@ -2327,7 +2334,7 @@ mod tests {
         }
 
         // Without the generic budget the same inputs admit eleven layers and
-        // the projected free is 15,432,896 B, far below the margin: the j1761
+        // the projected free is 15,430,848 B, far below the margin: the j1761
         // shortfall, reproduced on the CPU. (The primitive self-test peak,
         // which the one-time census does not hold live, then makes the actual
         // OOM plausible.)
@@ -2344,7 +2351,7 @@ mod tests {
         let projected_without = FREE_PRELOAD
             .checked_sub(used_without)
             .expect("still fits the card");
-        assert_eq!(projected_without, 15_432_896);
+        assert_eq!(projected_without, 15_430_848);
         assert!(projected_without < MARGIN);
     }
 
@@ -2634,9 +2641,10 @@ mod tests {
         };
         let (pages, arena, census) = census_of(&inputs).unwrap();
         let s1_total = census.owned_total().unwrap();
-        // Route storage includes D's `k1_shared` (245,760 B): 386,070,784 B,
-        // charged with A4 and the grouped-scatter scratch at 471,924,992 B.
-        assert_eq!(s1_total, 2_543_092_544, "S1 layout, no MTP");
+        // Route storage includes D's `k1_shared` (245,760 B) and the cohort
+        // count words (2,048 B): 386,072,832 B, charged with A4 and the
+        // grouped-scatter scratch at 471,927,040 B.
+        assert_eq!(s1_total, 2_543_094_592, "S1 layout, no MTP");
         // The ledger's sums agree before anything is emitted: the owned terms
         // sum to the owned total, and owned + budgets is the placement reserve.
         let owned_sum: u64 = census.owned_terms().iter().map(|(_, bytes)| bytes).sum();
@@ -2657,7 +2665,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             mtp_census.owned_total().unwrap(),
-            2_543_133_504,
+            2_543_135_552,
             "S1 layout, native MTP"
         );
         assert_eq!(census.boundary_state, 4 * 34_128_016);
