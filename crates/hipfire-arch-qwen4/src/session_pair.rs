@@ -272,6 +272,59 @@ pub const SLOWLINK_PRIMITIVES: [&str; 7] = [
     "zero_row_panel",
 ];
 
+/// Whether a case report honors the frozen pass/fail shape for `name`:
+/// `name` equal, `status` `pass`/`fail`, `mismatches` a `u64`, `detail` present.
+fn primitive_report_honored(name: &str, case: &Value) -> bool {
+    case.get("name").and_then(Value::as_str) == Some(name)
+        && matches!(
+            case.get("status").and_then(Value::as_str),
+            Some("pass" | "fail")
+        )
+        && case.get("mismatches").and_then(Value::as_u64).is_some()
+        && case.get("detail").is_some()
+}
+
+/// The independent error report for one case: names the case, carries no
+/// mismatch count (nothing was measured).
+fn primitive_error_case(name: &str, error: String) -> Value {
+    json!({
+        "name": name,
+        "status": "error",
+        "mismatches": Value::Null,
+        "detail": { "error": error },
+    })
+}
+
+/// Invoke `run` once per requested case, in order, each independently: an
+/// `Err` from one case, or a report that does not honor the frozen shape,
+/// becomes that case's own `status:"error"` entry (naming that case) and the
+/// remaining cases still run. Returns `{"cases":[..]}` with exactly one entry
+/// per requested name. This is the production collector
+/// `Qwen4Bundle::slowlink_primitive_selftest` runs its real owners through.
+pub(crate) fn collect_primitive_reports(
+    cases: &[&str],
+    mut run: impl FnMut(&str) -> Result<Value, String>,
+) -> Value {
+    let out: Vec<Value> = cases
+        .iter()
+        .map(|&name| match run(name) {
+            Err(error) => primitive_error_case(
+                name,
+                format!("slow-link primitive {name:?} could not run: {error}"),
+            ),
+            Ok(case) if primitive_report_honored(name, &case) => case,
+            Ok(case) => primitive_error_case(
+                name,
+                format!(
+                    "slow-link primitive {name:?} report does not carry \
+                     name/status/mismatches/detail: {case}"
+                ),
+            ),
+        })
+        .collect();
+    json!({ "cases": out })
+}
+
 /// Keys every receipt carries (`injection_consumed` is added on read).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SLOWLINK_RECEIPT_KEYS: [&str; 21] = [
@@ -854,12 +907,18 @@ impl Qwen4Bundle {
 
     /// Production-primitive self-test on the loaded bundle's real admitted S1
     /// transport/dispatch owners. Returns
-    /// `{"cases":[{"name","status":"pass"|"fail","mismatches":u64,"detail"}, ..]}`
-    /// for exactly the requested `cases`, in order. Every name is validated
-    /// before any diagnostic work; `Err` for an unknown/empty request, a load
-    /// without an admitted profile, a bundle that cannot run it now (open
-    /// window, other topology), a forward failure, or a case report that does
-    /// not honor the frozen shape. Never a pass by default.
+    /// `{"cases":[{"name","status","mismatches","detail"}, ..]}` for exactly
+    /// the requested `cases`, in order; `status` is `"pass"`/`"fail"` with a
+    /// measured `mismatches` (`u64`), or `"error"` with `mismatches: null` and
+    /// `detail: {"error": <string naming that case>}` when that case's own
+    /// setup/run failed or its report did not honor the frozen shape. Each
+    /// named case is invoked independently (its own T/D setup, drain and
+    /// restore): a failed case never stops, and is never reported on behalf
+    /// of, another case, and a failed setup never carries a fabricated
+    /// mismatch count. `Err` only for a global fault before any diagnostic
+    /// work: an unknown/empty request, a load without an admitted profile, a
+    /// bundle that cannot run it now (open window, other topology), or
+    /// missing forward ownership. Never a pass by default.
     pub fn slowlink_primitive_selftest(
         &mut self,
         gpu: &mut Gpu,
@@ -889,40 +948,13 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
-        let mut reports: Vec<Result<Value, String>> = Vec::with_capacity(cases.len());
-        for &name in cases {
-            let report = forward
+        let report = collect_primitive_reports(cases, |name| {
+            forward
                 .slowlink_primitive_selftest(self, gpu, name)
-                .map_err(|error| error.to_string());
-            let failed = report.is_err();
-            reports.push(report);
-            if failed {
-                break;
-            }
-        }
+                .map_err(|error| error.to_string())
+        });
         self.execution = Some(forward);
-        let mut out = Vec::with_capacity(cases.len());
-        for (&name, report) in cases.iter().zip(reports) {
-            let case = report.map_err(|error| {
-                BundleError::Forward(format!(
-                    "slow-link primitive {name:?} could not run: {error}"
-                ))
-            })?;
-            let honored = case.get("name").and_then(Value::as_str) == Some(name)
-                && matches!(
-                    case.get("status").and_then(Value::as_str),
-                    Some("pass" | "fail")
-                )
-                && case.get("mismatches").and_then(Value::as_u64).is_some()
-                && case.get("detail").is_some();
-            if !honored {
-                return Err(BundleError::Forward(format!(
-                    "slow-link primitive {name:?} report does not carry name/status/mismatches/detail: {case}"
-                )));
-            }
-            out.push(case);
-        }
-        Ok(json!({ "cases": out }))
+        Ok(report)
     }
 
     fn slowlink_begin_request(&mut self) {
@@ -2817,5 +2849,118 @@ mod slowlink_txn_tests {
             assert_eq!(SlowlinkFailPoint::parse(name), Some(point));
         }
         assert_eq!(SlowlinkFailPoint::parse("during-panel"), None);
+    }
+
+    fn passing(name: &str) -> Value {
+        json!({"name": name, "status": "pass", "mismatches": 0u64, "detail": {"rows": 1}})
+    }
+
+    fn collect(
+        fail_at: &[usize],
+        malformed_at: &[usize],
+    ) -> (Vec<String>, Vec<Value>) {
+        let mut invoked = Vec::new();
+        let report = collect_primitive_reports(&SLOWLINK_PRIMITIVES, |name| {
+            let index = invoked.len();
+            invoked.push(name.to_string());
+            if fail_at.contains(&index) {
+                Err(format!("setup of {name} failed"))
+            } else if malformed_at.contains(&index) {
+                Ok(json!({"name": name, "status": "pass"}))
+            } else {
+                Ok(passing(name))
+            }
+        });
+        let cases = report["cases"].as_array().expect("cases array").clone();
+        (invoked, cases)
+    }
+
+    fn assert_ordered_names(cases: &[Value]) {
+        assert_eq!(cases.len(), SLOWLINK_PRIMITIVES.len());
+        for (case, name) in cases.iter().zip(SLOWLINK_PRIMITIVES) {
+            assert_eq!(case["name"], name);
+        }
+    }
+
+    fn assert_error_case(case: &Value, name: &str) {
+        assert_eq!(case["status"], "error");
+        assert!(case["mismatches"].is_null(), "no fabricated count: {case}");
+        let error = case["detail"]["error"].as_str().expect("error string");
+        assert!(error.contains(&format!("{name:?}")), "error names its case: {error}");
+        for other in SLOWLINK_PRIMITIVES.iter().filter(|other| **other != name) {
+            assert!(!error.contains(other), "error carries {other}'s context: {error}");
+        }
+    }
+
+    #[test]
+    fn primitive_collector_runs_all_seven_in_order_when_all_pass() {
+        let (invoked, cases) = collect(&[], &[]);
+        assert_eq!(invoked, SLOWLINK_PRIMITIVES);
+        assert_ordered_names(&cases);
+        for case in &cases {
+            assert_eq!(case["status"], "pass");
+            assert_eq!(case["mismatches"], 0u64);
+        }
+    }
+
+    #[test]
+    fn primitive_collector_first_and_middle_errors_do_not_stop_or_infect_others() {
+        for failing in [0usize, 3, 6] {
+            let (invoked, cases) = collect(&[failing], &[]);
+            assert_eq!(invoked, SLOWLINK_PRIMITIVES, "all 7 invoked, failing {failing}");
+            assert_ordered_names(&cases);
+            for (index, case) in cases.iter().enumerate() {
+                if index == failing {
+                    assert_error_case(case, SLOWLINK_PRIMITIVES[index]);
+                } else {
+                    assert_eq!(*case, passing(SLOWLINK_PRIMITIVES[index]), "retained pass");
+                }
+            }
+            let errors = cases.iter().filter(|case| case["status"] == "error").count();
+            assert_eq!(errors, 1, "one error, not seven");
+        }
+    }
+
+    #[test]
+    fn primitive_collector_malformed_report_is_that_cases_error_only() {
+        let (invoked, cases) = collect(&[1], &[4]);
+        assert_eq!(invoked, SLOWLINK_PRIMITIVES);
+        assert_ordered_names(&cases);
+        assert_error_case(&cases[1], SLOWLINK_PRIMITIVES[1]);
+        assert_error_case(&cases[4], SLOWLINK_PRIMITIVES[4]);
+        assert!(cases[4]["detail"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not carry"));
+        for index in [0usize, 2, 3, 5, 6] {
+            assert_eq!(cases[index], passing(SLOWLINK_PRIMITIVES[index]));
+        }
+    }
+
+    #[test]
+    fn primitive_collector_rejects_misnamed_and_non_integer_reports() {
+        let report = collect_primitive_reports(&["zero_row_panel", "k1_tail_cohort"], |name| {
+            Ok(match name {
+                "zero_row_panel" => passing("k1_tail_cohort"),
+                _ => json!({"name": name, "status": "pass", "mismatches": -1, "detail": {}}),
+            })
+        });
+        let cases = report["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0]["name"], "zero_row_panel");
+        assert_eq!(cases[0]["status"], "error");
+        assert!(cases[0]["mismatches"].is_null());
+        assert_eq!(cases[1]["name"], "k1_tail_cohort");
+        assert_eq!(cases[1]["status"], "error");
+        assert!(cases[1]["mismatches"].is_null());
+    }
+
+    #[test]
+    fn primitive_collector_keeps_measured_fail_with_its_count() {
+        let report = collect_primitive_reports(&["delayed_reader_reuse"], |name| {
+            Ok(json!({"name": name, "status": "fail", "mismatches": 3u64, "detail": {}}))
+        });
+        assert_eq!(report["cases"][0]["status"], "fail");
+        assert_eq!(report["cases"][0]["mismatches"], 3u64);
     }
 }
