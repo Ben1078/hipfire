@@ -1,0 +1,212 @@
+{
+ "hold": "1",
+ "census_final": true,
+ "pending_final": [],
+ "census_role": "INFORMATION only: exact source-owner capacity arithmetic of what the S1 aggregate-route product and primitive-selftest purposes own at the real fixture (CPU census of declared source inputs, expressed as the MODEL of queried-granule/observed allocator capacity over those payloads; not a GPU physical-backing or recovery measurement, never a driver figure, never gated). The Hold 1 product question is the observed free-VRAM headroom (check_headroom.py: external 20 ms sysfs sampler AND in-process hipMemGetInfo pre_load/post_load/end, both >= 536,870,912 B); the 1 GiB runtime budget and the 512 MiB safety margin are unchanged and the slack over them is non-gating information.",
+ "source_emit": "SOURCE-CENSUS-R4.json (schema s1.source_census.v4): payload census SLOWLINK_J1778_CHOSEN_PROFILES (log line 816), owning allocation inventory (line 820) and individual-owner frontier (line 821) from CPU source 32c507c7b5cecab23cf6e14b001d4d87898c0416, tree 83a3e87203e8af97ba6d1f97bb3712a69e2ff5bf, base 0a3b67cb12ef63b60e7ea40a66689b99e3dcf981; holds/cpu-r4-arena-run6-logs/01-slowlink-residency.log, raw-log SHA-256 e45763b71a7ef913122a7eddc8c987d2bac3e9ad567c842acae8a33a99ed1dd4; canonical per-root arena plan from holds/CPU-R4-ARENA-RUN6.json. Exact owning getters (payload) plus the queried-granule backing model, not a GPU measurement; the source proof also preserves every workspace subterm.",
+ "route": "aggregate",
+ "fixture": {
+  "hidden_size": 2560,
+  "num_experts": 512,
+  "num_experts_per_tok": 10,
+  "moe_intermediate_size": 640,
+  "shared_expert_intermediate_size": 640,
+  "trunk_layers": 48,
+  "weight_layers_in_index": 49,
+  "mtp_weights": "1 layer of weights, native_mtp=false (weights fulfilled, runtime state/scratch reserve dropped)",
+  "native_mtp": false,
+  "gdn_state_format": "q8",
+  "qsa_state_format": "q8",
+  "max_seq": 16640,
+  "resident_expert_layers": 10,
+  "window_rows": 16384,
+  "page_count": 18,
+  "arch": "gfx1100",
+  "cold_f16": {
+   "bytes": 1298923520,
+   "tile_census_term": "f16_weight_shadow_bytes",
+   "tile_census_term_count": 1,
+   "extras_term_count": 0,
+   "note": "the cold BF16->F16 weight shadow PAYLOAD bound 1,298,923,520 is charged ONCE, as exactly one s1_tile_census_terms term of each purpose profile (and stated by f16_shadow_cold_bound_bytes); it is in no extras term and no second F16 term exists. Its modelled granule backing (1,300,234,240 = payload + 1,310,720 padding) is NOT an F16 term: the padding is carried inside the named allocation_backing_padding_bytes term of the tile census",
+   "backing_bytes": 1300234240
+  }
+ },
+ "device_weights": {
+  "non_expert_bytes": 5375000576,
+  "expert_layer_bytes": 1337982976,
+  "resident_expert_layers": 10,
+  "resident_expert_bytes": 13379829760,
+  "basis": "PHYSICAL (modelled queried-granule/observed-capacity) backing of the canonical arena plan: non-expert 5,375,000,576 + 10 x 1,337,982,976 = 18,754,830,336; NOT a per-allocation physical or recovery measurement",
+  "model_payload_metadata": {
+   "note": "model-index PAYLOAD bytes (logical tensor sizes), recorded separately from the physical backing above; informational, the profiles charge the backing",
+   "non_expert_payload_bytes": 5364055296,
+   "expert_layer_payload_bytes": 1336934400,
+   "resident_expert_payload_bytes": 13369344000,
+   "total_payload_bytes": 18733399296,
+   "non_expert_backing_padding_bytes": 10945280,
+   "expert_layer_backing_padding_bytes": 1048576,
+   "granule_bytes": 2097152,
+   "source": "SOURCE-CENSUS-R4.json physical_profiles[].weights and arena_backing_model"
+  }
+ },
+ "profiles": {
+  "product": {
+   "purpose": "product",
+   "tile_rows": 768,
+   "resident_expert_layers": 10,
+   "window_rows": 16384,
+   "page_count": 18,
+   "device_weights_bytes": 18754830336,
+   "s1_tile_census_bytes": 2761329452,
+   "s1_tile_census_terms": [
+    {"name": "forward_bytes", "bytes": 1011232772},
+    {"name": "state_bytes", "bytes": 68514080},
+    {"name": "qsa_context_bytes", "bytes": 281149440},
+    {"name": "workspace_total_bytes", "bytes": 23870984},
+    {"name": "f16_weight_shadow_bytes", "bytes": 1298923520},
+    {"name": "qsa_selector_bytes", "bytes": 0},
+    {"name": "mtp_bytes", "bytes": 0},
+    {"name": "gather_bytes", "bytes": 0},
+    {"name": "runtime_bytes", "bytes": 0},
+    {"name": "allocation_backing_padding_bytes", "bytes": 77638656}
+   ],
+   "f16_shadow_cold_bound_bytes": 1298923520,
+   "s1_extras_bytes": 2537898560,
+   "s1_extras_terms": [
+    {"name": "expert ring", "bytes": 167206912},
+    {"name": "expert lookahead", "bytes": 1337655296},
+    {"name": "route storage", "bytes": 470192384},
+    {"name": "A4 sidecars", "bytes": 0},
+    {"name": "group scatter", "bytes": 3278848},
+    {"name": "HC arena", "bytes": 414064640},
+    {"name": "boundary state", "bytes": 136512064},
+    {"name": "allocation_backing_padding_bytes", "bytes": 8988416}
+   ],
+   "device_core_bytes": 24054058348,
+   "sequential_diag_bytes": 0,
+   "device_owned_bytes": 24054058348,
+   "runtime_budget_bytes": 1073741824,
+   "safety_margin_bytes": 536870912
+  },
+  "primitive_selftest": {
+   "purpose": "primitive_selftest",
+   "tile_rows": 512,
+   "resident_expert_layers": 10,
+   "window_rows": 16384,
+   "page_count": 18,
+   "device_weights_bytes": 18754830336,
+   "s1_tile_census_bytes": 2484701100,
+   "s1_tile_census_terms": [
+    {"name": "forward_bytes", "bytes": 735014276},
+    {"name": "state_bytes", "bytes": 68514080},
+    {"name": "qsa_context_bytes", "bytes": 281149440},
+    {"name": "workspace_total_bytes", "bytes": 15974664},
+    {"name": "f16_weight_shadow_bytes", "bytes": 1298923520},
+    {"name": "qsa_selector_bytes", "bytes": 0},
+    {"name": "mtp_bytes", "bytes": 0},
+    {"name": "gather_bytes", "bytes": 0},
+    {"name": "runtime_bytes", "bytes": 0},
+    {"name": "allocation_backing_padding_bytes", "bytes": 85125120}
+   ],
+   "f16_shadow_cold_bound_bytes": 1298923520,
+   "s1_extras_bytes": 2531607104,
+   "s1_extras_terms": [
+    {"name": "expert ring", "bytes": 167206912},
+    {"name": "expert lookahead", "bytes": 1337655296},
+    {"name": "route storage", "bytes": 470192384},
+    {"name": "A4 sidecars", "bytes": 0},
+    {"name": "group scatter", "bytes": 3278848},
+    {"name": "HC arena", "bytes": 408821760},
+    {"name": "boundary state", "bytes": 136512064},
+    {"name": "allocation_backing_padding_bytes", "bytes": 7939840}
+   ],
+   "device_core_bytes": 23771138540,
+   "sequential_diag_bytes": 217821184,
+   "device_owned_bytes": 23988959724,
+   "runtime_budget_bytes": 1073741824,
+   "safety_margin_bytes": 536870912
+  }
+ },
+ "device_owned_bytes": 24054058348,
+ "device_owned_note": "the MAX of the two purposes' owned bytes (they load as sequential fresh processes): product 24,054,058,348 (core, no diagnostic) > primitive_selftest 23,988,959,724 (core 23,771,138,540 + diagnostic 217,821,184); NOT product core + the primitive diagnostic. Owned bytes are PHYSICAL-backing figures from the canonical arena plan (weights 18,754,830,336 physical; payload kept separately in device_weights.model_payload_metadata): the cold F16 PAYLOAD term 1,298,923,520 is unchanged and charged once, and every physical rounding is the named allocation_backing_padding_bytes term of the tile census (product 77,638,656 / primitive 85,125,120) and of the extras (product 8,988,416 / primitive 7,939,840). The backing is the MODEL over the queried granule/observed capacity, NOT a per-allocation physical or recovery measurement. The 1 GiB runtime budget and the 512 MiB safety margin are CHARGED ADMISSION BUDGETS, not physical owners: the runtime budget is separate from owned and the safety margin sits on top of it. HIP sampler own-reported totals are recorded separately from this census.",
+ "device_projection": {
+  "kind": "CPU projection of declared inputs, NOT a GPU measurement",
+  "preload_free_bytes": 25713180672,
+  "by_purpose": {
+   "product": {"slack_over_safety_bytes": 48509588},
+   "primitive_selftest": {"slack_over_safety_bytes": 113608212}
+  },
+  "arithmetic": "slack = preload free - owned - runtime budget - safety margin: product 25,713,180,672 - 24,054,058,348 - 1,073,741,824 - 536,870,912 = 48,509,588; primitive_selftest 25,713,180,672 - 23,988,959,724 - 1,073,741,824 - 536,870,912 = 113,608,212 (slack sits ON TOP of the safety margin; non-gating information, the gate is the observed sysfs/HIP minimum free VRAM >= 512 MiB)"
+ },
+ "card_bytes": 25769803776,
+ "physical_card_gib": 24,
+ "fabric_reservation_device_gib": 22.4,
+ "card_bytes_note": "card_bytes is the PHYSICAL 24 GiB card; the fabric exclusive-use device reservation (22.4 GiB) is separate and is what --print-memory prints as the device figure",
+ "session_cache_budget_cap_bytes_not_committed": 2147483648,
+ "session_cache_note": "the 2 GiB device session cache is a NOMINAL best-effort cap, NOT a commitment: recorded, never added to the owned census or to any reservation. The actual discretionary cache budget is derived by the runtime from the free device bytes at admission; at this fixture the product slack above the 512 MiB Safety margin is only 48,509,588 B",
+ "pending_working_set_ceiling_bytes_not_charged": 620021760,
+ "pending_ceiling_note": "information only; the 620,021,760 B pending working-set ceiling now lies INSIDE the bounded host snapshot cap (bounded_host_snapshot_cap_bytes 2 GiB TOTAL covering pending, resident, parked and quarantined snapshots per purpose) and is not an additional VRAM commitment",
+ "host_census": {
+  "product": {
+   "terms": [
+    {"name": "pinned_expert_owners_bytes", "bytes": 52140441600},
+    {"name": "host_map_owner_pad_bytes", "bytes": 81788928},
+    {"name": "external_ple_row_decoded_staging_bytes", "bytes": 83886080},
+    {"name": "ple_page_cache_bytes", "bytes": 268435456},
+    {"name": "t_pinned_tables_bytes", "bytes": 147456},
+    {"name": "max_sequential_diag_readback_d_bytes", "bytes": 351518720},
+    {"name": "forward_ple_stage_bytes", "bytes": 3932160},
+    {"name": "forward_token_stage_bytes", "bytes": 3072},
+    {"name": "forward_mesh_token_stage_bytes", "bytes": 3072},
+    {"name": "bounded_host_snapshot_cap_bytes", "bytes": 2147483648}
+   ],
+   "total_bytes": 55077640192
+  },
+  "primitive_selftest": {
+   "terms": [
+    {"name": "pinned_expert_owners_bytes", "bytes": 52140441600},
+    {"name": "host_map_owner_pad_bytes", "bytes": 81788928},
+    {"name": "external_ple_row_decoded_staging_bytes", "bytes": 83886080},
+    {"name": "ple_page_cache_bytes", "bytes": 268435456},
+    {"name": "t_pinned_tables_bytes", "bytes": 147456},
+    {"name": "max_sequential_diag_readback_d_bytes", "bytes": 351518720},
+    {"name": "forward_ple_stage_bytes", "bytes": 2621440},
+    {"name": "forward_token_stage_bytes", "bytes": 2048},
+    {"name": "forward_mesh_token_stage_bytes", "bytes": 2048},
+    {"name": "bounded_host_snapshot_cap_bytes", "bytes": 2147483648}
+   ],
+   "total_bytes": 55076327424
+  }
+ },
+ "host_owned_bytes": 55077640192,
+ "host_owned_note": "per-purpose S1 host census (the strict first-cell driver-check subtrahend is the product figure; host_owned_bytes is the MAX of the two purposes). Each purpose now also carries bounded_host_snapshot_cap_bytes = 2 GiB (2,147,483,648), the TOTAL bounded host snapshot cap covering pending, resident, parked and quarantined snapshots (the 620,021,760 B pending ceiling is inside it, not extra); product 52,930,156,544 + 2,147,483,648 = 55,077,640,192, primitive 52,928,843,776 + 2,147,483,648 = 55,076,327,424. The forward PLE stage is DISTINCT from the closed external-row decoded staging 83,886,080 B and follows each purpose's tile: tile x 16 x 160 x 2 B (product 768 -> 3,932,160; primitive 512 -> 2,621,440), and the token Vec and the mesh_tokens Vec are each tile x 4 B (3,072 / 2,048). The old 1536-row census was 52,934,094,848.",
+ "host_reservation_owned_bytes": 55740268544,
+ "host_reservation": {
+  "sequential_arm": "immutable beta ff799626e greedy arm (quality reference pin 10, allowed, no arithmetic impact; G2 mirrors UNCHANGED, EXPERT_STAGE never 0)",
+  "terms": [
+   {"name": "beta_old_max_bytes", "bytes": 55698259968},
+   {"name": "beta_forward_ple_stage_bytes", "bytes": 41943040},
+   {"name": "beta_forward_token_stage_bytes", "bytes": 32768},
+   {"name": "beta_forward_mesh_token_stage_bytes", "bytes": 32768}
+  ],
+  "beta_old_composition": "52,574,552,064 base + 3,123,707,904 construction (steady 4 mirrors 2,678,063,104 + last live Vec 445,644,800)",
+  "beta_chunk_rows_ceiling": 8192,
+  "total_bytes": 55740268544
+ },
+ "host_reservation_note": "SOURCE CAPACITY UPPER BOUND, not an observed beta allocation: the incumbent 8192-row chunk is the authoritative requested ceiling (forward PLE 8192 x 16 x 160 x 2 = 41,943,040 B, token and mesh Vecs 8192 x 4 = 32,768 B each); its actual chosen rung may downshift with free VRAM. The reservation is the sequential MAX of the beta arm and the S1 purposes (arms are fresh processes: the maximum, never the sum); the beta arm 55,740,268,544 still dominates both S1 purposes (55,077,640,192 / 55,076,327,424, each including the 2 GiB bounded host snapshot cap). Legacy G2 donor-restore mirror owners remain unchanged: beta ff799626e crates/hipfire-arch-qwen4/src/gpu_forward.rs:3961-3985; construction ceiling 3,123,707,904 B = steady four mirrors 2,678,063,104 + last live Vec 445,644,800. EXPERT_STAGE is never disabled for the beta reference.",
+ "host_allowance_bytes": 2147483648,
+ "host_total_with_allowance_bytes": 57887752192,
+ "fabric_hostmem_gib": 54,
+ "fabric_hostmem_bytes": 57982058496,
+ "host_slack_bytes": 94306304,
+ "allowances_are_declared_not_measured": true,
+ "census_basis": "Exact source owner-query payload census of the real-artifact fixture H2560 E512 K10 mi640 shared640, 48 trunk layers plus one weight-only MTP layer, native_mtp=false, Q8/Q8 state, max_seq 16640, 16384-row window, 18 pages, Aggregate route, 10 resident layers, expressed as PHYSICAL backing by the queried-granule model of the canonical arena plan (a model over the queried granule/observed capacity, not a per-allocation physical or recovery measurement; arena_backing_model.physical_backing_measured and recovery_measured are false). Weights physical 18,754,830,336 = non-expert 5,375,000,576 + 10 x 1,337,982,976 (payload 5,364,055,296 + 10 x 1,336,934,400 = 18,733,399,296, recorded separately). Product tile768: tile census payload 2,683,690,796 (forward 1,011,232,772 + state 68,514,080 + QSA 281,149,440 + workspace 23,870,984 + cold F16 shadows 1,298,923,520, charged once) + allocation_backing_padding_bytes 77,638,656 = 2,761,329,452; S1 extras payload 2,528,910,144 + padding 8,988,416 = 2,537,898,560; core/owned 18,754,830,336 + 2,761,329,452 + 2,537,898,560 = 24,054,058,348 B; no diagnostic. Primitive tile512: forward 735,014,276, workspace 15,974,664, the same state/QSA/cold shadows, tile census payload 2,399,575,980 + padding 85,125,120 = 2,484,701,100; extras 2,523,667,264 + 7,939,840 = 2,531,607,104; core 23,771,138,540 + sequential diagnostic 217,821,184 = owned 23,988,959,724 B. The two processes are sequential: root owned is MAX 24,054,058,348, never product core plus primitive diagnostic. The 1 GiB runtime budget and 512 MiB safety margin are unchanged separate charged admission budgets, not physical owners or measurements; slack over safety is product 48,509,588 / primitive 113,608,212 (non-gating); the product gate is observed free VRAM >=512 MiB from both samplers. The 2 GiB device session cache is a nominal cap, not a commitment (the runtime derives the actual discretionary budget; the fixture is 48,509,588 B above Safety). Host: each purpose adds a 2 GiB bounded host snapshot cap (pending, resident, parked and quarantine in total; the 620,021,760 B pending ceiling is inside it): product 55,077,640,192 / primitive 55,076,327,424; sequential beta (unchanged) still dominates at 55,740,268,544 + declared 2 GiB allowance = 57,887,752,192 <=54 GiB 57,982,058,496, slack 94,306,304. No allowance is labelled measured.",
+ "provenance": {
+  "model_config_sha256": "09bdc80f4f47dab77700880add826259a4cf6b0c2e9809219ed96b63d5af4a08",
+  "model_index_sha256": "0da73ebaf81137a16bfb83f138fc092febfb158a63b74bc342cddd895625706a",
+  "census_source_commit": "32c507c7b5cecab23cf6e14b001d4d87898c0416",
+  "census_source_tree": "83a3e87203e8af97ba6d1f97bb3712a69e2ff5bf",
+  "census_source_base": "0a3b67cb12ef63b60e7ea40a66689b99e3dcf981"
+ },
+ "provenance_note": "the harness commit/tree (this file's own commit) and the staged binary sha256 are recorded externally and never self-referenced here; the FINAL ledger adds provenance.census_source_commit/tree/base (the runtime source the census describes) and make_manifest.py checks them against the staged BUILD-IDENTITY.json, so a binary built from another source cannot be labelled with this census"
+}
