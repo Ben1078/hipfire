@@ -81,3 +81,7 @@ required-features = ["lab"]
 [[example]]
 name = "fn_ep_oracle"
 required-features = ["lab"]
+
+[[example]]
+name = "qwen4_slab_d2_capture"
+required-features = ["lab"]
