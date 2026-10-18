@@ -5643,11 +5643,12 @@ impl Qwen4GpuForwardScratch {
         scope: &Qwen4BandScope,
     ) -> Result<u64, Qwen4GpuForwardError> {
         let (slots, _) = Self::plan_scoped(config, max_chunk, mode, scope)?;
-        Self::owning_slot_bytes(&slots).try_fold(0u64, |total, bytes| {
+        let total = Self::owning_slot_bytes(&slots).try_fold(0u64, |total, bytes| {
             total
                 .checked_add(bytes?)
                 .ok_or_else(|| invalid("scratch device bytes overflow"))
-        })
+        });
+        total
     }
 
     /// Bytes of each owning slot of a plan, the only slots
