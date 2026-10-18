@@ -99,14 +99,7 @@ pub fn slowlink_load_bundle(
     session_cache_budget: Option<u64>,
     purpose: crate::slowlink_admission::AdmissionPurpose,
 ) -> Result<SlowlinkLoaded, String> {
-    load_inner(
-        gpu,
-        path,
-        max_seq,
-        session_cache_budget,
-        true,
-        purpose,
-    )?
+    load_inner(gpu, path, max_seq, session_cache_budget, true, purpose)?
         .ok_or_else(|| "slowlink load produced no bundle".to_string())
 }
 
