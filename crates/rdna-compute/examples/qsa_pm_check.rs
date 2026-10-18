@@ -18,6 +18,17 @@
 //! * `pm`: `indexed_attention_gathered_batch(.., true)`, the builder-module
 //!   attend over the same hipcc converter, converter included.
 //!
+//! `--arms LIST` (comma list drawn from `simt`, `hip`, `pm`; default all three)
+//! runs only the named arms in the GPU phases (arm runs, hashes, determinism,
+//! timing, derived cases) and in the numeric passes. `pm` requires `hip` (the
+//! byte comparison is PM vs hipcc). `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0`, the hg4
+//! kernel-name guard and every SIMT comparison (SIMT vs hip/pm/eager, saving
+//! vs SIMT, kill rule) apply only when `simt` is selected, so `--arms hip,pm`
+//! runs on a pack that carries the gathered module but no SIMT incumbent.
+//! Arm-keyed JSON carries only the selected arms and the run header records
+//! `selected_arms`; the default is the three-arm behavior. A `--reference-only`
+//! pass MUST be given the same `--arms` as the GPU pass that saved the samples.
+//!
 //! Formats are explicit (`QsaKvFormat` F32 / FP8 / Q8 from `geometry.format`):
 //! raw Q8_0 bytes (34-byte blocks: f16 scale + 32 i8 codes, head-major, 8
 //! blocks per 256-wide head) are uploaded as Raw and decoded on the host for
@@ -101,6 +112,31 @@ struct Opts {
     allow_non_hg4: bool,
     allow_truncated: bool,
     gpu_only: bool,
+    arms: [bool; 3],
+}
+impl Opts {
+    fn has(&self, arm: Arm) -> bool { self.arms[arm.idx()] }
+    /// Selected arms in canonical order (simt, hip, pm).
+    fn selected(&self) -> Vec<Arm> { Arm::ALL.into_iter().filter(|a| self.has(*a)).collect() }
+}
+
+/// JSON object keyed by arm name over the selected arms only.
+fn arm_json(o: &Opts, f: impl Fn(Arm) -> Value) -> serde_json::Map<String, Value> {
+    o.selected().into_iter().map(|a| (a.key().to_string(), f(a))).collect()
+}
+
+fn parse_arms(list: &str) -> Result<[bool; 3]> {
+    if list.trim().is_empty() { return Err("--arms: empty list (expected a comma list of simt, hip, pm)".into()) }
+    let mut sel = [false; 3];
+    for name in list.split(',') {
+        let name = name.trim();
+        let Some(arm) = Arm::ALL.into_iter().find(|a| a.key() == name) else {
+            return Err(format!("--arms: unknown arm {name:?} (expected a comma list of simt, hip, pm)"));
+        };
+        if std::mem::replace(&mut sel[arm.idx()], true) { return Err(format!("--arms: duplicate arm {name:?}")) }
+    }
+    if sel[Arm::Pm.idx()] && !sel[Arm::Hip.idx()] { return Err("--arms: pm requires hip (the byte comparison is PM vs hipcc)".into()) }
+    Ok(sel)
 }
 
 fn parse_args() -> Result<Opts> {
@@ -108,7 +144,7 @@ fn parse_args() -> Result<Opts> {
         dirs: Vec::new(), out: PathBuf::new(), work: PathBuf::new(), outputs: None, time: TimeSel::None,
         rounds: 3, calls: 20, warm: 3, hold_seconds: 600.0, layers: 12, replays: 2, sample_rows: 64,
         full_reference: false, derived: 0, edge_rows: 512, edge_sample_rows: 32, reference_only: false,
-        allow_non_hg4: false, allow_truncated: false, gpu_only: false,
+        allow_non_hg4: false, allow_truncated: false, gpu_only: false, arms: [true; 3],
     };
     let mut out = None;
     let mut work = None;
@@ -141,6 +177,7 @@ fn parse_args() -> Result<Opts> {
             "--allow-non-hg4" => o.allow_non_hg4 = true,
             "--allow-truncated" => o.allow_truncated = true,
             "--gpu-only" => o.gpu_only = true,
+            "--arms" => o.arms = parse_arms(&val(&mut it, &a)?)?,
             s if s.starts_with("--") => return Err(format!("unknown flag {s}")),
             _ => o.dirs.push(PathBuf::from(&a)),
         }
@@ -682,21 +719,33 @@ fn time_slot(gpu: &mut Gpu, c: &Case<'_>, arm: Arm, warm: usize, calls: usize) -
     Ok(Slot { median: median(t), min, max })
 }
 
-/// ABBA over the three arms: each round runs a rotated palindrome
-/// `[a0 a1 a2 a2 a1 a0]`, so every arm runs twice per round, mirrored. Each
-/// timed call is the whole API call (converter + attend for the gathered arms).
+/// Label of the rotated ABBA palindrome over `n` selected arms
+/// (`n = 3`: `[a0 a1 a2 a2 a1 a0]`).
+fn abba_label(n: usize) -> String {
+    let names: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
+    let all: Vec<String> = names.iter().chain(names.iter().rev()).cloned().collect();
+    format!("rotated ABBA palindromes [{}]", all.join(" "))
+}
+
+/// ABBA over the selected arms: each round runs a rotated palindrome
+/// `[a0 a1 a2 a2 a1 a0]` (three arms), so every arm runs twice per round,
+/// mirrored. Each timed call is the whole API call (converter + attend for the
+/// gathered arms). Unselected arms keep an empty slot list and a 0.0 median.
 /// Returns None when the hold deadline passed before the snapshot completed.
 fn time_snapshot(gpu: &mut Gpu, c: &Case<'_>, o: &Opts, deadline: Instant) -> Result<Option<([Vec<Slot>; 3], [f64; 3])>> {
+    let sel = o.selected();
+    let n = sel.len();
     let mut slots: [Vec<Slot>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for round in 0..o.rounds {
-        let a = |i: usize| Arm::ALL[(i + round) % 3];
-        for arm in [a(0), a(1), a(2), a(2), a(1), a(0)] {
+        let order: Vec<Arm> = (0..n).map(|i| sel[(i + round) % n]).collect();
+        for arm in order.iter().chain(order.iter().rev()).copied() {
             if Instant::now() > deadline { return Ok(None) }
             let s = time_slot(gpu, c, arm, o.warm, o.calls)?;
             slots[arm.idx()].push(s);
         }
     }
-    let ms = [0, 1, 2].map(|i| median(slots[i].iter().map(|s| s.median).collect()));
+    let mut ms = [0.0f64; 3];
+    for arm in &sel { ms[arm.idx()] = median(slots[arm.idx()].iter().map(|s| s.median).collect()); }
     Ok(Some((slots, ms)))
 }
 
@@ -734,7 +783,7 @@ fn aggregate(timed: &[Timed], o: &Opts, total: usize, truncated: bool) -> Value 
             let sums = [0, 1, 2].map(|i| ts.iter().map(|t| t.ms[i]).sum::<f64>());
             if complete { n_complete += 1; for i in 0..3 { direct[i] += sums[i]; } }
             layer_json.push(json!({"layer": layer, "chunks": ts.len(), "duplicate_position_starts": dup, "tiles_0_to_ctx": complete,
-                "sum_ms": {"simt": sums[0], "hip": sums[1], "pm": sums[2]},
+                "sum_ms": Value::Object(arm_json(o, |a| json!(sums[a.idx()]))),
                 "snapshots": ts.iter().map(|t| t.snapshot.clone()).collect::<Vec<_>>()}));
         }
         let mut g = json!({"artifact": artifact, "ctx": ctx, "route": route, "layers": layer_json, "complete_layers": n_complete,
@@ -744,14 +793,25 @@ fn aggregate(timed: &[Timed], o: &Opts, total: usize, truncated: bool) -> Value 
             let basis = if n_complete >= o.layers { direct } else { mean.map(|x| x * o.layers as f64) };
             let extrapolated = n_complete < o.layers;
             let saving = |i: usize| basis[0] - basis[i];
-            g["direct_sum_over_complete_layers_ms"] = json!({"simt": direct[0], "hip": direct[1], "pm": direct[2]});
-            g["mean_per_complete_layer_ms"] = json!({"simt": mean[0], "hip": mean[1], "pm": mean[2]});
-            g["aggregate_ms"] = json!({"simt": basis[0], "hip": basis[1], "pm": basis[2], "layers": o.layers,
-                "extrapolated_from_mean_complete_layer": extrapolated});
-            g["saving_vs_simt_ms"] = json!({"hip": saving(1), "pm": saving(2)});
-            g["kill_rule"] = json!({"rule": "<25 ms saved per 8K prefill aggregate over the QSA layers, converter included",
-                "applies_to_ctx_8192": ctx == 8192, "pm_saves_ge_25ms": saving(2) >= 25.0, "hip_saves_ge_25ms": saving(1) >= 25.0,
-                "pm_kill": ctx == 8192 && saving(2) < 25.0});
+            g["direct_sum_over_complete_layers_ms"] = Value::Object(arm_json(o, |a| json!(direct[a.idx()])));
+            g["mean_per_complete_layer_ms"] = Value::Object(arm_json(o, |a| json!(mean[a.idx()])));
+            let mut agg_ms = arm_json(o, |a| json!(basis[a.idx()]));
+            agg_ms.insert("layers".into(), json!(o.layers));
+            agg_ms.insert("extrapolated_from_mean_complete_layer".into(), json!(extrapolated));
+            g["aggregate_ms"] = Value::Object(agg_ms);
+            if o.has(Arm::Simt) {
+                let mut sv = serde_json::Map::new();
+                for a in [Arm::Hip, Arm::Pm] { if o.has(a) { sv.insert(a.key().into(), json!(saving(a.idx()))); } }
+                g["saving_vs_simt_ms"] = Value::Object(sv);
+                let mut kr = json!({"rule": "<25 ms saved per 8K prefill aggregate over the QSA layers, converter included",
+                    "applies_to_ctx_8192": ctx == 8192});
+                if o.has(Arm::Pm) { kr["pm_saves_ge_25ms"] = json!(saving(2) >= 25.0); }
+                if o.has(Arm::Hip) { kr["hip_saves_ge_25ms"] = json!(saving(1) >= 25.0); }
+                if o.has(Arm::Pm) { kr["pm_kill"] = json!(ctx == 8192 && saving(2) < 25.0); }
+                g["kill_rule"] = kr;
+            } else if o.has(Arm::Pm) {
+                g["saving_pm_vs_hip_ms"] = json!(basis[1] - basis[2]);
+            }
         }
         out.push(g);
     }
@@ -764,11 +824,11 @@ fn aggregate(timed: &[Timed], o: &Opts, total: usize, truncated: bool) -> Value 
 
 fn write_json(f: &mut std::fs::File, v: &Value) -> Result<()> { writeln!(f, "{v}").map_err(err) }
 
-fn save_samples(o: &Opts, l: &Loaded, rows: &[usize], outs: &[ArmOut; 3]) -> Result<()> {
+fn save_samples(o: &Opts, l: &Loaded, rows: &[usize], outs: &[Option<ArmOut>; 3]) -> Result<()> {
     std::fs::create_dir_all(&o.work).map_err(err)?;
     let mut arms = serde_json::Map::new();
-    for arm in Arm::ALL {
-        let s = take_rows(&outs[arm.idx()].bytes, rows, &l.geo);
+    for arm in o.selected() {
+        let s = take_rows(&outs[arm.idx()].as_ref().unwrap().bytes, rows, &l.geo);
         let b: Vec<u8> = s.iter().flat_map(|x| x.to_le_bytes()).collect();
         std::fs::write(o.work.join(format!("{}.{}.sample.f32", l.id, arm.key())), &b).map_err(err)?;
         arms.insert(arm.key().into(), json!(sha256(&b)));
@@ -777,7 +837,7 @@ fn save_samples(o: &Opts, l: &Loaded, rows: &[usize], outs: &[ArmOut; 3]) -> Res
         serde_json::to_vec_pretty(&json!({"rows": rows, "arm_sample_sha256": Value::Object(arms)})).map_err(err)?).map_err(err)?;
     if let Some(dir) = &o.outputs {
         std::fs::create_dir_all(dir).map_err(err)?;
-        for arm in Arm::ALL { std::fs::write(dir.join(format!("{}.{}.f32", l.id, arm.key())), &outs[arm.idx()].bytes).map_err(err)?; }
+        for arm in o.selected() { std::fs::write(dir.join(format!("{}.{}.f32", l.id, arm.key())), &outs[arm.idx()].as_ref().unwrap().bytes).map_err(err)?; }
     }
     Ok(())
 }
@@ -790,36 +850,38 @@ fn snapshot_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, index: usize, timing: bool
     let vdev = upload_cache(gpu, &l.v, l.fmt)?;
     let case = Case::new(gpu, l.geo, l.fmt, &l.q, &l.sel, &kdev, &vdev)?;
     let r: Result<()> = (|| {
-        let simt = arm_runs(gpu, &case, Arm::Simt, o.replays, o.allow_non_hg4)?;
-        let hip = arm_runs(gpu, &case, Arm::Hip, o.replays, o.allow_non_hg4)?;
-        let pm = arm_runs(gpu, &case, Arm::Pm, o.replays, o.allow_non_hg4)?;
-        let outs = [simt, hip, pm];
+        let mut outs: [Option<ArmOut>; 3] = [None, None, None];
+        for arm in o.selected() { outs[arm.idx()] = Some(arm_runs(gpu, &case, arm, o.replays, o.allow_non_hg4)?); }
         let rows = sample_rows(&l.geo, o.sample_rows, o.full_reference);
         save_samples(o, l, &rows, &outs)?;
-        let pm_hip = compare(&outs[2].bytes, &outs[1].bytes);
+        let out = |arm: Arm| outs[arm.idx()].as_ref();
+        let bytes = |arm: Arm| outs[arm.idx()].as_ref().map(|x| x.bytes.as_slice());
+        let cmp = |a: Arm, b: Arm| match (bytes(a), bytes(b)) { (Some(x), Some(y)) => compare(x, y), _ => Value::Null };
+        let pm_eq_hip = match (bytes(Arm::Pm), bytes(Arm::Hip)) { (Some(p), Some(h)) => Some(p == h), _ => None };
+        let pm_hip = cmp(Arm::Pm, Arm::Hip);
         let mut arms = serde_json::Map::new();
-        for arm in Arm::ALL {
-            let a = &outs[arm.idx()];
+        for arm in o.selected() {
+            let a = out(arm).unwrap();
             arms.insert(arm.key().into(), json!({"sha256": a.sha, "replay_sha256": a.replay_sha, "deterministic": a.deterministic,
                 "last_launched_kernel": a.kernel, "nonfinite_outputs": a.nonfinite, "bytes": a.bytes.len()}));
         }
         let eager = l.eager.as_ref().map(|e| json!({"sha256": sha256(e), "role": "identity only; never a numeric oracle",
-            "equals_simt": *e == outs[0].bytes, "equals_hip": *e == outs[1].bytes, "equals_pm": *e == outs[2].bytes}));
+            "equals_simt": bytes(Arm::Simt).map(|b| *e == b), "equals_hip": bytes(Arm::Hip).map(|b| *e == b), "equals_pm": bytes(Arm::Pm).map(|b| *e == b)}));
         let mut rec = json!({
             "kind": "snapshot", "id": l.id, "snapshot": l.path, "identity": l.header["identity"], "route_group": route_key(&l.path, &l.header),
             "geometry": l.geo.json(fmt_name(l.fmt)), "inputs": l.inputs, "arch": gpu.arch,
             "poison_output_patterns": POISON.iter().take(o.replays.max(1).min(3)).collect::<Vec<_>>(),
-            "arms": Value::Object(arms), "pm_vs_hip": pm_hip.clone(),
-            "pm_equals_hip": outs[2].bytes == outs[1].bytes,
-            "simt_vs_hip": compare(&outs[0].bytes, &outs[1].bytes), "simt_vs_pm": compare(&outs[0].bytes, &outs[2].bytes),
+            "arms": Value::Object(arms), "pm_vs_hip": pm_hip,
+            "pm_equals_hip": pm_eq_hip,
+            "simt_vs_hip": cmp(Arm::Simt, Arm::Hip), "simt_vs_pm": cmp(Arm::Simt, Arm::Pm),
             "eager": eager, "sample_rows": rows.len(),
         });
-        for arm in Arm::ALL {
-            let a = &outs[arm.idx()];
+        for arm in o.selected() {
+            let a = out(arm).unwrap();
             if !a.deterministic { failures.push(format!("{}: {} arm nondeterministic across replays", l.id, arm.key())) }
             if a.nonfinite > 0 { failures.push(format!("{}: {} arm produced {} non-finite outputs", l.id, arm.key(), a.nonfinite)) }
         }
-        if outs[2].bytes != outs[1].bytes { failures.push(format!("{}: PM bytes differ from hipcc gathered", l.id)) }
+        if pm_eq_hip == Some(false) { failures.push(format!("{}: PM bytes differ from hipcc gathered", l.id)) }
         if timing {
             if Instant::now() > deadline {
                 *truncated = true;
@@ -829,9 +891,9 @@ fn snapshot_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, index: usize, timing: bool
                     Some((slots, ms)) => {
                         let sj = |a: Arm| slots[a.idx()].iter().map(|s| json!({"median_ms": s.median, "min_ms": s.min, "max_ms": s.max})).collect::<Vec<_>>();
                         rec["timing"] = json!({"timed": true, "converter_included": true, "rounds": o.rounds, "calls_per_slot": o.calls,
-                            "warmup_per_slot": o.warm, "order": "rotated ABBA palindromes [a0 a1 a2 a2 a1 a0]",
-                            "slots": {"simt": sj(Arm::Simt), "hip": sj(Arm::Hip), "pm": sj(Arm::Pm)},
-                            "median_ms": {"simt": ms[0], "hip": ms[1], "pm": ms[2]}});
+                            "warmup_per_slot": o.warm, "order": abba_label(o.selected().len()),
+                            "slots": Value::Object(arm_json(o, |a| json!(sj(a)))),
+                            "median_ms": Value::Object(arm_json(o, |a| json!(ms[a.idx()])))});
                         let id = &l.header["identity"];
                         timed.push(Timed {
                             artifact: id["artifact"].as_str().unwrap_or("?").to_string(), layer: id["layer"].as_i64().unwrap_or(-1),
@@ -847,7 +909,7 @@ fn snapshot_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, index: usize, timing: bool
             }
         }
         write_json(file, &rec)?;
-        eprintln!("{} {} pm==hip:{} simt kernel:{}", index + 1, l.id, outs[2].bytes == outs[1].bytes, outs[0].kernel);
+        eprintln!("{} {} pm==hip:{} simt kernel:{}", index + 1, l.id, pm_eq_hip.map_or("n/a".to_string(), |b| b.to_string()), out(Arm::Simt).map_or("n/a", |x| x.kernel.as_str()));
         Ok(())
     })();
     case.free(gpu)?;
@@ -965,7 +1027,7 @@ fn derived_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, file: &mut std::fs::File, f
         kp = Some(upload_cache(gpu, &kb, l.fmt)?);
         vp = Some(upload_cache(gpu, &vb, l.fmt)?);
     }
-    let mut base_bytes: Option<[Vec<u8>; 3]> = None;
+    let mut base_bytes: [Option<Vec<u8>>; 3] = [None, None, None];
     let mut result: Result<()> = Ok(());
     for m in &muts {
         let (k, v) = if m.poison_cache { (kp.as_ref().unwrap(), vp.as_ref().unwrap()) } else { (&kdev, &vdev) };
@@ -978,38 +1040,48 @@ fn derived_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, file: &mut std::fs::File, f
             let limit = gpu.few_row_limit();
             let small_route = (1..=limit).contains(&m.geo.rows) && gpu.route_rows(m.geo.rows) <= limit;
             let admit_simt = o.allow_non_hg4 || small_route;
-            let outs = [Arm::Simt, Arm::Hip, Arm::Pm].map(|arm| arm_runs(gpu, &case, arm, o.replays.max(2), admit_simt));
-            let [a, b, c] = outs;
-            let outs = [a?, b?, c?];
+            let mut outs: [Option<ArmOut>; 3] = [None, None, None];
+            for arm in o.selected() { outs[arm.idx()] = Some(arm_runs(gpu, &case, arm, o.replays.max(2), admit_simt)?); }
+            let pm_eq_hip = match (&outs[Arm::Pm.idx()], &outs[Arm::Hip.idx()]) { (Some(p), Some(h)) => Some(p.bytes == h.bytes), _ => None };
+            let simt_guard = match &outs[Arm::Simt.idx()] {
+                Some(s) => json!({"native_requires_hg4": true, "small_row_decode_route_admitted": small_route, "few_row_limit": limit, "rows": m.geo.rows,
+                    "simt_launched_kernel": s.kernel}),
+                None => Value::Null,
+            };
             let mut rec = json!({"kind": "derived", "derived_from": l.path, "id": l.id, "label": m.label, "description": m.description,
                 "timed": false, "performance_claim": false, "geometry": m.geo.json(fmt_name(l.fmt)), "arch": gpu.arch,
-                "simt_route_guard": {"native_requires_hg4": true, "small_row_decode_route_admitted": small_route, "few_row_limit": limit, "rows": m.geo.rows,
-                    "simt_launched_kernel": outs[0].kernel},
+                "simt_route_guard": simt_guard,
                 "complete_cache_uploaded": true, "cache_rows": g.full_capacity, "row_view": {"first_snapshot_row": r0, "rows": e}});
             let mut arms = serde_json::Map::new();
-            for arm in Arm::ALL {
-                let x = &outs[arm.idx()];
+            for arm in o.selected() {
+                let x = outs[arm.idx()].as_ref().unwrap();
                 arms.insert(arm.key().into(), json!({"sha256": x.sha, "replay_sha256": x.replay_sha256_json(), "deterministic": x.deterministic,
                     "last_launched_kernel": x.kernel, "nonfinite_outputs": x.nonfinite}));
                 if !x.deterministic { failures.push(format!("{}:{}: {} nondeterministic", l.id, m.label, arm.key())) }
                 if x.nonfinite > 0 { failures.push(format!("{}:{}: {} non-finite output", l.id, m.label, arm.key())) }
             }
             rec["arms"] = Value::Object(arms);
-            rec["pm_equals_hip"] = json!(outs[2].bytes == outs[1].bytes);
-            if outs[2].bytes != outs[1].bytes { failures.push(format!("{}:{}: PM differs from hipcc gathered", l.id, m.label)) }
+            rec["pm_equals_hip"] = json!(pm_eq_hip);
+            if pm_eq_hip == Some(false) { failures.push(format!("{}:{}: PM differs from hipcc gathered", l.id, m.label)) }
             if m.label == "view-base" {
-                base_bytes = Some([outs[0].bytes.clone(), outs[1].bytes.clone(), outs[2].bytes.clone()]);
+                base_bytes = std::array::from_fn(|i| outs[i].as_ref().map(|x| x.bytes.clone()));
             }
             if m.identical_to_base {
-                let same: Vec<bool> = match &base_bytes { Some(b) => (0..3).map(|i| b[i] == outs[i].bytes).collect(), None => vec![false; 3] };
-                rec["identical_to_view_base"] = json!({"simt": same[0], "hip": same[1], "pm": same[2]});
-                if !same.iter().all(|&x| x) { failures.push(format!("{}:{}: output changed when only unread padding was poisoned", l.id, m.label)) }
+                let same: Vec<(Arm, bool)> = o.selected().into_iter()
+                    .map(|a| (a, base_bytes[a.idx()].as_ref().is_some_and(|b| *b == outs[a.idx()].as_ref().unwrap().bytes))).collect();
+                rec["identical_to_view_base"] = Value::Object(same.iter().map(|(a, s)| (a.key().to_string(), json!(*s))).collect());
+                if !same.iter().all(|(_, x)| *x) { failures.push(format!("{}:{}: output changed when only unread padding was poisoned", l.id, m.label)) }
             }
             if !m.empty_rows.is_empty() {
                 let w = m.geo.heads * m.geo.dim * 4;
-                let zero: Vec<bool> = outs.iter().map(|x| m.empty_rows.iter().all(|&r| x.bytes[r * w..(r + 1) * w].iter().all(|&b| b == 0))).collect();
-                rec["empty_rows_all_zero_bits"] = json!({"simt": zero[0], "hip": zero[1], "pm": zero[2], "rows": m.empty_rows.len()});
-                if !zero.iter().all(|&x| x) { failures.push(format!("{}:{}: empty selection did not yield exact zeros", l.id, m.label)) }
+                let zero: Vec<(Arm, bool)> = o.selected().into_iter().map(|a| {
+                    let x = outs[a.idx()].as_ref().unwrap();
+                    (a, m.empty_rows.iter().all(|&r| x.bytes[r * w..(r + 1) * w].iter().all(|&b| b == 0)))
+                }).collect();
+                let mut zj: serde_json::Map<String, Value> = zero.iter().map(|(a, z)| (a.key().to_string(), json!(*z))).collect();
+                zj.insert("rows".into(), json!(m.empty_rows.len()));
+                rec["empty_rows_all_zero_bits"] = Value::Object(zj);
+                if !zero.iter().all(|(_, x)| *x) { failures.push(format!("{}:{}: empty selection did not yield exact zeros", l.id, m.label)) }
             }
             // CPU numerics are deferred: persist the arms' sampled rows for the
             // offline pass (`derived_numeric_pass`), which rebuilds this mutation.
@@ -1017,8 +1089,8 @@ fn derived_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, file: &mut std::fs::File, f
             rows.extend(m.extra_rows.iter().copied());
             let rows: Vec<usize> = rows.into_iter().collect();
             let mut sample_sha = serde_json::Map::new();
-            for arm in Arm::ALL {
-                let s = take_rows(&outs[arm.idx()].bytes, &rows, &m.geo);
+            for arm in o.selected() {
+                let s = take_rows(&outs[arm.idx()].as_ref().unwrap().bytes, &rows, &m.geo);
                 let b: Vec<u8> = s.iter().flat_map(|x| x.to_le_bytes()).collect();
                 std::fs::write(o.work.join(format!("{}.derived.{}.{}.sample.f32", l.id, m.label, arm.key())), &b).map_err(err)?;
                 sample_sha.insert(arm.key().into(), json!(sha256(&b)));
@@ -1030,7 +1102,7 @@ fn derived_pass(gpu: &mut Gpu, o: &Opts, l: &Loaded, file: &mut std::fs::File, f
             rec["numeric"] = Value::Null;
             rec["numeric_deferred"] = json!("a kind:\"derived_numeric\" record follows from the CPU pass over the saved samples");
             write_json(file, &rec)?;
-            eprintln!("derived {} {} pm==hip:{}", l.id, m.label, outs[2].bytes == outs[1].bytes);
+            eprintln!("derived {} {} pm==hip:{}", l.id, m.label, pm_eq_hip.map_or("n/a".to_string(), |b| b.to_string()));
             Ok(())
         })();
         let freed = case.free(gpu);
@@ -1056,7 +1128,7 @@ fn numeric_pass(o: &Opts, l: &Loaded, file: &mut std::fs::File) -> Result<Value>
     let ref_secs = started.elapsed().as_secs_f64();
     let mut arms: [Option<Vec<f32>>; 3] = [None, None, None];
     let mut sources = serde_json::Map::new();
-    for arm in Arm::ALL {
+    for arm in o.selected() {
         let full = o.outputs.as_ref().map(|d| d.join(format!("{}.{}.f32", l.id, arm.key()))).filter(|p| p.exists());
         let sample = o.work.join(format!("{}.{}.sample.f32", l.id, arm.key()));
         let w = l.geo.heads * l.geo.dim;
@@ -1105,7 +1177,7 @@ fn derived_numeric_pass(o: &Opts, l: &Loaded, file: &mut std::fs::File) -> Resul
         }
         let w = m.geo.heads * m.geo.dim;
         let mut arms: [Option<Vec<f32>>; 3] = [None, None, None];
-        for arm in Arm::ALL {
+        for arm in o.selected() {
             let p = o.work.join(format!("{}.derived.{}.{}.sample.f32", l.id, m.label, arm.key()));
             if let Ok(b) = std::fs::read(&p) {
                 if b.len() != rows.len() * w * 4 { return Err(format!("{}: derived sample size mismatch", p.display())) }
@@ -1141,7 +1213,7 @@ fn main() -> Result<()> {
     if o.gpu_only && o.reference_only { return Err("--gpu-only and --reference-only are mutually exclusive".into()) }
     if !o.reference_only {
         if std::env::var_os("HIPFIRE_LOCK_DIR").is_none() { return Err("private HIPFIRE_LOCK_DIR required".into()) }
-        if std::env::var("HIPFIRE_QWEN4_QSA_WMMA_GATHER").as_deref() != Ok("0") {
+        if o.has(Arm::Simt) && std::env::var("HIPFIRE_QWEN4_QSA_WMMA_GATHER").as_deref() != Ok("0") {
             return Err("HIPFIRE_QWEN4_QSA_WMMA_GATHER=0 required so the SIMT arm is the incumbent hg4 route".into());
         }
     }
@@ -1160,6 +1232,7 @@ fn main() -> Result<()> {
         gpu.dpm_warmup(10.0).map_err(err)?;
         gpu_opt = Some(gpu);
     }
+    let selected_arms: Vec<&str> = o.selected().iter().map(|a| a.key()).collect();
     write_json(&mut file, &json!({
         "kind": "run", "arch": arch, "args": std::env::args().collect::<Vec<_>>(), "snapshots": paths.len(),
         "binary_sha256": exe_sha, "unix_time": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).ok(),
@@ -1168,6 +1241,7 @@ fn main() -> Result<()> {
         "arms": {"simt": "indexed_attention_attention_batch with HIPFIRE_QWEN4_QSA_WMMA_GATHER=0; launched kernel recorded per snapshot (must be ..._batched_hg4)",
                  "hip": "indexed_attention_gathered_batch(pm=false): hipcc converter + hipcc gathered WMMA attend",
                  "pm": "indexed_attention_gathered_batch(pm=true): hipcc converter + builder-module attend"},
+        "selected_arms": selected_arms,
         "hold": {"seconds": o.hold_seconds, "covers": "GPU phase: init warmup, arm runs/hashes, timing, derived-case GPU invariants; CPU numerics run after it unless --gpu-only defers them to --reference-only"},
     }))?;
     if let Some(mut gpu) = gpu_opt {
@@ -1212,7 +1286,12 @@ fn main() -> Result<()> {
     agg["numeric_gate_pass_counts"] = if o.gpu_only {
         json!({"measured": false, "reason": "--gpu-only: native and derived numerics are deferred to a --reference-only pass over the saved --work samples"})
     } else {
-        json!({"measured": true, "snapshots": gate_total, "simt": gate_pass[0], "hip": gate_pass[1], "pm": gate_pass[2], "derived_cases": derived_numeric})
+        let mut m = serde_json::Map::new();
+        m.insert("measured".into(), json!(true));
+        m.insert("snapshots".into(), json!(gate_total));
+        for arm in o.selected() { m.insert(arm.key().into(), json!(gate_pass[arm.idx()])); }
+        m.insert("derived_cases".into(), json!(derived_numeric));
+        Value::Object(m)
     };
     agg["failures"] = json!(failures);
     write_json(&mut file, &agg)?;

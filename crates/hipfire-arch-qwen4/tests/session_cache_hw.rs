@@ -62,12 +62,16 @@
 //! `HIPFIRE_GDN_TEST_STATE_QUANT=fp32 HIPFIRE_SESSION_CACHE_MODEL=$M <test-bin> --ignored --test-threads=1 --exact restored_prefill_matches_cold_on_flash_next`.
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
+use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
-use hipfire_arch_qwen4::{admit_hfqm_artifact, GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
+use hipfire_arch_qwen4::{
+    admit_hfqm_artifact_on, GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat,
+};
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
+use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, PleRowsOrigin, ResolvePolicy};
 use hipfire_runtime::serve_contract::CacheDomain;
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, SnapshotParts};
 use hipfire_runtime::spec::MtpDrafter;
@@ -82,6 +86,9 @@ mod hw_identity;
 
 const MODEL_ENV: &str = "HIPFIRE_SESSION_CACHE_MODEL";
 const MAX_SEQ: usize = 32768;
+/// Drafts per window the native MTP head is sized for when the expert
+/// placement reserves its device bytes (the tests draft three).
+const MTP_K: usize = 3;
 const DECODE: usize = 16;
 
 fn prompt(seed: u64, len: usize) -> Vec<u32> {
@@ -493,11 +500,37 @@ struct Loaded {
     backend: Qwen4KvBackend,
 }
 
+/// Payload bytes of a manifest entry: an expert-slab arena is one span whose
+/// byte length is its logical shape, every other entry is its tensor.
+fn slab_payload_bytes(
+    hfq: &HfqFile,
+    entry: &hipfire_runtime::weight_manifest::WeightEntry,
+) -> Option<u64> {
+    if entry
+        .name
+        .ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX)
+    {
+        return match entry.logical_shape.as_slice() {
+            [bytes] => Some(*bytes as u64),
+            _ => None,
+        };
+    }
+    hfq.tensor_data(&entry.name)
+        .map(|(_, bytes)| bytes.len() as u64)
+}
+
 /// Load the model named by `HIPFIRE_SESSION_CACHE_MODEL` and attach the
 /// forward and a session cache of `budget` bytes, with a disk tier in `disk`
 /// when given. `turn_snapshots` sets message-end snapshots explicitly,
 /// whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the `<|im_end|>` token is
 /// still the caller's `set_turn_end_token`).
+///
+/// Loads either the embedded-PLE monolith (Halo: every tensor a range, no
+/// placement change) or a split base with its `<model>.ple-q4`/`.ple-q8`
+/// sidecar on a discrete GPU, with the routed experts host-mapped per
+/// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` (explicit layer count, `auto`, or unset
+/// = all resident when they fit, else auto) after the MTP reserve; the
+/// resolved placement is printed to stderr once.
 fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     require_fabric_hold();
     let model = std::env::var_os(MODEL_ENV)
@@ -505,8 +538,38 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
     let mut hfq = HfqFile::open(&model).expect("open model");
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
-    let receipt = admit_hfqm_artifact(&hfq).expect("admission");
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        let archs = devices
+            .iter()
+            .map(|device| device.arch.as_str())
+            .collect::<Vec<_>>();
+        if residency::keeps_host_memory_out_of_reclaim(hipfire_arch_qwen4::ARCH_ID, &archs) {
+            hip_bridge::keep_host_memory_out_of_reclaim(&format!(
+                "Qwen4 model on {}",
+                archs.join(",")
+            ));
+        }
+    }
+    // The GPU arch drives `memory.ple_format = auto`; initialising it
+    // allocates no model memory, so admission still precedes every upload.
     let mut gpu = Gpu::init().expect("GPU");
+    // A split base needs its `<model>.ple-q4` / `.ple-q8` sidecar attached
+    // before admission (never derived here); a monolith keeps its embedded
+    // rows.
+    let choice = resolve_and_attach_ple_rows(
+        &mut hfq,
+        &model,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+        ResolvePolicy {
+            derive_missing_q4: false,
+            progress: None,
+        },
+    )
+    .expect("PLE rows");
+    // Admission is GPU-arch aware and runs after the PLE rows are attached,
+    // which the receipt's `ple_rows` records.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).expect("admission");
     let domain = CacheDomain::for_model(&hfq, &tokenizer, None, "qwen4", gpu.device_id);
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
@@ -517,36 +580,181 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         &receipt.manifest,
     )
     .expect("scratch plan");
-    if gpu.is_uma() {
-        hfq.drop_mmap();
-    }
-    let mesh = DeviceMesh::single().expect("mesh");
-    let expected = WeightOrigin::for_single(&mesh, &gpu);
-    let source = HfqModelSource::from_hfq(hfq);
-    let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        &mut gpu,
-        expected,
-        |entry| {
-            source
-                .tensor_range(&entry.name)
-                .map_err(|e| e.to_string())?
-                .map(SourcePayload::Range)
-                .ok_or_else(|| format!("missing tensor '{}'", entry.name))
-        },
-    )
-    .expect("weights");
     let (state_request, state_format) = hw_identity::resolve_gdn_test_state_format(
         &hipfire_runtime::config::get().kv_mode,
         &gpu,
         &receipt.config,
     )
     .expect("state format");
-    let vocab = receipt.config.vocab_size;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let use_ranges = gpu.is_uma();
+    let mut weights = receipt.manifest.weights.clone();
+    let explicit = residency::expert_vram_layers_from_env().expect("expert placement request");
+    let placement = if use_ranges {
+        explicit
+    } else {
+        let (non_expert, per_layer) =
+            residency::resident_split(&weights, |entry| slab_payload_bytes(&hfq, entry))
+                .expect("resident split");
+        let experts =
+            residency::routed_expert_bytes(&weights, |entry| slab_payload_bytes(&hfq, entry))
+                .expect("routed expert bytes");
+        let (free, _) = gpu.hip.get_vram_info().expect("free VRAM");
+        let free = free as u64;
+        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, MAX_SEQ);
+        let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
+            backend,
+            gpu.is_uma(),
+            MAX_SEQ,
+            chunk,
+            gpu.vmm_recommended_granularity().unwrap_or(1),
+        );
+        // Reserve the native MTP head's device bytes so the AR tests place
+        // exactly like the MTP ones.
+        let head = residency::language_head_dtype(&weights).expect("language head dtype");
+        let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
+            &gpu,
+            &receipt.config,
+            state_format.gdn,
+            MTP_K,
+        );
+        let mtp = hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+            &receipt.config,
+            &context,
+            chunk,
+            MTP_K,
+            head,
+            row_capture,
+            hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(&gpu),
+        )
+        .expect("native MTP device bytes");
+        let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            &gpu,
+            state_format.qsa,
+            state_format.qsa_f16_arena,
+        )
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                receipt.config.num_key_value_heads,
+                context.tokens,
+            )
+            .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
+            .expect("QSA gather scratch size overflows")
+        });
+        let reserve = residency::auto_vram_reserve(
+            &receipt.config,
+            &context,
+            chunk,
+            scratch_mode,
+            state_format.layout(),
+            Some(mtp),
+            gather,
+        )
+        .expect("auto VRAM reserve");
+        match residency::resolve_expert_vram_layers(explicit, || {
+            Ok(residency::fits_fully_resident(
+                free, non_expert, experts, reserve,
+            ))
+        })
+        .expect("expert placement")
+        {
+            Some(residency::ExpertVramLayers::Auto) => {
+                let required = non_expert
+                    .checked_add(reserve)
+                    .expect("non-expert weights plus reserve overflow");
+                assert!(
+                    free >= required,
+                    "not enough free VRAM for non-expert weights plus auto reserve"
+                );
+                Some(residency::ExpertVramLayers::Layers(
+                    residency::auto_vram_layers(
+                        free,
+                        non_expert,
+                        per_layer,
+                        receipt.config.num_hidden_layers,
+                        reserve,
+                    ),
+                ))
+            }
+            placement => placement,
+        }
+    };
+    let moe_layers = residency::moe_layer_count(&receipt.config);
+    let mut vram_layers = moe_layers;
+    if let Some(policy) = placement {
+        assert!(
+            !use_ranges,
+            "{} places experts in host RAM, which only a discrete GPU needs",
+            residency::EXPERT_VRAM_LAYERS_ENV
+        );
+        let residency::ExpertVramLayers::Layers(layers) = policy else {
+            panic!("unresolved auto expert placement");
+        };
+        residency::place_routed_experts(&mut weights, layers);
+        vram_layers = layers.min(receipt.config.num_hidden_layers);
+    }
+    let host_bytes =
+        residency::host_mapped_bytes(&weights, |entry| slab_payload_bytes(&hfq, entry))
+            .expect("host-mapped bytes");
+    residency::check_host_ram(
+        host_bytes,
+        rdna_compute::kv_slots::mem_available_bytes(),
+        residency::ttm_pool_estimate(),
+    )
+    .expect("host RAM for host-mapped experts");
+    residency::check_gtt_cap(host_bytes, residency::gtt_budget())
+        .expect("GTT cap for host-mapped experts");
+    eprintln!(
+        "session_cache_hw placement: trunk layers {} resident / {} host-mapped of {moe_layers}, \
+         {host_bytes} host-mapped bytes, PLE rows {} from {}",
+        vram_layers.min(moe_layers),
+        moe_layers.saturating_sub(vram_layers),
+        choice.format.name(),
+        match &choice.origin {
+            PleRowsOrigin::Embedded => "embedded model file".to_string(),
+            PleRowsOrigin::Sidecar(sidecar) => sidecar.display().to_string(),
+        }
+    );
+    if use_ranges {
+        hfq.drop_mmap();
+    }
+    let mesh = DeviceMesh::single().expect("mesh");
+    let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let source = HfqModelSource::from_hfq(hfq);
+    let transaction = fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            // An expert-slab layer arena is one span of the container, not a
+            // tensor (host-mapped arenas are copied from the live mapping).
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            // Ranges on UMA and for external rows, borrowed mmap bytes for
+            // resident tensors on a discrete card.
+            if use_ranges || entry.residency.is_external() {
+                return source
+                    .tensor_range(&entry.name)
+                    .map_err(|e| e.to_string())?
+                    .map(SourcePayload::Range)
+                    .ok_or_else(|| format!("missing tensor '{}'", entry.name));
+            }
+            let (info, bytes) = source
+                .tensor_data(&entry.name)
+                .ok_or_else(|| format!("missing tensor '{}'", entry.name))?;
+            Ok(SourcePayload::Borrowed { info, bytes })
+        },
+    )
+    .expect("weights");
+    let vocab = receipt.config.vocab_size;
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -554,8 +762,10 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         &mut gpu,
         MAX_SEQ,
         receipt.ple,
+        receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
