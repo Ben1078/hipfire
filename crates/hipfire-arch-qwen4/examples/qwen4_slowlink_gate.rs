@@ -184,7 +184,9 @@ fn purpose_name(purpose: AdmissionPurpose) -> &'static str {
 }
 
 /// The actual admission read back from the loaded bundle's profile.
-fn admitted_from(profile: Option<&hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile>) -> Option<(&'static str, u64)> {
+fn admitted_from(
+    profile: Option<&hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile>,
+) -> Option<(&'static str, u64)> {
     profile.map(|p| (purpose_name(p.purpose), p.tile_rows as u64))
 }
 
@@ -2228,7 +2230,10 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         let profile = purpose_name(purpose);
         let expected_tile = manifest_profile_tile(&manifest, profile).unwrap_or(0);
         // Expected only: nothing is admitted until a load succeeds.
-        out.insert("s1_profile".into(), s1_profile_evidence(purpose, &manifest, None));
+        out.insert(
+            "s1_profile".into(),
+            s1_profile_evidence(purpose, &manifest, None),
+        );
         progress.record("profile", out["s1_profile"].clone());
         let mut fixture = fixture;
         let session_cache = (args.mode == Mode::State).then_some(fixture.session_cache_bytes);
@@ -4907,7 +4912,12 @@ mod slowlink_receipt_tests {
     fn slowlink_receipt_final_report_serializes_the_handoff_contract() {
         let dir = scratch_dir("final");
         for (mode, route, purpose, tile) in [
-            ("primitives", "layer-major", AdmissionPurpose::PrimitiveSelftest, 512u64),
+            (
+                "primitives",
+                "layer-major",
+                AdmissionPurpose::PrimitiveSelftest,
+                512u64,
+            ),
             ("state", "layer-major", AdmissionPurpose::Product, 768),
         ] {
             let args = temp_args(&dir, mode, route);
