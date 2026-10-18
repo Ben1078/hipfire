@@ -700,6 +700,15 @@ impl SessionCacheUsage {
     }
 }
 
+/// One host snapshot a context growth removes because it pins a device owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostVictim {
+    /// Index into the pending captures.
+    Pending(usize),
+    /// A published host snapshot.
+    Pool(Key),
+}
+
 pub struct SessionCache {
     pool: CheckpointPool<StoredSnapshot>,
     domain: CacheDomain,
@@ -747,6 +756,10 @@ pub struct SessionCache {
     /// accounted (and unfreed) until a later drain succeeds; armed with the
     /// pressure policy, absent (no allocation) without it.
     quarantine: Option<Arc<Quarantine>>,
+    /// Keys of the published host snapshots, oldest publication first: the
+    /// host pool cannot be iterated, and the context-growth planner must find
+    /// the host descendants that pin a device owner.
+    host_index: Vec<Key>,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -1441,6 +1454,7 @@ impl SessionCache {
             host_skips_total: 0,
             backing_granule: None,
             quarantine: None,
+            host_index: Vec::new(),
         }
     }
 
@@ -1871,11 +1885,78 @@ impl SessionCache {
                 return (evicted, true);
             }
             match self.host_pool.pop_lru() {
-                Some((_, snapshot)) => {
+                Some((key, snapshot)) => {
+                    self.host_index.retain(|k| *k != key);
                     self.note_host_eviction(&snapshot);
                     evicted.extend(snapshot.into_store());
                 }
                 None => return (evicted, false),
+            }
+        }
+    }
+
+    /// Whether `parent`'s ancestor chain (through published or pending
+    /// snapshots on either tier) reaches a published DEVICE snapshot, the
+    /// only owner a context growth can release.
+    fn chain_reaches_device(&self, parent: &Key) -> bool {
+        let mut cur = parent.clone();
+        loop {
+            if self.pool.contains(&cur.0, cur.1, cur.2) {
+                return true;
+            }
+            match self.entry(&cur).and_then(|s| s.parent.clone()) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+    }
+
+    /// Pure planner of a context growth that finds every published device
+    /// snapshot pinned: the one host descendant whose removal (with its
+    /// unlink) moves a device owner toward release. A pending host snapshot
+    /// (deepest first) or an unpinned published host leaf (oldest first),
+    /// either way one whose parent chain reaches a device snapshot; host-only
+    /// chains and unrelated host entries are never chosen.
+    fn plan_device_blocker(&self) -> Option<HostVictim> {
+        let blocks = |snapshot: &StoredSnapshot| {
+            matches!(snapshot.location, SnapshotLocation::Host(_))
+                && snapshot
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| self.chain_reaches_device(parent))
+        };
+        if let Some(i) = self.pending.iter().rposition(|entry| blocks(&entry.1)) {
+            return Some(HostVictim::Pending(i));
+        }
+        self.host_index
+            .iter()
+            .find(|key| {
+                !self.host_pool.is_pinned(&key.0, key.1, key.2)
+                    && self
+                        .host_pool
+                        .peek(&key.0, key.1, key.2)
+                        .is_some_and(|snapshot| blocks(snapshot))
+            })
+            .map(|key| HostVictim::Pool(key.clone()))
+    }
+
+    /// Bookkeeping of one [`Self::plan_device_blocker`] victim, no GPU: take
+    /// it out of its pool (a published one counts as a host eviction),
+    /// unlink it from its parent and return its memory to free.
+    fn take_device_blocker(&mut self) -> Option<Store> {
+        match self.plan_device_blocker()? {
+            HostVictim::Pending(i) => {
+                let (_, snapshot) = self.pending.remove(i);
+                if let Some(parent) = &snapshot.parent {
+                    self.unlink(parent);
+                }
+                snapshot.into_store()
+            }
+            HostVictim::Pool(key) => {
+                let snapshot = self.host_pool.evict(&key.0, key.1, key.2)?;
+                self.host_index.retain(|k| *k != key);
+                self.note_host_eviction(&snapshot);
+                snapshot.into_store()
             }
         }
     }
@@ -2913,8 +2994,13 @@ impl SessionCache {
             };
             if id == CheckpointId::NONE {
                 refused.insert(key);
-            } else if self.children.contains_key(&key) {
-                self.pin_key(&key);
+            } else {
+                if host && !self.host_index.contains(&key) {
+                    self.host_index.push(key.clone());
+                }
+                if self.children.contains_key(&key) {
+                    self.pin_key(&key);
+                }
             }
             for snapshot in displaced {
                 self.retire(snapshot);
@@ -3033,6 +3119,7 @@ impl SessionCache {
     fn take_all_stores(&mut self) -> Vec<Store> {
         let pooled = self.pool.drain_blobs();
         let hosted = self.host_pool.drain_blobs();
+        self.host_index.clear();
         let pending = std::mem::take(&mut self.pending)
             .into_iter()
             .map(|entry| entry.1);
@@ -3073,7 +3160,7 @@ impl SessionCache {
         let mut freed = 0;
         loop {
             // A failed query cannot be helped by evicting.
-            if memory_fits(gpu, need, 0) != Some(false) {
+            if self.device_fits(gpu, need, 0) != Some(false) {
                 break;
             }
             // Only device owners relieve device pressure: a host block stays.
@@ -3096,11 +3183,20 @@ impl SessionCache {
                         self.evict_device(gpu, key, snapshot, need);
                         continue;
                     }
-                    None => self
-                        .pending
-                        .iter()
-                        .rposition(|entry| device_bytes(&entry.1) > 0)
-                        .map(|i| self.pending.remove(i).1),
+                    None => match self.take_device_blocker() {
+                        // A host descendant pins every releasable device
+                        // owner: drop it (its memory is host, never counted
+                        // as VRAM freed) and retry the device victims.
+                        Some(store) => {
+                            free_store(gpu, store);
+                            continue;
+                        }
+                        None => self
+                            .pending
+                            .iter()
+                            .rposition(|entry| device_bytes(&entry.1) > 0)
+                            .map(|i| self.pending.remove(i).1),
+                    },
                 },
             };
             let Some(snapshot) = snapshot else {
@@ -8159,5 +8255,129 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!((sent.get(), fences.get()), (1, 1));
+    }
+
+    /// Publish `snapshot` at cut `p` (linking its parent first, as capture
+    /// does) through the production `commit`.
+    fn publish_cut(cache: &mut SessionCache, hist: &[u32], p: usize, snapshot: StoredSnapshot) -> Key {
+        let key = cut_key(cache, hist, p);
+        if let Some(parent) = snapshot.parent.clone() {
+            cache.link(&parent);
+        }
+        cache.pending.push((key.clone(), snapshot));
+        cache.commit();
+        key
+    }
+
+    #[test]
+    fn slowlink_session_cache_growth_releases_a_device_parent_pinned_by_a_host_child() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, HUGE);
+        let device = publish_cut(&mut cache, &hist, 2, fake_snapshot(2));
+        let child = publish_cut(&mut cache, &hist, 3, host_snapshot(100, Some(device.clone()), &drops));
+        // Unrelated host entries: a standalone one and a host-only chain.
+        let lone = publish_cut(&mut cache, &hist, 5, host_snapshot(10, None, &drops));
+        let root = publish_cut(&mut cache, &hist, 6, host_snapshot(20, None, &drops));
+        let leaf = publish_cut(&mut cache, &hist, 7, host_snapshot(30, Some(root.clone()), &drops));
+
+        // The device pool has nothing evictable: the host child pins its parent.
+        assert!(cache.pool.is_pinned(&device.0, device.1, device.2));
+        assert!(cache.pool.pop_lru().is_none());
+        // The planner picks exactly that child, never the host-only chain.
+        assert_eq!(
+            cache.plan_device_blocker(),
+            Some(HostVictim::Pool(child.clone()))
+        );
+        let before = cache.usage();
+        let store = cache.take_device_blocker().expect("a blocking host child");
+        assert_eq!(released(&drops), 0, "bookkeeping frees nothing itself");
+        assert_eq!(store.host_bytes(), 100);
+        drop(store);
+        assert_eq!(released(&drops), 1);
+
+        // Ownership and counters are exact: one host eviction, 100 host bytes
+        // gone, no device byte or device eviction counted.
+        let after = cache.usage();
+        assert_eq!(after.host_evictions_total, before.host_evictions_total + 1);
+        assert_eq!(after.host_pool_bytes, before.host_pool_bytes - 100);
+        assert_eq!(after.evictions_total, before.evictions_total);
+        assert_eq!(after.pool_bytes, before.pool_bytes);
+        assert!(!cache.host_pool.contains(&child.0, child.1, child.2));
+        assert!(cache.children.get(&device).is_none());
+        // The device parent is releasable now, and is the next victim.
+        assert!(!cache.pool.is_pinned(&device.0, device.1, device.2));
+        assert!(cache.plan_device_blocker().is_none());
+        assert!(cache.pool.pop_lru().is_some());
+        // The unrelated host entries are untouched, chain still linked.
+        for key in [&lone, &root, &leaf] {
+            assert!(cache.host_pool.contains(&key.0, key.1, key.2));
+        }
+        assert!(cache.host_pool.is_pinned(&root.0, root.1, root.2));
+        assert_eq!(cache.host_index, vec![lone, root, leaf]);
+    }
+
+    #[test]
+    fn slowlink_session_cache_growth_unwinds_a_multi_host_chain_leaf_first_and_stops_at_host_only() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, HUGE);
+        let device = publish_cut(&mut cache, &hist, 2, fake_snapshot(2));
+        let h1 = publish_cut(&mut cache, &hist, 3, host_snapshot(10, Some(device.clone()), &drops));
+        let h2 = publish_cut(&mut cache, &hist, 4, host_snapshot(20, Some(h1.clone()), &drops));
+        let other = publish_cut(&mut cache, &hist, 5, host_snapshot(40, None, &drops));
+
+        // Only the unpinned leaf is a victim; its host parent is pinned by it.
+        assert_eq!(cache.plan_device_blocker(), Some(HostVictim::Pool(h2.clone())));
+        drop(cache.take_device_blocker());
+        assert_eq!(cache.plan_device_blocker(), Some(HostVictim::Pool(h1.clone())));
+        drop(cache.take_device_blocker());
+        assert_eq!(released(&drops), 2);
+        assert_eq!(cache.usage().host_evictions_total, 2);
+        // The device owner is free; no further host entry blocks anything.
+        assert!(cache.plan_device_blocker().is_none());
+        assert!(cache.take_device_blocker().is_none());
+        assert!(cache.pool.pop_lru().is_some());
+        assert!(cache.host_pool.contains(&other.0, other.1, other.2));
+        assert_eq!(cache.usage().host_pool_bytes, 40);
+
+        // A chain that never reaches the device blocks nothing.
+        let mut cache = policy_cache(HUGE, HUGE);
+        let root = publish_cut(&mut cache, &hist, 2, host_snapshot(10, None, &drops));
+        publish_cut(&mut cache, &hist, 3, host_snapshot(20, Some(root), &drops));
+        assert!(cache.plan_device_blocker().is_none());
+    }
+
+    #[test]
+    fn slowlink_session_cache_growth_drops_a_pending_host_descendant_and_unlinks_it() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = policy_cache(HUGE, HUGE);
+        let device = publish_cut(&mut cache, &hist, 2, fake_snapshot(2));
+        // This turn's captures: a host child and a device child of the device
+        // parent (the device one is the pending-device victim's business).
+        cache.link(&device);
+        cache.link(&device);
+        cache.pending.push((
+            cut_key(&cache, &hist, 3),
+            StoredSnapshot {
+                parent: Some(device.clone()),
+                ..fake_snapshot(3)
+            },
+        ));
+        cache.pending.push((
+            cut_key(&cache, &hist, 4),
+            host_snapshot(50, Some(device.clone()), &drops),
+        ));
+        assert_eq!(cache.plan_device_blocker(), Some(HostVictim::Pending(1)));
+        let evictions = cache.usage().host_evictions_total;
+        drop(cache.take_device_blocker());
+        assert_eq!(released(&drops), 1);
+        // A dropped pending capture is not a pool eviction; one link is gone.
+        assert_eq!(cache.usage().host_evictions_total, evictions);
+        assert_eq!(cache.children.get(&device), Some(&1));
+        assert_eq!(cache.pending.len(), 1);
+        // The pending DEVICE child is not a host victim.
+        assert!(cache.plan_device_blocker().is_none());
     }
 }
