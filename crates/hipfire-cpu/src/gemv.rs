@@ -412,7 +412,7 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
                             match cache.lookup.entry(key) {
                                 Entry::Occupied(e) => *e.get(),
                                 Entry::Vacant(e) => {
-                                    let groups = k / 256;
+                                    let groups = kind.len(k);
                                     let start = cache.sums.len();
                                     cache.sums.resize(start + groups, 0.0);
                                     simd::prepare_activation_sums(
@@ -477,8 +477,9 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
 #[cfg(target_arch = "x86_64")]
 #[derive(Default)]
 struct ActivationSumCache {
-    /// `Σx` for every *unique* eligible activation row seen this call, `k / 256`
-    /// f32 each, concatenated in first-seen order.
+    /// `Σx` for every *unique* eligible activation row seen this call,
+    /// `kind.len(k)` f32 each (`k / 256` for the MQ kinds, `k / 8` word sums for
+    /// E8P), concatenated in first-seen order.
     sums: Vec<f32>,
     /// Start index into `sums` per (job, token), flattened in job order;
     /// `usize::MAX` marks a token whose job is not prepared (scalar path or a
@@ -602,30 +603,75 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
         #[cfg(not(target_arch = "x86_64"))]
         let use_simd = simd::row_dot_enabled(q, _requested);
         #[cfg(target_arch = "x86_64")]
-        let prepared = use_simd && simd::activation_sum_kind(q).is_some();
+        let prepared_kind = if use_simd {
+            simd::activation_sum_kind(q)
+        } else {
+            None
+        };
+        #[cfg(target_arch = "x86_64")]
+        let pair = prepared_kind.is_some() && simd::has_row_pair_kernel(q);
         o[..m * n]
             .par_chunks_mut(rows_per_block * n)
             .enumerate()
             .for_each(|(block, rows)| {
-                for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
-                    let r = block * rows_per_block + within_block;
-                    let (row, srow) = row_slices(q, src.packed(j), m, k, r);
-                    #[cfg(target_arch = "x86_64")]
-                    if prepared {
-                        let base = token_base[j];
+                let first_row = block * rows_per_block;
+                #[cfg(target_arch = "x86_64")]
+                if let Some(kind) = prepared_kind {
+                    let base = token_base[j];
+                    let sum_len = kind.len(k);
+                    let sums_of = |t: usize| {
+                        let off = offsets[base + t];
+                        debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
+                        &sums[off..off + sum_len]
+                    };
+                    let mut r = first_row;
+                    let mut rest: &mut [f32] = rows;
+                    if pair {
+                        // Two rows at a time: each activation load is shared by
+                        // both rows' FMAs; every element is bit-identical to the
+                        // single-row kernel's.
+                        while rest.len() >= 2 * n {
+                            let (both, tail) = rest.split_at_mut(2 * n);
+                            let (out0, out1) = both.split_at_mut(n);
+                            let (row0, srow0) = row_slices(q, src.packed(j), m, k, r);
+                            let (row1, srow1) = row_slices(q, src.packed(j), m, k, r + 1);
+                            for t in 0..n {
+                                let [v0, v1] = simd::row_pair_dot_with_activation_sums(
+                                    q,
+                                    row0,
+                                    srow0,
+                                    row1,
+                                    srow1,
+                                    k,
+                                    &src.xs_row(j, t)[..k],
+                                    sums_of(t),
+                                );
+                                out0[t] = v0;
+                                out1[t] = v1;
+                            }
+                            rest = tail;
+                            r += 2;
+                        }
+                    }
+                    for chunk in rest.chunks_mut(n) {
+                        let (row, srow) = row_slices(q, src.packed(j), m, k, r);
                         for (t, v) in chunk.iter_mut().enumerate() {
-                            let off = offsets[base + t];
-                            debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
                             *v = simd::row_dot_with_activation_sums(
                                 q,
                                 row,
+                                srow,
                                 k,
                                 &src.xs_row(j, t)[..k],
-                                &sums[off..off + k / 256],
+                                sums_of(t),
                             );
                         }
-                        continue;
+                        r += 1;
                     }
+                    return;
+                }
+                for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
+                    let r = first_row + within_block;
+                    let (row, srow) = row_slices(q, src.packed(j), m, k, r);
                     for (t, v) in chunk.iter_mut().enumerate() {
                         *v = dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
                     }
@@ -1146,6 +1192,10 @@ mod test {
                 CpuQuant::Mq4G128V2,
                 CpuQuant::Mq3G256Lloyd,
                 CpuQuant::Mfp4G32E8,
+                CpuQuant::E8pI4G128R256,
+                CpuQuant::E8pI4G128R128,
+                CpuQuant::Mq3I4G128R256,
+                CpuQuant::Mq3I4G128R128,
             ] {
                 let packed = weights(q, m, k);
                 let one_row = |x: &[f32]| {

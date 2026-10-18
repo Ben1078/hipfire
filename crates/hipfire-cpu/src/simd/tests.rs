@@ -429,12 +429,13 @@ fn cached_and_uncached_agree_on_awkward_inputs() {
                 let x: Vec<f32> = (0..k)
                     .map(|i| (((i + token * 71) as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
                     .collect();
-                let mut sums = vec![0.0; k / 256];
-                prepare_activation_sums(activation_sum_kind(q).unwrap(), &x, &mut sums);
+                let kind = activation_sum_kind(q).unwrap();
+                let mut sums = vec![0.0; kind.len(k)];
+                prepare_activation_sums(kind, &x, &mut sums);
                 for row in 0..m {
                     let weights = &packed[row * row_bytes(q, k)..];
                     let uncached = row_dot_avx2(q, weights, &[], k, &x);
-                    let cached = row_dot_with_activation_sums(q, weights, k, &x, &sums);
+                    let cached = row_dot_with_activation_sums(q, weights, &[], k, &x, &sums);
                     assert_eq!(
                         cached.to_bits(),
                         uncached.to_bits(),
@@ -644,6 +645,158 @@ fn planar_avx2_and_scalar_agree_within_tolerance() {
                         "{q:?} {m}x{k} row {row}: {what} {got} vs f64 oracle {dot} \
                          (err {err:.3e}, Σ|wx| {l1:.3e})"
                     );
+                }
+            }
+        }
+    }
+}
+
+/// Activation with mixed magnitudes (`2^±10`) and signs, so the word sums and
+/// the signed-magnitude FMAs round differently from the benign [`planar_x`].
+#[cfg(target_arch = "x86_64")]
+fn e8p_awkward_x(k: usize, salt: usize) -> Vec<f32> {
+    planar_x(k, salt)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| match (i + salt) % 5 {
+            0 => v * 1024.0,
+            1 => v / 1024.0,
+            2 => -v,
+            _ => v,
+        })
+        .collect()
+}
+
+/// Row `r`'s `(codes, scales)` of a planar `[m, k]` tensor.
+#[cfg(target_arch = "x86_64")]
+fn planar_row(q: CpuQuant, packed: &[u8], m: usize, k: usize, r: usize) -> (&[u8], &[u8]) {
+    let (rb, spr) = (row_bytes(q, k), 2 * (k / 128));
+    let at = m * rb + r * spr;
+    (&packed[r * rb..(r + 1) * rb], &packed[at..at + spr])
+}
+
+/// E8P: the unprepared kernel (word sums inline), the prepared kernel (word
+/// sums from [`prepare_activation_sums`]) and the two-row kernel must agree to
+/// the bit, row by row, on random codes (every 16-bit word, so every shift bit
+/// and sign pattern) with random f16 scales and awkward activations. The pair
+/// kernel is also exercised on non-adjacent and identical rows.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn e8p_prepared_and_pair_kernels_are_bit_identical_to_unprepared() {
+    for q in [CpuQuant::E8pI4G128R256, CpuQuant::E8pI4G128R128] {
+        if !row_dot_enabled(q, Some(true)) {
+            eprintln!("skip {q:?}: AVX2/F16C absent on this runner");
+            continue;
+        }
+        assert!(has_row_pair_kernel(q), "{q:?}");
+        let kind = activation_sum_kind(q).expect("E8P has prepared sums");
+        for k in [128usize, 640, 2560] {
+            // R256 profiles need k % 256 (640 and 128 are R128-only shapes).
+            if k % q.k_multiple() != 0 {
+                continue;
+            }
+            let m = 7;
+            let packed = testfix::planar_tensor(q, m, k, 0xE8B0_0000 ^ k as u64);
+            for salt in 0..4 {
+                for x in [planar_x(k, salt), e8p_awkward_x(k, salt)] {
+                    let mut sums = vec![f32::NAN; kind.len(k)];
+                    assert_eq!(sums.len(), k / 8, "{q:?} k={k}");
+                    prepare_activation_sums(kind, &x, &mut sums);
+                    for r in 0..m {
+                        let (row, srow) = planar_row(q, &packed, m, k, r);
+                        let uncached = row_dot_avx2(q, row, srow, k, &x);
+                        let cached = row_dot_with_activation_sums(q, row, srow, k, &x, &sums);
+                        assert_eq!(
+                            cached.to_bits(),
+                            uncached.to_bits(),
+                            "{q:?} k={k} salt={salt} row={r}: cached vs uncached"
+                        );
+                    }
+                    for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 0), (3, 3)] {
+                        let (row0, srow0) = planar_row(q, &packed, m, k, a);
+                        let (row1, srow1) = planar_row(q, &packed, m, k, b);
+                        let [p0, p1] = row_pair_dot_with_activation_sums(
+                            q, row0, srow0, row1, srow1, k, &x, &sums,
+                        );
+                        let s0 = row_dot_with_activation_sums(q, row0, srow0, k, &x, &sums);
+                        let s1 = row_dot_with_activation_sums(q, row1, srow1, k, &x, &sums);
+                        assert_eq!(
+                            p0.to_bits(),
+                            s0.to_bits(),
+                            "{q:?} k={k} salt={salt} pair ({a},{b}) row {a}"
+                        );
+                        assert_eq!(
+                            p1.to_bits(),
+                            s1.to_bits(),
+                            "{q:?} k={k} salt={salt} pair ({a},{b}) row {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// E8P: the folded kernels (unprepared, prepared, pair) against the exact `f64`
+/// decode ([`planar_oracle`]; absolute `1e-5·Σ|w·x|`) and against the
+/// forced-scalar path under the same relative contract and cancellation floor as
+/// [`planar_avx2_and_scalar_agree_within_tolerance`].
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn e8p_folded_kernels_match_the_f64_decode_within_tolerance() {
+    for q in [CpuQuant::E8pI4G128R256, CpuQuant::E8pI4G128R128] {
+        if !row_dot_enabled(q, Some(true)) {
+            eprintln!("skip {q:?}: AVX2/F16C absent on this runner");
+            continue;
+        }
+        let kind = activation_sum_kind(q).expect("E8P has prepared sums");
+        for k in [128usize, 640, 2560] {
+            if k % q.k_multiple() != 0 {
+                continue;
+            }
+            let m = 8;
+            let packed = testfix::planar_tensor(q, m, k, 0xE8B1_0000 ^ k as u64);
+            for x in [planar_x(k, 0), e8p_awkward_x(k, 1)] {
+                let mut sums = vec![0.0f32; kind.len(k)];
+                prepare_activation_sums(kind, &x, &mut sums);
+                let mut scalar = vec![0.0f32; m];
+                gemv_with_simd(q, &packed, m, k, &x, &mut scalar, Some(false));
+                let floor = cancellation_floor(q, &packed, m, k, &x);
+                let oracle = planar_oracle(q, &packed, m, k, &x);
+                for r in 0..m {
+                    let (row, srow) = planar_row(q, &packed, m, k, r);
+                    let (prow, psrow) = planar_row(q, &packed, m, k, r ^ 1);
+                    let pair = if r % 2 == 0 {
+                        row_pair_dot_with_activation_sums(q, row, srow, prow, psrow, k, &x, &sums)
+                            [0]
+                    } else {
+                        row_pair_dot_with_activation_sums(q, prow, psrow, row, srow, k, &x, &sums)
+                            [1]
+                    };
+                    let kernels = [
+                        ("uncached", row_dot_avx2(q, row, srow, k, &x)),
+                        (
+                            "cached",
+                            row_dot_with_activation_sums(q, row, srow, k, &x, &sums),
+                        ),
+                        ("pair", pair),
+                    ];
+                    let (dot, l1) = oracle[r];
+                    for (what, got) in kernels {
+                        let err = (got as f64 - dot).abs();
+                        assert!(
+                            err <= 1e-5 * l1,
+                            "{q:?} k={k} row {r}: {what} {got} vs f64 oracle {dot} \
+                             (err {err:.3e}, Σ|wx| {l1:.3e})"
+                        );
+                        let scale = scalar[r].abs().max(1e-6).max(floor[r]);
+                        let rel = (got - scalar[r]).abs() / scale;
+                        assert!(
+                            rel <= 1e-4,
+                            "{q:?} k={k} row {r}: {what} {got} vs scalar {} (rel {rel:.3e})",
+                            scalar[r]
+                        );
+                    }
                 }
             }
         }

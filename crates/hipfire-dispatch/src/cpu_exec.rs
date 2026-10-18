@@ -2902,8 +2902,29 @@ mod moe_splice_tests {
         b
     }
 
-    /// A `[m, k]` weight tensor's bytes, group by group.
+    /// A `[m, k]` weight tensor's bytes, group by group. Planar formats
+    /// (`[codes plane][f16 scale plane]`, `tensor_bytes(q, m, k)` long): an
+    /// LCG-derived code plane (every E8P word / 3-bit code is legal) and finite,
+    /// normal, positive f16 scales.
     fn weight_bytes(q: CpuQuant, m: usize, k: usize, salt: usize) -> Vec<u8> {
+        if q.is_planar() {
+            let codes = m * hipfire_cpu::gemv::row_bytes(q, k);
+            let mut s = (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+            let mut next = move || {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u32
+            };
+            let mut out = Vec::with_capacity(hipfire_cpu::gemv::tensor_bytes(q, m, k));
+            out.extend((0..codes).map(|_| next() as u8));
+            for _ in 0..m * (k / 128) {
+                let scale = 0x2800u16 + (next() % 0x1400) as u16;
+                out.extend_from_slice(&scale.to_le_bytes());
+            }
+            assert_eq!(out.len(), hipfire_cpu::gemv::tensor_bytes(q, m, k));
+            return out;
+        }
         let groups = k / q.group_elems();
         let mut out = Vec::with_capacity(m * groups * q.group_bytes());
         for row in 0..m {
@@ -3878,33 +3899,40 @@ mod moe_splice_tests {
 
     // ── D2 row-invariance oracle across formats ────────────────────────────
 
-    /// An expert pool in format `q` of shape `(dim, mi)`; gate_up and down share
-    /// the format (D2's placement is per expert, and a graded split is its own
-    /// case in `graded_multirow_matches_per_expert_gemv`).
+    /// An expert pool of shape `(dim, mi)` with separate gate_up (`gq`) and down
+    /// (`dq`) formats: the row formats (D2's placement is per expert, a graded
+    /// split is its own case in `graded_multirow_matches_per_expert_gemv`) and
+    /// the planar E8P-I4 / W3 slab pairs (R256 gate_up, R128 down).
     struct QFix {
-        q: CpuQuant,
+        gq: CpuQuant,
+        dq: CpuQuant,
         dim: usize,
         mi: usize,
         gu: Vec<Vec<u8>>,
         dn: Vec<Vec<u8>>,
     }
 
-    fn qfix(q: CpuQuant, dim: usize, mi: usize, n_exp: usize) -> QFix {
+    fn qfix(gq: CpuQuant, dq: CpuQuant, dim: usize, mi: usize, n_exp: usize) -> QFix {
         QFix {
-            q,
+            gq,
+            dq,
             dim,
             mi,
-            gu: (0..n_exp).map(|e| weight_bytes(q, 2 * mi, dim, 3100 + 173 * e)).collect(),
-            dn: (0..n_exp).map(|e| weight_bytes(q, dim, mi, 7700 + 311 * e)).collect(),
+            gu: (0..n_exp)
+                .map(|e| weight_bytes(gq, 2 * mi, dim, 3100 + 173 * e))
+                .collect(),
+            dn: (0..n_exp)
+                .map(|e| weight_bytes(dq, dim, mi, 7700 + 311 * e))
+                .collect(),
         }
     }
 
     impl QFix {
         fn expert(&self, id: i32) -> CpuMoeExpert<'_> {
             CpuMoeExpert {
-                gate_up_quant: self.q,
+                gate_up_quant: self.gq,
                 gate_up: &self.gu[id as usize],
-                down_quant: self.q,
+                down_quant: self.dq,
                 down: &self.dn[id as usize],
             }
         }
@@ -3927,11 +3955,12 @@ mod moe_splice_tests {
         }
 
         /// Plain per-slot reference: single-row `gemv` projections with the
-        /// GPU's BF16 points and raw F32 down output.
+        /// GPU's BF16 points and raw F32 down output. The input rotation is the
+        /// DOWN quant's contract (as in `moe_slots_compute`).
         fn reference(&self, id: i32, x_row: &[f32]) -> Vec<f32> {
             let e = id as usize;
             let mut gv = vec![0.0f32; 2 * self.mi];
-            gemv(self.q, &self.gu[e], 2 * self.mi, self.dim, x_row, &mut gv);
+            gemv(self.gq, &self.gu[e], 2 * self.mi, self.dim, x_row, &mut gv);
             for g in gv.iter_mut() {
                 *g = bf16_rt(*g);
             }
@@ -3940,13 +3969,13 @@ mod moe_splice_tests {
             for h in hid.iter_mut() {
                 *h = bf16_rt(*h);
             }
-            match self.q.input_rotation() {
+            match self.dq.input_rotation() {
                 InputRotation::FwhtG128V2 => rotate_x_128_v2(&mut hid),
                 InputRotation::FwhtG256 => rotate_x(&mut hid),
                 InputRotation::None => {}
             }
             let mut dout = vec![0.0f32; self.dim];
-            gemv(self.q, &self.dn[e], self.dim, self.mi, &hid, &mut dout);
+            gemv(self.dq, &self.dn[e], self.dim, self.mi, &hid, &mut dout);
             dout
         }
     }
@@ -3954,10 +3983,11 @@ mod moe_splice_tests {
     /// D2 admits windows of 2..4 rows; each token's host slots (the cold
     /// experts of ITS route) and the canonically joined row must be byte
     /// identical to the one-row AR of that token at every row position, across
-    /// formats (cached-Σx MQ4/MQ6 and uncached), identical vs distinct tokens,
-    /// repeated experts across rows, changing cold sets, invalid slots, accepted
-    /// prefix replays (narrower windows, run in both orders so a wide window's
-    /// scratch is reused by a narrow one) and AR calls in between.
+    /// formats (cached-Σx MQ4/MQ6, uncached, and the planar E8P-I4 / W3 slab
+    /// pairs with a distinct gate_up and down quant), identical vs distinct
+    /// tokens, repeated experts across rows, changing cold sets, invalid slots,
+    /// accepted prefix replays (narrower windows, run in both orders so a wide
+    /// window's scratch is reused by a narrow one) and AR calls in between.
     #[test]
     fn d2_window_rows_are_byte_identical_to_one_row_ar_for_every_position() {
         let (top_k, n_exp) = (3usize, 8usize);
@@ -3970,13 +4000,16 @@ mod moe_splice_tests {
         // Cold experts per call (bit e = expert e is cold).
         let cold_sets = [0xFFu8, 0x55, 0xAA, 0x05, 0x00, 0x24, 0x81, 0x1B];
         let shapes = [
-            (CpuQuant::Mq4G128V2, 256usize, 128usize),
-            (CpuQuant::Mq4G256, 256, 256),
-            (CpuQuant::Mq6G256, 256, 256),
-            (CpuQuant::Mq4G256V2, 256, 256),
+            (CpuQuant::Mq4G128V2, CpuQuant::Mq4G128V2, 256usize, 128usize),
+            (CpuQuant::Mq4G256, CpuQuant::Mq4G256, 256, 256),
+            (CpuQuant::Mq6G256, CpuQuant::Mq6G256, 256, 256),
+            (CpuQuant::Mq4G256V2, CpuQuant::Mq4G256V2, 256, 256),
+            // Planar slab formats: gate_up and down use distinct row widths.
+            (CpuQuant::E8pI4G128R256, CpuQuant::E8pI4G128R128, 256, 128),
+            (CpuQuant::Mq3I4G128R256, CpuQuant::Mq3I4G128R128, 256, 128),
         ];
-        for (q, dim, mi) in shapes {
-            let fx = qfix(q, dim, mi, n_exp);
+        for (gq, dq, dim, mi) in shapes {
+            let fx = qfix(gq, dq, dim, mi, n_exp);
             let wts: Vec<f32> = (0..12)
                 .map(|s| (0.11 + 0.063 * s as f32) * if s % 3 == 1 { -1.0 } else { 1.0 })
                 .collect();
@@ -4014,7 +4047,7 @@ mod moe_splice_tests {
                             let mut out = stale(width * top_k * dim);
                             fx.run(width, top_k, &ids, &host, &x[..width * dim], &mut out);
                             let ctx = format!(
-                                "{q:?} scenario {si} identical={identical} cold={cold:#04x} width={width}"
+                                "{gq:?}/{dq:?} scenario {si} identical={identical} cold={cold:#04x} width={width}"
                             );
                             for t in 0..width {
                                 for j in 0..top_k {

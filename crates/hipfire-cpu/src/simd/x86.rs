@@ -1093,21 +1093,25 @@ static E8P_MAGNITUDE: Aligned32<[[f32; 8]; 256]> = Aligned32({
     t
 });
 
-/// E8P sign-flip table, 4 KiB: row `sign7`, lane `k` is `-0.0` (a pure sign-bit
-/// XOR mask) iff the lane is flipped — bit `k` of `sign7` for `k < 7`, and for
-/// lane 7 iff `popcount(sign7)` is odd (the other half of the parity rule, as in
-/// `e8p_i4_reference::build_mask`). XOR with [`E8P_MAGNITUDE`] yields the signed
-/// lane `±2|g|`.
-static E8P_SIGN: Aligned32<[[f32; 8]; 128]> = Aligned32({
-    let mut t = [[0.0f32; 8]; 128];
+/// E8P sign-flip table, 8 KiB: row `hi`, lane `k` is `-0.0` (a pure sign-bit
+/// XOR mask) iff the lane is flipped — bit `k` of `sign7 = hi & 0x7f` for
+/// `k < 7`, and for lane 7 iff `popcount(sign7)` is odd (the other half of the
+/// parity rule, as in `e8p_i4_reference::build_mask`). Indexed by the *whole*
+/// high byte of a wire word, so the shift bit (`hi >> 7`) selects a duplicate of
+/// the `sign7` row and is ignored: the lookup needs no mask. XOR with
+/// [`E8P_MAGNITUDE`] yields the signed lane `±2|g|`; the shift offset is folded
+/// out of the lane loop entirely (see [`off8`]).
+static E8P_SIGN: Aligned32<[[f32; 8]; 256]> = Aligned32({
+    let mut t = [[0.0f32; 8]; 256];
     let mut s = 0usize;
-    while s < 128 {
+    while s < 256 {
+        let s7 = s & 0x7f;
         let mut k = 0;
         while k < 8 {
             let flip = if k < 7 {
-                (s >> k) & 1 == 1
+                (s7 >> k) & 1 == 1
             } else {
-                (s as u32).count_ones() & 1 == 1
+                (s7 as u32).count_ones() & 1 == 1
             };
             t[s][k] = if flip { -0.0 } else { 0.0 };
             k += 1;
@@ -1117,24 +1121,109 @@ static E8P_SIGN: Aligned32<[[f32; 8]; 128]> = Aligned32({
     t
 });
 
-/// `+1.0` / `-1.0` indexed by the E8P shift bit (`true` = `-1/4`, i.e. `-1` in `v`).
-static E8P_SHIFT_OFFSET: [f32; 2] = [1.0, -1.0];
-
-/// One eight-lane `f32` vector of an E8P wire word's `v` values (odd integers in
-/// `[-11, 11]`): `(magnitude[idx] ^ sign[sign7]) + (shift ? -1 : +1)`.
+/// One eight-lane `f32` vector of an E8P wire word's signed magnitudes
+/// `mag[idx] ^ sign[hi]` — the word's `v` values *without* the shift offset
+/// (`v = this + off`, `off = -1` iff the shift bit, else `+1`).
+///
+/// The word is one little-endian `u16` load (x86 is little-endian): `idx` is its
+/// low byte and the whole high byte indexes [`E8P_SIGN`].
 ///
 /// # Safety
 ///
-/// Requires AVX2 and the two word bytes at `p` (`idx`, then `sign7 | shift << 7`).
+/// Requires AVX2 and the two word bytes at `p`.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn e8p_word(p: *const u8) -> __m256 {
-    let idx = *p as usize;
-    let hi = *p.add(1) as usize;
-    let mag = _mm256_load_ps(E8P_MAGNITUDE.0[idx].as_ptr());
-    let sign = _mm256_load_ps(E8P_SIGN.0[hi & 0x7f].as_ptr());
-    let offset = _mm256_broadcast_ss(&E8P_SHIFT_OFFSET[hi >> 7]);
-    _mm256_add_ps(_mm256_xor_ps(mag, sign), offset)
+unsafe fn wm16(p: *const u8) -> __m256 {
+    let w = (p as *const u16).read_unaligned() as usize;
+    _mm256_xor_ps(
+        _mm256_load_ps(E8P_MAGNITUDE.0[w & 0xff].as_ptr()),
+        _mm256_load_ps(E8P_SIGN.0[w >> 8].as_ptr()),
+    )
+}
+
+/// `off_w · S_w` for the eight words at `cp` against their eight activation word
+/// sums at `s`: `off = -1` iff the word's bit 15, applied as a sign-bit XOR of
+/// `S_w` (exact: `-1 · S = -S`, `+1 · S = S`).
+///
+/// # Safety
+///
+/// Requires AVX2, 16 readable bytes at `cp` and 8 readable `f32` at `s`.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn off8(cp: *const u8, s: *const f32) -> __m256 {
+    let w = _mm256_cvtepu16_epi32(_mm_loadu_si128(cp as *const __m128i));
+    let sign_bit = _mm256_and_si256(_mm256_slli_epi32(w, 16), _mm256_set1_epi32(i32::MIN));
+    _mm256_xor_ps(_mm256_loadu_ps(s), _mm256_castsi256_ps(sign_bit))
+}
+
+/// The sums `S_w` of the eight 8-lane chunks of `x[0..64]` (lane `i` = the sum of
+/// `x[8i..8i+8]`), in one fixed `hadd`/permute order. Both the prepared sums
+/// ([`activation_sums_e8p`]) and the inline path of [`e8p_row_dot`] use exactly
+/// this function, which is what makes the two paths bit-identical.
+///
+/// # Safety
+///
+/// Requires AVX2 and 64 readable `f32` at `x`.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn chunk_sums8(x: *const f32) -> __m256 {
+    let c = |i: usize| _mm256_loadu_ps(x.add(8 * i));
+    let h01 = _mm256_hadd_ps(c(0), c(1));
+    let h23 = _mm256_hadd_ps(c(2), c(3));
+    let h45 = _mm256_hadd_ps(c(4), c(5));
+    let h67 = _mm256_hadd_ps(c(6), c(7));
+    // [c0l c1l c2l c3l | c0h c1h c2h c3h], then likewise for chunks 4..7.
+    let q0 = _mm256_hadd_ps(h01, h23);
+    let q1 = _mm256_hadd_ps(h45, h67);
+    let lo = _mm256_permute2f128_ps(q0, q1, 0x20);
+    let hi = _mm256_permute2f128_ps(q0, q1, 0x31);
+    _mm256_add_ps(lo, hi)
+}
+
+/// Per-word activation sums for [`e8p_row_dot_cached`] /
+/// [`e8p_row_pair_dot_cached`]: `out[w] = Σ x[8w..8w+8]` for `w < len`, in
+/// [`chunk_sums8`] order.
+///
+/// # Safety
+///
+/// Requires AVX2; `len % 8 == 0` (`len = k / 8`, `k % 64 == 0`); `8 * len`
+/// readable `f32` at `x` and `len` writable `f32` at `out`.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn activation_sums_e8p(x: *const f32, out: *mut f32, len: usize) {
+    for c in 0..len / 8 {
+        _mm256_storeu_ps(out.add(8 * c), chunk_sums8(x.add(64 * c)));
+    }
+}
+
+/// One 128-group of an E8P row, folded: `Σ_lanes v·x` as
+/// `((a0+a1)+(a2+a3)) + (off8(lo)+off8(hi))` with `a0..a3` the four FMA
+/// accumulators over the group's 16 signed-magnitude words ([`wm16`]) and `sp`
+/// the group's 16 word sums.
+///
+/// # Safety
+///
+/// Requires AVX2 and FMA; 32 readable bytes at `cp`, 128 `f32` at `xp`, 16 `f32`
+/// at `sp`.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn e8p_group(cp: *const u8, xp: *const f32, sp: *const f32) -> __m256 {
+    let mut a0 = _mm256_setzero_ps();
+    let mut a1 = _mm256_setzero_ps();
+    let mut a2 = _mm256_setzero_ps();
+    let mut a3 = _mm256_setzero_ps();
+    for w in 0..4 {
+        let c = cp.add(w * 8);
+        let xw = xp.add(w * 32);
+        a0 = _mm256_fmadd_ps(wm16(c), _mm256_loadu_ps(xw), a0);
+        a1 = _mm256_fmadd_ps(wm16(c.add(2)), _mm256_loadu_ps(xw.add(8)), a1);
+        a2 = _mm256_fmadd_ps(wm16(c.add(4)), _mm256_loadu_ps(xw.add(16)), a2);
+        a3 = _mm256_fmadd_ps(wm16(c.add(6)), _mm256_loadu_ps(xw.add(24)), a3);
+    }
+    let off = _mm256_add_ps(off8(cp, sp), off8(cp.add(16), sp.add(8)));
+    _mm256_add_ps(
+        _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)),
+        off,
+    )
 }
 
 /// The f16 at `p` widened to f32 and broadcast to all eight lanes.
@@ -1145,13 +1234,22 @@ unsafe fn f16_broadcast(p: *const u8) -> __m256 {
     _mm256_cvtph_ps(_mm_set1_epi16(bits as i16))
 }
 
-/// E8P-I4 planar row (qt 135 / 136): `Σ_g (0.25·f32(d_g)) · Σ_w v_w · x_w`.
+/// E8P-I4 planar row (qt 135 / 136): `Σ_g (0.25·f32(d_g)) · Σ_w v_w · x_w`,
+/// with each word's shift offset folded out of the lane loop.
 ///
-/// Per 128-group: 16 words, each one table decode ([`e8p_word`]) FMA'd into one
-/// of four independent accumulators (breaking the FMA latency chain), folded at
-/// the group end into the row accumulator with the group's `0.25·f32(d)` — one
-/// fold per 128 weights, one horizontal sum per row. `0.25·f32(d)` is exact, so
-/// this is the scalar decode's `(f32(d)·0.25)·v` weight up to summation order.
+/// A word's lanes are `v = s + off` with `s = mag[idx] ^ sign[hi]` (the signed
+/// magnitudes, [`wm16`]) and `off = -1` iff the shift bit, else `+1`, so
+/// `Σ_lanes v·x = Σ_lanes s·x + off·S_w` with `S_w` the word's eight-lane
+/// activation sum ([`chunk_sums8`]). Per 128-group ([`e8p_group`]): 16 words
+/// FMA'd into four independent accumulators (breaking the FMA latency chain),
+/// plus the two [`off8`] vectors, folded into the row accumulator with the
+/// group's `0.25·f32(d)` — one fold per 128 weights, one horizontal sum per row.
+/// `0.25·f32(d)` is exact, so this is the scalar decode's `(f32(d)·0.25)·v`
+/// weight up to summation order.
+///
+/// This is the unprepared entry: each group's 16 word sums are computed inline
+/// into a small aligned stack buffer with [`chunk_sums8`]. It is bit-identical to
+/// [`e8p_row_dot_cached`] over [`activation_sums_e8p`].
 ///
 /// # Safety
 ///
@@ -1166,26 +1264,101 @@ pub(super) unsafe fn e8p_row_dot(
 ) -> f32 {
     let quarter = _mm256_set1_ps(0.25);
     let mut row = _mm256_setzero_ps();
+    let mut sums = Aligned32([0.0f32; 16]);
     for g in 0..k / 128 {
-        let cp = codes.add(g * 32);
         let xp = x.add(g * 128);
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        let mut a2 = _mm256_setzero_ps();
-        let mut a3 = _mm256_setzero_ps();
-        for w in 0..4 {
-            let c = cp.add(w * 8);
-            let xw = xp.add(w * 32);
-            a0 = _mm256_fmadd_ps(e8p_word(c), _mm256_loadu_ps(xw), a0);
-            a1 = _mm256_fmadd_ps(e8p_word(c.add(2)), _mm256_loadu_ps(xw.add(8)), a1);
-            a2 = _mm256_fmadd_ps(e8p_word(c.add(4)), _mm256_loadu_ps(xw.add(16)), a2);
-            a3 = _mm256_fmadd_ps(e8p_word(c.add(6)), _mm256_loadu_ps(xw.add(24)), a3);
-        }
-        let group = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        _mm256_store_ps(sums.0.as_mut_ptr(), chunk_sums8(xp));
+        _mm256_store_ps(sums.0.as_mut_ptr().add(8), chunk_sums8(xp.add(64)));
+        let group = e8p_group(codes.add(g * 32), xp, sums.0.as_ptr());
         let scale = _mm256_mul_ps(f16_broadcast(scales.add(2 * g)), quarter);
         row = _mm256_fmadd_ps(group, scale, row);
     }
     hsum256(row)
+}
+
+/// [`e8p_row_dot`] over word sums prepared by [`activation_sums_e8p`]
+/// (`k / 8` of them): the same group helper, scale fold and reduction, with the
+/// inline [`chunk_sums8`] replaced by the cached value it would have produced —
+/// bit-identical to the unprepared row.
+///
+/// # Safety
+///
+/// As [`e8p_row_dot`], plus `k / 8` readable `f32` at `sums`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn e8p_row_dot_cached(
+    codes: *const u8,
+    scales: *const u8,
+    k: usize,
+    x: *const f32,
+    sums: *const f32,
+) -> f32 {
+    let quarter = _mm256_set1_ps(0.25);
+    let mut row = _mm256_setzero_ps();
+    for g in 0..k / 128 {
+        let group = e8p_group(codes.add(g * 32), x.add(g * 128), sums.add(g * 16));
+        let scale = _mm256_mul_ps(f16_broadcast(scales.add(2 * g)), quarter);
+        row = _mm256_fmadd_ps(group, scale, row);
+    }
+    hsum256(row)
+}
+
+/// Two E8P rows against the same activation and prepared word sums at once: each
+/// activation load is shared by both rows' FMAs. Each row's operation order is
+/// exactly [`e8p_row_dot_cached`]'s, so `[r0, r1]` is bit-identical to two
+/// single-row calls.
+///
+/// # Safety
+///
+/// As [`e8p_row_dot_cached`], for both rows: `k / 4` readable bytes at `c0` and
+/// at `c1`, `2 * (k / 128)` at `s0` and at `s1` (the two rows may be anywhere,
+/// they need not be adjacent), `k` readable `f32` at `x`, `k / 8` at `sums`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn e8p_row_pair_dot_cached(
+    c0: *const u8,
+    s0: *const u8,
+    c1: *const u8,
+    s1: *const u8,
+    k: usize,
+    x: *const f32,
+    sums: *const f32,
+) -> [f32; 2] {
+    let codes = [c0, c1];
+    let scales = [s0, s1];
+    let quarter = _mm256_set1_ps(0.25);
+    let mut row = [_mm256_setzero_ps(); 2];
+    for g in 0..k / 128 {
+        let xp = x.add(g * 128);
+        let sp = sums.add(g * 16);
+        let mut a = [[_mm256_setzero_ps(); 4]; 2];
+        for w in 0..4 {
+            let xw = xp.add(w * 32);
+            let x0 = _mm256_loadu_ps(xw);
+            let x1 = _mm256_loadu_ps(xw.add(8));
+            let x2 = _mm256_loadu_ps(xw.add(16));
+            let x3 = _mm256_loadu_ps(xw.add(24));
+            for r in 0..2 {
+                let c = codes[r].add(g * 32 + w * 8);
+                a[r][0] = _mm256_fmadd_ps(wm16(c), x0, a[r][0]);
+                a[r][1] = _mm256_fmadd_ps(wm16(c.add(2)), x1, a[r][1]);
+                a[r][2] = _mm256_fmadd_ps(wm16(c.add(4)), x2, a[r][2]);
+                a[r][3] = _mm256_fmadd_ps(wm16(c.add(6)), x3, a[r][3]);
+            }
+        }
+        for r in 0..2 {
+            let cp = codes[r].add(g * 32);
+            let off = _mm256_add_ps(off8(cp, sp), off8(cp.add(16), sp.add(8)));
+            let group = _mm256_add_ps(
+                _mm256_add_ps(
+                    _mm256_add_ps(a[r][0], a[r][1]),
+                    _mm256_add_ps(a[r][2], a[r][3]),
+                ),
+                off,
+            );
+            let scale = _mm256_mul_ps(f16_broadcast(scales[r].add(2 * g)), quarter);
+            row[r] = _mm256_fmadd_ps(group, scale, row[r]);
+        }
+    }
+    [hsum256(row[0]), hsum256(row[1])]
 }
 
 /// Eight W3 codes centered by `3.5` as `f32` lanes: `c - 3.5 = (2c - 7) / 2`

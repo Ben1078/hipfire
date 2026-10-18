@@ -97,6 +97,31 @@ grouped quant (plain tensor, 256-element "group").
 | 49 | MQ3G256V2 | 104 | per-128 `fp16` `[s z]×2` | 3-bit packs | yes | `mq3g256v2_row_dot` | AVX2 + FMA + F16C |
 | 50 | MQ2G256V2 | 72 | per-128 `fp16` `[s z]×2` | 2-bit packs | yes | `mq2g256v2_row_dot` | AVX2 + FMA + F16C |
 | 51 | MQ2G256LloydU | 72 | 4-entry `fp16` codebook | 2-bit indices | **no** (unrotated) | `mq2g256lloydu_row_dot` | AVX2 + FMA + F16C |
+| 53 | MQ4G128V2 | 68/128 | per-128 `fp16` `[s z]` | nibbles | yes (FWHT-128) | `mq4g128v2_row_dot` | AVX2 + FMA + F16C |
+| 131 | MQ3I4G128R256 (W3) | 48/128 + plane | **planar**: f16 scale plane after all code rows | 3-bit codes, `d·(2c−7)` | yes | `w3_row_dot` | AVX2 + FMA + F16C |
+| 132 | MQ3I4G128R128 (W3 down) | 48/128 + plane | as qt 131 | as qt 131 | yes (FWHT-128) | `w3_row_dot` | AVX2 + FMA + F16C |
+| 135 | E8PI4G128R256 (E8P) | 32/128 + plane | **planar**: f16 scale plane after all code rows | E8P lattice words (8 weights per u16) | yes | `e8p_row_dot`; prepared `e8p_row_dot_cached`, `e8p_row_pair_dot_cached` | AVX2 + FMA + F16C |
+| 136 | E8PI4G128R128 (E8P down) | 32/128 + plane | as qt 135 | as qt 135 | yes (FWHT-128) | as qt 135 | AVX2 + FMA + F16C |
+
+**Planar slab formats (qt 131/132/135/136)** keep a row's codes and its f16
+scales in separate planes (`gemv::row_slices` hands the kernel both), so
+`row_bytes` is the codes-plane stride and whole-tensor sizes use
+`gemv::tensor_bytes`. The E8P kernel decodes a word with one `u16` load and two
+L1 tables (`E8P_MAGNITUDE[idx]`, with lane 7's row-parity sign folded in, XOR
+`E8P_SIGN[high byte]`, 256 rows so the shift bit needs no mask) and FMAs the
+signed magnitudes into four accumulators. The shift offset (`±1` per word) is
+not added per word: it is folded per group as `Σ_w off_w · S_w`, where `S_w` is
+the sum of the word's eight activation lanes (a sign-bit XOR on `S_w`, eight
+words per vector op). `S` is prepared once per activation row in the batched
+GEMV (`ActivationSumKind::E8pWords`, `k/8` sums) and computed inline per group
+by the unprepared row dot in the same order, so the prepared, unprepared and
+two-row kernels are bit-identical per row; the two-row kernel shares each
+activation load between two weight rows. Measured single thread (Zen5, gate/up
+`[1280, 2560]` and down `[2560, 640]`, streaming): 14.7 Gw/s for the previous
+per-word-offset kernel, 19.4 prepared single-row, 23.2 two-row (1.58×). The
+decode CPU arm (`moe_cpu_host_slot_outputs`, 1 row × 10 slots, 16 pinned
+threads; `hipfire-dispatch` example `d2_cpu_arm_bench`) gains 1.20× on an
+all-E8P layer and 1.07× at a 54 % E8P slot share, and is unchanged on all-MQ4.
 
 ### Gates
 
@@ -126,8 +151,7 @@ any runner.
   (`MQ{2,3}G256GL`, MoE-indexed only), qt 22 (`TidI32`, a routing table, not a
   weight), qt 42 (`MFP4G32E8G128`, qt 34 row layout with 128-wide rotation
   groups), qt 52 (`MQ4G256V2L`, codes index an external per-tensor
-  `lloyd_levels` sidecar rather than a per-group header), qt 53 (`MQ4G128V2`,
-  68 B per-128 groups, admitted by typed Qwen4 consumers only). See `quant.rs`'s
+  `lloyd_levels` sidecar rather than a per-group header). See `quant.rs`'s
   test module for the itemised reasoning on the older entries.
 - **Non-x86_64.** `avx2_available()` is `false`, so every format stays scalar;
   there is no NEON path.
