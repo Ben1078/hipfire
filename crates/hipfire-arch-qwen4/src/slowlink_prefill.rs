@@ -5531,7 +5531,10 @@ mod slowlink_prompt {
                         plan.launch_cuts(),
                         tiles,
                     );
-                    assert_eq!(summary.0, 8192, "the retained snapshot cadence is unchanged");
+                    assert_eq!(
+                        summary.0, 8192,
+                        "the retained snapshot cadence is unchanged"
+                    );
                     match &shared {
                         None => shared = Some(summary),
                         Some(first) => assert_eq!(

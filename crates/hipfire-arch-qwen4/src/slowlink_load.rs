@@ -275,12 +275,7 @@ fn load_inner(
             s1::SlowlinkMode::from_env(),
             &shape,
             || {
-                pre_init_free.set(
-                    load.gpu
-                        .device_mem_info()
-                        .ok()
-                        .map(|(free, _)| free as u64),
-                );
+                pre_init_free.set(load.gpu.device_mem_info().ok().map(|(free, _)| free as u64));
                 crate::host_link::host_link(load.gpu)
             },
             || {

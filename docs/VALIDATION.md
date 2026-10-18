@@ -428,16 +428,18 @@ from an independent 20 ms sysfs used/total sampler together with the existing
 in-process `hipMemGetInfo` `pre_load`, `post_load` and `end` points. Primitive
 identity, 7-case, load and teardown checks must pass; the memory census, the
 residual and the peak are informational only and are not driver attribution.
-The census is source-owned (11 admitted resident layers: owned core
-24,850,537,964 B plus nominal diagnostic 217,812,992 B = 25,068,350,956 B),
-not an actual driver figure; GPU-pool parked bytes are counted as used. This is
+The census is source-owned and records the actual admitted placement separately
+from its declared reference projection; neither is an actual driver figure.
+GPU-pool parked bytes are counted as used. This is
 a headroom product question and does not select a driver explanation. A
 missing cell is `incomplete`, not a pass.
 
 Purpose profiles (Main's choice from the joint admission frontier). The load
 admits one tile per purpose and a request never falls to the other's: the
 **product** profile (every state, headroom, greedy and perf cell, and any later
-product claim) is a **768-row** tile with at least ten resident layers; the
+product claim) is a **768-row** tile with the largest resident-layer count that
+fits the actual post-initialization memory quote. Ten layers is preferred, not
+a floor; zero is legal when the base budget fits and a host layer remains. The
 **primitive_selftest** profile (`--mode primitives`) is a **512-row** tile that
 funds the self-test diagnostic inside the reserve. The primitive cell therefore
 proves kernel correctness at 512 rows only; it is not a product-shape
@@ -494,8 +496,8 @@ runtime now read one shared capability predicate for the model-lifetime
 BF16-to-F16 weight shadows (the census had charged them on exact gfx1201 only,
 so gfx1100 charged 0 of the real artifact's 1,298,923,520 B; the existing
 512-row threshold and cold-owner bound are unchanged); S1 admission evaluates
-(tile, resident layers) jointly and keeps the >=10 resident floor, a tile of at
-most 1,536 rows (the admitted purpose profile above), the full 16,384-row window
+(tile, resident layers) jointly; that repair retained the then-current >=10
+policy, a tile of at most 1,536 rows (the admitted purpose profile above), the full 16,384-row window
 and the lookahead charge; every admitted
 S1 owner (page ring, route region, HC arena, window scratch, boundary stages)
 is bound once at the selected load and requests only consume it, an allocation
@@ -506,6 +508,22 @@ object's exports. No new env or config knob, no cache reservation or eviction
 path and no lowered floor, window or lookahead came with them; the packaged
 index legitimately differs from the legacy runtime cache hash. No
 performance claim follows from any of this.
+
+R5 supersedes that resident-count policy after `j1811`: the primitive load
+refused N9 before any kernel or state case ran. The outer `pre_load` free point
+was 25,713,180,672 B, but admission after link/copy initialization observed
+25,560,088,576 B. That measured 146 MiB interval loss is not a universal tax.
+The model-free pinned-only `j1855` probe isolated it at the first nonblocking
+HIP stream creation, before any copy or event; synchronous pinned copying
+initialized the same state implicitly. Copy size and `HSA_ENABLE_SDMA=1` did
+not avoid it in the tested HIP paths.
+Projection, frontier and admission now consume one pure post-initialization
+quote; its witness proves the selected count fits and N+1 does not. The
+512 MiB safety, remaining runtime budget, window and lookahead are unchanged.
+The manifest's resident count is reference data, never an expected value
+presented as observed. Product-state headroom still gates at 512 MiB in both
+counter domains; no primitive, identity, state, greedy or KLD gate is relaxed.
+
 
 Durable gate progress. Every `qwen4_slowlink_gate` run appends bounded JSONL
 records to `<output>.progress.jsonl` (no new flag), each written and

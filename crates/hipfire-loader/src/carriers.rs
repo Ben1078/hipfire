@@ -2149,12 +2149,8 @@ fn load_qwen4_rank_scoped(
             slowlink_mode,
             &shape,
             || {
-                slowlink_pre_init_free.set(
-                    ctx.gpu
-                        .device_mem_info()
-                        .ok()
-                        .map(|(free, _)| free as u64),
-                );
+                slowlink_pre_init_free
+                    .set(ctx.gpu.device_mem_info().ok().map(|(free, _)| free as u64));
                 hipfire_arch_qwen4::host_link::host_link(&*ctx.gpu)
             },
             || {
@@ -7823,7 +7819,10 @@ mod qwen4_slowlink_tests {
             free_bytes: before,
         });
         assert_eq!(same.resident_layers, 10);
-        assert_eq!(same.placement.memory.observed_initialization_bytes(), Some(0));
+        assert_eq!(
+            same.placement.memory.observed_initialization_bytes(),
+            Some(0)
+        );
         let lost = admit(s1::AdmissionMemory {
             pre_init_free_bytes: Some(before),
             free_bytes: before - MEASURED_LOSS,
@@ -7840,7 +7839,10 @@ mod qwen4_slowlink_tests {
             free_bytes: before - MEASURED_LOSS,
         });
         assert_eq!(unknown.resident_layers, 9);
-        assert_eq!(unknown.placement.memory.observed_initialization_bytes(), None);
+        assert_eq!(
+            unknown.placement.memory.observed_initialization_bytes(),
+            None
+        );
     }
 
     #[test]
