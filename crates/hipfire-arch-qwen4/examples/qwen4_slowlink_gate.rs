@@ -355,7 +355,13 @@ fn sync(gpu: &Gpu) -> Result<(), String> {
     gpu_error(gpu.hip.device_synchronize(), "device synchronize")
 }
 
-/// `SessionCache::usage` as JSON, plus the summed device footprint.
+/// `SessionCache::usage` as JSON: the DEVICE-only footprint (`device_total_bytes`
+/// sums the device owners and never a host byte) and, separately, the pinned
+/// HOST ownership categories and counters of the opt-in pressure-selected
+/// host snapshot tier (`host_total_bytes` sums each host owner once).
+/// `pressure_host_policy` records whether that tier is armed (a nonzero host
+/// budget) and its host budget; the device-side budget is the admitted
+/// profile's `device_snapshot_budget_bytes`, recorded with the placement.
 fn usage_value(usage: &SessionCacheUsage) -> Value {
     let device_total = [
         usage.pool_bytes,
@@ -366,11 +372,34 @@ fn usage_value(usage: &SessionCacheUsage) -> Value {
     ]
     .into_iter()
     .fold(0u64, u64::saturating_add);
+    let host_total = [
+        usage.host_pool_bytes,
+        usage.host_pending_bytes,
+        usage.host_resident_bytes,
+        usage.host_deferred_release_bytes,
+        usage.host_parked_bytes,
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add);
     json!({
         "pool_bytes": usage.pool_bytes, "budget_bytes": usage.budget_bytes,
         "pending_bytes": usage.pending_bytes, "resident_bytes": usage.resident_bytes,
         "deferred_release_bytes": usage.deferred_release_bytes, "parked_bytes": usage.parked_bytes,
         "evictions_total": usage.evictions_total, "device_total_bytes": device_total,
+        "host_budget_bytes": usage.host_budget_bytes, "host_pool_bytes": usage.host_pool_bytes,
+        "host_pending_bytes": usage.host_pending_bytes,
+        "host_resident_bytes": usage.host_resident_bytes,
+        "host_deferred_release_bytes": usage.host_deferred_release_bytes,
+        "host_parked_bytes": usage.host_parked_bytes,
+        "host_captures_total": usage.host_captures_total,
+        "host_restores_total": usage.host_restores_total,
+        "host_evictions_total": usage.host_evictions_total,
+        "host_skips_total": usage.host_skips_total,
+        "host_total_bytes": host_total,
+        "pressure_host_policy": {
+            "armed": usage.host_budget_bytes > 0,
+            "host_budget_bytes": usage.host_budget_bytes,
+        },
     })
 }
 
@@ -379,18 +408,57 @@ fn usage_json(cache: Option<&SessionCache>) -> Value {
     cache.map_or(Value::Null, |cache| usage_value(&cache.usage()))
 }
 
-/// Per-request cache evidence: occupancy before and after and the ACTUAL
-/// evictions between them (the cache's own counter delta, never derived from
-/// the occupancy change). `Null` delta when either side has no counter.
-fn cache_evidence(before: &Value, after: &Value) -> Value {
-    let delta = match (
-        before["evictions_total"].as_u64(),
-        after["evictions_total"].as_u64(),
-    ) {
+/// `after - before` of one monotonic counter; `Null` when either side lacks it
+/// or it went backwards.
+fn counter_delta(before: &Value, after: &Value, key: &str) -> Value {
+    match (before[key].as_u64(), after[key].as_u64()) {
         (Some(b), Some(a)) => a.checked_sub(b).map_or(Value::Null, |d| json!(d)),
         _ => Value::Null,
-    };
-    json!({"before": before, "after": after, "evictions_delta": delta})
+    }
+}
+
+/// Per-request cache evidence: occupancy before and after and the ACTUAL
+/// counter deltas between them (the cache's own counters, never derived from
+/// the occupancy change): device evictions and the host tier's captures,
+/// restores, evictions and skips. `Null` delta when either side has no counter.
+fn cache_evidence(before: &Value, after: &Value) -> Value {
+    json!({
+        "before": before, "after": after,
+        "evictions_delta": counter_delta(before, after, "evictions_total"),
+        "host_captures_delta": counter_delta(before, after, "host_captures_total"),
+        "host_restores_delta": counter_delta(before, after, "host_restores_total"),
+        "host_evictions_delta": counter_delta(before, after, "host_evictions_total"),
+        "host_skips_delta": counter_delta(before, after, "host_skips_total"),
+    })
+}
+
+/// Problems with the snapshot storage a published capture left behind. A
+/// stored snapshot is a device pool byte OR a pinned-host pool byte (the
+/// pressure tier may place every capture on the host); an empty or missing
+/// usage fails, so a capture that stored nothing never passes.
+fn stored_snapshot_problems(published: &Value) -> Vec<String> {
+    if !published.is_object() {
+        return vec!["no session cache usage was recorded after commit".to_string()];
+    }
+    let device = published["pool_bytes"].as_u64().unwrap_or(0);
+    let host = published["host_pool_bytes"].as_u64().unwrap_or(0);
+    if device == 0 && host == 0 {
+        return vec![
+            "no snapshot was published to the pool (device pool_bytes 0 and host_pool_bytes 0 after commit)"
+                .to_string(),
+        ];
+    }
+    Vec::new()
+}
+
+/// Adds the case's own cache evidence (before-plan to after) once both
+/// occupancy samples exist.
+fn attach_case_cache_evidence(detail: &mut Value) {
+    let evidence = cache_evidence(
+        &detail["cache_usage_before_plan"],
+        &detail["cache_usage_after"],
+    );
+    detail["cache_evidence"] = evidence;
 }
 
 /// How the gate's phase samples are taken, recorded in every sample.
@@ -1148,6 +1216,7 @@ fn boundary_case(
             .extend(boundary_plan_problems(cut, planned, live));
         case.detail["restore_run"] = json!(false);
         case.detail["cache_usage_after"] = ctx.cache_usage();
+        attach_case_cache_evidence(&mut case.detail);
         return case;
     }
     let warm = match cold_commit(ctx, ext, planned) {
@@ -1155,6 +1224,7 @@ fn boundary_case(
         Err(e) => {
             case.restore.push(format!("restored prefill: {e}"));
             case.detail["cache_usage_after"] = ctx.cache_usage();
+            attach_case_cache_evidence(&mut case.detail);
             return case;
         }
     };
@@ -1191,6 +1261,7 @@ fn boundary_case(
     case.detail["cold_state"] = cold.state["combined"].clone();
     case.detail["warm_state"] = warm.state["combined"].clone();
     case.detail["cache_usage_after"] = ctx.cache_usage();
+    attach_case_cache_evidence(&mut case.detail);
     case
 }
 
@@ -1276,15 +1347,12 @@ fn boundary_cases(
                 receipt.as_ref(),
                 layer_major,
             ));
-            if published["pool_bytes"].as_u64().unwrap_or(0) == 0 {
-                capture_problems.push(
-                    "no snapshot was published to the pool (pool_bytes 0 after commit)".into(),
-                );
-            }
+            capture_problems.extend(stored_snapshot_problems(published));
             json!({
                 "prompt_rows": boundary.prompt_ids.len(), "marker_id": marker, "cuts": cuts,
                 "receipt": receipt, "cache_usage_after_clear": cleared,
                 "cache_usage_after_commit": published,
+                "cache_evidence": cache_evidence(&cleared, published),
             })
         }
     };
@@ -1445,11 +1513,7 @@ fn boundary16k_checks(ctx: &mut Ctx, checks: &mut Checks, detail: &mut Vec<Value
                 receipt.as_ref(),
                 layer_major,
             ));
-            if published["pool_bytes"].as_u64().unwrap_or(0) == 0 {
-                capture_problems.push(
-                    "no snapshot was published to the pool (pool_bytes 0 after commit)".into(),
-                );
-            }
+            capture_problems.extend(stored_snapshot_problems(published));
             json!({
                 "prompt_rows": ids.len(), "cuts": cuts, "cadence": "unchanged 8192-row natural cadence",
                 "receipt": receipt, "cache_usage_after_clear": cleared,
@@ -2321,7 +2385,9 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                    "host_mapped_tensors": loaded.host_mapped_tensors, "slowlink_profile": loaded.slowlink_profile,
                    "expected_purpose": purpose_name(purpose), "expected_tile_rows": expected_tile,
                    "admitted_purpose": admitted_from(profile_now).map(|a| a.0),
-                   "admitted_tile_rows": admitted_tile}),
+                   "admitted_tile_rows": admitted_tile,
+                   "admitted_device_snapshot_budget_bytes": profile_now.map(|p| p.device_snapshot_budget_bytes),
+                   "pressure_host_policy": usage_json(loaded.bundle.session_cache())["pressure_host_policy"].clone()}),
         );
         progress.checks(&checks);
         // A failure from here on still owns the GPU: its point sample is
@@ -3360,19 +3426,38 @@ mod slowlink_receipt_tests {
         assert!(!boundary_capture_problems(&CUTS, None, false).is_empty());
     }
 
+    /// A full usage literal: device owners 11/22/33/44 plus `pool`, host owners
+    /// 101/202/303/404 plus `host_pool`, and distinct counters.
+    fn usage_literal(
+        pool: u64,
+        evictions: u64,
+        host_pool: u64,
+        host: [u64; 4],
+    ) -> SessionCacheUsage {
+        SessionCacheUsage {
+            pool_bytes: pool,
+            budget_bytes: 2 << 30,
+            pending_bytes: 11,
+            resident_bytes: 22,
+            deferred_release_bytes: 33,
+            parked_bytes: 44,
+            evictions_total: evictions,
+            host_budget_bytes: 2 << 30,
+            host_pool_bytes: host_pool,
+            host_pending_bytes: 101,
+            host_resident_bytes: 202,
+            host_deferred_release_bytes: 303,
+            host_parked_bytes: 404,
+            host_captures_total: host[0],
+            host_restores_total: host[1],
+            host_evictions_total: host[2],
+            host_skips_total: host[3],
+        }
+    }
+
     #[test]
     fn slowlink_receipt_cache_usage_evidence_reports_the_actual_eviction_delta() {
-        let usage = |pool: u64, evictions: u64| {
-            usage_value(&SessionCacheUsage {
-                pool_bytes: pool,
-                budget_bytes: 2 << 30,
-                pending_bytes: 11,
-                resident_bytes: 22,
-                deferred_release_bytes: 33,
-                parked_bytes: 44,
-                evictions_total: evictions,
-            })
-        };
+        let usage = |pool: u64, evictions: u64| usage_value(&usage_literal(pool, evictions, 0, [0; 4]));
         let before = usage(4096, 3);
         // Occupancy fell by two snapshots but exactly one eviction ran: the
         // delta is the counter's, not derived from the occupancy change.
@@ -3392,6 +3477,146 @@ mod slowlink_receipt_tests {
         assert!(cache_evidence(&Value::Null, &after)["evictions_delta"].is_null());
         assert!(cache_evidence(&after, &before)["evictions_delta"].is_null());
         assert!(usage_json(None).is_null());
+    }
+
+    #[test]
+    fn slowlink_receipt_host_only_captures_count_as_successful_storage() {
+        // Every capture went to the pinned-host tier: the device pool is empty.
+        let host_only = usage_value(&usage_literal(0, 0, 4096, [5, 0, 0, 0]));
+        assert_eq!(host_only["pool_bytes"], json!(0));
+        assert_eq!(host_only["host_pool_bytes"], json!(4096));
+        assert!(stored_snapshot_problems(&host_only).is_empty());
+        // A device-only capture (old tier, no host bytes) still counts.
+        let device_only = usage_value(&usage_literal(4096, 0, 0, [0; 4]));
+        assert!(stored_snapshot_problems(&device_only).is_empty());
+        // A receipt written before the host fields existed keeps passing on its pool.
+        let old = json!({"pool_bytes": 4096, "evictions_total": 0});
+        assert!(stored_snapshot_problems(&old).is_empty());
+        // Host storage never stands in for a requested cut: a plan that reuses
+        // fewer rows than the cut, or a request that recomputed from row 0,
+        // still fails whatever the host tier holds.
+        assert!(!boundary_coverage_problems(&CUTS, &[(CUTS[0], 0)]).is_empty());
+        assert!(!boundary_restore_problems(
+            1536,
+            0,
+            false,
+            Some(&json!({"entry_pos": 0, "prompt_rows": 1836})),
+            1836,
+        )
+        .is_empty());
+        assert!(boundary_restore_problems(
+            1536,
+            1536,
+            false,
+            Some(&json!({"entry_pos": 1536, "prompt_rows": 300})),
+            1836,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_empty_or_missing_requested_snapshot_storage_fails() {
+        // Both tiers empty after the commit: nothing was captured.
+        let empty = usage_value(&usage_literal(0, 0, 0, [0; 4]));
+        let problems = stored_snapshot_problems(&empty);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no snapshot was published"), "{problems:?}");
+        // Counters alone are not storage: a capture that was evicted again, or
+        // skipped under pressure, leaves nothing to restore.
+        let evicted = usage_value(&usage_literal(0, 2, 0, [3, 0, 3, 7]));
+        assert!(!stored_snapshot_problems(&evicted).is_empty());
+        // Pending, resident and deferred host bytes are not published pool bytes.
+        assert_eq!(evicted["host_total_bytes"], json!(101 + 202 + 303 + 404));
+        // No usage at all (no cache attached) and a malformed usage fail too.
+        assert!(!stored_snapshot_problems(&Value::Null).is_empty());
+        assert!(!stored_snapshot_problems(&json!("usage")).is_empty());
+        assert!(!stored_snapshot_problems(&json!({})).is_empty());
+        // A missing requested boundary snapshot stays a coverage failure.
+        assert_eq!(
+            boundary_coverage_problems(&CUTS, &[]).len(),
+            CUTS.len(),
+            "every requested cut needs an executed exact restore"
+        );
+    }
+
+    #[test]
+    fn slowlink_receipt_device_totals_never_add_host_bytes() {
+        let usage = usage_value(&usage_literal(4096, 1, 8192, [1, 2, 3, 4]));
+        // device_total_bytes: the five DEVICE owners only.
+        assert_eq!(usage["device_total_bytes"], json!(4096 + 11 + 22 + 33 + 44));
+        // host_total_bytes: the five HOST owners, each once, no device byte.
+        assert_eq!(
+            usage["host_total_bytes"],
+            json!(8192 + 101 + 202 + 303 + 404)
+        );
+        // The budgets are policy, not occupancy: neither total includes them.
+        assert_eq!(usage["budget_bytes"], json!(2u64 << 30));
+        assert_eq!(usage["host_budget_bytes"], json!(2u64 << 30));
+        // Host occupancy moving never moves the device total, and vice versa.
+        let more_host = usage_value(&usage_literal(4096, 1, 1 << 30, [1, 2, 3, 4]));
+        assert_eq!(more_host["device_total_bytes"], usage["device_total_bytes"]);
+        let more_device = usage_value(&usage_literal(1 << 30, 1, 8192, [1, 2, 3, 4]));
+        assert_eq!(more_device["host_total_bytes"], usage["host_total_bytes"]);
+    }
+
+    #[test]
+    fn slowlink_receipt_additive_host_ownership_counters_all_serialize() {
+        let before = usage_value(&usage_literal(0, 1, 4096, [2, 1, 0, 3]));
+        let after = usage_value(&usage_literal(0, 4, 8192, [7, 3, 2, 5]));
+        for (key, value) in [
+            ("host_budget_bytes", 2u64 << 30),
+            ("host_pool_bytes", 8192),
+            ("host_pending_bytes", 101),
+            ("host_resident_bytes", 202),
+            ("host_deferred_release_bytes", 303),
+            ("host_parked_bytes", 404),
+            ("host_captures_total", 7),
+            ("host_restores_total", 3),
+            ("host_evictions_total", 2),
+            ("host_skips_total", 5),
+            ("host_total_bytes", 8192 + 101 + 202 + 303 + 404),
+        ] {
+            assert_eq!(after[key], json!(value), "{key}");
+        }
+        // The existing device keys are untouched.
+        for key in [
+            "pool_bytes",
+            "budget_bytes",
+            "pending_bytes",
+            "resident_bytes",
+            "deferred_release_bytes",
+            "parked_bytes",
+            "evictions_total",
+            "device_total_bytes",
+        ] {
+            assert!(after[key].is_u64(), "{key}");
+        }
+        // The pressure policy is recorded: armed by a nonzero host budget.
+        assert_eq!(
+            after["pressure_host_policy"],
+            json!({"armed": true, "host_budget_bytes": 2u64 << 30})
+        );
+        let mut off = usage_literal(0, 0, 0, [0; 4]);
+        off.host_budget_bytes = 0;
+        assert_eq!(
+            usage_value(&off)["pressure_host_policy"],
+            json!({"armed": false, "host_budget_bytes": 0})
+        );
+        // Per-request evidence carries the actual counter deltas.
+        let evidence = cache_evidence(&before, &after);
+        assert_eq!(evidence["evictions_delta"], json!(3));
+        assert_eq!(evidence["host_captures_delta"], json!(5));
+        assert_eq!(evidence["host_restores_delta"], json!(2));
+        assert_eq!(evidence["host_evictions_delta"], json!(2));
+        assert_eq!(evidence["host_skips_delta"], json!(2));
+        // A counter that went backwards, or a side without it, has no delta.
+        assert!(cache_evidence(&after, &before)["host_captures_delta"].is_null());
+        assert!(cache_evidence(&json!({}), &after)["host_restores_delta"].is_null());
+        // The per-case evidence is built from the before-plan and after samples.
+        let mut detail = json!({"cache_usage_before_plan": before, "cache_usage_after": after});
+        attach_case_cache_evidence(&mut detail);
+        assert_eq!(detail["cache_evidence"]["host_captures_delta"], json!(5));
+        assert_eq!(detail["cache_evidence"]["after"]["host_pool_bytes"], json!(8192));
     }
 
     #[test]
