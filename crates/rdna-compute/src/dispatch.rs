@@ -5016,9 +5016,9 @@ impl Gpu {
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             return Ok(Some(shadow.buf.as_ptr()));
         }
-        // Allocate + dequantize. Use alloc_tensor so the shadow follows the
-        // same GpuTensor hygiene (tracked in pool if applicable).
-        let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
+        // Allocate + dequantize. The destination is the source's planned arena span
+        // when registered, else a pooled GpuTensor (same hygiene as before).
+        let fp16 = self.alloc_f16_shadow_dest(key, m * k, "ensure_fp16_shadow")?;
         self.dequantize_hfq4g256_to_f16(&w_mq4.buf, &fp16.buf, m, k)?;
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
@@ -5040,30 +5040,7 @@ impl Gpu {
             return Ok(shadow.buf.as_ptr());
         }
         let n = m * k;
-        // A source registered with the S1 arena is served ONLY from its planned span
-        // (an allocation failure is the caller's error, never an individual fallback);
-        // every other source keeps the legacy pooled allocation.
-        let fp16 = if let Some(member) = self.f16_shadow_arena.lookup(key) {
-            self.bind_thread()?;
-            let bytes = n
-                .checked_mul(2)
-                .ok_or_else(|| HipError::new(0, "BF16 shadow too large"))?;
-            let view = {
-                let mut device = DirectHipRuntime { hip: &self.hip };
-                let (root, offset) = self
-                    .f16_shadow_arena
-                    .ensure_member(&mut device, member, bytes)
-                    .map_err(|e| exact_alloc_hip_error("ensure_bf16_f16_shadow", e))?;
-                root.byte_view(offset, bytes)
-            };
-            GpuTensor {
-                buf: view,
-                shape: vec![n],
-                dtype: DType::F16,
-            }
-        } else {
-            self.alloc_tensor(&[n], DType::F16)?
-        };
+        let fp16 = self.alloc_f16_shadow_dest(key, n, "ensure_bf16_f16_shadow")?;
         self.ensure_kernel(
             "gemm_bf16_xf32_multirow",
             kernels::GEMM_BF16_XF32_MULTIROW_SRC,
@@ -5161,7 +5138,7 @@ impl Gpu {
             kernels::MTP_Q8_DET_PM_GFX1151,
             crate::gemm::MTP_Q8_DET_PM_ENTRY,
         )?;
-        let fp16 = self.alloc_tensor(&[elems], DType::F16)?;
+        let fp16 = self.alloc_f16_shadow_dest(key, elems, "ensure_q8_0_f16_shadow")?;
         let ip = weight.buf.as_ptr();
         let op = fp16.buf.as_ptr();
         let nv = elems as i32;
@@ -5206,7 +5183,8 @@ impl Gpu {
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             return Ok(Some(shadow.buf.as_ptr()));
         }
-        let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
+        let fp16 =
+            self.alloc_f16_shadow_dest(key, m * k, "ensure_mfp4e8_soa_fp16_shadow_gfx942")?;
         self.dequantize_mfp4g32_e8_soa_to_f16_gfx942(&weight.buf, &fp16.buf, m, k)?;
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
@@ -5325,8 +5303,9 @@ impl Gpu {
     /// source weight of `plan.f16_shadows.members[i]` (sorted order). Rejects a bad
     /// plan or bindings, an existing arena, held quarantined roots, and any bound
     /// source that already has a cached shadow (a stale entry is never accepted).
-    /// After this, [`Self::ensure_bf16_f16_shadow`] serves registered sources from
-    /// lazily exact-allocated roots and leaves unknown sources on the legacy path.
+    /// After this, every `ensure_*` F16 shadow arm (BF16, HFQ4, Q8_0, MFP4) serves a
+    /// registered source from its planned span of a lazily exact-allocated root,
+    /// and leaves unknown sources on the legacy path.
     pub fn install_f16_shadow_arena(
         &mut self,
         plan: Arc<crate::byte_arena::ModelWeightArenaPlan>,
@@ -5364,6 +5343,68 @@ impl Gpu {
         )
         .map(|_| ())
         .map_err(|msg| HipError::new(0, &format!("clear_f16_shadow_arena: {msg}")))
+    }
+
+    /// Drop the cached F16 shadow VIEW of one arena-registered source so its shadow
+    /// can be recomputed after the source's bytes were rewritten in place (same
+    /// pointer, new format). The planned root and the source binding stay: the next
+    /// `ensure_*` conversion for the same pointer re-fills the SAME planned span.
+    /// The device is quiesced before returning when a view was dropped, so no
+    /// queued kernel can still read the old shadow bytes. Returns `Ok(true)` when a
+    /// view was dropped, `Ok(false)` for an unregistered source or no cached view
+    /// (nothing touched). Only borrowed (arena) views are ever dropped here.
+    pub fn invalidate_f16_shadow_source(&mut self, source_ptr: usize) -> HipResult<bool> {
+        if self.f16_shadow_arena.lookup(source_ptr).is_none() {
+            return Ok(false);
+        }
+        if !self
+            .fp16_shadow_cache
+            .get(&source_ptr)
+            .is_some_and(|t| t.buf.is_borrowed())
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Quiesce BEFORE forgetting the view: on a failed sync the entry stays.
+        self.hip.device_synchronize()?;
+        self.fp16_shadow_cache.remove(&source_ptr);
+        Ok(true)
+    }
+
+    /// Destination of a model-lifetime F16 shadow of `n` elements for the source at
+    /// `key`. A source registered with the S1 arena gets a borrowed view of its
+    /// planned span (root exact-allocated lazily, once; the span bounds the view and
+    /// an allocation failure is the caller's error, never an individual fallback);
+    /// every other source keeps the legacy pooled allocation. Shared by every
+    /// `ensure_*` shadow arm, so a source whose format changes in place keeps using
+    /// the one planned span whatever conversion arm fills it. Cache keys and
+    /// conversion kernels are the arms' own and unchanged.
+    fn alloc_f16_shadow_dest(
+        &mut self,
+        key: usize,
+        n: usize,
+        context: &str,
+    ) -> HipResult<GpuTensor> {
+        let Some(member) = self.f16_shadow_arena.lookup(key) else {
+            return self.alloc_tensor(&[n], DType::F16);
+        };
+        self.bind_thread()?;
+        let bytes = n
+            .checked_mul(2)
+            .ok_or_else(|| HipError::new(0, &format!("{context}: F16 shadow too large")))?;
+        let view = {
+            let mut device = DirectHipRuntime { hip: &self.hip };
+            let (root, offset) = self
+                .f16_shadow_arena
+                .ensure_member(&mut device, member, bytes)
+                .map_err(|e| exact_alloc_hip_error(context, e))?;
+            root.byte_view(offset, bytes)
+        };
+        Ok(GpuTensor {
+            buf: view,
+            shape: vec![n],
+            dtype: DType::F16,
+        })
     }
 
     /// The installed F16-shadow arena plan, if any.
