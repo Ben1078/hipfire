@@ -773,14 +773,18 @@ pub enum AdmissionPurpose {
 }
 
 /// Device bytes the primitive self-tests allocate beyond the tile call's own
-/// tensors, from the authoritative helpers (no copied constants): the
-/// transport's [`PanelPoolSpec::selftest_reserve`] total and the dispatch
-/// crate's per-case diagnostic peaks
-/// (`slowlink_prefill::selftest::diagnostic_bytes`) at the real geometry over
-/// an all-expert binding. The primitives run one at a time and each releases
-/// before the next begins (the transport's buffers are `hip.malloc`/`free`,
-/// not pool-resident), so the budget is the largest single primitive, never
-/// the sum. 0 for [`AdmissionPurpose::Product`].
+/// tensors, from the authoritative helpers (no copied case list or constants):
+/// the transport's [`PanelPoolSpec::selftest_reserve`] total and the dispatch
+/// crate's whole-suite ledger (`selftest::suite_diagnostic_bytes` over
+/// `selftest::DEFAULT_SUITE`: the largest case-local total plus the grow-only
+/// scratch slots and their growth transient, `SuiteBytes::device_total`, the
+/// conservative figure that deducts nothing the census already reserved) over
+/// the staged binding the primitives really run: one transport slot, i.e.
+/// `PanelLimits::S1.experts_per_slot.min(n_exp)` experts, never every expert.
+/// The transport's primitive and the dispatch suite are separate sequential
+/// cases that each release before the next begins (`hip.malloc`/`free`
+/// immediately after sync; `diag_scope` drains the parked pool), so the budget
+/// is the larger of the two, never the sum. 0 for [`AdmissionPurpose::Product`].
 ///
 /// [`PanelPoolSpec::selftest_reserve`]: crate::gpu_forward::panel_stage::PanelPoolSpec::selftest_reserve
 pub fn diagnostic_budget_bytes(
@@ -790,41 +794,33 @@ pub fn diagnostic_budget_bytes(
     down_layer_bytes: u64,
 ) -> Result<u64, String> {
     use hipfire_dispatch::pipeline::slowlink_prefill::selftest::{
-        diagnostic_bytes, DiagCase, DiagGeometry,
+        suite_diagnostic_bytes, DiagGeometry, DEFAULT_SUITE,
     };
     use hipfire_dispatch::pipeline::slowlink_prefill::PanelLimits;
     if purpose == AdmissionPurpose::Product {
         return Ok(0);
     }
+    let limits = PanelLimits::S1;
     let pages = PanelPageLayout::new(geometry.num_experts, gate_up_layer_bytes, down_layer_bytes)?;
     let transport = pages
         .pool_spec()?
         .selftest_reserve()
         .ok_or_else(|| "slow-link prefill selftest reserve overflows".to_string())?;
-    let mut peak = u64::try_from(transport.total_device_bytes)
+    let transport = u64::try_from(transport.total_device_bytes)
         .map_err(|_| "slow-link prefill selftest reserve overflows".to_string())?;
     let diag_geometry = DiagGeometry {
         hidden: geometry.hidden,
         n_exp: geometry.num_experts,
         mi: geometry.moe_intermediate,
-        binding_experts: geometry.num_experts,
+        binding_experts: limits.experts_per_slot.min(geometry.num_experts),
         k1_rows: 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
         shared_intermediate: geometry.shared_intermediate,
     };
-    for case in [
-        DiagCase::CanonicalCombine,
-        DiagCase::WithinExpertCanary,
-        DiagCase::K1TailCohort,
-        DiagCase::ZeroRowPanel,
-        DiagCase::DecodeTailCohort,
-    ] {
-        let bytes = diagnostic_bytes(case, &diag_geometry, PanelLimits::S1)
-            .map_err(|error| error.to_string())?;
-        let device = u64::try_from(bytes.device_peak)
-            .map_err(|_| "slow-link prefill diagnostic bytes overflow".to_string())?;
-        peak = peak.max(device);
-    }
-    Ok(peak)
+    let suite = suite_diagnostic_bytes(&DEFAULT_SUITE, &diag_geometry, limits)
+        .map_err(|error| error.to_string())?;
+    let dispatch = u64::try_from(suite.device_total())
+        .map_err(|_| "slow-link prefill diagnostic bytes overflow".to_string())?;
+    Ok(transport.max(dispatch))
 }
 
 /// Everything the S1 profile costs beyond the incumbent's 1,536-row reserve,
@@ -2101,17 +2097,38 @@ mod tests {
             }
             other => panic!("the historical floor must be a deficit, got {other:?}"),
         }
+        // The old conservative stress input (24 GiB less a fixed 1.5 GiB
+        // driver allowance, i.e. the runtime reserved twice over) is a
+        // deliberate decline now: it cannot keep ten layers beside the 1 GiB
+        // runtime budget (nine fit), so the admission refuses rather than
+        // shrinking below the floor. It is no longer the gate input; the
+        // measured j1761 pre-load free above is.
+        let conservative = AdmissionInputs {
+            free: 24 * GIB - 3 * GIB / 2,
+            ..inputs(reserve.placement_bytes(true))
+        };
+        match admit(&conservative) {
+            Err(SlowlinkDecline::Deficit(deficit)) => {
+                assert_eq!(deficit.resident_layers, 9);
+                assert_eq!(deficit.required_layers, S1_MIN_RESIDENT_LAYERS);
+                assert!(deficit.deficit_bytes > 0);
+            }
+            other => panic!("the double-reserved input must decline, got {other:?}"),
+        }
     }
 
     /// The j1761 proof of the admission fix, on the measured inputs. The XTX
-    /// reported 25,713,180,672 B free before the load and 2,558,525,440 B after
-    /// it: the load used 887,055,700 B beyond the source weights and the tile
-    /// (847,209,812 B incremental to the 39,845,888 B pre-load baseline), which
-    /// no census term models. With `runtime_overhead` charged the admission
-    /// keeps exactly ten layers at tile 1,536 with 18 pages and the projected
-    /// free after the load, the S1 allocations and the self-test peak is at
-    /// least the 512 MiB safety margin; without it the same inputs admit
-    /// eleven layers and the projection is negative (the observed OOM).
+    /// reported 25,713,180,672 B free before the load (39,845,888 B already in
+    /// use) and 2,558,525,440 B after it: the load used 887,055,700 B in total,
+    /// 847,209,812 B incremental to the pre-load baseline, beyond the source
+    /// weights and the tile, which no census term models. The free figure is
+    /// the pre-load free, so the INCREMENTAL gap is what is subtracted from
+    /// it. With `runtime_overhead` charged the admission keeps exactly ten
+    /// layers at tile 1,536 with 18 pages and the projected free after the
+    /// load, the S1 allocations and the self-test peak is at least the 512 MiB
+    /// safety margin (1,352,367,296 B before the diagnostics, 1,134,546,112 B
+    /// after them); without it the same inputs admit eleven layers and only
+    /// 15,432,896 B of free remain.
     #[test]
     fn slowlink_residency_j1761_admission_keeps_ten_layers_and_projects_the_margin() {
         use crate::expert_residency::{auto_vram_layers, AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
@@ -2176,7 +2193,24 @@ mod tests {
             link_gbps: 7.09,
         };
 
-        // The self-test peak is the authoritative transport/dispatch figure.
+        // The self-test peak is the authoritative transport/dispatch figure: the
+        // dispatch suite over the staged 32-expert binding (182,065,968 B:
+        // 171,091,200 case-local + 10,733,568 persistent + 241,200 growth) is
+        // below the transport's 217,821,184 B reserve, which is the larger.
+        let suite = hipfire_dispatch::pipeline::slowlink_prefill::selftest::suite_diagnostic_bytes(
+            &hipfire_dispatch::pipeline::slowlink_prefill::selftest::DEFAULT_SUITE,
+            &hipfire_dispatch::pipeline::slowlink_prefill::selftest::DiagGeometry {
+                hidden: 2560,
+                n_exp: 512,
+                mi: 640,
+                binding_experts: 32,
+                k1_rows: 3,
+                shared_intermediate: 640,
+            },
+            hipfire_dispatch::pipeline::slowlink_prefill::PanelLimits::S1,
+        )
+        .unwrap();
+        assert_eq!(suite.device_total(), 182_065_968);
         let selftest = diagnostic_budget_bytes(
             &ModelGeometry::from_config(&config).unwrap(),
             AdmissionPurpose::PrimitiveSelftest,
@@ -2184,7 +2218,7 @@ mod tests {
             DOWN_LAYER,
         )
         .unwrap();
-        assert!(selftest >= 217_821_184, "at least the transport reserve");
+        assert_eq!(selftest, 217_821_184, "the transport reserve is the larger");
         assert_eq!(
             diagnostic_budget_bytes(
                 &ModelGeometry::from_config(&config).unwrap(),
@@ -2205,11 +2239,14 @@ mod tests {
             assert_eq!(owned, 2_543_092_544, "{label}");
             assert_eq!(profile.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
             assert_eq!(profile.census.diagnostic, diagnostic);
-            // Projected free after the load (weights, tile census and the whole
-            // observed unattributed gap), the S1 allocations and the self-test
-            // peak: at least the safety margin.
+            // Projected free after the load (weights, tile census and the
+            // observed unattributed INCREMENTAL gap: the free figure is the
+            // pre-load free, so the 39,845,888 B pre-load baseline is already
+            // out of it and must not be counted again), the S1 allocations and
+            // the self-test peak: at least the safety margin.
             let resident = profile.resident_layers as u64 * LAYER;
-            let used = NON_EXPERT + resident + TILE_CENSUS + LOAD_GAP_TOTAL + owned + diagnostic;
+            let used =
+                NON_EXPERT + resident + TILE_CENSUS + LOAD_GAP_INCREMENTAL + owned + diagnostic;
             let projected = FREE_PRELOAD.checked_sub(used).expect("fits the card");
             assert!(
                 projected >= MARGIN,
@@ -2218,7 +2255,10 @@ mod tests {
         }
 
         // Without the generic budget the same inputs admit eleven layers and
-        // the projection is negative: the j1761 OOM, reproduced on the CPU.
+        // the projected free is 15,432,896 B, far below the margin: the j1761
+        // shortfall, reproduced on the CPU. (The primitive self-test peak,
+        // which the one-time census does not hold live, then makes the actual
+        // OOM plausible.)
         let (_, _, census) = census_of(&inputs(0)).unwrap();
         let without_budget = census.owned_total().unwrap();
         let reserve_without = TILE_CENSUS + without_budget + MARGIN;
@@ -2227,12 +2267,13 @@ mod tests {
         let used_without = NON_EXPERT
             + layers_without as u64 * LAYER
             + TILE_CENSUS
-            + LOAD_GAP_TOTAL
+            + LOAD_GAP_INCREMENTAL
             + without_budget;
-        assert!(
-            used_without > FREE_PRELOAD,
-            "eleven layers beside the observed gap exceed the card"
-        );
+        let projected_without = FREE_PRELOAD
+            .checked_sub(used_without)
+            .expect("still fits the card");
+        assert_eq!(projected_without, 15_432_896);
+        assert!(projected_without < MARGIN);
     }
 
     /// Every non-S1 load (the incumbent, fast links, unified memory, every
