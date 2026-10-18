@@ -834,6 +834,28 @@ pub fn group_scatter_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64,
     })
 }
 
+/// The Gpu grow-only scratch buffers a full window reserves, one entry per
+/// allocation (the two A4 sidecar slots on the slab route, the grouped-scatter
+/// slot on every route), from the dispatch crate's own layout. They sum to
+/// [`a4_sidecar_bytes`] + [`group_scatter_bytes`].
+pub fn window_scratch_sizes(geometry: &ModelGeometry, rows: usize) -> Result<Vec<u64>, String> {
+    hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(&route_dims(
+        geometry, rows,
+    ))
+    .map_err(|error| error.to_string())
+    .and_then(|layout| {
+        layout
+            .scratch_allocation_sizes()
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| {
+                u64::try_from(bytes)
+                    .map_err(|_| "slow-link prefill window scratch overflows".to_string())
+            })
+            .collect()
+    })
+}
+
 /// What an admitted S1 profile is for. The product charges nothing for
 /// diagnostics; the Hold 1 primitive self-tests charge their own peak INSIDE
 /// the admitted reserve ([`diagnostic_budget_bytes`]), so they are never
@@ -1048,6 +1070,10 @@ pub struct GranuleCharge {
     pub route_region: u64,
     /// The HC-stream arena, one allocation of [`PromptArenaLayout::total_bytes`].
     pub hc_arena: u64,
+    /// The window's Gpu grow-only scratch buffers (A4 sidecar slots on the
+    /// slab route, the grouped-scatter slot), one allocation each
+    /// ([`window_scratch_sizes`]).
+    pub window_scratch: u64,
     /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary stages' part allocations.
     pub boundary_stages: u64,
     /// Granule slack of ONE resident expert layer (its gate/up and down
@@ -1060,7 +1086,7 @@ pub struct GranuleCharge {
 
 impl GranuleCharge {
     /// Every fixed term, named, in log order (the per-layer slack is not one).
-    pub fn terms(&self) -> [(&'static str, u64); 11] {
+    pub fn terms(&self) -> [(&'static str, u64); 12] {
         let base = self.base.terms();
         [
             base[0],
@@ -1073,6 +1099,7 @@ impl GranuleCharge {
             ("expert pages", self.expert_pages),
             ("route region", self.route_region),
             ("HC arena", self.hc_arena),
+            ("window scratch", self.window_scratch),
             ("boundary stages", self.boundary_stages),
         ]
     }
@@ -1420,6 +1447,10 @@ fn granule_charge(
         )?,
         route_region: slack(census.route_storage),
         hc_arena: slack(arena.total_bytes),
+        window_scratch: crate::expert_residency::granule_slack_total(
+            window_scratch_sizes(&inputs.geometry, inputs.window_rows)?,
+            granule,
+        )?,
         boundary_stages: checked_mul(
             S1_MAX_BOUNDARY_SNAPSHOTS as u64,
             inputs.granule.boundary_stage_slack,
@@ -4524,6 +4555,29 @@ mod tests {
             granule_slack(GATE_UP_LAYER, g) + granule_slack(DOWN_LAYER, g)
         );
         assert_eq!(charge.boundary_stages, 4 * 1_234);
+        // The slab route's three Gpu grow-only scratch buffers: two A4 slots
+        // (20 x 16,384 x 72 B and 5 x 16,384 x 10 x 72 B) and the grouped
+        // scatter slot (3,278,848 B, over one granule), each its own
+        // allocation: 1,572,864 + 1,835,008 + 915,456 B of slack.
+        let scratch = window_scratch_sizes(&on_inputs.geometry, on_inputs.window_rows).unwrap();
+        assert_eq!(scratch, vec![23_592_960, 58_982_400, 3_278_848]);
+        assert_eq!(
+            scratch.iter().sum::<u64>(),
+            a4_sidecar_bytes(&on_inputs.geometry, on_inputs.window_rows).unwrap()
+                + group_scatter_bytes(&on_inputs.geometry, on_inputs.window_rows).unwrap()
+        );
+        assert_eq!(granule_slack(3_278_848, g), 915_456);
+        assert_eq!(charge.window_scratch, 1_572_864 + 1_835_008 + 915_456);
+        // The aggregate route has no A4 sidecars: only the scatter slot.
+        let aggregate = ModelGeometry::from_config(
+            &crate::config::compact_test_config(),
+            WindowRoute::Aggregate,
+        )
+        .unwrap();
+        assert_eq!(
+            window_scratch_sizes(&aggregate, on_inputs.window_rows).unwrap(),
+            vec![3_278_848]
+        );
         // The Flash-Next layer: gate/up is a granule multiple, down is not.
         assert_eq!(granule_slack(GATE_UP_LAYER, g), 0);
         assert_eq!(granule_slack(DOWN_LAYER, g), 1_048_576);
