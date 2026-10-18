@@ -2454,6 +2454,217 @@ mod tests {
         }
     }
 
+    /// Aggregate-route residency ledger on the measured j1761 preload (the
+    /// route the real MQ4 artifact declares): the route comes from the
+    /// declared stacked-tensor manifest, every owned/budget/projection figure
+    /// comes from the actual census, D's layout getters and the diagnostic
+    /// budget (k1 48, tail 3,066, diagnostic geometry k1 9) with nothing
+    /// copied, and one structured JSON line is printed (`--nocapture`). It is a
+    /// CPU census of the declared fixture, NOT a runtime GPU measurement.
+    /// The historical slab ledger above is unchanged.
+    #[test]
+    fn slowlink_residency_hold1_aggregate_ledger_for_the_real_mq4_fixture() {
+        use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        use hipfire_dispatch::pipeline::slowlink_prefill::selftest::{
+            suite_diagnostic_bytes, DiagGeometry, DEFAULT_SUITE,
+        };
+        use hipfire_dispatch::pipeline::slowlink_prefill::{PanelLimits, PromptRouteLayout};
+        use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
+        use rdna_compute::tensor_ops::QsaKvFormat;
+        const FREE_PRELOAD: u64 = 25_713_180_672;
+        const NON_EXPERT: u64 = 5_364_055_296;
+        const LAYER: u64 = 1_336_934_400;
+        const TILE_CENSUS: u64 = 2_237_111_724;
+        const LOAD_GAP_INCREMENTAL: u64 = 847_209_812;
+        const MARGIN: u64 = 536_870_912;
+        // The route is read from the declared artifact layout (stacked expert
+        // tensors), never defaulted.
+        let manifest = [
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            "model.language_model.layers.0.mlp.experts.down_proj",
+        ]
+        .map(|name| {
+            WeightEntry::model(
+                name,
+                vec![4, 4, 256],
+                rdna_compute::DType::MQ4G256V2,
+                ShardPolicy::Replicate,
+            )
+        });
+        let route = window_route_of(&manifest);
+        assert_eq!(route, WindowRoute::Aggregate);
+
+        let config = crate::config::compact_test_config();
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+        workspace[0].1 = 47_559_944;
+        let reserve = AutoReserve::new(
+            Some(5_517_207_808),
+            ReserveCensus {
+                qsa_context: 281_149_440,
+                state: 68_514_080,
+                forward: 1_839_888_260,
+                f16_shadows: 0,
+                workspace,
+                qsa_selector: 0,
+                mtp: 0,
+                gather: 0,
+                runtime: 0,
+            },
+        )
+        .unwrap();
+        let geometry = ModelGeometry::from_config(&config, route).unwrap();
+        let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
+        let selftest = diagnostic_budget_bytes(
+            &geometry,
+            AdmissionPurpose::PrimitiveSelftest,
+            GATE_UP_LAYER,
+            DOWN_LAYER,
+        )
+        .unwrap();
+        let transport = PanelPageLayout::new(geometry.num_experts, GATE_UP_LAYER, DOWN_LAYER)
+            .unwrap()
+            .pool_spec()
+            .unwrap()
+            .selftest_reserve()
+            .unwrap()
+            .total_device_bytes as u64;
+        let limits = PanelLimits::S1;
+        let diag_geometry = DiagGeometry {
+            hidden: geometry.hidden,
+            n_exp: geometry.num_experts,
+            mi: geometry.moe_intermediate,
+            binding_experts: limits.experts_per_slot.min(geometry.num_experts),
+            k1_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1,
+            shared_intermediate: geometry.shared_intermediate,
+            route,
+        };
+        let suite = suite_diagnostic_bytes(&DEFAULT_SUITE, &diag_geometry, limits).unwrap();
+        assert_eq!(selftest, transport.max(suite.device_total() as u64));
+
+        let mut purposes = Vec::new();
+        for (label, diagnostic) in [("product", 0u64), ("primitive_selftest", selftest)] {
+            let inputs = AdmissionInputs {
+                geometry,
+                free: FREE_PRELOAD,
+                non_expert: NON_EXPERT,
+                layer_expert_bytes: LAYER,
+                gate_up_layer_bytes: GATE_UP_LAYER,
+                down_layer_bytes: DOWN_LAYER,
+                trunk_layers: config.num_hidden_layers,
+                base_reserve: reserve.placement_bytes(true),
+                baseline_layers: 0,
+                fixed_state_bytes: stage,
+                pending_save_bytes: 0,
+                diagnostic_bytes: diagnostic,
+                base_runtime_reserved_bytes: reserve.census.runtime,
+                checkpoint_stride_rows: 8192,
+                window_rows: S1_WINDOW_ROWS,
+                link_gbps: 7.09,
+            };
+            let profile = admit(&inputs)
+                .unwrap_or_else(|decline| panic!("{label} must admit on the aggregate route: {decline}"));
+            assert_eq!(profile.resident_layers, 10, "{label}");
+            assert_eq!(profile.tile_rows, 1536, "{label}");
+            assert_eq!(profile.pages.total_pages(), 18, "{label}");
+            let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+            assert_eq!(layout.route(), WindowRoute::Aggregate);
+            let census = &profile.census;
+            let owned = census.owned_total().unwrap();
+            let owned_sum: u64 = census.owned_terms().iter().map(|(_, bytes)| bytes).sum();
+            let budget_sum: u64 = census.budget_terms().iter().map(|(_, bytes)| bytes).sum();
+            assert_eq!(owned_sum, owned, "{label}");
+            assert_eq!(owned_sum + budget_sum, census.total().unwrap(), "{label}");
+            let resident = profile.resident_layers as u64 * LAYER;
+            let used =
+                NON_EXPERT + resident + TILE_CENSUS + LOAD_GAP_INCREMENTAL + owned + diagnostic;
+            let projected = FREE_PRELOAD.checked_sub(used).expect("fits the card");
+            assert!(
+                projected >= MARGIN,
+                "{label}: projected free {projected} B is below the {MARGIN} B margin"
+            );
+            purposes.push(serde_json::json!({
+                "purpose": label,
+                "resident_layers": profile.resident_layers,
+                "tile_rows": profile.tile_rows,
+                "window_rows": profile.window_rows,
+                "page_count": profile.pages.total_pages(),
+                "owned_total_bytes": owned,
+                "owned_terms": census
+                    .owned_terms()
+                    .iter()
+                    .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
+                    .collect::<Vec<_>>(),
+                "budget_terms": census
+                    .budget_terms()
+                    .iter()
+                    .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
+                    .collect::<Vec<_>>(),
+                "reserve_bytes": census.total().unwrap(),
+                "diagnostic_budget_bytes": diagnostic,
+                "route_layout": {
+                    "route": "aggregate",
+                    "total_bytes": layout.total_bytes(),
+                    "charged_bytes": layout.charged_bytes(),
+                    "a4_sidecar_bytes": layout.a4_sidecar_bytes(),
+                    "x_f16_bytes": layout.x_f16_bytes(),
+                    "tail_ids_bytes": layout.tail_ids_bytes(),
+                    "cohort_counts_bytes": layout.cohort_counts_bytes(),
+                    "group_scatter_bytes": layout.group_scatter_bytes(),
+                },
+                "projection": {
+                    "preload_free_bytes": FREE_PRELOAD,
+                    "non_expert_bytes": NON_EXPERT,
+                    "resident_expert_bytes": resident,
+                    "tile_census_bytes": TILE_CENSUS,
+                    "observed_incremental_load_gap_bytes": LOAD_GAP_INCREMENTAL,
+                    "used_bytes": used,
+                    "projected_free_bytes": projected,
+                    "safety_margin_bytes": MARGIN,
+                    "margin_slack_bytes": projected - MARGIN,
+                },
+            }));
+        }
+
+        let ledger = serde_json::json!({
+            "fixture": {
+                "config": "compact_test_config",
+                "inputs": "j1761 preload free, non-expert, per-layer, tile-census and incremental-gap figures (CPU census of declared inputs, not a runtime GPU measurement)",
+                "arch": "gfx1100",
+                "route": "aggregate (declared stacked expert tensors)",
+                "trunk_layers": config.num_hidden_layers,
+                "weight_layers_in_index": 49,
+                "native_mtp": false,
+                "state_format": { "qsa": "q8", "gdn": "q8" },
+                "route_dims": {
+                    "rows": S1_WINDOW_ROWS,
+                    "k1_rows": S1_K1_TAIL_ROWS,
+                    "tail_rows": S1_AGGREGATE_TAIL_ROWS,
+                },
+                "diag_geometry": {
+                    "k1_rows": diag_geometry.k1_rows,
+                    "binding_experts": diag_geometry.binding_experts,
+                    "shared_intermediate": diag_geometry.shared_intermediate,
+                },
+            },
+            "diagnostics": {
+                "transport_reserve_bytes": transport,
+                "dispatch_suite_device_total_bytes": suite.device_total(),
+                "budget_bytes": selftest,
+            },
+            "purposes": purposes,
+        });
+        println!(
+            "SLOWLINK_AGGREGATE_RESIDENCY_LEDGER {}",
+            serde_json::to_string(&ledger).unwrap()
+        );
+    }
+
     /// The generic runtime budget supplements what the base reserve already
     /// charges and never doubles it: the combined runtime reservation (the
     /// base census's `runtime` plus the S1 `runtime_overhead` term) is exactly
