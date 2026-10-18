@@ -3886,7 +3886,10 @@ pub(crate) fn try_run_prompt(
     let moe_iu4 = moe_iu4_receipt(&MoeIu4Facts {
         route: profile.geometry.route,
         requested: gpu.qwen4_moe_sym_iu4_requested(),
-        descriptor: gpu.qwen4_moe_sym_kernel(),
+        // The kernel family the windows actually ran: only the IU4 window route has one.
+        descriptor: gpu
+            .qwen4_moe_sym_kernel()
+            .filter(|_| profile.geometry.route == dsp::WindowRoute::AggregateSymIu4),
         source_symmetric: profile.sym_iu4_source_symmetric,
         final_verified: forward.sym_iu4_coverage(),
         a4_sidecar_bytes: profile.census.a4_sidecars,
