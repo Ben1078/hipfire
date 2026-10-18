@@ -774,19 +774,19 @@ fn layout(part_bytes: impl IntoIterator<Item = usize>) -> (Vec<usize>, usize) {
     (offsets, end)
 }
 
-/// Device bytes a snapshot owns; a disk snapshot owns none.
+/// Device bytes a snapshot owns; a host or disk snapshot owns none.
 fn device_bytes(snapshot: &StoredSnapshot) -> u64 {
     match snapshot.location {
         SnapshotLocation::Device(_) => snapshot.bytes,
-        SnapshotLocation::Disk { .. } => 0,
+        SnapshotLocation::Host(_) | SnapshotLocation::Disk { .. } => 0,
     }
 }
 
-/// Pinned-host bytes a snapshot owns.
+/// Pinned-host bytes a snapshot owns; a device or disk snapshot owns none.
 fn host_bytes(snapshot: &StoredSnapshot) -> u64 {
     match snapshot.location {
         SnapshotLocation::Host(_) => snapshot.bytes,
-        _ => 0,
+        SnapshotLocation::Device(_) | SnapshotLocation::Disk { .. } => 0,
     }
 }
 
