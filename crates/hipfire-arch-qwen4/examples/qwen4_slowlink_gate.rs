@@ -81,6 +81,45 @@ mod slowlink_receipt;
 use slowlink_receipt::*;
 
 const USAGE: &str = "usage: qwen4_slowlink_gate --model ABS --fixture ABS.json --output ABS.json --mode primitives|state|product|perf --route incumbent|layer-major --manifest ABS.json";
+
+/// Diagnostic-only: the census is a source commitment, not a live allocation,
+/// and the residual is not an estimate of the actual driver footprint.
+const MEMORY_DIAGNOSTIC_NOTE: &str = "diagnostic only, never gates the verdict: owned census figures are source commitments, not live allocations, and the residual is not an actual driver estimate";
+
+/// The checks whose execution decides the verdict for `mode`. The census
+/// residual is deliberately absent: it is reported as `memory_observations`.
+fn required_check_ids(mode: Mode, fixture: &Fixture, route: Expect) -> Vec<String> {
+    let mut required: Vec<String> = match mode {
+        Mode::Primitives => PRIMITIVE_CASES
+            .iter()
+            .map(|n| format!("primitive.{n}"))
+            .collect(),
+        Mode::State => state_required(fixture, route),
+        Mode::Product => product_required(fixture),
+        Mode::Perf => perf_required(fixture),
+    };
+    required.push("identity.manifest".to_string());
+    required.push("load.placement".to_string());
+    required
+}
+
+/// The primitive cell's census/residual observations as a NON-GATING
+/// diagnostic. Ledger and residual problems are `info_error(s)`, never checks.
+fn memory_diagnostic(samples: &[Value], ledger: Result<MemoryLedger, String>) -> Value {
+    let mut diag = match ledger {
+        Err(e) => json!({"samples": samples, "info_error": e}),
+        Ok(ledger) => {
+            let (problems, mut receipt) = memory_problems(samples, &ledger);
+            receipt["info_errors"] = json!(problems);
+            receipt
+        }
+    };
+    diag["required"] = json!(false);
+    diag["gating"] = json!(false);
+    diag["note"] = json!(MEMORY_DIAGNOSTIC_NOTE);
+    diag
+}
+
 const ROUTE_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_PREFILL";
 const REPORT_SCHEMA: &str = "hipfire.qwen4.slowlink_gate.v1";
 /// Greedy ids compared / reported for the restore and replay checks.
@@ -1664,7 +1703,7 @@ fn run(args: &Args) -> Result<bool, String> {
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     // Baseline sample: after the HIP context exists, before any model allocation.
     // Only the primitive cell (Hold 1's first cell) runs the heavy telemetry:
-    // the smaps/fdinfo background sampler and the required residual check.
+    // the smaps/fdinfo background sampler and the non-gating census diagnostic.
     // Timed and quality cells keep their previous pipeline (point diagnostics).
     let heavy_memory = args.mode == Mode::Primitives;
     let mut mem_samples = vec![mem_sample(&gpu, "pre_load", heavy_memory)];
@@ -1677,20 +1716,7 @@ fn run(args: &Args) -> Result<bool, String> {
             gpu_arch: gpu.arch.clone(),
         },
     );
-    let mut required = match args.mode {
-        Mode::Primitives => PRIMITIVE_CASES
-            .iter()
-            .map(|n| format!("primitive.{n}"))
-            .collect(),
-        Mode::State => state_required(&fixture, args.route),
-        Mode::Product => product_required(&fixture),
-        Mode::Perf => perf_required(&fixture),
-    };
-    required.push("identity.manifest".to_string());
-    required.push("load.placement".to_string());
-    if sampler.is_some() {
-        required.push("memory.unowned_residual".to_string());
-    }
+    let required = required_check_ids(args.mode, &fixture, args.route);
     let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
     let mut checks = Checks::new(&required_refs);
     checks.push(
@@ -1780,31 +1806,15 @@ fn run(args: &Args) -> Result<bool, String> {
             Mode::Perf => run_perf(&mut ctx, &mut checks, &mut out),
         }
         if let Some(sampler) = sampler {
-            // The primitive cell (Hold 1's first cell) only: the heavy sampler
-            // and the required residual check against the manifest's census.
+            // The primitive cell (Hold 1's first cell) only: the heavy sampler.
+            // Its census residual is recorded as a non-gating diagnostic.
             ctx.sample_memory("end");
             let mut samples = std::mem::take(&mut ctx.mem);
             samples.push(sampler.finish());
-            match memory_ledger(&manifest) {
-                Err(e) => {
-                    out.insert("memory_observations".into(), json!({"samples": samples}));
-                    checks.fail("memory.unowned_residual", e, Value::Null);
-                }
-                Ok(ledger) => {
-                    let (problems, receipt) = memory_problems(&samples, &ledger);
-                    checks.push(
-                        "memory.unowned_residual",
-                        problems,
-                        json!({
-                            "observed": receipt["observed"], "residual": receipt["residual"],
-                            "allowances": receipt["allowances"],
-                            "device_guard": receipt["device_guard"],
-                            "see": "evidence.memory_observations",
-                        }),
-                    );
-                    out.insert("memory_observations".into(), receipt);
-                }
-            }
+            out.insert(
+                "memory_observations".into(),
+                memory_diagnostic(&samples, memory_ledger(&manifest)),
+            );
         } else {
             // Every other cell (state, product, timed perf): no sampler thread,
             // no smaps, no census requirement. Three light point diagnostics,
@@ -3073,5 +3083,91 @@ mod slowlink_receipt_tests {
             (max.drm_gtt, max.rss_file, max.vm_pin),
             (Some(5), Some(9), None)
         );
+    }
+
+    #[test]
+    fn slowlink_receipt_obsolete_residual_criterion_is_not_a_required_check() {
+        let fixture = Fixture::parse(&fixture()).unwrap();
+        for mode in [Mode::Primitives, Mode::State, Mode::Product, Mode::Perf] {
+            for route in [Expect::LayerMajor, Expect::Incumbent] {
+                let ids = required_check_ids(mode, &fixture, route);
+                assert!(
+                    !ids.iter().any(|n| n == "memory.unowned_residual"),
+                    "{mode:?}: {ids:?}"
+                );
+                assert!(ids.iter().any(|n| n == "identity.manifest"), "{mode:?}");
+                assert!(ids.iter().any(|n| n == "load.placement"), "{mode:?}");
+            }
+        }
+        // The primitive cell: exactly the cases plus identity and load.
+        let ids = required_check_ids(Mode::Primitives, &fixture, Expect::LayerMajor);
+        assert_eq!(ids.len(), PRIMITIVE_CASES.len() + 2);
+        for case in PRIMITIVE_CASES {
+            assert!(ids.contains(&format!("primitive.{case}")), "{case}");
+        }
+    }
+
+    #[test]
+    fn slowlink_receipt_residual_over_allowance_is_info_and_the_verdict_is_the_primitives() {
+        let fixture = Fixture::parse(&fixture()).unwrap();
+        let ids = required_check_ids(Mode::Primitives, &fixture, Expect::LayerMajor);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut checks = Checks::new(&refs);
+        for id in &ids {
+            checks.pass(id, Value::Null);
+        }
+        // VRAM and host far over every allowance and the device guard.
+        let over = counters(200 * GIB, 0, 200 * GIB, 30 * GIB, 200 * GIB);
+        let diag = memory_diagnostic(&memory_with(over, over), Ok(ledger()));
+        let info = diag["info_errors"].as_array().unwrap();
+        assert!(
+            info.iter()
+                .any(|p| p.as_str().unwrap().contains("unowned VRAM residual")),
+            "{info:?}"
+        );
+        assert!(!info.is_empty());
+        // The overrun cannot change the verdict or add a check row.
+        assert_eq!(checks.status(), "pass");
+        assert!(checks.missing().is_empty());
+        assert!(!checks.json().to_string().contains("memory.unowned_residual"));
+        // The census and residual stay serialized as a labelled non-gating diagnostic.
+        assert_eq!(diag["required"], json!(false));
+        assert_eq!(diag["gating"], json!(false));
+        assert!(diag["note"].as_str().unwrap().contains("not live allocations"));
+        assert!(diag["note"].as_str().unwrap().contains("not an actual driver"));
+        assert!(diag["observed"].is_object());
+        assert!(diag["residual"].is_object());
+        assert!(diag["allowances"].is_object());
+        assert_eq!(diag["samples"].as_array().unwrap().len(), 5);
+        // A primitive failure still fails the verdict.
+        checks.fail(&ids[0], "primitive broke", Value::Null);
+        assert_eq!(checks.status(), "fail");
+    }
+
+    #[test]
+    fn slowlink_receipt_residual_within_allowance_has_no_info_errors() {
+        let diag = memory_diagnostic(&good_memory(), Ok(ledger()));
+        assert_eq!(diag["info_errors"], json!([]));
+        assert_eq!(diag["gating"], json!(false));
+        assert_eq!(diag["residual"]["vram_bytes"], json!(GIB / 2));
+    }
+
+    #[test]
+    fn slowlink_receipt_unreadable_ledger_or_telemetry_is_an_info_error_not_a_check() {
+        // The census is missing from the manifest: an info_error with the samples kept.
+        let samples = good_memory();
+        let diag = memory_diagnostic(&samples, memory_ledger(&manifest()));
+        assert!(diag["info_error"].as_str().unwrap().contains("manifest key"));
+        assert_eq!(diag["samples"].as_array().unwrap().len(), samples.len());
+        assert_eq!(diag["required"], json!(false));
+        assert_eq!(diag["gating"], json!(false));
+        // Incomplete telemetry: the diagnostic is still produced, with info_errors.
+        let diag = memory_diagnostic(&[], Ok(ledger()));
+        assert!(!diag["info_errors"].as_array().unwrap().is_empty());
+        assert_eq!(diag["gating"], json!(false));
+        // Neither case touches a verdict.
+        let mut checks = Checks::new(&["primitive.x"]);
+        checks.pass("primitive.x", Value::Null);
+        assert_eq!(checks.status(), "pass");
     }
 }
