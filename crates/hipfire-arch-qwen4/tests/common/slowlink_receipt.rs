@@ -2446,7 +2446,10 @@ fn witness_int(w: &Value, key: &str) -> Option<i128> {
 /// Every reason the admission witness is not a proof of a valid, maximal,
 /// actual placement; empty means proven. A missing, partial or forged witness
 /// never passes.
-pub fn admission_witness_problems(witness: Option<&Value>, actual: &AdmissionActual) -> Vec<String> {
+pub fn admission_witness_problems(
+    witness: Option<&Value>,
+    actual: &AdmissionActual,
+) -> Vec<String> {
     let Some(w) = witness.filter(|w| w.is_object()) else {
         return vec![
             "admission witness missing: the actual placement is not proved maximal-fits".into(),
@@ -2471,7 +2474,9 @@ pub fn admission_witness_problems(witness: Option<&Value>, actual: &AdmissionAct
         match w.get(key) {
             Some(Value::Null) => {}
             Some(v) if v.as_u64().is_some() => {}
-            _ => bad.push(format!("admission.{key} missing (unsigned integer or null)")),
+            _ => bad.push(format!(
+                "admission.{key} missing (unsigned integer or null)"
+            )),
         }
     }
     if w.get("memory_basis").and_then(Value::as_str) != Some(ADMISSION_MEMORY_BASIS) {
@@ -2605,12 +2610,11 @@ pub fn reference_weight_delta(
     actual_resident: u64,
     layer_payload_bytes: u64,
 ) -> Result<i128, String> {
-    let reference = manifest_profile_u64(manifest, profile, "resident_expert_layers").ok_or(
-        format!(
+    let reference =
+        manifest_profile_u64(manifest, profile, "resident_expert_layers").ok_or(format!(
             "manifest {} missing",
             profile_path(profile, "resident_expert_layers")
-        ),
-    )?;
+        ))?;
     (i128::from(actual_resident) - i128::from(reference))
         .checked_mul(i128::from(layer_payload_bytes))
         .ok_or_else(|| "placement accounting delta overflows".to_string())
@@ -2635,13 +2639,12 @@ pub fn placement_accounting(
     let delta = layer_payload_bytes
         .ok_or_else(|| "the actual layer payload bytes are unknown".to_string())
         .and_then(|p| reference_weight_delta(manifest, profile, actual_resident, p));
-    let (weights, owned, delta_json, error) = match (&delta, reference("device_weights_bytes"), reference("device_owned_bytes")) {
-        (Ok(d), Some(w), Some(o)) => (
-            shifted(w, *d),
-            shifted(o, *d),
-            i64::try_from(*d).ok(),
-            None,
-        ),
+    let (weights, owned, delta_json, error) = match (
+        &delta,
+        reference("device_weights_bytes"),
+        reference("device_owned_bytes"),
+    ) {
+        (Ok(d), Some(w), Some(o)) => (shifted(w, *d), shifted(o, *d), i64::try_from(*d).ok(), None),
         (Err(e), _, _) => (None, None, None, Some(e.clone())),
         _ => (
             None,

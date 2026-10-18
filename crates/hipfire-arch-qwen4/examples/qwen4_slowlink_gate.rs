@@ -2720,9 +2720,16 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         let admission = profile_now.map(admission_witness);
         let weight_delta: Option<Result<i128, String>> = profile_now.map(|p| {
             layer_payload_bytes(p)
-                .ok_or_else(|| "resident layer bytes are below the layer's backing slack".to_string())
+                .ok_or_else(|| {
+                    "resident layer bytes are below the layer's backing slack".to_string()
+                })
                 .and_then(|payload| {
-                    reference_weight_delta(&manifest, profile, loaded.resident_layers as u64, payload)
+                    reference_weight_delta(
+                        &manifest,
+                        profile,
+                        loaded.resident_layers as u64,
+                        payload,
+                    )
                 })
         });
         let accounting = profile_now.map(|p| {
@@ -2769,8 +2776,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                     &AdmissionActual {
                         resident_layers: Some(loaded.resident_layers as u64),
                         trunk_layers: Some(loaded.num_layers as u64),
-                        snapshot_budget_bytes: profile_now
-                            .map(|p| p.device_snapshot_budget_bytes),
+                        snapshot_budget_bytes: profile_now.map(|p| p.device_snapshot_budget_bytes),
                     },
                 ));
             }
@@ -2890,12 +2896,13 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                 "memory_observations".into(),
                 memory_diagnostic(
                     &samples,
-                    memory_ledger(&manifest, purpose_name(load_purpose(args.mode)))
-                        .and_then(|ledger| match &weight_delta {
+                    memory_ledger(&manifest, purpose_name(load_purpose(args.mode))).and_then(
+                        |ledger| match &weight_delta {
                             Some(Ok(delta)) => ledger.at_actual_placement(*delta),
                             Some(Err(error)) => Err(error.clone()),
                             None => Ok(ledger),
-                        }),
+                        },
+                    ),
                 ),
             );
         } else {
@@ -5818,9 +5825,11 @@ mod slowlink_receipt_tests {
         // are all valid counts, one that leaves no host layer is not.
         for reference in [0u64, 9, 11] {
             let mut ok = manifest();
-            ok["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] =
-                json!(reference);
-            assert!(profile_shape_problems(&ok).is_empty(), "reference {reference}");
+            ok["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] = json!(reference);
+            assert!(
+                profile_shape_problems(&ok).is_empty(),
+                "reference {reference}"
+            );
         }
         let mut all_resident = manifest();
         all_resident["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] =
@@ -6162,7 +6171,9 @@ mod slowlink_receipt_tests {
         // The base does not fit: no count, not even zero, is a valid fit.
         let no_base = quote(base_free(0, 0) - 1, None, 0);
         assert_eq!(no_base.slack, -1);
-        assert!(judged(&no_base).iter().any(|m| m.contains("oversubscribed")));
+        assert!(judged(&no_base)
+            .iter()
+            .any(|m| m.contains("oversubscribed")));
         // Every layer resident leaves no host layer: an S1 profile is not claimed.
         let all = quote(base_free(48, 5), None, 48);
         assert!(judged(&all).iter().any(|m| m.contains("no host layer")));
@@ -6172,12 +6183,30 @@ mod slowlink_receipt_tests {
         let w = admission_witness_json(&n9);
         let slack = u64::try_from(n9.slack).unwrap();
         for actual in [
-            AdmissionActual { resident_layers: Some(10), ..actual_of(&n9) },
-            AdmissionActual { resident_layers: None, ..actual_of(&n9) },
-            AdmissionActual { trunk_layers: Some(47), ..actual_of(&n9) },
-            AdmissionActual { trunk_layers: None, ..actual_of(&n9) },
-            AdmissionActual { snapshot_budget_bytes: Some(slack + 1), ..actual_of(&n9) },
-            AdmissionActual { snapshot_budget_bytes: None, ..actual_of(&n9) },
+            AdmissionActual {
+                resident_layers: Some(10),
+                ..actual_of(&n9)
+            },
+            AdmissionActual {
+                resident_layers: None,
+                ..actual_of(&n9)
+            },
+            AdmissionActual {
+                trunk_layers: Some(47),
+                ..actual_of(&n9)
+            },
+            AdmissionActual {
+                trunk_layers: None,
+                ..actual_of(&n9)
+            },
+            AdmissionActual {
+                snapshot_budget_bytes: Some(slack + 1),
+                ..actual_of(&n9)
+            },
+            AdmissionActual {
+                snapshot_budget_bytes: None,
+                ..actual_of(&n9)
+            },
         ] {
             assert!(
                 !admission_witness_problems(Some(&w), &actual).is_empty(),
@@ -6192,8 +6221,9 @@ mod slowlink_receipt_tests {
         assert!(
             !admission_witness_problems(Some(&Value::Null), &AdmissionActual::default()).is_empty()
         );
-        assert!(!admission_witness_problems(Some(&json!([])), &AdmissionActual::default())
-            .is_empty());
+        assert!(
+            !admission_witness_problems(Some(&json!([])), &AdmissionActual::default()).is_empty()
+        );
         let n9 = quote(POST_INIT, Some(PRE_INIT), 9);
         let w = admission_witness_json(&n9);
         let keys: Vec<String> = w.as_object().unwrap().keys().cloned().collect();
@@ -6236,11 +6266,16 @@ mod slowlink_receipt_tests {
         // loss and a forged fresh-free basis all fail.
         assert!(!tampered(&n9, "preferred_deficit_bytes", |v| *v = json!(0)).is_empty());
         assert!(!tampered(&n9, "observed_initialization_bytes", |v| *v = json!(0)).is_empty());
-        assert!(!tampered(&n9, "free_before_initialization_bytes", |v| *v = json!(PRE_INIT + 1))
-            .is_empty());
+        assert!(!tampered(&n9, "free_before_initialization_bytes", |v| *v =
+            json!(PRE_INIT + 1))
+        .is_empty());
         assert!(!tampered(&n9, "memory_basis", |v| *v = json!("pre_load")).is_empty());
-        assert!(!tampered(&n9, "initialization_charged_via_free", |v| *v = json!(false)).is_empty());
-        assert!(!tampered(&n9, "initialization_charged_via_free", |v| *v = json!("true")).is_empty());
+        assert!(!tampered(&n9, "initialization_charged_via_free", |v| *v =
+            json!(false))
+        .is_empty());
+        assert!(!tampered(&n9, "initialization_charged_via_free", |v| *v =
+            json!("true"))
+        .is_empty());
         // A witness that claims N10 against a nine-layer quote's free fails.
         let mut forged = admission_witness_json(&n9);
         forged["resident_layers"] = json!(10);
@@ -6252,7 +6287,10 @@ mod slowlink_receipt_tests {
     #[test]
     fn slowlink_receipt_manifest_reference_count_never_masquerades_as_the_actual_placement() {
         let m = manifest();
-        assert_eq!(manifest_profile_u64(&m, PROFILE_PRODUCT, "resident_expert_layers"), Some(10));
+        assert_eq!(
+            manifest_profile_u64(&m, PROFILE_PRODUCT, "resident_expert_layers"),
+            Some(10)
+        );
         // An actual nine-layer admission is valid against a ten-layer reference.
         assert!(
             profile_load_problems(&m, PROFILE_PRODUCT, "product", Some(768), Some(16384))
@@ -6264,7 +6302,10 @@ mod slowlink_receipt_tests {
         assert_eq!(acc["reference"]["resident_expert_layers"], 10);
         assert_eq!(acc["actual"]["resident_layers"], 9);
         assert_eq!(acc["actual"]["host_layers"], 39);
-        assert_eq!(acc["actual"]["weights_delta_vs_reference_bytes"], -(payload as i64));
+        assert_eq!(
+            acc["actual"]["weights_delta_vs_reference_bytes"],
+            -(payload as i64)
+        );
         assert_eq!(acc["actual"]["device_weights_bytes"], 20 * GIB - payload);
         let ref_owned = manifest_profile_u64(&m, PROFILE_PRODUCT, "device_owned_bytes").unwrap();
         assert_eq!(acc["actual"]["device_owned_bytes"], ref_owned - payload);
@@ -6285,9 +6326,18 @@ mod slowlink_receipt_tests {
         with_root["memory_ledger"]["owned_host_bytes"] = json!(80 * GIB);
         let ledger = memory_ledger(&with_root, PROFILE_PRIMITIVE).unwrap();
         let moved = ledger.at_actual_placement(-(payload as i128)).unwrap();
-        assert_eq!(moved.owned_device_bytes, ledger.owned_device_bytes - payload);
-        assert_eq!(moved.decomposition.weights, ledger.decomposition.weights - payload);
-        assert_eq!(moved.decomposition.committed_sum(), Some(moved.owned_device_bytes));
+        assert_eq!(
+            moved.owned_device_bytes,
+            ledger.owned_device_bytes - payload
+        );
+        assert_eq!(
+            moved.decomposition.weights,
+            ledger.decomposition.weights - payload
+        );
+        assert_eq!(
+            moved.decomposition.committed_sum(),
+            Some(moved.owned_device_bytes)
+        );
         assert!(moved.census_basis.contains("ACTUAL"));
         assert!(ledger
             .at_actual_placement(-(ledger.owned_device_bytes as i128) - 1)
