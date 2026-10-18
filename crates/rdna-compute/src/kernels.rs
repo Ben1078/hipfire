@@ -4545,6 +4545,45 @@ pub fn qwen4_moe_scatter_stable_top10_gfx1100_src() -> &'static str {
     });
     &SRC
 }
+/// Exact arch-guard text of [`QWEN4_MOE_SYM_CHECK_GFX1201_SRC`] (`#if`/`#error`/`#endif`).
+pub const QWEN4_MOE_SYM_CHECK_GFX1201_ARCH_GUARD: &str = concat!(
+    "#if !defined(__gfx1201__) && defined(__HIP_DEVICE_COMPILE__)\n",
+    "#error \"qwen4_moe_sym_check.gfx1201.hip is gfx1201-only\"\n",
+    "#endif\n",
+);
+/// Exact entry declaration of [`QWEN4_MOE_SYM_CHECK_GFX1201_SRC`], the only occurrence of its name.
+pub const QWEN4_MOE_SYM_CHECK_GFX1201_ENTRY_DECL: &str =
+    "extern \"C\" __global__ void qwen4_moe_sym_check_gfx1201(";
+/// The same declaration under the gfx1100 entry name.
+pub const QWEN4_MOE_SYM_CHECK_GFX1100_ENTRY_DECL: &str =
+    "extern \"C\" __global__ void qwen4_moe_sym_check_gfx1100(";
+/// The symmetric-grid header checker assembled for gfx1100: the gfx1201 body (arch-neutral HIP:
+/// one 256-thread block per 256 headers, `__syncthreads_or`, no wave-size construct) with ONLY
+/// its exact arch guard removed and ONLY its entry renamed to `qwen4_moe_sym_check_gfx1100`. The
+/// compiler's own gfx1100 macros stay intact (no arch spoofing). Both edits assert that their
+/// text occurs exactly once, so a drifted source panics instead of mis-assembling.
+pub fn qwen4_moe_sym_check_gfx1100_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let src = QWEN4_MOE_SYM_CHECK_GFX1201_SRC;
+        assert_eq!(
+            src.matches("qwen4_moe_sym_check_gfx1201").count(),
+            1,
+            "the gfx1201 checker entry name drifted from the source"
+        );
+        let unguarded = strip_exact_arch_guard(src, QWEN4_MOE_SYM_CHECK_GFX1201_ARCH_GUARD);
+        assert_eq!(
+            unguarded.matches(QWEN4_MOE_SYM_CHECK_GFX1201_ENTRY_DECL).count(),
+            1,
+            "the gfx1201 checker entry declaration drifted from the source"
+        );
+        unguarded.replacen(
+            QWEN4_MOE_SYM_CHECK_GFX1201_ENTRY_DECL,
+            QWEN4_MOE_SYM_CHECK_GFX1100_ENTRY_DECL,
+            1,
+        )
+    });
+    &SRC
+}
 /// Sealed expert-slab decode lane-union planner (gfx1201, gfx1151): routed ids ->
 /// fixed-capacity per-codec-bucket K1 descriptors, no host readback.
 pub const QWEN4_SLAB_UNION_PLAN_SRC: &str =

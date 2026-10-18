@@ -2849,6 +2849,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!(
+            "qwen4_moe_sym_check_gfx1100",
+            kernels::qwen4_moe_sym_check_gfx1100_src(),
+            ["qwen4_moe_sym_check_gfx1100"]
+        );
+        add!(
             "qwen4_slab_union_plan_gfx1100",
             kernels::qwen4_slab_union_plan_gfx1100_src(),
             ["qwen4_slab_union_plan"]
@@ -5795,6 +5800,63 @@ mod tests {
         assert!(!gfx1151
             .iter()
             .any(|e| e.module == "qwen4_slab_union_plan_gfx1100"));
+    }
+
+    /// The gfx1100 header checker is the gfx1201 source with exactly its arch guard removed and
+    /// exactly its entry renamed (a genuine gfx1100 compile, no fake arch macro), registered
+    /// only in the gfx1100 arm under its own module key.
+    #[test]
+    fn gfx1100_sym_check_is_the_gfx1201_source_with_two_exact_edits() {
+        let original = kernels::QWEN4_MOE_SYM_CHECK_GFX1201_SRC;
+        let assembled = kernels::qwen4_moe_sym_check_gfx1100_src();
+        assert_eq!(original.matches(kernels::QWEN4_MOE_SYM_CHECK_GFX1201_ARCH_GUARD).count(), 1);
+        assert_eq!(original.matches(kernels::QWEN4_MOE_SYM_CHECK_GFX1201_ENTRY_DECL).count(), 1);
+        assert_eq!(original.matches("qwen4_moe_sym_check_gfx1201").count(), 1);
+        assert_eq!(
+            assembled,
+            original
+                .replacen(kernels::QWEN4_MOE_SYM_CHECK_GFX1201_ARCH_GUARD, "", 1)
+                .replacen(
+                    kernels::QWEN4_MOE_SYM_CHECK_GFX1201_ENTRY_DECL,
+                    kernels::QWEN4_MOE_SYM_CHECK_GFX1100_ENTRY_DECL,
+                    1
+                )
+        );
+        assert_eq!(assembled.matches("qwen4_moe_sym_check_gfx1100(").count(), 1);
+        assert!(!assembled.contains("qwen4_moe_sym_check_gfx1201"));
+        assert!(!assembled.contains("#error"));
+        for forbidden in [
+            "#define __gfx",
+            "#undef __gfx",
+            "__gfx",
+            "__builtin_amdgcn",
+            "__shfl",
+            "__ballot",
+            "__activemask",
+            "warpSize",
+        ] {
+            assert!(
+                !assembled.contains(forbidden),
+                "{forbidden} in the assembled gfx1100 checker source"
+            );
+        }
+        let gfx1100 = entries("gfx1100", "").unwrap();
+        let check = gfx1100
+            .iter()
+            .find(|e| e.module == "qwen4_moe_sym_check_gfx1100")
+            .expect("gfx1100 checker module");
+        assert_eq!(check.symbols, ["qwen4_moe_sym_check_gfx1100"]);
+        assert_eq!(check.source(), assembled);
+        for arch in ["gfx1151", "gfx1201", "gfx906", "gfx942"] {
+            assert!(
+                !entries(arch, "")
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.module == "qwen4_moe_sym_check_gfx1100"),
+                "{arch}"
+            );
+        }
+        assert!(!gfx1100.iter().any(|e| e.module == "qwen4_moe_sym_check_gfx1201"));
     }
 
     #[test]

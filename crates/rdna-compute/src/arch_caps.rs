@@ -58,6 +58,7 @@ pub struct ArchCaps {
     has_wmma: bool,
     has_wmma_w32: bool,
     has_wmma_w32_gfx12: bool,
+    has_iu4_wmma: bool,
     has_gfx11_plus_simt: bool,
     has_dot2_f32_f16: bool,
     has_mmq: bool,
@@ -144,6 +145,7 @@ impl ArchCaps {
         let has_wmma = is_rdna3 || is_rdna4;
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
+        let has_iu4_wmma = has_wmma_w32 || has_wmma_w32_gfx12;
         let has_gfx11_plus_simt = is_rdna3 || is_rdna4;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let has_mmq = is_gfx906 || is_rdna3;
@@ -206,6 +208,7 @@ impl ArchCaps {
             has_wmma,
             has_wmma_w32,
             has_wmma_w32_gfx12,
+            has_iu4_wmma,
             has_gfx11_plus_simt,
             has_dot2_f32_f16,
             has_mmq,
@@ -452,6 +455,13 @@ impl ArchCaps {
     }
     pub fn has_wmma_w32_gfx12(&self) -> bool {
         self.has_wmma_w32_gfx12
+    }
+    /// Wave32 integer-4 WMMA hardware: gfx11 (RDNA3 / 3.5) `v_wmma_i32_16x16x16_iu4`
+    /// (K16) and gfx12 (RDNA4) `v_wmma_i32_16x16x32_iu4` (K32). Hardware only: it says
+    /// nothing about which kernels, images or producers exist for a codec; those come from
+    /// the kernel inventory and its admission (`crate::gemm::moe_sym_iu4_kernel`).
+    pub fn has_iu4_wmma(&self) -> bool {
+        self.has_iu4_wmma
     }
     /// gfx11-generation wave32 SIMT ISA, shared by gfx12: DPP16 row shifts,
     /// `permlanex16`, and the gfx11+ buffer-resource descriptor (word3
@@ -856,6 +866,28 @@ mod tests {
         for arch in &["gfx1151", "gfx1201"] {
             let caps = make_caps(arch);
             assert!(caps.has_gfx11_plus_simt() && caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn iu4_wmma_is_the_gfx11_and_gfx12_wave32_hardware_capability() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            let caps = make_caps(arch);
+            assert!(caps.has_iu4_wmma(), "{arch}");
+            assert_eq!(
+                caps.has_iu4_wmma(),
+                caps.has_wmma_w32() || caps.has_wmma_w32_gfx12(),
+                "{arch}"
+            );
+        }
+        for arch in &[
+            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+            "gfx940", "gfx941", "gfx942", "",
+        ] {
+            assert!(!make_caps(arch).has_iu4_wmma(), "{arch:?}");
         }
     }
 

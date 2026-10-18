@@ -1395,60 +1395,48 @@ impl Gpu {
         }
     }
 
-    /// K3 down A4 producer of the gfx1100 slab K2 prefill: grouped BF16 SwiGLU rows `h`
-    /// `[grouped_rows, 640]` -> the compact flat-slot `block_i4_128` down sidecar
-    /// `[5, total_slots]` (record `g * total_slots + sorted[p]`, 72 bytes), padding rows
-    /// emit nothing. The row-local `mq_i4_a4_r128_k640_gfx1100` entry (certified builder
-    /// module `mq_i4_a4_pm_gfx1100`, 48-byte kernarg, grid `5 * grouped_rows`, block 32);
-    /// `k` must be 640. Same handle and ownership as [`Gpu::qwen4_moe_rotate128_i4`]
-    /// (which refuses gfx1100). gfx1100 builds the sidecar with K3; gfx1201 and gfx1151 (no K3, `k3` is `None`)
-    /// delegate to [`Gpu::qwen4_moe_rotate128_i4`] unchanged, before the K3 lookup.
-    pub fn qwen4_moe_rotate128_i4_slab(
+    /// K3 down A4 producer of the gfx1100 K2 prefill: grouped BF16 SwiGLU rows `h`
+    /// `[grouped_rows, k]` -> the compact flat-slot `block_i4_128` down sidecar
+    /// `[k / 128, total_slots]` (record `g * total_slots + sorted[p]`, 72 bytes), padding rows
+    /// emit nothing. `producer` is the descriptor's embedded row-local entry (module key, image,
+    /// symbol, `k`; for gfx1100 `mq_i4_a4_r128_k640_gfx1100` of the certified builder module
+    /// `mq_i4_a4_pm_gfx1100`, 48-byte kernarg, grid `(k / 128) * grouped_rows`, block 32) and
+    /// `k` must equal the producer's `k`. Same handle and ownership as the hipcc arm of
+    /// [`Gpu::qwen4_moe_rotate128_i4`], which dispatches here.
+    pub(crate) fn qwen4_moe_rotate128_i4_embedded(
         &mut self,
+        (module, image, symbol, producer_k): (&'static str, &'static [u8], &'static str, usize),
         h: &GpuTensor,
         sorted: &GpuTensor,
         k: usize,
         grouped_rows: usize,
         total_slots: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
-        let arch = self.slab_kernels("qwen4_moe_rotate128_i4_slab")?;
-        if matches!(arch.arch, "gfx1201" | "gfx1151") {
-            return self.qwen4_moe_rotate128_i4(h, sorted, k, grouped_rows, total_slots);
-        }
-        let Some((module, image, symbol)) = arch.k3 else {
+        if k != producer_k || grouped_rows == 0 || total_slots == 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "qwen4_moe_rotate128_i4_slab: no K3 A4 producer on {}",
-                    self.arch
-                ),
-            ));
-        };
-        if k != SLAB_DOWN_K || grouped_rows == 0 || total_slots == 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "qwen4_moe_rotate128_i4_slab: need k == 640 and nonzero rows",
+                &format!("qwen4_moe_rotate128_i4: need k == {producer_k} and nonzero rows"),
             ));
         }
         crate::moe::require_span(
             h,
             &[grouped_rows, k, 2],
-            "qwen4_moe_rotate128_i4_slab grouped BF16 rows",
+            "qwen4_moe_rotate128_i4 grouped BF16 rows",
         )?;
         crate::moe::require_span(
             sorted,
             &[grouped_rows, 4],
-            "qwen4_moe_rotate128_i4_slab sorted slots",
+            "qwen4_moe_rotate128_i4 sorted slots",
         )?;
         let grid_x = u32::try_from((k / 128) * grouped_rows).map_err(|_| {
-            hip_bridge::HipError::new(0, "qwen4_moe_rotate128_i4_slab: grid exceeds u32")
+            hip_bridge::HipError::new(0, "qwen4_moe_rotate128_i4: grid exceeds u32")
         })?;
         let (pv, lv) = match (u32::try_from(grouped_rows), u32::try_from(total_slots)) {
             (Ok(p), Ok(l)) => (p, l),
             _ => {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    "qwen4_moe_rotate128_i4_slab: extent overflow",
+                    "qwen4_moe_rotate128_i4: extent overflow",
                 ))
             }
         };
@@ -2030,6 +2018,22 @@ impl Gpu {
         )?;
         self.take_device_wait_error()?;
         Ok((a, b))
+    }
+
+    /// Sealed-slab down A4 producer: the sealed expert-slab arch gate
+    /// ([`slab_arch_kernels`]) then [`Gpu::qwen4_moe_rotate128_i4`] (the descriptor's producer:
+    /// K3 on gfx1100, hipcc on gfx1201 and gfx1151). Removed once the slab callers call
+    /// [`Gpu::qwen4_moe_rotate128_i4`] directly.
+    pub fn qwen4_moe_rotate128_i4_slab(
+        &mut self,
+        h: &GpuTensor,
+        sorted: &GpuTensor,
+        k: usize,
+        grouped_rows: usize,
+        total_slots: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.slab_kernels("qwen4_moe_rotate128_i4_slab")?;
+        self.qwen4_moe_rotate128_i4(h, sorted, k, grouped_rows, total_slots)
     }
 }
 
