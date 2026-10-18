@@ -806,7 +806,7 @@ fn moe_descriptor_json(gpu: &Gpu) -> serde_json::Value {
         "threads": kernel.block_threads,
         "gate_producer": kernel.gate_producer.module,
         "down_producer": down_producer,
-        "checker": kernel.checker.symbol,
+        "checker": (kernel.checker)().symbol,
         "c2": kernel.gate_producer.require_c2,
     })
 }

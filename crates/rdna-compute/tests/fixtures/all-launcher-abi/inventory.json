@@ -289,7 +289,9 @@
   "non_launching": {
     "crates/rdna-compute/src/cdna/gfx942.rs::fp8b128_moe_grouped_build_identity": "records the JIT build identity (source/object hashes) of the FP8 MoE module; compiles, never launches",
     "crates/rdna-compute/src/dispatch.rs::recorded_launch_artifact": "replay artifact lookup: maps a launched symbol name to its module; names only",
-    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols": "selector returning the symbol names qwen4_moe_sym_gemm launches; that launcher resolves its name through this function",
+    "crates/rdna-compute/src/gemm.rs::moe_sym_iu4_checker_gfx1151": "checker-only descriptor factory returning the exact checker module, source and symbol struct; source loads and the launch happen in qwen4_moe_sym_check, which is checked separately, and the GEMM selectors carry the function pointer without consulting it; it never launches",
+    "crates/rdna-compute/src/gemm.rs::moe_sym_iu4_kernel": "descriptor lookup that checks the hardware and the raw K2 module/entry inventory and returns metadata including the GEMM, producers and checker; it never launches, and qwen4_moe_sym_gemm and qwen4_moe_sym_check are checked separately",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gfx1151_hipcc_src": "returns the shipped HIP source through the descriptor source pointer; ensure_kernel compiles it and the GEMM/checker checked launchers launch its entries; the source accessor never launches",
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_w3_gemm_symbols": "selector of the MQ3-I4 NT1 anchor names used by oracles; production launches the NT4 entries through qwen4_moe_sym_w3_gemm",
     "crates/rdna-compute/src/gemm.rs::ensure_qwen4_moe_sym_w3_pm_entry": "module loader (ensure_embedded_kernel) for the W3 PM entries; loads, never launches",
     "crates/rdna-compute/src/kernel_registry.rs::entries": "kernel registry table (module, symbols, source); compile inventory only",
@@ -321,6 +323,10 @@
     "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_moe_grouped_top10_silu_bf16out": {
       "to": "gemm_mq4g256v2_moe_grouped_wmma_k2_impl",
       "reason": "passes its BF16-output entry name to the shared launcher through the gfx11_entry parameter"
+    },
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm": {
+      "to": "qwen4_moe_sym_nt1_gemm",
+      "reason": "forwards the NT1 descriptor [module, entry] to the shared NT1 launcher through its [module, func] parameter; the NT4 and NT8 launchers are checked on their own launch"
     },
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_w3_gemm": {
       "to": "qwen4_moe_sym_nt1_gemm",
@@ -404,7 +410,7 @@
       "scopes": [
         {
           "name": "rc4b",
-          "reason": "e8p_containment loads historical OLD images through cx.load_old_image from mandatory old_dir: rc4b on gfx1201/gfx1100, plus the pre-rc5 gfx1151 baseline 11411610be74647b1855e6e37fddcd1178ca7881. Re-audited upstream e95865cf1fd864f453956d0bddb2426e98bf33fc adds only the gfx1151 historical K2 basename in k2_old_stem and two diagnostic strings in run; Main authorized exactly those two fingerprint updates, with no handle or ABI change. The handles go to k1_run as K1Path::OldImage, which builds the pre-guard 88-byte k1_blob(.., None) and calls launch_raw (k1_phase, k1_chain); k2_gemm launches the OLD K2 handle through launch_raw with a 60-byte NT1 blob (five pointers and five i32). run, run_body, phase, k2_old_stem, k2_run, k2_pipeline, k2_phase and k2_chain remain the pinned selectors and drivers. NEW paths remain independently checked. The report records only an image digest, with no expected-hash check, so this gate proves the separately loaded old_dir source origin and pinned call chain, not historical artifact authenticity.",
+          "reason": "e8p_containment loads historical OLD images through cx.load_old_image from mandatory old_dir: rc4b on gfx1201/gfx1100, plus the pre-rc5 gfx1151 baseline 11411610be74647b1855e6e37fddcd1178ca7881. Re-audited upstream e95865cf1fd864f453956d0bddb2426e98bf33fc adds only the gfx1151 historical K2 basename in k2_old_stem and two diagnostic strings in run; Main authorized exactly those two fingerprint updates, with no handle or ABI change. The handles go to k1_run as K1Path::OldImage, which builds the pre-guard 88-byte k1_blob(.., None) and calls launch_raw (k1_phase, k1_chain); k2_gemm launches the OLD K2 handle through launch_raw with a 60-byte NT1 blob (five pointers and five i32). run, run_body, phase, k2_old_stem, k2_run, k2_pipeline, k2_phase and k2_chain remain the pinned selectors and drivers. NEW paths remain independently checked. The report records only an image digest, with no expected-hash check, so this gate proves the separately loaded old_dir source origin and pinned call chain, not historical artifact authenticity. Gfx1100Iu4Wiring re-audited upstream c6801c19a as rename-only, authorized by Main 2026-10-18: k2_phase and k2_pipeline change qwen4_moe_rotate256_i4_slab to qwen4_moe_rotate256_i4 and qwen4_moe_rotate128_i4_slab to qwen4_moe_rotate128_i4 with the same arguments and no handle, ABI or old-image change; the k2_phase and k2_pipeline audit-pin update is for a pure rename, not a waiver.",
           "file": "crates/hipfire-runtime/examples/moe_nan_guard_regress/e8p_containment.rs",
           "callers": [
             "k2_gemm"
@@ -418,8 +424,8 @@
             "k1_chain": "bd0d1ef8192d2d2a",
             "k2_gemm": "fed4a86cbe254f14",
             "k2_run": "82933ee545e75d79",
-            "k2_pipeline": "3dd9de7948d19e5a",
-            "k2_phase": "4189f717dc05f2a2",
+            "k2_pipeline": "ab61e7b56d5a300e",
+            "k2_phase": "273e56572159d390",
             "k2_chain": "8deed42ef11b46ac"
           }
         }

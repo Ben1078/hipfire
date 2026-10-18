@@ -48417,7 +48417,10 @@ pub struct MoeSymIu4Kernel {
     pub hipcc_twin: Option<MoeSymIu4HipccTwin>,
     pub gate_producer: MoeSymIu4GateProducer,
     pub down_producer: MoeSymIu4DownProducer,
-    pub checker: MoeSymIu4Checker,
+    /// Per-arch factory of the header checker (`zp == -8 * sc`, finite). A callable, not an
+    /// inline value, so the checker-only metadata is separate from the GEMM symbol selection
+    /// that reads the other descriptor fields; call it where the checker launches.
+    pub checker: fn() -> MoeSymIu4Checker,
     /// An unset `HIPFIRE_QWEN4_MOE_SYM_IU4` requests the route: true for the qualified gfx1151 /
     /// gfx1201 defaults, false for gfx1100 (default OFF until its Flash-Next qualification).
     pub default_requested: bool,
@@ -48442,6 +48445,35 @@ fn qwen4_moe_sym_gfx1151_hipcc_src() -> &'static str {
 
 fn qwen4_moe_sym_check_gfx1201_src() -> &'static str {
     kernels::QWEN4_MOE_SYM_CHECK_GFX1201_SRC
+}
+
+/// Header checker of the gfx1100 descriptor. Checker metadata lives behind per-arch factories
+/// ([`MoeSymIu4Kernel::checker`]) rather than inline in the descriptor table, so GEMM symbol
+/// selection that reads the descriptor never materializes checker identity.
+fn moe_sym_iu4_checker_gfx1100() -> MoeSymIu4Checker {
+    MoeSymIu4Checker {
+        module: "qwen4_moe_sym_check_gfx1100",
+        source: kernels::qwen4_moe_sym_check_gfx1100_src,
+        symbol: "qwen4_moe_sym_check_gfx1100",
+    }
+}
+
+/// Header checker of the gfx1151 descriptor (the hipcc module's per-header grid checker).
+fn moe_sym_iu4_checker_gfx1151() -> MoeSymIu4Checker {
+    MoeSymIu4Checker {
+        module: QWEN4_MOE_SYM_MODULE,
+        source: qwen4_moe_sym_gfx1151_hipcc_src,
+        symbol: QWEN4_MOE_SYM_CHECK,
+    }
+}
+
+/// Header checker of the gfx1201 descriptor.
+fn moe_sym_iu4_checker_gfx1201() -> MoeSymIu4Checker {
+    MoeSymIu4Checker {
+        module: QWEN4_MOE_SYM_CHECK_GFX1201_MODULE,
+        source: qwen4_moe_sym_check_gfx1201_src,
+        symbol: QWEN4_MOE_SYM_CHECK_GFX1201_MODULE,
+    }
 }
 
 /// The three aggregate symmetric-IU4 MoE descriptors: gfx1100 MQ4 (NT1), gfx1151 MQ4 (NT4) and
@@ -48472,11 +48504,7 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
             symbol: crate::slab_moe::MQ_I4_A4_GFX1100_SYMBOL,
             k: crate::slab_moe::SLAB_DOWN_K,
         },
-        checker: MoeSymIu4Checker {
-            module: "qwen4_moe_sym_check_gfx1100",
-            source: kernels::qwen4_moe_sym_check_gfx1100_src,
-            symbol: "qwen4_moe_sym_check_gfx1100",
-        },
+        checker: moe_sym_iu4_checker_gfx1100,
         default_requested: false,
     },
     MoeSymIu4Kernel {
@@ -48505,11 +48533,7 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
         down_producer: MoeSymIu4DownProducer::Hipcc {
             module: QWEN4_MOE_ROTATE128_I4,
         },
-        checker: MoeSymIu4Checker {
-            module: QWEN4_MOE_SYM_MODULE,
-            source: qwen4_moe_sym_gfx1151_hipcc_src,
-            symbol: QWEN4_MOE_SYM_CHECK,
-        },
+        checker: moe_sym_iu4_checker_gfx1151,
         default_requested: true,
     },
     MoeSymIu4Kernel {
@@ -48534,11 +48558,7 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
         down_producer: MoeSymIu4DownProducer::Hipcc {
             module: QWEN4_MOE_ROTATE128_I4,
         },
-        checker: MoeSymIu4Checker {
-            module: QWEN4_MOE_SYM_CHECK_GFX1201_MODULE,
-            source: qwen4_moe_sym_check_gfx1201_src,
-            symbol: QWEN4_MOE_SYM_CHECK_GFX1201_MODULE,
-        },
+        checker: moe_sym_iu4_checker_gfx1201,
         default_requested: true,
     },
 ];
@@ -49187,7 +49207,7 @@ impl Gpu {
             ));
         };
         self.bind_thread()?;
-        let checker = kernel.checker;
+        let checker = (kernel.checker)();
         self.ensure_kernel(checker.module, (checker.source)(), checker.symbol)?;
         let check = checker.symbol;
         let bad = self.alloc_tensor(&[words], DType::F32)?;
@@ -53184,15 +53204,16 @@ mod route_selector_tests {
                 "{arch}: gate producer"
             );
             assert_eq!(row.gate_producer.require_c2, arch == "gfx1100", "{arch}");
+            let row_checker = (row.checker)();
             let checker = registry
                 .iter()
-                .find(|e| e.module == row.checker.module)
+                .find(|e| e.module == row_checker.module)
                 .unwrap_or_else(|| panic!("{arch}: checker module"));
-            assert!(checker.symbols.contains(&row.checker.symbol), "{arch}: checker symbol");
-            assert_eq!(checker.source(), (row.checker.source)(), "{arch}: checker source");
+            assert!(checker.symbols.contains(&row_checker.symbol), "{arch}: checker symbol");
+            assert_eq!(checker.source(), (row_checker.source)(), "{arch}: checker source");
             // The header test every checker implements: finite and zp == -8 * sc.
             assert!(
-                (row.checker.source)().contains("!isfinite(sc) || !isfinite(zp) || zp != -8.0f * sc"),
+                (row_checker.source)().contains("!isfinite(sc) || !isfinite(zp) || zp != -8.0f * sc"),
                 "{arch}: checker predicate"
             );
             if let Some(twin) = &row.hipcc_twin {
