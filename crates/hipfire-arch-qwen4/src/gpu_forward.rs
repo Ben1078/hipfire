@@ -7124,6 +7124,15 @@ fn populate_moe_runtimes<T, E>(
 }
 
 impl Qwen4GpuForward {
+    /// `(verified, total)` routed trunk MoE layers whose final bound pointer tables passed the
+    /// load-time header check ([`Qwen4MoeLayerRuntime::verify_symmetric`], host-mapped S1 layers
+    /// included): the receipt's `moe_iu4.final_headers_verified`. `(0, total)` when the route
+    /// was never requested.
+    pub(crate) fn sym_iu4_coverage(&self) -> (usize, usize) {
+        let total = self.moe.iter().flatten().count();
+        let verified = self.moe.iter().flatten().filter(|layer| layer.symmetric).count();
+        (verified, total)
+    }
     /// Whether any CPU numerical mode is armed: the D1 whole-layer splice or
     /// the D2 tier split. Admission (row cap, eager, replay/capture refusal,
     /// speculative width) keys on this; the D1-only per-layer flag stays
@@ -7482,12 +7491,15 @@ impl Qwen4GpuForward {
                     }
                 }
             }
-            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`, default on for
-            // gfx1151 and gfx1201, `=0` off): verify each layer's final
-            // expert headers once, before any capture, and size the route's
+            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for gfx1151 and
+            // gfx1201, default OFF and explicit `=1` only on gfx1100, `=0` off): verify each
+            // layer's final expert headers once, before any capture, and size the route's
             // scratch for the chunk cap. Layers that fail (every layer of an
             // asymmetric artifact) keep the F16 route; nothing runs (and no new
-            // module loads) unless the route was requested.
+            // module loads) unless the route was requested. The loop covers EVERY routed trunk
+            // layer, the S1 host-mapped ones included: their pointer tables hold the
+            // device-visible aliases of the same pinned payload the S1 transport pages DMA from
+            // ([`Qwen4MoeLayerRuntime::s1_host_sources`] translates those very entries).
             // (An EP rank verifies its full chunk tables in `attach_ep`, once
             // every peer's experts are mapped.)
             // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): its grouped-row
@@ -7520,7 +7532,19 @@ impl Qwen4GpuForward {
                         bundle.config.num_experts,
                     )?;
             }
-            if !stock_fp8 && ep.is_none() && moe_count > 0 && gpu.qwen4_moe_sym_iu4_requested() {
+            // An S1 load whose window route resolved to the F16 `Aggregate` lowering (flag off,
+            // or requested but a routed layer's source headers / recipe refused it) is
+            // whole-profile F16: no layer verifies symmetric, so no tile anywhere classifies as
+            // IU4 and no uncharged sym scratch is reserved (mixed verdicts are not budgeted).
+            let s1_f16_profile = bundle.slowlink_profile().is_some_and(|profile| {
+                profile.geometry.route == crate::slowlink_admission::WindowRoute::Aggregate
+            });
+            if !stock_fp8
+                && ep.is_none()
+                && moe_count > 0
+                && !s1_f16_profile
+                && gpu.qwen4_moe_sym_iu4_requested()
+            {
                 let mut verified = 0usize;
                 for layer in moe.iter_mut().flatten() {
                     verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
@@ -7551,23 +7575,33 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
-            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above never runs
-            // there (`qwen4_moe_sym_iu4_requested` is gfx1151/gfx1201-only), yet the slab K2
-            // prefill reuses its grouping scratch, down sidecar and shared gate/up scratch.
-            // Reserve them here, before any capture, through the slab-only entry (the
-            // unsuffixed reserve keeps refusing gfx1100). gfx1201 slab loads are unchanged.
+            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above runs there
+            // only under an explicit `HIPFIRE_QWEN4_MOE_SYM_IU4=1` (default OFF on gfx1100), yet
+            // the slab K2 prefill reuses its grouping scratch, down sidecar and shared gate/up
+            // scratch. Reserve them here, before any capture, through the same reserve (no
+            // growth when that block already ran). gfx1201 slab loads are unchanged.
             if !stock_fp8
                 && ep.is_none()
                 && gpu.arch == "gfx1100"
                 && moe.iter().flatten().any(|layer| layer.slab.is_some())
             {
-                gpu.reserve_qwen4_moe_sym_slab(
+                gpu.reserve_qwen4_moe_sym(
                     max_chunk,
                     bundle.config.num_experts_per_tok,
                     bundle.config.num_experts,
                     bundle.config.hidden_size,
                     bundle.config.moe_intermediate_size,
                 )?;
+            }
+            // Phase 2 of the symmetric IU4 window route proof (the source-header scan before
+            // placement was phase 1): a load charged for `AggregateSymIu4` needs every routed
+            // trunk layer's FINAL bound tables verified above. A shortfall fails the load here,
+            // before serving, never a silent switch to a differently budgeted route.
+            if let Some(route) = bundle.slowlink_profile().map(|profile| profile.geometry.route) {
+                let total = moe.iter().flatten().count();
+                let verified = moe.iter().flatten().filter(|layer| layer.symmetric).count();
+                crate::slowlink_admission::check_sym_iu4_final_headers(route, verified, total)
+                    .map_err(invalid)?;
             }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;

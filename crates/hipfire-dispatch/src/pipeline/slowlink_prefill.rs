@@ -42,6 +42,11 @@
 //!   routed tail per expert binding over their route ids masked to it (accumulating in place,
 //!   bindings ascending); a one-row tile is the decode GEMV cohort.  All three share one lease
 //!   and one sweep; a window need contain no WMMA tile.
+//! * `AggregateSymIu4` (the same stacked-expert layout, resolved onto the symmetric IU4 route,
+//!   default OFF): K2 tiles ([`TileKind::AggregateIu4`], `route_rows >= 512`) run the grouped
+//!   NT1 IU4 kernels over the window's A4 sidecars of the saved F32 activations (the slab
+//!   route's K2 arm, over the aggregate expert pointer tables of the binding), with the same
+//!   F32-tail and one-row decode cohorts as `Aggregate`; the window holds no F16 activations.
 //!
 //! The shared combine is the same for the BF16-row K2 kinds: `slowlink_combine_panel`.
 //! The arithmetic of every kernel is the incumbent's: this module adds no GEMM algorithm.
@@ -71,7 +76,7 @@ const A4_RECORD_BYTES: usize = 72;
 const A4_BLOCK_K: usize = 128;
 
 /// The three Gpu grow-only scratch needs `[a4_gate_up, a4_down, group_scatter]` of a window of
-/// `rows` tokens: the IU4 A4 sidecars (`0, 0` on the aggregate route, which quantizes nothing)
+/// `rows` tokens: the IU4 A4 sidecars (`0, 0` on the F16 aggregate route, which quantizes nothing)
 /// and the grouped-scatter layout. One expression for the route layout's census and the
 /// selftest's ledger.
 fn window_scratch_sizes(
@@ -81,7 +86,7 @@ fn window_scratch_sizes(
     n_exp: usize,
     rows: usize,
 ) -> [usize; 3] {
-    let (a4_gate_up, a4_down) = if route == WindowRoute::Aggregate {
+    let (a4_gate_up, a4_down) = if !route.quantizes_window() {
         (0, 0)
     } else {
         (
@@ -213,12 +218,39 @@ pub enum WindowRoute {
     /// tiles below it the incumbent's F32 grouped/indexed arm as a per-binding cohort, and a
     /// one-row tile the decode GEMV cohort.
     Aggregate,
+    /// The aggregate layout resolved onto the symmetric IU4 route (every routed trunk layer's
+    /// headers symmetric, opt-in, descriptor present): K2 tiles (>= 512 route rows) run the
+    /// grouped IU4 kernels over the window's A4 sidecars of the saved F32 activations; tiles
+    /// below it and one-row tiles are the same F32-tail / decode cohorts as [`Self::Aggregate`].
+    AggregateSymIu4,
+}
+
+impl WindowRoute {
+    /// The receipt label (`moe_iu4.window_route`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SlabIu4 => "slab-iu4",
+            Self::Aggregate => "aggregate",
+            Self::AggregateSymIu4 => "aggregate-sym-iu4",
+        }
+    }
+
+    /// Stacked-expert (non-slab) layout: F32-tail and decode cohorts run per binding over the
+    /// aggregate pointer tables.
+    pub fn is_aggregate_layout(self) -> bool {
+        matches!(self, Self::Aggregate | Self::AggregateSymIu4)
+    }
+
+    /// The window's K2 arm runs the grouped IU4 kernels over window-wide A4 sidecars.
+    pub fn quantizes_window(self) -> bool {
+        matches!(self, Self::SlabIu4 | Self::AggregateSymIu4)
+    }
 }
 
 /// The numerical class of one tile of a window: which of the incumbent's lowerings its rows run.
 /// A window may mix kinds of one [`WindowRoute`]; the K2 kinds ([`TileKind::SlabK2`],
-/// [`TileKind::AggregateWmma`]) run window-wide grouped panels, every other kind is a cohort
-/// run per expert binding against the same lease.
+/// [`TileKind::AggregateWmma`], [`TileKind::AggregateIu4`]) run window-wide grouped panels,
+/// every other kind is a cohort run per expert binding against the same lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileKind {
     /// Slab K2 (grouped IU4), `route_rows > few_row_limit`.
@@ -227,6 +259,9 @@ pub enum TileKind {
     SlabK1Tail,
     /// Aggregate F16 WMMA grouped arm (`route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`).
     AggregateWmma,
+    /// Aggregate symmetric IU4 grouped arm (`route_rows >= QWEN4_MOE_SYM_IU4_MIN_ROWS`), the
+    /// K2 tile of an [`WindowRoute::AggregateSymIu4`] window.
+    AggregateIu4,
     /// Aggregate F32 grouped (or few-row indexed-down) arm below the WMMA threshold, 2.. rows.
     AggregateF32Tail,
     /// The incumbent's one-row DECODE call.
@@ -236,15 +271,20 @@ pub enum TileKind {
 impl TileKind {
     /// Whether the tile's rows join the window-wide grouped K2 panels.
     pub fn is_k2(self) -> bool {
-        matches!(self, Self::SlabK2 | Self::AggregateWmma)
+        matches!(self, Self::SlabK2 | Self::AggregateWmma | Self::AggregateIu4)
     }
 
-    /// The window route the kind belongs to.
-    pub fn route(self) -> Option<WindowRoute> {
+    /// Whether a tile of this kind may run inside a `window` of the given route.  The F32 tail
+    /// belongs to both aggregate routes and a decode tile to any (its own lowering family is
+    /// checked against the window by [`PreparedChunkCall::new`]); the F16 WMMA K2 arm never runs
+    /// inside an IU4 window and the IU4 K2 arm never inside an F16 one.
+    pub fn compatible_with(self, window: WindowRoute) -> bool {
         match self {
-            Self::SlabK2 | Self::SlabK1Tail => Some(WindowRoute::SlabIu4),
-            Self::AggregateWmma | Self::AggregateF32Tail => Some(WindowRoute::Aggregate),
-            Self::Decode => None,
+            Self::SlabK2 | Self::SlabK1Tail => window == WindowRoute::SlabIu4,
+            Self::AggregateWmma => window == WindowRoute::Aggregate,
+            Self::AggregateIu4 => window == WindowRoute::AggregateSymIu4,
+            Self::AggregateF32Tail => window.is_aggregate_layout(),
+            Self::Decode => true,
         }
     }
 }
@@ -316,7 +356,7 @@ impl PromptRouteLayout {
             || d.n_exp == 0
             || d.mi == 0
             || cohort_rows.is_none_or(|n| n > d.rows)
-            || (d.tail_rows > 0 && d.route != WindowRoute::Aggregate)
+            || (d.tail_rows > 0 && !d.route.is_aggregate_layout())
         {
             return Err(bail(format!("degenerate route storage dimensions {d:?}")));
         }
@@ -366,8 +406,8 @@ impl PromptRouteLayout {
         // unchanged): the F32-tail tiles' masked-id scratch, the window's rotated F16
         // activations and the panel-local slot map (only when some row takes the WMMA arm), and
         // the decode cohort's per-binding scratch rows (one decode tile's `[10, hidden]`).
-        let aggregate = d.route == WindowRoute::Aggregate;
-        let wmma = aggregate && d.rows > d.k1_rows + d.tail_rows;
+        let aggregate = d.route.is_aggregate_layout();
+        let wmma = d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows;
         let tail_ids = field(mul(mul(d.tail_rows, K_TOP)?, I32_BYTES)?)?;
         let x_f16 = field(if wmma {
             mul(mul(d.rows, d.hidden)?, F16_BYTES)?
@@ -429,10 +469,12 @@ impl PromptRouteLayout {
 
     /// Bytes of the two IU4 A4 sidecars at window rows (`int4_mmq_x_scratch` of the gate/up
     /// activation and `qwen4_moe_down_i4_scratch` of the down activation): what the producer
-    /// kernels reserve when the window's rows quantize.  Zero on the aggregate route, which
+    /// kernels reserve when the window's rows quantize.  Zero on the F16 aggregate route, which
     /// quantizes nothing: its window activations are the region's `x_f16` field
     /// ([`Self::x_f16_bytes`]) and its panel-local F16 down input fits the F16 X scratch the
-    /// tile's own rotation already reserves.
+    /// tile's own rotation already reserves.  The symmetric aggregate route charges both
+    /// sidecars (gate `20 * rows * 72`, down `5 * rows * 10 * 72` at the S1 geometry) and no
+    /// `x_f16`.
     pub fn a4_sidecar_bytes(&self) -> usize {
         let [gate_up, down, _] = self.scratch_allocation_sizes();
         gate_up + down
@@ -653,6 +695,36 @@ fn decode_admission(
     }
 }
 
+/// Pre-mutation admission of a tile of `kind` and own lowering `family` into a `window`: the
+/// kind must be one the window's route runs ([`TileKind::compatible_with`]) and the tile's
+/// lowering family must be the window's (a one-row decode call or an F32 tail of the stacked
+/// layout belongs to both aggregate routes; nothing else crosses families).
+fn admit_into_window(
+    kind: TileKind,
+    family: WindowRoute,
+    window: WindowRoute,
+) -> Result<(), DispatchError> {
+    if !kind.compatible_with(window) {
+        return Err(bail(format!(
+            "a {kind:?} tile does not run inside a {window:?} window"
+        )));
+    }
+    let family_ok = match window {
+        WindowRoute::SlabIu4 => family == WindowRoute::SlabIu4,
+        WindowRoute::Aggregate => family == WindowRoute::Aggregate,
+        WindowRoute::AggregateSymIu4 => matches!(
+            family,
+            WindowRoute::Aggregate | WindowRoute::AggregateSymIu4
+        ),
+    };
+    if !family_ok {
+        return Err(bail(format!(
+            "the tile's routed lowering {family:?} differs from the window's {window:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl<'a> PreparedChunkCall<'a> {
     /// Pre-mutation admission.  `Err` means the window must stay on the incumbent route; it
     /// is returned before anything is launched or written.  `gpu.route_rows` must already be
@@ -662,10 +734,12 @@ impl<'a> PreparedChunkCall<'a> {
         call: &'a SealedMoeCall<'a>,
         row0: usize,
         position: usize,
+        window: WindowRoute,
     ) -> Result<Self, DispatchError> {
         if let Some(params) = call.decode_params() {
             // `seal_moe_for_layer` seals a decode call when `route_rows == 1`.
-            let route = decode_admission(gpu, params)?;
+            let family = decode_admission(gpu, params)?;
+            admit_into_window(TileKind::Decode, family, window)?;
             let selection = match call.kernel_selection() {
                 super::moe_program::MoeKernelSelection::Decode(selection) => selection,
                 super::moe_program::MoeKernelSelection::Prefill(_) => {
@@ -698,7 +772,7 @@ impl<'a> PreparedChunkCall<'a> {
                 position,
                 k2: false,
                 kind: TileKind::Decode,
-                route,
+                route: window,
                 decode: true,
                 use_path2: false,
                 hidden: params.hidden,
@@ -719,7 +793,7 @@ impl<'a> PreparedChunkCall<'a> {
         };
         let use_path2 = selection.uses_grouped_rows();
         let tile = super::qt44_qt53_prefill::slowlink_admission(gpu, params, use_path2)?;
-        let (k2, kind, route) = match tile {
+        let (k2, kind, family) = match tile {
             super::qt44_qt53_prefill::SlowlinkTile::SlabK2 => {
                 (true, TileKind::SlabK2, WindowRoute::SlabIu4)
             }
@@ -729,10 +803,14 @@ impl<'a> PreparedChunkCall<'a> {
             super::qt44_qt53_prefill::SlowlinkTile::AggregateWmma => {
                 (true, TileKind::AggregateWmma, WindowRoute::Aggregate)
             }
+            super::qt44_qt53_prefill::SlowlinkTile::AggregateIu4 => {
+                (true, TileKind::AggregateIu4, WindowRoute::AggregateSymIu4)
+            }
             super::qt44_qt53_prefill::SlowlinkTile::AggregateF32Tail => {
                 (false, TileKind::AggregateF32Tail, WindowRoute::Aggregate)
             }
         };
+        admit_into_window(kind, family, window)?;
         if selection.cpu_split || selection.cpu_deferred_experts {
             return Err(bail(
                 "a CPU-split or CPU-deferred call is not a layer-major tile",
@@ -747,7 +825,7 @@ impl<'a> PreparedChunkCall<'a> {
             position,
             k2,
             kind,
-            route,
+            route: window,
             decode: false,
             use_path2,
             hidden: params.gate_up_k,
@@ -823,21 +901,43 @@ impl<'a> PreparedChunkCall<'a> {
             usize::from(self.use_path2),
         ]
     }
+
+    /// This tile as the pre-mutation window compatibility check sees it.
+    pub fn window_arm(&self) -> WindowArm {
+        WindowArm {
+            signature: self.arm_signature(),
+            k2: self.k2,
+            kind: self.kind,
+        }
+    }
 }
 
-/// Whether the tiles of a window (in order, each `(signature, is_k2)`) are compatible: every
-/// tile has the first tile's geometry (the first five signature values) and every K2 tile
-/// the first K2 tile's arm (the sixth).  K1 tiles, prefill tails and one-row decode calls,
-/// keep their own original path.  This is exactly what [`prepare_routes`] enforces tile by
-/// tile; the selector runs it before the first mutation to bypass instead.
-pub fn window_arms_compatible(tiles: &[([usize; 6], bool)]) -> bool {
-    let Some((first, _)) = tiles.first() else {
+/// One tile of a window for [`window_arms_compatible`]: its [`PreparedChunkCall::arm_signature`],
+/// whether it runs the K2 grouped kernels and its numerical class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowArm {
+    pub signature: [usize; 6],
+    pub k2: bool,
+    pub kind: TileKind,
+}
+
+/// Whether the tiles of a `window` (in order) are compatible: every tile's kind runs inside the
+/// window's route ([`TileKind::compatible_with`]: the F16 WMMA arm never in an IU4 window, the
+/// IU4 arm never in an F16 one), every tile has the first tile's geometry (the first five
+/// signature values) and every K2 tile the first K2 tile's arm (the sixth).  K1 tiles, prefill
+/// tails and one-row decode calls, keep their own original path.  This is exactly what
+/// [`prepare_routes`] enforces tile by tile; the selector runs it before the first mutation to
+/// bypass instead.
+pub fn window_arms_compatible(window: WindowRoute, tiles: &[WindowArm]) -> bool {
+    let Some(first) = tiles.first() else {
         return true;
     };
-    let k2_arm = tiles.iter().find(|t| t.1).map(|t| t.0[5]);
-    tiles
-        .iter()
-        .all(|(sig, k2)| sig[..5] == first[..5] && (!*k2 || Some(sig[5]) == k2_arm))
+    let k2_arm = tiles.iter().find(|t| t.k2).map(|t| t.signature[5]);
+    tiles.iter().all(|t| {
+        t.kind.compatible_with(window)
+            && t.signature[..5] == first.signature[..5]
+            && (!t.k2 || Some(t.signature[5]) == k2_arm)
+    })
 }
 
 // ───────────────────────────── storage ─────────────────────────────
@@ -1459,20 +1559,20 @@ pub fn finish_route_plan(
     let inverse = routes.ids_view(layout.inverse, 0, d.rows);
     let counts = routes.view(layout.counts, d.n_exp * I32_BYTES, DType::Raw);
     let offsets = routes.view(layout.offsets, (d.n_exp + 1) * I32_BYTES, DType::Raw);
-    let aggregate = d.route == WindowRoute::Aggregate;
-    let scatter = if aggregate {
-        // The incumbent's own stable grouping of the aggregate F16 WMMA route (the arch gate
-        // admits gfx1100, gfx1151 and gfx1201 here, not the slab entry).  The window's F16
-        // activations were rotated tile by tile in `prepare_routes`.
-        Gpu::moe_scatter_stable_top10
-    } else {
+    if d.route.quantizes_window() {
         // The window's activations quantize once per layer (row-wise, so independent of the
-        // tile that produced a row).
+        // tile that produced a row): the saved F32 rows through the descriptor's gate producer
+        // (C2).  The aggregate F16 route instead rotated its F16 activations tile by tile in
+        // `prepare_routes`.
         let x_norm = routes.f32_rows(layout.x_norm, 0, d.rows, d.hidden);
-        routes.window_xq = Some(hip(
-            gpu.qwen4_moe_rotate256_i4_slab(&x_norm, d.hidden, d.rows)
-        )?);
+        routes.window_xq = Some(hip(gpu.qwen4_moe_rotate256_i4(&x_norm, d.hidden, d.rows))?);
+    }
+    let scatter = if d.route == WindowRoute::SlabIu4 {
         Gpu::moe_scatter_stable_top10_slab
+    } else {
+        // The incumbent's own stable grouping of the aggregate routes (the arch gate admits
+        // gfx1100, gfx1151 and gfx1201 here, not the slab entry).
+        Gpu::moe_scatter_stable_top10
     };
     hip(scatter(
         gpu,
@@ -1838,7 +1938,14 @@ pub fn execute_panel(
             DType::Raw,
         );
         match d.route {
-            WindowRoute::SlabIu4 => {
+            WindowRoute::SlabIu4 | WindowRoute::AggregateSymIu4 => {
+                // The grouped IU4 K2 arm over the window's A4 sidecars.  The sorted/tile views
+                // are this panel's, their entries GLOBAL window slot ids: the gate/up GEMM reads
+                // the saved row `slot / 10` of the `d.rows`-row sidecar, the down producer
+                // quantizes the panel's BF16 SwiGLU rows into their global slot records of a
+                // `slots`-slot sidecar and the down GEMM reads them at `slot / 1`, however the
+                // panel's own Y rows are numbered.  The aggregate route runs it over the
+                // aggregate expert pointer tables of the binding (same raw MQ4 leases).
                 let xq = routes
                     .window_xq
                     .as_ref()
@@ -1856,7 +1963,7 @@ pub fn execute_panel(
                     d.rows,
                     false,
                 ))?;
-                let xdown = hip(gpu.qwen4_moe_rotate128_i4_slab(
+                let xdown = hip(gpu.qwen4_moe_rotate128_i4(
                     params.y_gate_up_grouped,
                     &sorted,
                     d.mi,
@@ -2061,7 +2168,7 @@ fn run_k1_cohort(
                 // write the persistent rows directly.  The aggregate indexed GEMVs write EVERY
                 // slot (zero for an id outside the binding): each binding's launch goes to the
                 // tile's scratch rows and only its own slots' rows are merged.
-                let aggregate = d.route == WindowRoute::Aggregate;
+                let aggregate = d.route.is_aggregate_layout();
                 let tmp = aggregate
                     .then(|| routes.view(layout.k1_tmp, slots * d.hidden * F32_BYTES, DType::F32));
                 view.down_expanded = tmp.as_ref().unwrap_or(&y0);
@@ -2591,13 +2698,13 @@ pub mod selftest {
             row0 += rows;
         }
         routes.filled = row0;
+        if d.route.is_aggregate_layout() && tiles.iter().any(|t| t.k1) {
+            return Err(bail("the aggregate routes have no prefill K1 tile"));
+        }
         if d.route == WindowRoute::Aggregate {
-            // The aggregate K2 arm reads the window's rotated F16 activations, which
+            // The aggregate F16 K2 arm reads the window's rotated F16 activations, which
             // `prepare_routes` produces tile by tile; the synthetic tiles' F32 activations are
             // rotated the same way (all K2: the aggregate route has no prefill K1 tile).
-            if tiles.iter().any(|t| t.k1) {
-                return Err(bail("the aggregate route has no prefill K1 tile"));
-            }
             // In pieces of the aggregate route's minimum tile (512 rows, whose F16 X scratch
             // every real tile already reserves), so the diagnostic grows no Gpu scratch.
             for lo in (0..row0).step_by(AGGREGATE_MIN_TILE_ROWS) {
@@ -3116,7 +3223,7 @@ pub mod selftest {
                 out.device_parts = dev;
                 out.host_parts = host;
             }
-            DiagCase::K1TailCohort if g.route == WindowRoute::Aggregate => {
+            DiagCase::K1TailCohort if g.route.is_aggregate_layout() => {
                 // The aggregate route's cohort primitive: one real F32-tail call (`k1_rows`
                 // rows, shared expert of `shared_intermediate`) is the whole window; its
                 // reference is the incumbent's unmasked routed tail into a zero target.
@@ -3254,11 +3361,11 @@ pub mod selftest {
         Ok(match case {
             DiagCase::CanonicalCombine => ScratchSlots::default(),
             DiagCase::WithinExpertCanary => window_scratch(g, limits.max_grouped_rows),
-            DiagCase::K1TailCohort if g.route == WindowRoute::Aggregate => {
+            DiagCase::K1TailCohort if g.route.is_aggregate_layout() => {
                 window_scratch(g, g.k1_rows)
             }
             DiagCase::K1TailCohort => window_scratch(g, 64 + g.k1_rows),
-            DiagCase::ZeroRowPanel if g.route == WindowRoute::Aggregate => window_scratch(g, 40),
+            DiagCase::ZeroRowPanel if g.route.is_aggregate_layout() => window_scratch(g, 40),
             DiagCase::ZeroRowPanel => {
                 window_scratch(g, 40).max_with(&window_scratch(g, g.k1_rows.max(1)))
             }
@@ -3738,7 +3845,9 @@ pub mod selftest {
         let mut rep = PrimitiveReport::new("k1_tail_cohort");
         match call.route {
             WindowRoute::SlabIu4 => k1_scenario(gpu, call, binding, limits, seed, true, &mut rep)?,
-            WindowRoute::Aggregate => f32_tail_scenario(gpu, call, binding, limits, &mut rep)?,
+            WindowRoute::Aggregate | WindowRoute::AggregateSymIu4 => {
+                f32_tail_scenario(gpu, call, binding, limits, &mut rep)?
+            }
         }
         Ok(rep)
     }
@@ -4528,32 +4637,68 @@ mod slowlink_panel_tests {
 
     #[test]
     fn slowlink_panel_arm_signatures_enforce_geometry_and_the_k2_arm_only_between_k2_tiles() {
-        // (signature, is_k2) with signature = [hidden, n_exp, mi, down_m, shared_I, use_path2].
-        let k2 = ([2560, 512, 640, 2560, 640, 1], true);
+        // signature = [hidden, n_exp, mi, down_m, shared_I, use_path2].
+        let arm = |signature: [usize; 6], k2: bool, kind: TileKind| WindowArm {
+            signature,
+            k2,
+            kind,
+        };
+        let w = WindowRoute::SlabIu4;
+        let k2 = arm([2560, 512, 640, 2560, 640, 1], true, TileKind::SlabK2);
         // A K1 prefill tail and a one-row decode tile, each on its own original path.
-        let k1_tail = ([2560, 512, 640, 2560, 640, 0], false);
-        let decode = ([2560, 512, 640, 2560, 640, 0], false);
-        assert!(window_arms_compatible(&[k2, k2, k1_tail]));
-        assert!(window_arms_compatible(&[k2, k2, decode]));
+        let k1_tail = arm([2560, 512, 640, 2560, 640, 0], false, TileKind::SlabK1Tail);
+        let decode = arm([2560, 512, 640, 2560, 640, 0], false, TileKind::Decode);
+        assert!(window_arms_compatible(w, &[k2, k2, k1_tail]));
+        assert!(window_arms_compatible(w, &[k2, k2, decode]));
         assert!(
-            window_arms_compatible(&[k1_tail, k2, k2, decode]),
+            window_arms_compatible(w, &[k1_tail, k2, k2, decode]),
             "a window may open with K1"
         );
         assert!(
-            window_arms_compatible(&[decode, k1_tail]),
+            window_arms_compatible(w, &[decode, k1_tail]),
             "a K1-only window"
         );
         // Two K2 tiles on different K2 arms never share a window, even when a K1 tile opens it.
-        let other_arm = ([2560, 512, 640, 2560, 640, 0], true);
-        assert!(!window_arms_compatible(&[k2, other_arm]));
-        assert!(!window_arms_compatible(&[decode, k2, other_arm]));
+        let other_arm = arm([2560, 512, 640, 2560, 640, 0], true, TileKind::SlabK2);
+        assert!(!window_arms_compatible(w, &[k2, other_arm]));
+        assert!(!window_arms_compatible(w, &[decode, k2, other_arm]));
         // Any geometry difference refuses, K1 or not.
         for field in 0..5 {
             let mut bad = k1_tail;
-            bad.0[field] += 1;
-            assert!(!window_arms_compatible(&[k2, bad]), "field {field}");
-            assert!(!window_arms_compatible(&[bad, k2]), "field {field}");
+            bad.signature[field] += 1;
+            assert!(!window_arms_compatible(w, &[k2, bad]), "field {field}");
+            assert!(!window_arms_compatible(w, &[bad, k2]), "field {field}");
         }
+    }
+
+    #[test]
+    fn slowlink_panel_window_arms_refuse_a_tile_kind_of_another_route() {
+        let arm = |k2: bool, kind: TileKind| WindowArm {
+            signature: [2560, 512, 640, 2560, 640, 1],
+            k2,
+            kind,
+        };
+        let wmma = arm(true, TileKind::AggregateWmma);
+        let iu4 = arm(true, TileKind::AggregateIu4);
+        let tail = arm(false, TileKind::AggregateF32Tail);
+        let decode = arm(false, TileKind::Decode);
+        let slab = arm(true, TileKind::SlabK2);
+        let f16 = WindowRoute::Aggregate;
+        let sym = WindowRoute::AggregateSymIu4;
+        // The F32 tail and the decode tile stay valid inside both aggregate windows.
+        assert!(window_arms_compatible(f16, &[wmma, wmma, tail, decode]));
+        assert!(window_arms_compatible(sym, &[iu4, iu4, tail, decode]));
+        assert!(window_arms_compatible(sym, &[tail, decode]));
+        // The F16 WMMA arm never runs in an IU4 window and the IU4 arm never in an F16 one.
+        assert!(!window_arms_compatible(sym, &[iu4, wmma, tail]));
+        assert!(!window_arms_compatible(f16, &[wmma, iu4, tail]));
+        assert!(!window_arms_compatible(sym, &[wmma]));
+        assert!(!window_arms_compatible(f16, &[iu4]));
+        // Neither aggregate window holds a slab tile, nor the slab window an aggregate one.
+        assert!(!window_arms_compatible(sym, &[slab]));
+        assert!(!window_arms_compatible(f16, &[slab]));
+        assert!(!window_arms_compatible(WindowRoute::SlabIu4, &[iu4]));
+        assert!(!window_arms_compatible(WindowRoute::SlabIu4, &[tail]));
     }
 
     #[test]
@@ -4730,6 +4875,192 @@ mod slowlink_panel_tests {
         assert_eq!(slab.tail_ids_bytes(), 0);
     }
 
+    fn sym_iu4_dims(rows: usize, k1_rows: usize, tail_rows: usize) -> PromptRouteDims {
+        PromptRouteDims {
+            route: WindowRoute::AggregateSymIu4,
+            ..aggregate_dims(rows, k1_rows, tail_rows)
+        }
+    }
+
+    #[test]
+    fn slowlink_panel_aggregate_sym_iu4_layout_charges_both_a4_sidecars_and_no_f16_window() {
+        // The real split artifact's identity at the full 16384-row window with its 48 decode
+        // rows: the F16 aggregate window rows and 2048-row slot map are gone, both A4 sidecars
+        // (gate 20 * N * 72, down 5 * N * 10 * 72) and the saved F32 activations (the region's
+        // `x_norm`, every route's) are charged.
+        let f16 = PromptRouteLayout::new(&aggregate_dims(16_384, 48, 0)).unwrap();
+        let s = PromptRouteLayout::new(&sym_iu4_dims(16_384, 48, 0)).unwrap();
+        assert_eq!(s.route(), WindowRoute::AggregateSymIu4);
+        assert_eq!(s.x_f16_bytes(), 0);
+        assert_eq!(s.a4_sidecar_bytes(), 20 * 16_384 * 72 + 5 * 16_384 * 10 * 72);
+        assert_eq!(s.a4_sidecar_bytes(), 82_575_360);
+        assert_eq!(s.a4_sidecar_bytes() / (1 << 20), 78);
+        assert_eq!(s.x_norm_bytes(), 16_384 * 2560 * 4);
+        assert_eq!(s.local_sorted, s.x_f16, "no panel-local F16 slot map");
+        assert_eq!(s.x_f16, s.tail_ids + align_up(s.tail_ids_bytes()).unwrap());
+        // Region: the F16 aggregate region minus its F16 rows and slot map.
+        assert_eq!(
+            f16.total_bytes() - s.total_bytes(),
+            83_886_080 + 2048 * 4
+        );
+        assert_eq!(s.total_bytes(), 386_175_232);
+        assert_eq!(s.group_scatter_bytes(), f16.group_scatter_bytes());
+        assert_eq!(s.charged_bytes(), 472_029_440);
+        assert_eq!(
+            s.charged_bytes(),
+            s.total_bytes() + 82_575_360 + s.group_scatter_bytes()
+        );
+        // Against the slab route: the same A4 sidecars and region but the one decode tile's
+        // `[10, hidden]` F32 scratch.
+        let mut slab = dims(16_384);
+        slab.k1_rows = 48;
+        let slab = PromptRouteLayout::new(&slab).unwrap();
+        assert_eq!(s.a4_sidecar_bytes(), slab.a4_sidecar_bytes());
+        assert_eq!(s.total_bytes() - slab.total_bytes(), 10 * 2560 * 4);
+        // The F16 aggregate route is byte-for-byte what it was (flag-off equivalence): the
+        // layout numbers pinned by the aggregate tests above are unchanged.
+        assert_eq!(f16.a4_sidecar_bytes(), 0);
+        assert_eq!(f16.total_bytes(), 470_069_504);
+        assert_eq!(f16.charged_bytes(), 473_348_352);
+    }
+
+    #[test]
+    fn slowlink_panel_aggregate_sym_iu4_layout_keeps_the_aggregate_tail_and_decode_cohorts() {
+        for (rows, k1, tail) in [
+            (1usize, 1usize, 0usize),
+            (3, 0, 3),
+            (512, 1, 511),
+            (513, 1, 511),
+            (1537, 1, 8),
+            (16384, 48, 3066),
+        ] {
+            let f16 = PromptRouteLayout::new(&aggregate_dims(rows, k1, tail)).unwrap();
+            let s = PromptRouteLayout::new(&sym_iu4_dims(rows, k1, tail)).unwrap();
+            assert_eq!(s.total_bytes() % ALIGN, 0, "{rows}/{k1}/{tail}");
+            // Cohort scratch is the aggregate route's, field for field.
+            assert_eq!(s.tail_ids_bytes(), f16.tail_ids_bytes());
+            assert_eq!(s.cohort_counts_bytes(), f16.cohort_counts_bytes());
+            assert_eq!(s.k1_bytes(), f16.k1_bytes());
+            assert_eq!(
+                s.cohort_counts - s.k1_tmp,
+                f16.cohort_counts - f16.k1_tmp,
+                "the decode cohort's scratch rows: {rows}/{k1}/{tail}"
+            );
+            // No F16 window whatever the row mix, and a window with WMMA-class rows costs the
+            // F16 region less its F16 rows and slot map.
+            assert_eq!(s.x_f16_bytes(), 0);
+            assert_eq!(s.local_sorted, s.x_f16);
+            if rows > k1 + tail {
+                assert_eq!(
+                    f16.total_bytes() - s.total_bytes(),
+                    align_up(rows * 2560 * 2).unwrap() + 2048 * 4,
+                    "{rows}/{k1}/{tail}"
+                );
+            } else {
+                assert_eq!(f16.total_bytes(), s.total_bytes());
+            }
+            let fields = [
+                s.x_norm,
+                s.route_ids,
+                s.topk_ids,
+                s.topk_weights,
+                s.sorted,
+                s.tiles,
+                s.inverse,
+                s.counts,
+                s.offsets,
+                s.accumulator,
+                s.shared_hidden,
+                s.shared_scalar,
+                s.k1_y0,
+                s.k1_ids,
+                s.k1_shared,
+                s.tail_ids,
+                s.x_f16,
+                s.local_sorted,
+                s.k1_tmp,
+                s.cohort_counts,
+                s.total,
+            ];
+            assert!(fields.iter().all(|f| f % ALIGN == 0), "{rows}/{k1}/{tail}");
+            assert!(
+                fields.windows(2).all(|w| w[0] <= w[1]),
+                "{rows}/{k1}/{tail}"
+            );
+        }
+        // Tail rows exist on both aggregate routes only, and with the K1 rows fit the window.
+        assert!(PromptRouteLayout::new(&sym_iu4_dims(8, 4, 5)).is_err());
+        assert!(PromptRouteLayout::new(&sym_iu4_dims(8, 4, 4)).is_ok());
+    }
+
+    #[test]
+    fn slowlink_panel_window_route_labels_and_families() {
+        assert_eq!(WindowRoute::SlabIu4.label(), "slab-iu4");
+        assert_eq!(WindowRoute::Aggregate.label(), "aggregate");
+        assert_eq!(WindowRoute::AggregateSymIu4.label(), "aggregate-sym-iu4");
+        for (route, aggregate, quantizes) in [
+            (WindowRoute::SlabIu4, false, true),
+            (WindowRoute::Aggregate, true, false),
+            (WindowRoute::AggregateSymIu4, true, true),
+        ] {
+            assert_eq!(route.is_aggregate_layout(), aggregate, "{route:?}");
+            assert_eq!(route.quantizes_window(), quantizes, "{route:?}");
+        }
+    }
+
+    #[test]
+    fn slowlink_panel_aggregate_sym_iu4_slots_stay_global_under_panel_local_offsets() {
+        // 800 tokens, one heavy expert holding 7000 of the 8000 slots (3+ bounded panels).
+        let tokens = 800usize;
+        let slots = tokens * K_TOP;
+        let heavy = 7usize;
+        let ids: Vec<i32> = (0..slots)
+            .map(|s| {
+                if s % 8 != 0 {
+                    heavy as i32
+                } else {
+                    (100 + s / 8 % 60) as i32
+                }
+            })
+            .collect();
+        let (g, p) = plan(&ids, Vec::new());
+        let panels = p.schedule(&runs(32), PanelLimits::S1).unwrap();
+        let heavy_panels: Vec<_> = panels
+            .iter()
+            .filter(|r| r.rows > 0 && r.expert_lo <= heavy && heavy < r.expert_hi)
+            .collect();
+        assert!(heavy_panels.len() >= 3, "{} panels", heavy_panels.len());
+        let mut beyond_one_panel = false;
+        let mut seen = vec![false; slots];
+        for r in panels.iter().filter(|r| r.rows > 0) {
+            assert!(r.rows <= PanelLimits::S1.max_grouped_rows);
+            for row in r.row_base..r.row_base + r.rows {
+                let slot = g.sorted[row];
+                if slot < 0 {
+                    continue;
+                }
+                let slot = slot as usize;
+                // The panel's own Y row is local; the sorted entry the A4 producer and the IU4
+                // GEMMs index with is the GLOBAL slot: gate/up reads the saved row `slot / 10`
+                // of the window, down the sidecar record `slot / 1` of the window's slots.
+                let y_row = row - r.row_base;
+                assert!(y_row < r.rows);
+                assert!(slot < slots && slot / K_TOP < tokens);
+                assert_eq!(g.inverse[slot] as usize, row, "inverse is a GLOBAL grouped row");
+                beyond_one_panel |= slot >= PanelLimits::S1.max_grouped_rows;
+                assert!(!seen[slot], "slot {slot} routed twice");
+                seen[slot] = true;
+            }
+        }
+        assert!(beyond_one_panel, "global slots exceed any panel-local numbering");
+        assert_eq!(seen.iter().filter(|s| **s).count(), slots);
+        // The sidecar extents the launches pass: gate/up `x_row_div 10, x_src_rows = rows`,
+        // down `x_row_div 1, x_src_rows = rows * 10`, both inside the builder GEMMs' slot bound.
+        let l = PromptRouteLayout::new(&sym_iu4_dims(16_384, 48, 0)).unwrap();
+        assert!(K_TOP * l.dims().rows <= 1 << 22);
+        assert!(l.dims().rows * K_TOP * I32_BYTES <= l.topk_ids_bytes());
+    }
+
     #[test]
     fn slowlink_panel_aggregate_layout_fields_are_aligned_and_disjoint() {
         for (rows, k1, tail) in [
@@ -4796,8 +5127,12 @@ mod slowlink_panel_tests {
     }
 
     #[test]
-    fn slowlink_panel_tile_kinds_name_their_numerical_class_and_route() {
-        assert!(TileKind::SlabK2.is_k2() && TileKind::AggregateWmma.is_k2());
+    fn slowlink_panel_tile_kinds_name_their_numerical_class_and_window_compatibility() {
+        assert!(
+            TileKind::SlabK2.is_k2()
+                && TileKind::AggregateWmma.is_k2()
+                && TileKind::AggregateIu4.is_k2()
+        );
         for cohort in [
             TileKind::SlabK1Tail,
             TileKind::AggregateF32Tail,
@@ -4805,18 +5140,58 @@ mod slowlink_panel_tests {
         ] {
             assert!(!cohort.is_k2(), "{cohort:?}");
         }
-        assert_eq!(TileKind::SlabK2.route(), Some(WindowRoute::SlabIu4));
-        assert_eq!(TileKind::SlabK1Tail.route(), Some(WindowRoute::SlabIu4));
-        assert_eq!(
-            TileKind::AggregateWmma.route(),
-            Some(WindowRoute::Aggregate)
-        );
-        assert_eq!(
-            TileKind::AggregateF32Tail.route(),
-            Some(WindowRoute::Aggregate)
-        );
-        assert_eq!(TileKind::Decode.route(), None);
+        let routes = [
+            WindowRoute::SlabIu4,
+            WindowRoute::Aggregate,
+            WindowRoute::AggregateSymIu4,
+        ];
+        // (kind, the windows it may run in): the compatibility matrix.
+        let matrix: [(TileKind, [bool; 3]); 6] = [
+            (TileKind::SlabK2, [true, false, false]),
+            (TileKind::SlabK1Tail, [true, false, false]),
+            (TileKind::AggregateWmma, [false, true, false]),
+            (TileKind::AggregateIu4, [false, false, true]),
+            (TileKind::AggregateF32Tail, [false, true, true]),
+            (TileKind::Decode, [true, true, true]),
+        ];
+        for (kind, allowed) in matrix {
+            for (route, ok) in routes.iter().zip(allowed) {
+                assert_eq!(kind.compatible_with(*route), ok, "{kind:?} in {route:?}");
+            }
+        }
         assert_eq!(AGGREGATE_MIN_TILE_ROWS, 512);
+        assert_eq!(
+            AGGREGATE_MIN_TILE_ROWS,
+            rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            "the IU4 K2 tile starts at the F16 WMMA K2 tile's route rows"
+        );
+    }
+
+    #[test]
+    fn slowlink_panel_tile_admission_checks_kind_and_lowering_family_against_the_window() {
+        // A tile of `kind` with its own lowering `family` in a `window`.
+        let ok = |kind, family, window| admit_into_window(kind, family, window).is_ok();
+        let (slab, f16, sym) = (
+            WindowRoute::SlabIu4,
+            WindowRoute::Aggregate,
+            WindowRoute::AggregateSymIu4,
+        );
+        assert!(ok(TileKind::AggregateIu4, sym, sym));
+        assert!(!ok(TileKind::AggregateIu4, sym, f16));
+        assert!(!ok(TileKind::AggregateWmma, f16, sym));
+        assert!(ok(TileKind::AggregateWmma, f16, f16));
+        // The F32 tail (family aggregate) rides in both aggregate windows, never the slab one.
+        assert!(ok(TileKind::AggregateF32Tail, f16, f16));
+        assert!(ok(TileKind::AggregateF32Tail, f16, sym));
+        assert!(!ok(TileKind::AggregateF32Tail, f16, slab));
+        // A decode tile follows its own layer family: aggregate decode in either aggregate
+        // window, slab decode only in the slab window.
+        assert!(ok(TileKind::Decode, f16, f16));
+        assert!(ok(TileKind::Decode, f16, sym));
+        assert!(!ok(TileKind::Decode, f16, slab));
+        assert!(ok(TileKind::Decode, slab, slab));
+        assert!(!ok(TileKind::Decode, slab, sym));
+        assert!(!ok(TileKind::Decode, slab, f16));
     }
 
     #[test]

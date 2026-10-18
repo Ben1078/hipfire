@@ -2145,6 +2145,12 @@ fn load_qwen4_rank_scoped(
             chunk_rows_env: chunk_rows_env.as_deref(),
             max_seq: ctx.max_seq,
         };
+        // The symmetric IU4 window route's one source-byte scan of every routed trunk layer
+        // (run only when its device terms hold, `HIPFIRE_QWEN4_MOE_SYM_IU4=1`).
+        let routed_source_symmetric = || {
+            hipfire_arch_qwen4::artifact::routed_headers_symmetric(&hfq, &manifest)
+                .map_err(|error| error.to_string())
+        };
         s1::select_load_profile(
             slowlink_mode,
             &shape,
@@ -2173,6 +2179,7 @@ fn load_qwen4_rank_scoped(
                     state_format,
                     scratch_mode,
                     purpose: s1::AdmissionPurpose::Product,
+                    routed_source_symmetric: &routed_source_symmetric,
                 };
                 let arenas = s1::single_device_arena_plan(&load)?;
                 let facts = s1::single_device_facts_with_arenas(
@@ -7645,6 +7652,7 @@ mod qwen4_slowlink_tests {
             // The product loader's own purpose (never inferred from the
             // diagnostic bytes): it admits the product tile.
             purpose: s1::AdmissionPurpose::Product,
+            sym_iu4_source_symmetric: None,
         }
     }
 

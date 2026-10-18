@@ -166,7 +166,7 @@ impl WindowPlan {
 /// the pre-mutation preflight refuses a tile whose sealed call disagrees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TileCohort {
-    /// Window-wide grouped panels: slab K2 or the aggregate F16 WMMA arm.
+    /// Window-wide grouped panels: slab K2, the aggregate F16 WMMA arm or the aggregate IU4 arm.
     K2,
     /// The K1 cohort: slab few-row tails, or the aggregate one-row decode.
     K1,
@@ -189,7 +189,7 @@ pub(crate) fn tile_cohort(
                 TileCohort::K2
             }
         }
-        dsp::WindowRoute::Aggregate => {
+        dsp::WindowRoute::Aggregate | dsp::WindowRoute::AggregateSymIu4 => {
             if route_rows <= 1 {
                 TileCohort::K1
             } else if route_rows < dsp::AGGREGATE_MIN_TILE_ROWS {
@@ -204,7 +204,9 @@ pub(crate) fn tile_cohort(
 /// The cohort the dispatch crate's own classification of a sealed call lands in.
 pub(crate) fn kind_cohort(kind: dsp::TileKind) -> TileCohort {
     match kind {
-        dsp::TileKind::SlabK2 | dsp::TileKind::AggregateWmma => TileCohort::K2,
+        dsp::TileKind::SlabK2 | dsp::TileKind::AggregateWmma | dsp::TileKind::AggregateIu4 => {
+            TileCohort::K2
+        }
         dsp::TileKind::SlabK1Tail | dsp::TileKind::Decode => TileCohort::K1,
         dsp::TileKind::AggregateF32Tail => TileCohort::F32Tail,
     }
@@ -262,7 +264,7 @@ pub(crate) fn sweep_tiles(
     tiles: &[TilePlan],
     few_row_limit: usize,
 ) -> SweepTiles {
-    let preferred = if route == dsp::WindowRoute::Aggregate {
+    let preferred = if route.is_aggregate_layout() {
         tiles.iter().position(|tile| {
             tile_cohort(route, tile.routing.route_rows, few_row_limit) == TileCohort::K2
         })
@@ -1110,6 +1112,8 @@ pub(crate) struct ReceiptInputs<'a> {
     pub(crate) peak_vram_bytes: Option<u64>,
     /// `"ok"` or `"aborted: ..."`.
     pub(crate) status: String,
+    /// The C2 `moe_iu4` object ([`moe_iu4_receipt`]).
+    pub(crate) moe_iu4: Value,
 }
 
 /// The layer-major receipt: measured fields only. A window that never ran
@@ -1132,6 +1136,7 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
         "route": "layer-major",
         "selected_by": mode_label(inputs.mode),
         "bypass_reason": Value::Null,
+        "moe_iu4": inputs.moe_iu4.clone(),
         "status": inputs.status,
         "entry_pos": plan.entry_pos,
         "prompt_rows": plan.rows,
@@ -1183,6 +1188,104 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
         "vram_measurement": {
             "method": "hipMemGetInfo_post_request_sample",
             "continuous_peak": false,
+        },
+    })
+}
+
+/// The C2 `moe_iu4.tiles` counts of a request's tiles by dispatch class `[aggregate_iu4,
+/// aggregate_wmma, aggregate_f32_tail, slab_k2, k1_or_decode]`: each mixer tile of the plan once
+/// (not once per layer sweep), classified from its ORIGINAL routing rows ([`tile_cohort`]) on the
+/// window `route`, exactly the cohort the dispatch call's own [`dsp::TileKind`] must land in
+/// ([`kind_cohort`], checked before any mutation).
+pub(crate) fn moe_iu4_tile_counts(
+    route: dsp::WindowRoute,
+    tiles: &[TilePlan],
+    few_row_limit: usize,
+) -> [u64; 5] {
+    let mut counts = [0u64; 5];
+    for tile in tiles {
+        let slot = match tile_cohort(route, tile.routing.route_rows, few_row_limit) {
+            TileCohort::K2 => match route {
+                dsp::WindowRoute::AggregateSymIu4 => 0,
+                dsp::WindowRoute::Aggregate => 1,
+                dsp::WindowRoute::SlabIu4 => 3,
+            },
+            TileCohort::F32Tail => 2,
+            TileCohort::K1 => 4,
+        };
+        counts[slot] += 1;
+    }
+    counts
+}
+
+/// What the C2 `moe_iu4` receipt object reports.
+pub(crate) struct MoeIu4Facts {
+    /// The window route the profile's census was charged for.
+    pub(crate) route: dsp::WindowRoute,
+    /// `Gpu::qwen4_moe_sym_iu4_requested` at receipt time (reporting only; the route was
+    /// resolved at load).
+    pub(crate) requested: bool,
+    pub(crate) descriptor: Option<&'static rdna_compute::gemm::MoeSymIu4Kernel>,
+    /// The load's source-header verdict ([`SlowlinkProfile::sym_iu4_source_symmetric`]).
+    pub(crate) source_symmetric: Option<bool>,
+    /// The final bound tables' `(verified, total)` routed MoE layers
+    /// ([`Qwen4GpuForward::sym_iu4_coverage`]).
+    pub(crate) final_verified: (usize, usize),
+    pub(crate) a4_sidecar_bytes: u64,
+    pub(crate) window_rows: usize,
+    /// [`moe_iu4_tile_counts`].
+    pub(crate) tiles: [u64; 5],
+}
+
+/// The descriptor object of the C2 receipt: the device descriptor's image, serving entries,
+/// NT, block threads, producers and checker.
+fn moe_iu4_descriptor(kernel: &rdna_compute::gemm::MoeSymIu4Kernel) -> Value {
+    use rdna_compute::gemm::MoeSymIu4DownProducer;
+    let down_producer = match kernel.down_producer {
+        MoeSymIu4DownProducer::Hipcc { module } => module,
+        MoeSymIu4DownProducer::Embedded { symbol, .. } => symbol,
+    };
+    json!({
+        "arch": kernel.arch,
+        "module": kernel.module,
+        "gate_up": kernel.entries[0][0],
+        "down": kernel.entries[0][1],
+        "nt": kernel.tiles_per_cta[0],
+        "threads": kernel.block_threads,
+        "gate_producer": kernel.gate_producer.module,
+        "down_producer": down_producer,
+        "checker": kernel.checker.symbol,
+        "c2": kernel.gate_producer.require_c2,
+    })
+}
+
+/// The required top-level `moe_iu4` object of `hipfire.qwen4.slowlink_receipt.v1` (C2), for
+/// every window route. `window_slot_stride` is the GLOBAL flat-slot extent every K2 panel
+/// indexes the window's A4 sidecars with (`window_rows * 10`, down `x_row_div 1`; gate/up reads
+/// the saved row `slot / 10`), reported only on the IU4 route (0 elsewhere); the panels' own Y
+/// rows are local to their view.
+pub(crate) fn moe_iu4_receipt(facts: &MoeIu4Facts) -> Value {
+    let sym = facts.route == dsp::WindowRoute::AggregateSymIu4;
+    let [aggregate_iu4, aggregate_wmma, aggregate_f32_tail, slab_k2, k1_or_decode] = facts.tiles;
+    let stride: u64 = if sym {
+        (facts.window_rows * dsp::K_TOP) as u64
+    } else {
+        0
+    };
+    json!({
+        "window_route": facts.route.label(),
+        "requested": facts.requested,
+        "descriptor": facts.descriptor.map_or(Value::Null, moe_iu4_descriptor),
+        "source_headers_symmetric": facts.source_symmetric,
+        "final_headers_verified": [facts.final_verified.0 as u64, facts.final_verified.1 as u64],
+        "a4_sidecar_bytes": facts.a4_sidecar_bytes,
+        "window_slot_stride": stride,
+        "tiles": {
+            "aggregate_iu4": aggregate_iu4,
+            "aggregate_wmma": aggregate_wmma,
+            "aggregate_f32_tail": aggregate_f32_tail,
+            "slab_k2": slab_k2,
+            "k1_or_decode": k1_or_decode,
         },
     })
 }
@@ -1508,18 +1611,20 @@ pub(crate) fn window_scratch_args(profile: &SlowlinkProfile) -> WindowScratchArg
 
 /// Grow the Gpu scratch the window's one count barrier would otherwise grow on
 /// the first long request, through the same reserve entries the forward's
-/// tile-sized reservation uses: the slab route reserves the grouping scratch,
-/// the down sidecar and the gate/up sidecar; the aggregate route (no A4
-/// sidecars) only the grouping scratch.
+/// tile-sized reservation uses: the slab route and the symmetric aggregate route
+/// reserve the grouping scratch, the down sidecar and the gate/up sidecar at the
+/// FULL window (`reserve_qwen4_moe_sym`, load-bound: no lazy first-request growth);
+/// the F16 aggregate route (no A4 sidecars) only the grouping scratch.
 fn reserve_window_scratch(gpu: &mut Gpu, args: WindowScratchArgs) -> Result<(), String> {
     match args.route {
-        dsp::WindowRoute::SlabIu4 => gpu.reserve_qwen4_moe_sym_slab(
-            args.rows,
-            dsp::K_TOP,
-            args.experts,
-            args.hidden,
-            args.intermediate,
-        ),
+        dsp::WindowRoute::SlabIu4 | dsp::WindowRoute::AggregateSymIu4 => gpu
+            .reserve_qwen4_moe_sym(
+                args.rows,
+                dsp::K_TOP,
+                args.experts,
+                args.hidden,
+                args.intermediate,
+            ),
         dsp::WindowRoute::Aggregate => {
             gpu.reserve_qwen4_moe_group_scratch(args.rows, dsp::K_TOP, args.experts)
         }
@@ -1604,6 +1709,26 @@ fn plan_runtime(
             profile.census.route_storage
         ));
     }
+    if layout.a4_sidecar_bytes() as u64 != profile.census.a4_sidecars
+        || layout.group_scatter_bytes() as u64 != profile.census.group_scatter
+    {
+        return Err(format!(
+            "{} route A4 sidecars/group scatter layout is {}/{} bytes, the census charged {}/{}",
+            profile.geometry.route.label(),
+            layout.a4_sidecar_bytes(),
+            layout.group_scatter_bytes(),
+            profile.census.a4_sidecars,
+            profile.census.group_scatter
+        ));
+    }
+    // Phase 2 of the symmetric IU4 route proof, repeated at the S1 attach: every routed trunk
+    // layer's final bound tables verified (the forward's load already refused a shortfall).
+    let (verified, total) = forward.sym_iu4_coverage();
+    crate::slowlink_admission::check_sym_iu4_final_headers(
+        profile.geometry.route,
+        verified,
+        total,
+    )?;
     let stream_bytes = profile.arena.span(ArenaField::HcStreams).bytes;
     if profile.arena.total_bytes % 4 != 0 || stream_bytes > profile.arena.total_bytes {
         return Err("HC-stream arena bytes are not whole F32 elements".to_string());
@@ -2348,7 +2473,7 @@ fn preflight_signatures(
                 .is_some_and(|runtime| runtime.s1_host_mapped())
         })
         .ok_or_else(|| "no host-resident expert layer".to_string())?;
-    let mut arms: Vec<([usize; 6], bool)> = Vec::new();
+    let mut arms: Vec<dsp::WindowArm> = Vec::new();
     for (rows, routing) in signatures {
         let stub = TilePlan {
             index: 0,
@@ -2376,7 +2501,13 @@ fn preflight_signatures(
                     return Err(invalid("a host layer's FFN is not MoE"));
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
-                dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position)
+                dsp::PreparedChunkCall::new(
+                    &*gpu,
+                    &sealed,
+                    0,
+                    stub.position,
+                    profile.geometry.route,
+                )
                     .map(|call| {
                         (
                             call.arm_signature(),
@@ -2413,14 +2544,18 @@ fn preflight_signatures(
                 routing.route_rows
             ));
         }
-        arms.push((arm, is_k2));
+        arms.push(dsp::WindowArm {
+            signature: arm,
+            k2: is_k2,
+            kind,
+        });
     }
     // Every tile shares the layer geometry (the first five signature values);
     // the grouped-path flag is the K2 tiles' one frozen arm. A few-row tail (a
     // prefill K1 call or the one-row decode call) keeps its own original arm as
     // a separate cohort, so it is compared on geometry alone and never refused
     // for its arm. One shared rule with the dispatch crate's prepare.
-    if !dsp::window_arms_compatible(&arms) {
+    if !dsp::window_arms_compatible(profile.geometry.route, &arms) {
         return Err(format!(
             "the plan's tiles seal incompatible dispatch arms (signature, K2): {arms:?}"
         ));
@@ -3178,7 +3313,13 @@ impl Run<'_, '_> {
                 for (tile, sealed) in frame_tiles.iter().zip(&sealed) {
                     let (scopes, _) = self.forward.enter_tile_scopes(gpu, tile.rows);
                     let call =
-                        dsp::PreparedChunkCall::new(&*gpu, sealed, tile.window_row, tile.position);
+                        dsp::PreparedChunkCall::new(
+                            &*gpu,
+                            sealed,
+                            tile.window_row,
+                            tile.position,
+                            self.profile.geometry.route,
+                        );
                     Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
                     calls.push(call.map_err(dsp_err("admission"))?);
                 }
@@ -3309,6 +3450,7 @@ impl Run<'_, '_> {
         routes: Option<&mut dsp::PromptRouteStorage>,
     ) -> R<Option<(usize, usize, usize, usize, usize)>> {
         let geo = self.geo;
+        let window_route = self.profile.geometry.route;
         let tile = &w.tiles[ti];
         let n = tile.rows;
         if geo.ple_layer == Some(layer) {
@@ -3391,7 +3533,13 @@ impl Run<'_, '_> {
                     };
                     let sealed = env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
                     let call =
-                        dsp::PreparedChunkCall::new(&*gpu, &sealed, tile.window_row, tile.position)
+                        dsp::PreparedChunkCall::new(
+                            &*gpu,
+                            &sealed,
+                            tile.window_row,
+                            tile.position,
+                            window_route,
+                        )
                             .map_err(dsp_err("admission"))?;
                     dsp::prepare_routes(gpu, &call, routes)
                         .map_err(dsp_err("route preparation"))?;
@@ -3410,6 +3558,7 @@ impl Run<'_, '_> {
         routes: &dsp::PromptRouteStorage,
     ) -> R<()> {
         let geo = self.geo;
+        let window_route = self.profile.geometry.route;
         let tile = &w.tiles[ti];
         self.gpu
             .set_router_row_base(if tile.rows > 1 { tile.position } else { 0 });
@@ -3428,7 +3577,13 @@ impl Run<'_, '_> {
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
                 let call =
-                    dsp::PreparedChunkCall::new(&*gpu, &sealed, tile.window_row, tile.position)
+                    dsp::PreparedChunkCall::new(
+                        &*gpu,
+                        &sealed,
+                        tile.window_row,
+                        tile.position,
+                        window_route,
+                    )
                         .map_err(dsp_err("admission"))?;
                 let mut hook = ForwardScopeHook {
                     forward: &*self.forward,
@@ -3728,6 +3883,16 @@ pub(crate) fn try_run_prompt(
         .device_mem_info()
         .ok()
         .map(|(free, total)| total.saturating_sub(free) as u64);
+    let moe_iu4 = moe_iu4_receipt(&MoeIu4Facts {
+        route: profile.geometry.route,
+        requested: gpu.qwen4_moe_sym_iu4_requested(),
+        descriptor: gpu.qwen4_moe_sym_kernel(),
+        source_symmetric: profile.sym_iu4_source_symmetric,
+        final_verified: forward.sym_iu4_coverage(),
+        a4_sidecar_bytes: profile.census.a4_sidecars,
+        window_rows: profile.window_rows,
+        tiles: moe_iu4_tile_counts(profile.geometry.route, &plan.tiles, geo.few_row_limit),
+    });
     let receipt = |status: String| {
         layer_major_receipt(&ReceiptInputs {
             mode,
@@ -3738,6 +3903,7 @@ pub(crate) fn try_run_prompt(
             reports: &reports,
             peak_vram_bytes: post_request_vram_used,
             status,
+            moe_iu4: moe_iu4.clone(),
         })
     };
     let (mut stored, result) = match outcome {
@@ -3921,7 +4087,13 @@ fn dispatch_case(
                 return Err(invalid("a host layer's FFN is not MoE"));
             };
             let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
-            let call = dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position)
+            let call = dsp::PreparedChunkCall::new(
+                &*gpu,
+                &sealed,
+                0,
+                stub.position,
+                profile.geometry.route,
+            )
                 .map_err(dsp_err("admission"))?;
             if call.window_route() != profile.geometry.route {
                 return Err(invalid(format!(
@@ -3930,13 +4102,17 @@ fn dispatch_case(
                     profile.geometry.route
                 )));
             }
-            // On the aggregate route these checks run on an actual WMMA call
-            // (the admitted tile rows); an F32-tail call never stands in.
-            if profile.geometry.route == dsp::WindowRoute::Aggregate
-                && call.tile_kind() != dsp::TileKind::AggregateWmma
-            {
+            // On an aggregate route these checks run on an actual K2 call (the admitted tile
+            // rows): the F16 WMMA arm on `Aggregate`, the IU4 arm on `AggregateSymIu4`; an
+            // F32-tail call never stands in.
+            let k2_kind = match profile.geometry.route {
+                dsp::WindowRoute::Aggregate => Some(dsp::TileKind::AggregateWmma),
+                dsp::WindowRoute::AggregateSymIu4 => Some(dsp::TileKind::AggregateIu4),
+                dsp::WindowRoute::SlabIu4 => None,
+            };
+            if let Some(expected) = k2_kind.filter(|expected| call.tile_kind() != *expected) {
                 return Err(invalid(format!(
-                    "the {name} check anchors on an actual aggregate WMMA call; the {rows}-row \
+                    "the {name} check anchors on an actual {expected:?} call; the {rows}-row \
                      tile sealed as {:?}",
                     call.tile_kind()
                 )));
@@ -4022,7 +4198,7 @@ fn decode_tail_case(
     let decode_row0 = dsp::selftest::DECODE_TAIL_ANCHOR_ROWS;
     let anchor_rows = match profile.geometry.route {
         dsp::WindowRoute::SlabIu4 => decode_row0,
-        dsp::WindowRoute::Aggregate => profile.tile_rows,
+        dsp::WindowRoute::Aggregate | dsp::WindowRoute::AggregateSymIu4 => profile.tile_rows,
     };
     let position = bundle.state.position;
     let anchor_tile = TilePlan {
@@ -4075,8 +4251,13 @@ fn decode_tail_case(
             let mut calls = Vec::with_capacity(sealed.len());
             for (tile, sealed) in tiles.iter().zip(&sealed) {
                 let (scopes, _) = forward.enter_tile_scopes(gpu, tile.rows);
-                let call =
-                    dsp::PreparedChunkCall::new(&*gpu, sealed, tile.window_row, tile.position);
+                let call = dsp::PreparedChunkCall::new(
+                    &*gpu,
+                    sealed,
+                    tile.window_row,
+                    tile.position,
+                    profile.geometry.route,
+                );
                 Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
                 calls.push(call.map_err(dsp_err("admission"))?);
             }
@@ -4198,7 +4379,13 @@ fn f32_tail_case(
                         return Err(invalid("a resident layer's FFN is not MoE"));
                     };
                     let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
-                    let call = dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, tile.position)
+                    let call = dsp::PreparedChunkCall::new(
+                        &*gpu,
+                        &sealed,
+                        0,
+                        tile.position,
+                        profile.geometry.route,
+                    )
                         .map_err(dsp_err("admission"))?;
                     if call.tile_kind() != dsp::TileKind::AggregateF32Tail {
                         return Err(invalid(format!(
@@ -4296,8 +4483,8 @@ pub(crate) fn primitive_selftest(
                     })
                 })
             }
-            dsp::WindowRoute::Aggregate => f32_tail_case(forward, &*bundle, gpu, &rt, &profile)
-                .and_then(|f32_tail| {
+            dsp::WindowRoute::Aggregate | dsp::WindowRoute::AggregateSymIu4 => {
+                f32_tail_case(forward, &*bundle, gpu, &rt, &profile).and_then(|f32_tail| {
                     decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
                         json!({
                             "name": name,
@@ -4309,7 +4496,8 @@ pub(crate) fn primitive_selftest(
                             },
                         })
                     })
-                }),
+                })
+            }
         },
         other => Err(invalid(format!("unknown slow-link primitive {other:?}"))),
     };
@@ -4392,7 +4580,22 @@ mod slowlink_prompt {
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
             purpose,
+            sym_iu4_source_symmetric: None,
         }
+    }
+
+    /// The `moe_iu4` object of a receipt whose window ran the slab route with no request.
+    pub(super) fn no_moe_iu4() -> Value {
+        moe_iu4_receipt(&MoeIu4Facts {
+            route: dsp::WindowRoute::SlabIu4,
+            requested: false,
+            descriptor: None,
+            source_symmetric: None,
+            final_verified: (0, 0),
+            a4_sidecar_bytes: 0,
+            window_rows: S1_WINDOW_ROWS,
+            tiles: [0; 5],
+        })
     }
 
     /// [`profile_with_budgets`] admitted FRESH on the artifact route `route` at
@@ -4707,6 +4910,7 @@ mod slowlink_prompt {
             reports: &reports,
             peak_vram_bytes: None,
             status: "ok".to_string(),
+            moe_iu4: no_moe_iu4(),
         });
         assert_eq!(receipt["sweeps"], 3);
         assert_eq!(receipt["windows"].as_array().unwrap().len(), 3);
@@ -5587,12 +5791,14 @@ mod slowlink_prompt {
             reports: &[report],
             peak_vram_bytes: Some(22 << 30),
             status: "ok".to_string(),
+            moe_iu4: no_moe_iu4(),
         });
         for key in [
             "schema",
             "route",
             "selected_by",
             "bypass_reason",
+            "moe_iu4",
             "entry_pos",
             "prompt_rows",
             "windows",
@@ -5669,6 +5875,7 @@ mod slowlink_prompt {
                 reports,
                 peak_vram_bytes: None,
                 status: "ok".to_string(),
+                moe_iu4: no_moe_iu4(),
             })
         };
         // Every group was acquired (the transport discarded nothing), yet the
@@ -5789,7 +5996,7 @@ mod slowlink_prompt {
             );
             let window = &plan.windows[0];
             match route {
-                dsp::WindowRoute::Aggregate => {
+                dsp::WindowRoute::Aggregate | dsp::WindowRoute::AggregateSymIu4 => {
                     assert_eq!(
                         tile_cohort(route, 256, 8),
                         TileCohort::F32Tail,
@@ -6596,7 +6803,11 @@ mod slowlink_eager_load {
     use super::slowlink_prompt::{primitive_profile_on, product_profile_on};
     use super::*;
 
-    const ROUTES: [dsp::WindowRoute; 2] = [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::Aggregate];
+    const ROUTES: [dsp::WindowRoute; 3] = [
+        dsp::WindowRoute::SlabIu4,
+        dsp::WindowRoute::Aggregate,
+        dsp::WindowRoute::AggregateSymIu4,
+    ];
 
     /// The two ACTUAL admitted profiles of `route`: product (768-row tile) and
     /// primitive-purpose (512-row tile).
@@ -6725,7 +6936,7 @@ mod slowlink_eager_load {
                 rdna_compute::scratch::qwen4_moe_group_layout(args.rows * dsp::K_TOP, args.experts)
                     .bytes as u64;
             let sidecars = match args.route {
-                dsp::WindowRoute::SlabIu4 => {
+                dsp::WindowRoute::SlabIu4 | dsp::WindowRoute::AggregateSymIu4 => {
                     rdna_compute::scratch::qwen4_moe_down_i4_bytes(args.hidden, args.rows).unwrap()
                         as u64
                         + rdna_compute::scratch::qwen4_moe_down_i4_bytes(
@@ -6866,5 +7077,229 @@ mod slowlink_eager_load {
         assert!(!error.contains("released to the device pool"), "{error}");
         assert_eq!(dev.quarantined, LOAD_OWNERS[..4].to_vec());
         assert!(dev.log.iter().all(|entry| !entry.starts_with("release")));
+    }
+}
+
+#[cfg(test)]
+mod slowlink_moe_iu4 {
+    use super::slowlink_prompt::{no_moe_iu4, plan_for_profile, product_profile_on};
+    use super::*;
+    use rdna_compute::expert_capabilities::QT_MQ4_XTS;
+
+    const SYM: dsp::WindowRoute = dsp::WindowRoute::AggregateSymIu4;
+    const F16: dsp::WindowRoute = dsp::WindowRoute::Aggregate;
+
+    fn gfx1100_routing(rows: usize) -> TileRouting {
+        TileRouting {
+            route_rows: rows,
+            bf16_streams: rows >= dsp::AGGREGATE_MIN_TILE_ROWS,
+        }
+    }
+
+    fn gfx1100_descriptor() -> &'static rdna_compute::gemm::MoeSymIu4Kernel {
+        let caps = rdna_compute::arch_caps::ArchCaps::new(
+            "gfx1100",
+            std::sync::Arc::new(rdna_compute::FeatureFlags::for_test("gfx1100")),
+        );
+        rdna_compute::gemm::moe_sym_iu4_kernel(&caps, QT_MQ4_XTS).expect("a gfx1100 MQ4 descriptor")
+    }
+
+    #[test]
+    fn slowlink_moe_iu4_cohorts_split_at_the_512_and_1536_route_row_boundaries() {
+        let few_row_limit = 8;
+        // One row is the decode cohort, 2..=511 the F32 tail, 512+ the K2 (IU4) tile; every
+        // boundary of the 512/1536 floors, identical to the F16 aggregate route's.
+        for (rows, expected) in [
+            (1usize, TileCohort::K1),
+            (2, TileCohort::F32Tail),
+            (511, TileCohort::F32Tail),
+            (512, TileCohort::K2),
+            (513, TileCohort::K2),
+            (1535, TileCohort::K2),
+            (1536, TileCohort::K2),
+            (1537, TileCohort::K2),
+        ] {
+            assert_eq!(tile_cohort(SYM, rows, few_row_limit), expected, "{rows} rows");
+            assert_eq!(
+                tile_cohort(SYM, rows, few_row_limit),
+                tile_cohort(F16, rows, few_row_limit),
+                "{rows} rows: the IU4 window never re-tags the F32 tail or decode tile"
+            );
+        }
+        assert_eq!(dsp::AGGREGATE_MIN_TILE_ROWS, 512);
+        // The dispatch classes the cohorts must land in.
+        assert_eq!(kind_cohort(dsp::TileKind::AggregateIu4), TileCohort::K2);
+        assert_eq!(kind_cohort(dsp::TileKind::AggregateWmma), TileCohort::K2);
+        assert_eq!(kind_cohort(dsp::TileKind::AggregateF32Tail), TileCohort::F32Tail);
+        assert_eq!(kind_cohort(dsp::TileKind::Decode), TileCohort::K1);
+    }
+
+    #[test]
+    fn slowlink_moe_iu4_sweep_anchors_and_registers_like_the_aggregate_route() {
+        let tile = |index: usize, rows: usize| TilePlan {
+            index,
+            window: 0,
+            prompt_row: 0,
+            window_row: 0,
+            stream_offset: 0,
+            rows,
+            position: 0,
+            routing: gfx1100_routing(rows),
+            ends_at_cut: None,
+            last_in_window: false,
+        };
+        // An F32 tail opens the window: the anchor is still the first K2 (IU4) tile.
+        let tiles = [tile(0, 300), tile(1, 768), tile(2, 1), tile(3, 256)];
+        let f16 = sweep_tiles(F16, &tiles, 8);
+        let sym = sweep_tiles(SYM, &tiles, 8);
+        assert_eq!(sym, f16);
+        assert_eq!(sym.anchor, Some(1));
+        assert_eq!(sym.cohort, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn slowlink_moe_iu4_16k_window_keeps_the_final_256_row_tail_f32() {
+        let profile = product_profile_on(SYM);
+        assert_eq!(profile.tile_rows, 768);
+        let plan = plan_for_profile(&profile, 0, 16384, &[], &gfx1100_routing, 8)
+            .unwrap()
+            .expect("a 16K request plans on the IU4 route");
+        assert_eq!(plan.windows.len(), 1);
+        // 21 full 768-row IU4 tiles and the final 256-row tile, which never joins the IU4 K2.
+        let counts = moe_iu4_tile_counts(SYM, &plan.tiles, 8);
+        assert_eq!(counts, [21, 0, 1, 0, 0]);
+        assert_eq!(plan.tiles.last().unwrap().rows, 256);
+        assert_eq!(plan.windows[0].tail_rows, 256);
+        assert_eq!(plan.windows[0].k1_rows, 0);
+        // The F16 route classifies the same tiles with the WMMA arm in the IU4 tiles' place.
+        let f16 = moe_iu4_tile_counts(F16, &plan.tiles, 8);
+        assert_eq!(f16, [0, 21, 1, 0, 0]);
+        let slab = moe_iu4_tile_counts(dsp::WindowRoute::SlabIu4, &plan.tiles, 8);
+        assert_eq!(slab, [0, 0, 0, 22, 0]);
+    }
+
+    #[test]
+    fn slowlink_moe_iu4_census_is_the_runtime_layout_and_charges_both_sidecars() {
+        for route in [dsp::WindowRoute::SlabIu4, F16, SYM] {
+            let profile = product_profile_on(route);
+            let layout = dsp::PromptRouteLayout::new(&profile.route_dims()).unwrap();
+            assert_eq!(layout.route(), route);
+            assert_eq!(layout.total_bytes() as u64, profile.census.route_storage);
+            assert_eq!(layout.a4_sidecar_bytes() as u64, profile.census.a4_sidecars);
+            assert_eq!(
+                layout.group_scatter_bytes() as u64,
+                profile.census.group_scatter
+            );
+        }
+        let sym = product_profile_on(SYM);
+        let f16 = product_profile_on(F16);
+        assert_eq!(sym.window_rows, 16384);
+        // Both A4 sidecars (gate 20 * N * 72, down 5 * N * 10 * 72): 78.75 MiB at 16K.
+        assert_eq!(sym.census.a4_sidecars, 82_575_360);
+        assert_eq!(sym.census.a4_sidecars, 20 * 16384 * 72 + 5 * 16384 * 10 * 72);
+        assert_eq!(f16.census.a4_sidecars, 0);
+        // No window F16 input and no panel-local F16 slot map on the IU4 route.
+        let layout = dsp::PromptRouteLayout::new(&sym.route_dims()).unwrap();
+        assert_eq!(layout.x_f16_bytes(), 0);
+        assert_eq!(
+            f16.census.route_storage - sym.census.route_storage,
+            83_886_080 + 2048 * 4
+        );
+        // The F32 tail cohort and decode rows keep the aggregate bounds on both routes.
+        assert_eq!(sym.route_dims().tail_rows, f16.route_dims().tail_rows);
+        assert_eq!(sym.route_dims().k1_rows, f16.route_dims().k1_rows);
+        assert_eq!(sym.census.group_scatter, f16.census.group_scatter);
+        // Every other term of the census is unchanged between the routes.
+        assert_eq!(sym.census.ring, f16.census.ring);
+        assert_eq!(sym.census.lookahead, f16.census.lookahead);
+        assert_eq!(sym.census.arena, f16.census.arena);
+        assert_eq!(sym.census.boundary_state, f16.census.boundary_state);
+        assert_eq!(
+            Some(sym.resident_layers),
+            sym.placement.largest_fitting_layers()
+        );
+    }
+
+    #[test]
+    fn slowlink_moe_iu4_window_scratch_reserves_the_full_window_sidecars() {
+        let profile = product_profile_on(SYM);
+        let args = window_scratch_args(&profile);
+        assert_eq!(args.route, SYM);
+        assert_eq!(args.rows, 16384);
+        assert_eq!(args.hidden, 2560);
+        assert_eq!(args.intermediate, 640);
+        // The reserve entry's own byte formula (`reserve_qwen4_moe_sym`: grouping scratch, down
+        // sidecar `intermediate / 128 * slots * 72`, gate sidecar) is the census' charge.
+        let slots = args.rows * dsp::K_TOP;
+        assert_eq!(
+            (args.intermediate / 128 * slots * 72) as u64
+                + (args.hidden / 128 * args.rows * 72) as u64,
+            profile.census.a4_sidecars
+        );
+        assert_eq!(
+            rdna_compute::scratch::qwen4_moe_group_layout(slots, args.experts).bytes as u64,
+            profile.census.group_scatter
+        );
+    }
+
+    #[test]
+    fn slowlink_moe_iu4_receipt_names_the_route_descriptor_tiles_and_verdicts() {
+        let kernel = gfx1100_descriptor();
+        let receipt = moe_iu4_receipt(&MoeIu4Facts {
+            route: SYM,
+            requested: true,
+            descriptor: Some(kernel),
+            source_symmetric: Some(true),
+            final_verified: (48, 48),
+            a4_sidecar_bytes: 82_575_360,
+            window_rows: 16384,
+            tiles: [21, 0, 1, 0, 0],
+        });
+        assert_eq!(receipt["window_route"], "aggregate-sym-iu4");
+        assert_eq!(receipt["requested"], true);
+        assert_eq!(receipt["source_headers_symmetric"], true);
+        assert_eq!(receipt["final_headers_verified"], json!([48u64, 48u64]));
+        assert_eq!(receipt["a4_sidecar_bytes"], 82_575_360u64);
+        assert_eq!(receipt["window_slot_stride"], 163_840u64);
+        let d = &receipt["descriptor"];
+        assert_eq!(d["arch"], "gfx1100");
+        assert_eq!(d["module"], "qwen4_moe_iu4_sym_pm_gfx1100");
+        assert_eq!(d["gate_up"], "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100");
+        assert_eq!(d["down"], "qwen4_moe_down_iu4_sym_pm_gfx1100");
+        assert_eq!(d["nt"], 1);
+        assert_eq!(d["threads"], json!([64, 128]));
+        assert_eq!(d["gate_producer"], "mq_rotate_x_i4");
+        assert_eq!(d["down_producer"], "mq_i4_a4_r128_k640_gfx1100");
+        assert_eq!(d["checker"], "qwen4_moe_sym_check_gfx1100");
+        assert_eq!(d["c2"], true);
+        assert_eq!(
+            receipt["tiles"],
+            json!({
+                "aggregate_iu4": 21,
+                "aggregate_wmma": 0,
+                "aggregate_f32_tail": 1,
+                "slab_k2": 0,
+                "k1_or_decode": 0,
+            })
+        );
+        // Every other route reports its own label, a null verdict where no scan ran and no
+        // slot stride.
+        let f16 = moe_iu4_receipt(&MoeIu4Facts {
+            route: F16,
+            requested: false,
+            descriptor: None,
+            source_symmetric: None,
+            final_verified: (0, 48),
+            a4_sidecar_bytes: 0,
+            window_rows: 16384,
+            tiles: [0, 21, 1, 0, 0],
+        });
+        assert_eq!(f16["window_route"], "aggregate");
+        assert!(f16["descriptor"].is_null() && f16["source_headers_symmetric"].is_null());
+        assert_eq!(f16["window_slot_stride"], 0u64);
+        assert_eq!(
+            no_moe_iu4()["window_route"],
+            dsp::WindowRoute::SlabIu4.label()
+        );
     }
 }

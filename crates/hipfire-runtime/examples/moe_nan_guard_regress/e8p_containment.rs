@@ -966,7 +966,7 @@ fn k2_pipeline(
     let t_x = up_f32(&mut cx.gpu, x)?;
     let xq_g = cx
         .gpu
-        .qwen4_moe_rotate256_i4_slab(&t_x, GATE_K, rows)
+        .qwen4_moe_rotate256_i4(&t_x, GATE_K, rows)
         .map_err(e)?;
     let (gate, t_h) = k2_run(
         cx,
@@ -982,7 +982,7 @@ fn k2_pipeline(
     )?;
     let xq_d = cx
         .gpu
-        .qwen4_moe_rotate128_i4_slab(&t_h, &t_sorted, DOWN_KK, gr, slots)
+        .qwen4_moe_rotate128_i4(&t_h, &t_sorted, DOWN_KK, gr, slots)
         .map_err(e)?;
     let (down, t_y) = k2_run(
         cx,
@@ -1018,7 +1018,7 @@ fn k2_phase(
         let t_x = up_f32(&mut cx.gpu, &x)?;
         let xq_g = cx
             .gpu
-            .qwen4_moe_rotate256_i4_slab(&t_x, GATE_K, rows)
+            .qwen4_moe_rotate256_i4(&t_x, GATE_K, rows)
             .map_err(e)?;
         let tag = format!("{} K2 rows={rows}", ph.label);
         // gate/up: old image vs new launcher.
@@ -1051,7 +1051,7 @@ fn k2_phase(
         // down (input: the new gate/up output through the real A4 producer): old vs new.
         let xq_d = cx
             .gpu
-            .qwen4_moe_rotate128_i4_slab(&t_h, &t_sorted, DOWN_KK, gr, slots)
+            .qwen4_moe_rotate128_i4(&t_h, &t_sorted, DOWN_KK, gr, slots)
             .map_err(e)?;
         let (old_d, t_old_d) = k2_run(
             cx,

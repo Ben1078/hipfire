@@ -155,6 +155,19 @@ fn load_inner(
     let scratch_mode =
         crate::artifact::source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
             .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    // The one artifact scan the symmetric IU4 window route
+    // (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`) needs: the source-byte symmetry of every routed trunk
+    // layer, read from the HFQ before the model source takes ownership of it, and only when the
+    // route's other terms hold (`SymIu4RouteFacts::scan_needed`). A unified-memory load never
+    // selects S1 and may have dropped its mapping.
+    let routed_symmetric: Option<Result<bool, String>> = (!gpu.is_uma()
+        && crate::slowlink_admission::SymIu4RouteFacts::of_gpu(gpu).scan_needed(
+            crate::slowlink_admission::window_route_of(&receipt.manifest.weights),
+        ))
+    .then(|| {
+        crate::artifact::routed_headers_symmetric(&hfq, &receipt.manifest)
+            .map_err(|error| error.to_string())
+    });
     let unified = gpu.is_uma();
     if unified {
         hfq.drop_mmap();
@@ -262,6 +275,7 @@ fn load_inner(
             state_format,
             scratch_mode,
             purpose,
+            routed_source_symmetric: &|| routed_symmetric.clone().unwrap_or(Ok(false)),
         };
         // Device free memory just before the host-link initialization. The
         // selector runs the link closure only after its probe-free

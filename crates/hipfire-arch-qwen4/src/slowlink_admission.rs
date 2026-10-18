@@ -415,6 +415,114 @@ pub fn window_route_of(weights: &[hipfire_runtime::weight_manifest::WeightEntry]
     }
 }
 
+/// The Qwen4 MoE programs' recipe keeps the BF16 storage boundaries the symmetric IU4 kernels
+/// implement (`MoeRecipe::SoftmaxGatedShared { bf16_round_trip: true, .. }` in `program.rs` and
+/// the forward's own params): the recipe fact of [`SymIu4RouteFacts`]. Every tile call still
+/// re-checks its own recipe in the dispatch crate's admission.
+pub const QWEN4_MOE_RECIPE_BF16_ROUND_TRIP: bool = true;
+
+/// The terms of [`resolve_window_route`] besides the artifact layout. All four are decided
+/// BEFORE census and allocation; none is read again at execution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SymIu4RouteFacts {
+    /// The device has a symmetric IU4 MoE kernel descriptor for MQ4 experts
+    /// (`Gpu::qwen4_moe_sym_kernel`).
+    pub descriptor: bool,
+    /// `Gpu::qwen4_moe_sym_iu4_requested`: the typed flag requested the route (gfx1100: explicit
+    /// `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only, `=0` kills), the C2 candidate set holds and a descriptor
+    /// exists.
+    pub requested: bool,
+    /// The MoE recipe's BF16 round trip ([`QWEN4_MOE_RECIPE_BF16_ROUND_TRIP`]).
+    pub recipe_bf16_round_trip: bool,
+    /// Source-byte symmetry of EVERY routed trunk layer's QT44/QT53 headers
+    /// (`artifact::routed_headers_symmetric`); `None` until the scan ran, which it does only when
+    /// the three other terms and the layout hold ([`Self::scan_needed`]).
+    pub source_symmetric: Option<bool>,
+}
+
+impl SymIu4RouteFacts {
+    /// The device terms of `gpu` (no source scan).
+    pub fn of_gpu(gpu: &rdna_compute::Gpu) -> Self {
+        Self {
+            descriptor: gpu.qwen4_moe_sym_kernel().is_some(),
+            requested: gpu.qwen4_moe_sym_iu4_requested(),
+            recipe_bf16_round_trip: QWEN4_MOE_RECIPE_BF16_ROUND_TRIP,
+            source_symmetric: None,
+        }
+    }
+
+    /// Whether the source header scan can change the verdict: the artifact layout is the
+    /// stacked aggregate one and the other three terms hold. Otherwise the layout route is the
+    /// answer and no header byte is read.
+    pub fn scan_needed(&self, layout: WindowRoute) -> bool {
+        layout == WindowRoute::Aggregate
+            && self.descriptor
+            && self.requested
+            && self.recipe_bf16_round_trip
+    }
+}
+
+/// The window route of a load, resolved from the pure layout classifier
+/// ([`window_route_of`]) and the terms of [`SymIu4RouteFacts`]: [`WindowRoute::AggregateSymIu4`]
+/// iff the layout is the stacked aggregate one AND the device has a descriptor AND the route was
+/// requested AND every routed trunk layer's source headers are symmetric AND the recipe keeps the
+/// BF16 boundaries; otherwise the layout route (the whole profile stays on the F16 aggregate
+/// route when any layer fails). Pure.
+pub fn resolve_window_route(layout: WindowRoute, facts: &SymIu4RouteFacts) -> WindowRoute {
+    if facts.scan_needed(layout) && facts.source_symmetric == Some(true) {
+        WindowRoute::AggregateSymIu4
+    } else {
+        layout
+    }
+}
+
+/// A resolved window route and the source-header verdict behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedWindowRoute {
+    pub route: WindowRoute,
+    /// `Some` only when the scan ran ([`SymIu4RouteFacts::scan_needed`]).
+    pub source_symmetric: Option<bool>,
+}
+
+/// [`resolve_window_route`] running `scan` (the artifact's routed-header scan) once, and only
+/// when [`SymIu4RouteFacts::scan_needed`]. A scan error is the caller's decline, never a guess.
+pub fn resolve_window_route_with_scan(
+    layout: WindowRoute,
+    mut facts: SymIu4RouteFacts,
+    scan: impl FnOnce() -> Result<bool, String>,
+) -> Result<ResolvedWindowRoute, String> {
+    if facts.source_symmetric.is_none() && facts.scan_needed(layout) {
+        facts.source_symmetric = Some(scan()?);
+    }
+    Ok(ResolvedWindowRoute {
+        route: resolve_window_route(layout, &facts),
+        source_symmetric: facts.source_symmetric,
+    })
+}
+
+/// Phase 2 of the route proof: the FINAL bound pointer tables' header verdicts
+/// (`Qwen4GpuForward`'s load-time `verify_symmetric` loop over every routed trunk layer's
+/// device-visible tables, host-mapped S1 layers included) against the charged route. An
+/// [`WindowRoute::AggregateSymIu4`] profile needs `verified == total > 0`; anything else is a
+/// load error BEFORE serving (the census, placement and scratch were charged for this route, so
+/// the load never silently switches to a differently budgeted one). Every other route passes.
+pub fn check_sym_iu4_final_headers(
+    route: WindowRoute,
+    verified: usize,
+    total: usize,
+) -> Result<(), String> {
+    if route != WindowRoute::AggregateSymIu4 || (total > 0 && verified == total) {
+        return Ok(());
+    }
+    Err(format!(
+        "qwen4: the slow-link symmetric IU4 window route ({}) was admitted from the artifact's \
+         source headers, but the loaded final expert tables verified only {verified}/{total} \
+         routed MoE layers symmetric; declining the load before serving (the charged census is \
+         for this route and no differently budgeted route is substituted)",
+        route.label()
+    ))
+}
+
 /// The model dimensions the S1 layouts are sized from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelGeometry {
@@ -797,7 +905,7 @@ pub fn route_dims(
         k1_rows: S1_K1_TAIL_ROWS,
         tail_rows: match geometry.route {
             WindowRoute::SlabIu4 => 0,
-            WindowRoute::Aggregate => S1_AGGREGATE_TAIL_ROWS,
+            WindowRoute::Aggregate | WindowRoute::AggregateSymIu4 => S1_AGGREGATE_TAIL_ROWS,
         },
         route: geometry.route,
     }
@@ -937,7 +1045,9 @@ pub fn diagnostic_budget_bytes(
         // grouped-down row count): the maximum, 9.
         k1_rows: match geometry.route {
             WindowRoute::SlabIu4 => 3.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS),
-            WindowRoute::Aggregate => rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1,
+            WindowRoute::Aggregate | WindowRoute::AggregateSymIu4 => {
+                rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1
+            }
         },
         shared_intermediate: geometry.shared_intermediate,
         route: geometry.route,
@@ -1338,6 +1448,9 @@ pub struct AdmissionInputs {
     /// What the profile is for; [`purpose_tile_rows`] of it is the tile
     /// [`admit`] admits.
     pub purpose: AdmissionPurpose,
+    /// The source-header verdict the window route was resolved from
+    /// ([`SymIu4RouteFacts::source_symmetric`]); `None` when no scan ran.
+    pub sym_iu4_source_symmetric: Option<bool>,
 }
 
 /// The immutable admitted S1 profile: the frozen placement the load took and
@@ -1385,6 +1498,9 @@ pub struct SlowlinkProfile {
     /// it is NOT reserve, not safety credit, and a consumer may draw at most
     /// this much, never the margin.
     pub device_snapshot_budget_bytes: u64,
+    /// The source-header verdict behind [`ModelGeometry::route`] (see
+    /// [`AdmissionInputs::sym_iu4_source_symmetric`]).
+    pub sym_iu4_source_symmetric: Option<bool>,
 }
 
 impl SlowlinkProfile {
@@ -1441,10 +1557,17 @@ impl SlowlinkProfile {
 
     /// The placement log line.
     pub fn describe(&self) -> String {
+        // Only the opt-in IU4 route names itself: every other load logs byte for byte as before.
+        let route = match self.geometry.route {
+            WindowRoute::AggregateSymIu4 => {
+                format!(", window route {}", WindowRoute::AggregateSymIu4.label())
+            }
+            WindowRoute::SlabIu4 | WindowRoute::Aggregate => String::new(),
+        };
         format!(
             "slow-link prefill (S1): {} MiB charged [{}], {}-row tile, {}-row window, \
              {} resident layers (no-stage incumbent baseline {}), {}+{} expert pages of {} bytes ({} KiB pinned host table staging), link {:.1} GB/s, \
-             allocation granule {} KiB: {} MiB owner slack [{}] charged beside the census, {} MiB device snapshot budget; placement quote: {}",
+             allocation granule {} KiB: {} MiB owner slack [{}] charged beside the census, {} MiB device snapshot budget; placement quote: {}{}",
             self.census.total().unwrap_or(0) >> 20,
             self.census.describe(),
             self.tile_rows,
@@ -1461,6 +1584,7 @@ impl SlowlinkProfile {
             self.granule.describe(),
             self.device_snapshot_budget_bytes >> 20,
             self.placement.describe(self.resident_layers),
+            route,
         )
     }
 }
@@ -1709,6 +1833,7 @@ pub(crate) fn admit_at_tile(
         baseline_layers: inputs.baseline_layers,
         checkpoint_stride_rows: inputs.checkpoint_stride_rows,
         link_gbps: inputs.link_gbps,
+        sym_iu4_source_symmetric: inputs.sym_iu4_source_symmetric,
         purpose: inputs.purpose,
     })
 }
@@ -1917,6 +2042,13 @@ pub struct LoadFacts<'a> {
     /// gfx1100 link) resolved at load: the non-S1 checkpoint cadence an S1
     /// load preserves. Never a placement or scratch input.
     pub checkpoint_stride_rows: usize,
+    /// The window route resolved BEFORE the census ([`resolve_window_route`] over
+    /// [`window_route_of`]`(weights)`): what [`load_admission_inputs`] sizes every route-dependent
+    /// byte from. Must be the layout route or [`WindowRoute::AggregateSymIu4`] of an aggregate
+    /// layout; a hidden read of the typed flag later would defeat the charge.
+    pub window_route: WindowRoute,
+    /// The source-header verdict behind [`Self::window_route`]; `None` when no scan ran.
+    pub sym_iu4_source_symmetric: Option<bool>,
 }
 
 /// [`AdmissionInputs`] from [`LoadFacts`] and the measured narrow `link_gbps`:
@@ -1928,7 +2060,14 @@ pub fn load_admission_inputs(
     link_gbps: f64,
 ) -> Result<AdmissionInputs, SlowlinkDecline> {
     use crate::expert_residency as residency;
-    let route = window_route_of(facts.weights);
+    let layout = window_route_of(facts.weights);
+    let route = facts.window_route;
+    if route != layout && !(layout == WindowRoute::Aggregate && route == WindowRoute::AggregateSymIu4)
+    {
+        return Err(SlowlinkDecline::Geometry(format!(
+            "the resolved window route {route:?} is not the artifact layout {layout:?}'s"
+        )));
+    }
     let geometry =
         ModelGeometry::from_config(facts.config, route).map_err(SlowlinkDecline::Geometry)?;
     let (non_expert, layer_expert_bytes) = residency::resident_split(facts.weights, facts.bytes_of)
@@ -2004,6 +2143,7 @@ pub fn load_admission_inputs(
         window_rows: facts.window_rows,
         link_gbps,
         purpose: facts.purpose,
+        sym_iu4_source_symmetric: facts.sym_iu4_source_symmetric,
     })
 }
 
@@ -2152,6 +2292,11 @@ pub struct SingleDeviceLoad<'a> {
     /// self-tests (which charge their own diagnostic reserve inside the
     /// admission, never beside it).
     pub purpose: AdmissionPurpose,
+    /// The artifact's source-byte symmetry scan of EVERY routed trunk layer
+    /// (`artifact::routed_headers_symmetric`), run at most once and only when
+    /// [`SymIu4RouteFacts::scan_needed`] holds. A caller with no artifact bytes passes a scan
+    /// that answers `Ok(false)`: the route then stays on the layout.
+    pub routed_source_symmetric: &'a dyn Fn() -> Result<bool, String>,
 }
 
 /// The two-family weight arena plan of a single-device S1 load: the resident
@@ -2231,6 +2376,12 @@ pub fn single_device_facts_with_arenas<'a>(
     // The tile reserve once: its census total sizes the placement and its
     // runtime charge is the credit the S1 runtime budget supplements.
     let tile_reserve = single_device_reserve(load, purpose_tile_rows(load.purpose))?;
+    // Resolve the optional route before the final post-initialization memory sample.
+    let resolved = resolve_window_route_with_scan(
+        window_route_of(load.weights),
+        SymIu4RouteFacts::of_gpu(load.gpu),
+        || (load.routed_source_symmetric)(),
+    )?;
     // The device's own allocation granule (`crate::expert_residency::granule_slack`
     // documents the backing model), read once by the plan's factory.
     let granule_bytes = arenas.granule_bytes as u64;
@@ -2279,6 +2430,8 @@ pub fn single_device_facts_with_arenas<'a>(
         // The incumbent's own checkpoint cadence: the requested chunk resolved
         // once, exactly as the non-S1 load sizes and chunks with it.
         checkpoint_stride_rows: placement_chunk,
+        window_route: resolved.route,
+        sym_iu4_source_symmetric: resolved.source_symmetric,
     })
 }
 
@@ -2509,6 +2662,7 @@ mod tests {
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
             purpose: AdmissionPurpose::Product,
+            sym_iu4_source_symmetric: None,
         }
     }
 
@@ -3104,6 +3258,7 @@ mod tests {
             window_rows: S1_WINDOW_ROWS.min(J1778_MAX_SEQ),
             link_gbps: 7.09,
             purpose,
+            sym_iu4_source_symmetric: None,
         }
     }
 
@@ -3910,6 +4065,7 @@ mod tests {
                 window_rows: S1_WINDOW_ROWS,
                 link_gbps: 7.09,
                 purpose: AdmissionPurpose::Product,
+                sym_iu4_source_symmetric: None,
             };
             let (_, _, census) = census_of(&inputs).unwrap();
             // The supplement is exactly what the base lacks.
@@ -4042,6 +4198,7 @@ mod tests {
             window_rows: S1_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
             purpose: AdmissionPurpose::Product,
+            sym_iu4_source_symmetric: None,
         };
         let (pages, arena, census) = census_of(&inputs).unwrap();
         let s1_total = census.owned_total().unwrap();
@@ -4243,7 +4400,11 @@ mod tests {
         assert_eq!(window_route_of(&[]), WindowRoute::Aggregate);
 
         let config = crate::config::compact_test_config();
-        for route in [WindowRoute::SlabIu4, WindowRoute::Aggregate] {
+        for route in [
+            WindowRoute::SlabIu4,
+            WindowRoute::Aggregate,
+            WindowRoute::AggregateSymIu4,
+        ] {
             let geometry = ModelGeometry::from_config(&config, route).unwrap();
             assert_eq!(geometry.route, route);
             assert_eq!(route_dims(&geometry, 16384).route, route);
@@ -4288,6 +4449,18 @@ mod tests {
                             * hipfire_dispatch::pipeline::slowlink_prefill::K_TOP
                             * 4
                     );
+                    assert_eq!(layout.tail_ids_bytes(), 122_640);
+                    assert_eq!(
+                        layout.charged_bytes() as u64,
+                        route_storage_bytes(&geometry, 16384).unwrap()
+                            + a4_sidecar_bytes(&geometry, 16384).unwrap()
+                            + group_scatter_bytes(&geometry, 16384).unwrap()
+                    );
+                }
+                WindowRoute::AggregateSymIu4 => {
+                    // Both A4 sidecars, no window F16 input, the aggregate cohort bounds.
+                    assert_eq!(layout.a4_sidecar_bytes(), 82_575_360);
+                    assert_eq!(layout.x_f16_bytes(), 0);
                     assert_eq!(layout.tail_ids_bytes(), 122_640);
                     assert_eq!(
                         layout.charged_bytes() as u64,
@@ -6554,6 +6727,234 @@ mod tests {
             let payload_only = admit(&inputs(free_for(&inputs(0), 10))).unwrap();
             assert_eq!(payload_only.granule, GranuleCharge::default());
             assert_eq!(GranuleInputs::default().granule_bytes, 0);
+        }
+    }
+
+    // ── symmetric IU4 window route (default OFF) ─────────────────────────
+
+    #[test]
+    fn slowlink_admission_sym_iu4_route_resolution_truth_table() {
+        for layout in [WindowRoute::SlabIu4, WindowRoute::Aggregate] {
+            for descriptor in [false, true] {
+                for requested in [false, true] {
+                    for recipe in [false, true] {
+                        for source in [None, Some(false), Some(true)] {
+                            let facts = SymIu4RouteFacts {
+                                descriptor,
+                                requested,
+                                recipe_bf16_round_trip: recipe,
+                                source_symmetric: source,
+                            };
+                            let all = layout == WindowRoute::Aggregate
+                                && descriptor
+                                && requested
+                                && recipe;
+                            let expected = if all && source == Some(true) {
+                                WindowRoute::AggregateSymIu4
+                            } else {
+                                layout
+                            };
+                            let label = format!("{layout:?} {facts:?}");
+                            assert_eq!(resolve_window_route(layout, &facts), expected, "{label}");
+                            // The scan can change the verdict exactly when the layout and the
+                            // three device/recipe terms hold.
+                            assert_eq!(facts.scan_needed(layout), all, "{label}");
+                        }
+                    }
+                }
+            }
+        }
+        // Flag off (not requested) is the incumbent layout route whatever else holds.
+        let off = SymIu4RouteFacts {
+            descriptor: true,
+            requested: false,
+            recipe_bf16_round_trip: true,
+            source_symmetric: Some(true),
+        };
+        assert_eq!(
+            resolve_window_route(WindowRoute::Aggregate, &off),
+            WindowRoute::Aggregate
+        );
+    }
+
+    #[test]
+    fn slowlink_admission_sym_iu4_scan_runs_once_and_only_when_it_can_change_the_verdict() {
+        use std::cell::Cell;
+        let base = SymIu4RouteFacts {
+            descriptor: true,
+            requested: true,
+            recipe_bf16_round_trip: true,
+            source_symmetric: None,
+        };
+        let run = |layout, facts: SymIu4RouteFacts, answer: Result<bool, String>| {
+            let calls = Cell::new(0usize);
+            let out = resolve_window_route_with_scan(layout, facts, || {
+                calls.set(calls.get() + 1);
+                answer
+            });
+            (out, calls.get())
+        };
+        let resolved = |route, source_symmetric| Ok(ResolvedWindowRoute { route, source_symmetric });
+        let (sym, f16) = (WindowRoute::AggregateSymIu4, WindowRoute::Aggregate);
+        assert_eq!(run(f16, base, Ok(true)), (resolved(sym, Some(true)), 1));
+        assert_eq!(run(f16, base, Ok(false)), (resolved(f16, Some(false)), 1));
+        // No scan when it cannot change the verdict.
+        for facts in [
+            SymIu4RouteFacts { requested: false, ..base },
+            SymIu4RouteFacts { descriptor: false, ..base },
+            SymIu4RouteFacts { recipe_bf16_round_trip: false, ..base },
+        ] {
+            assert_eq!(run(f16, facts, Ok(true)), (resolved(f16, None), 0), "{facts:?}");
+        }
+        assert_eq!(
+            run(WindowRoute::SlabIu4, base, Ok(true)),
+            (resolved(WindowRoute::SlabIu4, None), 0)
+        );
+        // A verdict already known is never rescanned.
+        let known = SymIu4RouteFacts { source_symmetric: Some(true), ..base };
+        assert_eq!(run(f16, known, Ok(false)), (resolved(sym, Some(true)), 0));
+        // A scan error is the caller's decline, never a guess.
+        let (error, calls) = run(f16, base, Err("short payload".to_string()));
+        assert_eq!(error, Err("short payload".to_string()));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn slowlink_admission_sym_iu4_late_final_header_mismatch_is_a_load_error() {
+        let sym = WindowRoute::AggregateSymIu4;
+        assert_eq!(check_sym_iu4_final_headers(sym, 48, 48), Ok(()));
+        for (verified, total) in [(47usize, 48usize), (0, 48), (0, 0)] {
+            let error = check_sym_iu4_final_headers(sym, verified, total).unwrap_err();
+            assert!(error.contains(&format!("{verified}/{total}")), "{error}");
+            assert!(error.contains("before serving"), "{error}");
+            assert!(error.contains("aggregate-sym-iu4"), "{error}");
+        }
+        // Every other route has no IU4 coverage to meet (the F16 route keeps its asymmetric
+        // layers on the F16 arm).
+        for route in [WindowRoute::SlabIu4, WindowRoute::Aggregate] {
+            assert_eq!(check_sym_iu4_final_headers(route, 0, 48), Ok(()));
+        }
+    }
+
+    #[test]
+    fn slowlink_residency_sym_iu4_route_adapts_before_declining_on_a_base_miss() {
+        let sym_route = WindowRoute::AggregateSymIu4;
+        for purpose in [AdmissionPurpose::Product, AdmissionPurpose::PrimitiveSelftest] {
+            let f16_inputs = j1778_inputs(WindowRoute::Aggregate, purpose, J1778_PRELOAD_FREE);
+            let inputs = j1778_inputs(sym_route, purpose, J1778_PRELOAD_FREE);
+            let f16 = admit(&f16_inputs).unwrap();
+            let profile = admit(&inputs).unwrap();
+            let label = format!("{purpose:?}");
+            assert_eq!(profile.geometry.route, sym_route, "{label}");
+            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(profile.resident_layers, 10, "{label}");
+            // Both A4 sidecars (78.75 MiB at 16K) and no window F16 input or F16 slot map.
+            assert_eq!(profile.census.a4_sidecars, 82_575_360, "{label}");
+            assert_eq!(f16.census.a4_sidecars, 0, "{label}");
+            assert_eq!(
+                f16.census.route_storage - profile.census.route_storage,
+                83_886_080 + 2048 * 4,
+                "{label}"
+            );
+            // Every other owned term is the aggregate route's, byte for byte.
+            assert_eq!(profile.census.ring, f16.census.ring, "{label}");
+            assert_eq!(profile.census.lookahead, f16.census.lookahead, "{label}");
+            assert_eq!(profile.census.group_scatter, f16.census.group_scatter, "{label}");
+            assert_eq!(profile.census.arena, f16.census.arena, "{label}");
+            assert_eq!(profile.census.boundary_state, f16.census.boundary_state, "{label}");
+            // The census is the runtime layout's (what `plan_runtime` re-checks at attach).
+            let layout =
+                hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(
+                    &profile.route_dims(),
+                )
+                .unwrap();
+            assert_eq!(layout.total_bytes() as u64, profile.census.route_storage, "{label}");
+            assert_eq!(layout.a4_sidecar_bytes() as u64, profile.census.a4_sidecars, "{label}");
+            // Exact budget boundary: the slack in bytes less free still admits ten layers;
+            // one byte fewer keeps nine, and only a miss on the zero-layer base declines.
+            let slack = j1778_slack(&inputs, &profile, 10);
+            assert!(slack > 0, "{label}");
+            let edge = AdmissionInputs {
+                memory: AdmissionMemory::actual(
+                    J1778_PRELOAD_FREE - u64::try_from(slack).unwrap(),
+                ),
+                ..inputs
+            };
+            assert_eq!(admit(&edge).unwrap().resident_layers, 10, "{label}");
+            let below = AdmissionInputs {
+                memory: AdmissionMemory::actual(edge.memory.free_bytes - 1),
+                ..edge
+            };
+            let nine = admit(&below).unwrap();
+            assert_eq!(nine.resident_layers, 9, "{label}");
+            assert_eq!(nine.placement.preferred_deficit_bytes(), 1, "{label}");
+            let base_free = edge.memory.free_bytes - 10 * LAYER;
+            let base = AdmissionInputs {
+                memory: AdmissionMemory::actual(base_free),
+                ..inputs
+            };
+            assert_eq!(admit(&base).unwrap().resident_layers, 0, "{label}");
+            let miss = AdmissionInputs {
+                memory: AdmissionMemory::actual(base_free - 1),
+                ..base
+            };
+            assert!(matches!(admit(&miss), Err(SlowlinkDecline::Deficit(_))), "{label}");
+        }
+    }
+
+    #[test]
+    fn slowlink_admission_sym_iu4_route_dims_keep_the_aggregate_cohort_bounds() {
+        let config = crate::config::compact_test_config();
+        let dims = |route| {
+            route_dims(
+                &ModelGeometry::from_config(&config, route).unwrap(),
+                S1_WINDOW_ROWS,
+            )
+        };
+        let (f16, sym) = (dims(WindowRoute::Aggregate), dims(WindowRoute::AggregateSymIu4));
+        assert_eq!(sym.tail_rows, S1_AGGREGATE_TAIL_ROWS);
+        assert_eq!((sym.k1_rows, sym.tail_rows), (f16.k1_rows, f16.tail_rows));
+        assert_eq!(sym.route, WindowRoute::AggregateSymIu4);
+        // The pure classifier never answers the IU4 route: it is resolved, not declared.
+        assert_eq!(window_route_of(&[]), WindowRoute::Aggregate);
+    }
+
+    #[test]
+    fn slowlink_admission_sym_iu4_profile_log_names_only_the_opt_in_route() {
+        let purpose = AdmissionPurpose::Product;
+        let f16 = admit(&j1778_inputs(WindowRoute::Aggregate, purpose, J1778_PRELOAD_FREE))
+            .unwrap()
+            .describe();
+        let sym = admit(&j1778_inputs(
+            WindowRoute::AggregateSymIu4,
+            purpose,
+            J1778_PRELOAD_FREE,
+        ))
+        .unwrap()
+        .describe();
+        assert!(!f16.contains("window route"), "{f16}");
+        assert!(sym.ends_with(", window route aggregate-sym-iu4"), "{sym}");
+    }
+
+    #[test]
+    fn slowlink_admission_sym_iu4_flag_off_profile_is_the_f16_aggregate_profile() {
+        // `HIPFIRE_QWEN4_MOE_SYM_IU4` unset/0 (not requested) resolves the incumbent layout
+        // route whatever else holds, so every byte, placement and selection of the current S1
+        // Aggregate route is unchanged.
+        let off = SymIu4RouteFacts {
+            descriptor: true,
+            requested: false,
+            recipe_bf16_round_trip: true,
+            source_symmetric: Some(true),
+        };
+        let route = resolve_window_route(WindowRoute::Aggregate, &off);
+        assert_eq!(route, WindowRoute::Aggregate);
+        for purpose in [AdmissionPurpose::Product, AdmissionPurpose::PrimitiveSelftest] {
+            let resolved = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+            let incumbent = j1778_inputs(WindowRoute::Aggregate, purpose, J1778_PRELOAD_FREE);
+            assert_eq!(census_of(&resolved).unwrap().2, census_of(&incumbent).unwrap().2);
+            assert_eq!(admit(&resolved).unwrap(), admit(&incumbent).unwrap());
+            assert_eq!(census_of(&resolved).unwrap().2.a4_sidecars, 0);
         }
     }
 }

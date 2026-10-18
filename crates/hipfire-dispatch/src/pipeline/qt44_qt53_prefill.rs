@@ -1220,8 +1220,9 @@ fn shared_down_row_fold(
 /// Whether path 2 takes the symmetric IU4 arm (fn-moe-sym): the layer's
 /// experts were verified symmetric at load (the policy says so), the recipe
 /// keeps the BF16 boundaries the kernels implement, the activation is F32,
-/// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for
-/// gfx1151 and gfx1201; >= 512 rows, C2 producers). It replaces scatter,
+/// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4` through the arch's symmetric IU4
+/// descriptor: default on for gfx1151 and gfx1201, default OFF and explicit `=1` only on
+/// gfx1100; >= 512 rows, C2 producers). It replaces scatter,
 /// gate/up, unscatter/rotation and down; the combine reads its BF16 rows like
 /// the F16 WMMA arm's.
 fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
@@ -1985,7 +1986,7 @@ fn slab_gate_up(
         }
         return Ok(());
     }
-    let xq = hip(gpu.qwen4_moe_rotate256_i4_slab(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+    let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
     let host_mapped = experts_host_mapped(p);
     let gate_up_ptrs = p
         .expert_stage_ptrs
@@ -2102,7 +2103,7 @@ fn slab_down(
             p.batch_size,
         );
     }
-    let xq = hip(gpu.qwen4_moe_rotate128_i4_slab(
+    let xq = hip(gpu.qwen4_moe_rotate128_i4(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
         p.down_k,
@@ -2931,6 +2932,11 @@ pub(super) enum SlowlinkTile {
     /// route end to end: SwiGLU in the gate/up epilogue, BF16 grouped rows, the down's own
     /// unscatter + 128-wide rotation, the BF16-input combine ([`wmma_tile_route`]).
     AggregateWmma,
+    /// The same aggregate route on the symmetric IU4 arm ([`sym_iu4`]: the layer's experts
+    /// verified symmetric at load, the recipe, F32 activation and the device admitting it for
+    /// `>= 512` route rows): the window's K2 tile of an `AggregateSymIu4` window, run by the
+    /// grouped NT1 IU4 kernels over the window's A4 sidecars.
+    AggregateIu4,
     /// The same aggregate route below the WMMA row threshold: the incumbent's F32 grouped
     /// (or, up to `few_row_limit` rows, F32-grouped gate/up + indexed down) arm.  Run per
     /// expert binding by [`slowlink_f32_tail_panel`], through the incumbent's own stage
@@ -2947,9 +2953,10 @@ pub(super) enum SlowlinkTile {
 ///   `route_rows <= few_row_limit`), or
 /// * the aggregate stacked-expert QT44/QT53 route (no slab declaration; the declared capability
 ///   is `Qt44Qt53Grouped`/`Qt44Qt53GroupedSymmetric`, uniform dtypes, no per-expert tags) whose
-///   tile takes the F16 WMMA grouped arm ([`SlowlinkTile::AggregateWmma`]) or, below the WMMA row
-///   threshold, the F32 grouped arm ([`SlowlinkTile::AggregateF32Tail`]).  The symmetric IU4
-///   arm and path 1 have no panel lowering and are refused here.
+///   tile takes the F16 WMMA grouped arm ([`SlowlinkTile::AggregateWmma`]), the symmetric IU4
+///   arm ([`SlowlinkTile::AggregateIu4`]: exactly the incumbent's own [`sym_iu4`] predicate) or,
+///   below the WMMA row threshold, the F32 grouped arm ([`SlowlinkTile::AggregateF32Tail`]).
+///   Path 1 has no panel lowering and is refused here.
 ///
 /// `use_path2` is the call's own grouped-rows selection.  `Err` means the caller must stay on
 /// the incumbent route; nothing has been launched or written.
@@ -3015,8 +3022,12 @@ pub(super) fn slowlink_admission(
         if p.expert_dtype_tags.is_some() {
             return refuse("the aggregate layer carries per-expert dtype tags");
         }
+        // The incumbent's own predicate (layer policy `Qt44Qt53GroupedSymmetric`, BF16 recipe,
+        // F32 activation, `qwen4_moe_sym_iu4_applies(rows)`): such a tile is the K2 tile of
+        // an `AggregateSymIu4` window, and `PreparedChunkCall::new` refuses it inside any
+        // other window (an F16 window with an IU4-eligible layer bypasses to the incumbent).
         if sym_iu4(gpu, p, use_path2) {
-            return refuse("the symmetric IU4 arm of the aggregate route has no panel lowering");
+            return Ok(SlowlinkTile::AggregateIu4);
         }
         if wmma_tile_route(gpu, p, use_path2) {
             return Ok(SlowlinkTile::AggregateWmma);
