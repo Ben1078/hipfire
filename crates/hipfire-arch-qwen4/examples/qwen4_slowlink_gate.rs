@@ -482,14 +482,19 @@ fn checked_sum(parts: &[u64]) -> Option<u64> {
 /// The admitted profile's allocation-granule census, additive and separate
 /// from the sealed LOGICAL ledger. The census terms (seven owned, two budget)
 /// stay logical payload; the granule backing padding is reported per owner
-/// beside them and is never folded into a logical figure. `physical_*` are
-/// the logical bytes plus that padding, each counted once:
-/// `physical_owned = logical owned + S1 owner padding` and
-/// `physical_reserved = census total + (base + S1 owner) padding`, which must
-/// equal the profile's own `reserve_bytes()` (`profile_reserve_bytes`).
-/// Resident-layer padding is per admitted layer and reported on its own.
-/// Diagnostic evidence only: nothing here gates a verdict, and it is a
-/// source commitment, not a live allocation or an arena claim.
+/// beside them and is never folded into a logical figure. SCOPE: the physical
+/// figures are the S1 INCREMENT the profile charges beside the incumbent base
+/// reserve (the base reserve's payload is not in this profile), not the total
+/// model-owned bytes. `padding_s1 = fixed padding - base padding` (both from
+/// the profile's own public totals, so a future owner added to either side
+/// cannot vanish); the S1 terms listed are the fixed terms whose names are not
+/// base-reserve owners, and `terms_close` flags any difference between that
+/// list's sum and the derived total. `physical_owned_s1 = logical owned + S1
+/// padding` and `physical_reserved_s1 = census total + (base + S1) padding`,
+/// which must equal the profile's own `reserve_bytes()`. Resident-layer
+/// padding is per admitted layer and reported on its own. Diagnostic
+/// evidence only: nothing here gates a verdict, and it is a source
+/// commitment, not a live allocation or an arena claim.
 fn granule_evidence(
     census: &SlowlinkCensus,
     granule: &GranuleCharge,
@@ -501,13 +506,20 @@ fn granule_evidence(
     let budget = census.budget_terms();
     let base = granule.base.terms();
     let fixed = granule.terms();
-    let s1_padding = &fixed[base.len()..];
+    let s1_padding: Vec<(&'static str, u64)> = fixed
+        .iter()
+        .filter(|(name, _)| !base.iter().any(|(base_name, _)| base_name == name))
+        .copied()
+        .collect();
     let owned_total = census.owned_total().ok();
     let budget_total = checked_sum(&budget.map(|(_, bytes)| bytes));
     let logical_reserve = census.total().ok();
-    let s1_padding_total = checked_sum(&s1_padding.iter().map(|(_, b)| *b).collect::<Vec<_>>());
     let base_padding_total = granule.base.total().ok();
     let padding_total = granule.total().ok();
+    let s1_padding_total = padding_total
+        .zip(base_padding_total)
+        .and_then(|(fixed_total, base_total)| fixed_total.checked_sub(base_total));
+    let s1_terms_sum = checked_sum(&s1_padding.iter().map(|(_, b)| *b).collect::<Vec<_>>());
     let physical_owned = owned_total
         .zip(s1_padding_total)
         .and_then(|(logical, padding)| logical.checked_add(padding));
@@ -533,7 +545,9 @@ fn granule_evidence(
         },
         "backing_padding": {
             "s1_owner_bytes": s1_padding_total,
-            "s1_owner_terms": term_rows(s1_padding),
+            "s1_owner_terms": term_rows(&s1_padding),
+            "s1_owner_terms_sum_bytes": s1_terms_sum,
+            "terms_close": s1_padding_total.is_some() && s1_padding_total == s1_terms_sum,
             "base_reserve_bytes": base_padding_total,
             "base_reserve_terms": term_rows(&base),
             "fixed_total_bytes": padding_total,
@@ -542,8 +556,9 @@ fn granule_evidence(
             "resident_layers_bytes": layers_padding,
         },
         "physical": {
-            "owned_bytes": physical_owned,
-            "reserved_bytes": physical_reserved,
+            "scope": "S1 increment charged beside the incumbent base reserve; the base reserve's payload is not in this profile, so these are not total model-owned bytes",
+            "owned_s1_bytes": physical_owned,
+            "reserved_s1_bytes": physical_reserved,
             "profile_reserve_bytes": profile_reserve,
             "profile_reserve_error": profile_reserve_error,
             "reserve_consistent": physical_reserved.is_some()
@@ -3741,6 +3756,8 @@ mod slowlink_receipt_tests {
             expert_pages: 11,
             route_region: 22,
             hc_arena: 33,
+            window_scratch: 915_456,
+            boundary_stages: 55,
             layer: 44,
             ..GranuleCharge::default()
         };
@@ -3749,7 +3766,7 @@ mod slowlink_receipt_tests {
         let logical_owned = 1_000 + 2_000 + 3_000 + 4_000 + 5_000 + 6_000 + 7_000;
         let logical_reserve = logical_owned + 100 + 10;
         let s1_padding = granule.total().unwrap() - granule.base.total().unwrap();
-        assert!(s1_padding >= 11 + 22 + 33);
+        assert!(s1_padding >= 11 + 22 + 33 + 915_456 + 55);
         let reserve = logical_reserve + granule.total().unwrap();
         let evidence = granule_evidence(&census, &granule, 10, 12345, Ok(reserve));
         // Logical stays payload: the seven owned terms and two budget terms are
@@ -3761,10 +3778,24 @@ mod slowlink_receipt_tests {
         assert_eq!(evidence["logical_payload"]["budget_terms"].as_array().unwrap().len(), 2);
         // Physical is logical + padding, each once, and matches the profile's reserve.
         assert_eq!(evidence["allocation_granule_bytes"], json!(2u64 << 20));
-        assert_eq!(evidence["physical"]["owned_bytes"], json!(logical_owned + s1_padding));
-        assert_eq!(evidence["physical"]["reserved_bytes"], json!(reserve));
+        assert_eq!(evidence["physical"]["owned_s1_bytes"], json!(logical_owned + s1_padding));
+        assert_eq!(evidence["physical"]["reserved_s1_bytes"], json!(reserve));
         assert_eq!(evidence["physical"]["profile_reserve_bytes"], json!(reserve));
         assert_eq!(evidence["physical"]["reserve_consistent"], json!(true));
+        // The scope is the S1 increment, never total model-owned bytes.
+        assert!(evidence["physical"]["scope"].as_str().unwrap().contains("S1 increment"));
+        assert!(evidence["physical"].get("owned_bytes").is_none());
+        // Every S1 owner term (including window scratch) is listed by name and
+        // the list closes onto the derived total, so none can silently vanish.
+        let names: Vec<&str> = evidence["backing_padding"]["s1_owner_terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"window scratch") && names.contains(&"boundary stages"));
+        assert!(!names.contains(&"weight tensors"), "{names:?}");
+        assert_eq!(evidence["backing_padding"]["terms_close"], json!(true));
         // The padding terms sum to the fixed total once; the base owners are
         // reported apart from the S1 owners and the per-layer slack is not a fixed term.
         let padding = &evidence["backing_padding"];
@@ -3791,8 +3822,8 @@ mod slowlink_receipt_tests {
         // No granule model (payload-only accounting): padding is zero and physical == logical.
         let none = granule_evidence(&census, &GranuleCharge::default(), 10, 0, Ok(logical_reserve));
         assert_eq!(none["backing_padding"]["fixed_total_bytes"], json!(0));
-        assert_eq!(none["physical"]["owned_bytes"], json!(logical_owned));
-        assert_eq!(none["physical"]["reserved_bytes"], json!(logical_reserve));
+        assert_eq!(none["physical"]["owned_s1_bytes"], json!(logical_owned));
+        assert_eq!(none["physical"]["reserved_s1_bytes"], json!(logical_reserve));
         // The cache's device usage fields stay labelled payload, never physical backing.
         let usage = usage_value(&usage_literal(1, 0, 0, [0; 4]));
         assert!(usage["byte_units"].as_str().unwrap().starts_with("payload bytes"));
