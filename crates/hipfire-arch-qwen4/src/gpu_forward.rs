@@ -313,6 +313,36 @@ fn trunk_prefill_invariant_scope(prefill: bool, arch: &str, rdna_opt_in: bool) -
     prefill && (arch == "gfx942" || (arch == "gfx1151" && rdna_opt_in))
 }
 
+/// The canonical-routing scope flags `(pm_invariant, append)` of a forward of
+/// `rows` rows over explicit knob values (`HIPFIRE_QWEN4_APPEND_WMMA`, its
+/// `_MIN_ROWS`, `HIPFIRE_PREFILL_PM_INVARIANT`): the one pure decision
+/// [`Qwen4GpuForward`]'s forward and the placement census of the lazy F16
+/// weight shadows (`expert_residency::f16_shadow_route_rows`) both read, so
+/// the rows a shadow-creating route sees cannot drift from the census.
+pub(crate) fn qwen4_route_scope_flags(
+    prefill_scope: bool,
+    arch: &str,
+    rows: usize,
+    append_enabled: bool,
+    append_min_rows: usize,
+    pm_invariant_enabled: bool,
+) -> (bool, bool) {
+    let pm_invariant = trunk_prefill_invariant_scope(
+        prefill_scope,
+        arch,
+        arch == "gfx1151" && pm_invariant_enabled,
+    );
+    let append = rdna_compute::prefill_invariant::qwen4_append_wmma_route(
+        append_enabled,
+        prefill_scope,
+        arch,
+        rows,
+        append_min_rows,
+        pm_invariant,
+    );
+    (pm_invariant, append)
+}
+
 /// Rows the `FnSymGfx1201` plan sizes the F32 fallback MoE buffers for.  A
 /// larger MoE invocation that is not on the symmetric IU4 route has no buffer
 /// to run in; dispatch refuses it before its first launch.
@@ -8957,21 +8987,14 @@ impl Qwen4GpuForward {
     /// The routing/scope flags a forward of `rows` rows runs under, from
     /// whether the bundle's prefill entry set `prefill_scope`.
     fn route_scopes(prefill_scope: bool, gpu: &Gpu, rows: usize) -> (bool, bool) {
-        let pm_invariant = trunk_prefill_invariant_scope(
-            prefill_scope,
-            &gpu.arch,
-            gpu.arch == "gfx1151"
-                && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled(),
-        );
-        let append = rdna_compute::prefill_invariant::qwen4_append_wmma_route(
-            rdna_compute::prefill_invariant::qwen4_append_wmma_enabled(),
+        qwen4_route_scope_flags(
             prefill_scope,
             &gpu.arch,
             rows,
+            rdna_compute::prefill_invariant::qwen4_append_wmma_enabled(),
             rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows(),
-            pm_invariant,
-        );
-        (pm_invariant, append)
+            rdna_compute::prefill_invariant::prefill_pm_invariant_enabled(),
+        )
     }
 
     /// Exact HC-streams geometry of a `rows`-row mesh forward on `route`:

@@ -2840,6 +2840,8 @@ mod tests {
     /// (`AutoReserve.census.runtime`), so the same XTX input (base 0) still
     /// gets the full 1 GiB and a capable path never pays 1 GiB twice. No arch,
     /// card or host name is consulted.
+    /// SYNTHETIC census terms (base 0 plus a runtime credit), not the real
+    /// artifact; the real fixture's base lives in `j1778_reserve_at`.
     #[test]
     fn slowlink_residency_runtime_budget_supplements_the_base_runtime_without_double_counting() {
         use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
@@ -2913,6 +2915,8 @@ mod tests {
     /// opt-out: `slowlink == false`) resolves the byte-identical reserve it
     /// always did, whether the historical floor wins, the census wins, or the
     /// floor is retired; only an admitted S1 profile reads the census alone.
+    /// SYNTHETIC census (zero terms, not the real artifact): the policy is
+    /// arithmetic over the census it is given.
     #[test]
     fn slowlink_residency_non_s1_loads_keep_the_incumbent_reserve() {
         use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
@@ -2987,6 +2991,8 @@ mod tests {
     /// one structured JSON ledger (`--nocapture`). The legacy context is the
     /// discrete card's charge; the VMM 2 MiB row is conditional on the backend
     /// the load actually observes.
+    /// The `tile` section carries the corrected base census with the F16
+    /// weight shadow cold bound beside it; the S1 terms stay the layout's.
     #[test]
     fn slowlink_residency_hold1_ledger_for_the_real_mq4_fixture() {
         use crate::gpu_forward::Qwen4ForwardScratchMode::Full;
@@ -3078,6 +3084,15 @@ mod tests {
         .unwrap();
         assert_eq!(forward_census.total().unwrap(), forward);
         let safety = crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES;
+        // The corrected base census at this tile: the measured terms PLUS the F16
+        // weight shadow cold bound of the real artifact (the retired
+        // zero-shadow figure is never emitted as real-input truth).
+        let base = j1778_reserve_at(tile);
+        assert_eq!(base.census.f16_shadows, J1778_SHADOWS);
+        assert_eq!(
+            base.census.workspace.iter().map(|term| term.1).sum::<u64>(),
+            workspace_total
+        );
 
         let mut contexts = Vec::new();
         for (label, backend, granularity, conditional) in [
@@ -3135,6 +3150,9 @@ mod tests {
                     "input_only": forward_census.input_only,
                     "output_only": forward_census.output_only,
                 },
+                "f16_shadow_cold_bound_bytes": base.census.f16_shadows,
+                "base_census_bytes": base.census_total,
+                "base_census_bytes_without_shadows": base.census_total - base.census.f16_shadows,
                 "workspace_total_bytes": workspace_total,
                 "workspace_terms": workspace
                     .iter()

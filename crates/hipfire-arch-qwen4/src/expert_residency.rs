@@ -1359,10 +1359,10 @@ pub fn f16_shadow_bytes_scope(
 /// Largest `route_rows` ([`rdna_compute::Gpu::route_rows`]) any prefill
 /// forward of at most `chunk_rows` rows reaches on `arch`: the chunk itself,
 /// or the canonical prefill rows when the forward runs under the canonical
-/// routing scope (gfx1151's agent-turn append route for 48..511-row tiles
-/// and its opt-in batch-invariant profile, exactly
-/// `Qwen4Forward::route_scopes`). The F16 WMMA route and its lazy shadows are
-/// gated on THIS count, so the census must read it, not the raw chunk.
+/// routing scope, decided by the SAME pure helper the forward reads
+/// ([`crate::gpu_forward::qwen4_route_scope_flags`]). The F16 WMMA route and
+/// its lazy shadows are gated on THIS count, so the census must read it, not
+/// the raw chunk.
 pub fn f16_shadow_route_rows(arch: &str, chunk_rows: usize) -> usize {
     use rdna_compute::prefill_invariant as invariant;
     f16_shadow_route_rows_with(
@@ -1383,26 +1383,22 @@ pub fn f16_shadow_route_rows_with(
     chunk_rows: usize,
     append_enabled: bool,
     append_min_rows: usize,
-    pm_invariant_opt_in: bool,
+    pm_invariant_enabled: bool,
 ) -> usize {
-    use rdna_compute::prefill_invariant as invariant;
-    // The batch-invariant profile is gfx1151's opt-in; gfx942 pins it but has
-    // no WMMA capability to shadow.
-    let pm_invariant = arch == "gfx1151" && pm_invariant_opt_in;
-    // Some prefill forward of at most `chunk_rows` rows takes the append route
-    // iff its largest sub-512-row size does (`qwen4_append_wmma_route`).
-    let append_rows = chunk_rows.min(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1);
-    let scoped = pm_invariant
-        || invariant::qwen4_append_wmma_route(
-            append_enabled,
-            true,
-            arch,
-            append_rows,
-            append_min_rows,
-            false,
-        );
-    if scoped {
-        chunk_rows.max(invariant::QWEN4_PREFILL_CANON_ROWS)
+    // The batch-invariant flag does not depend on the row count, and the append
+    // route is open for rows in `append_min_rows..512`: some prefill forward of
+    // at most `chunk_rows` rows runs scoped iff the largest sub-512-row size does.
+    let probe_rows = chunk_rows.min(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1);
+    let (pm_invariant, append) = crate::gpu_forward::qwen4_route_scope_flags(
+        true,
+        arch,
+        probe_rows,
+        append_enabled,
+        append_min_rows,
+        pm_invariant_enabled,
+    );
+    if pm_invariant || append {
+        chunk_rows.max(rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS)
     } else {
         chunk_rows
     }
