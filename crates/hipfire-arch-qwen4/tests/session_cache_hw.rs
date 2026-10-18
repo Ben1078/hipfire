@@ -1331,8 +1331,9 @@ mod slowlink_receipt;
 
 /// S1 slow-link layer-major prefill: the session-cache chain and branch of
 /// `restored_prefill_matches_cold_on_flash_next`, with the loader's
-/// admission-first placement (the S1 profile's joint placement: at least ten
-/// resident layers, the rest host-mapped) and the route forced through the
+/// admission-first placement (the S1 profile's joint placement: the largest
+/// resident layer count that actually fits, ten preferred but never a floor,
+/// the rest host-mapped) and the route forced through the
 /// production switch
 /// (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`). Every cold and restored prefill must
 /// carry a valid S1 route receipt (a call of at most one tile may be an
@@ -1345,7 +1346,10 @@ mod slowlink_receipt;
 #[ignore = "needs a HIP GPU, a narrow-link host, HIPFIRE_SESSION_CACHE_MODEL and --features reference-parity"]
 fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
     use hipfire_arch_qwen4::state_parity::{slowlink_load_bundle, SlowlinkLoaded};
-    use slowlink_receipt::{validate, validate_forced_short, Expect, Limits, MAX_TILE_ROWS};
+    use slowlink_receipt::{
+        admission_actual, admission_witness, admission_witness_problems, validate,
+        validate_forced_short, Expect, Limits, MAX_TILE_ROWS,
+    };
 
     require_fabric_hold();
     match std::env::var("HIPFIRE_QWEN4_SLOWLINK_PREFILL") {
@@ -1360,6 +1364,7 @@ fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
         mut bundle,
         vocab,
         resident_layers,
+        num_layers,
         placement,
         slowlink_profile,
         ..
@@ -1372,9 +1377,23 @@ fn slowlink_restored_prefill_matches_cold_layer_major_on_flash_next() {
     )
     .expect("slowlink load");
     assert!(
-        slowlink_profile && resident_layers >= 10,
+        slowlink_profile,
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
     );
+    // No resident floor: the actual count must be a maximal-fits proof
+    // (selected fits, one more does not, a host layer remains).
+    {
+        let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
+        let witness = admission_witness(profile);
+        let bad = admission_witness_problems(
+            Some(&witness),
+            &admission_actual(Some(profile), resident_layers, num_layers),
+        );
+        assert!(
+            bad.is_empty(),
+            "the admission is not a maximal-fits proof: {bad:?}\nwitness: {witness}"
+        );
+    }
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let a = prompt(0xa, 3 * chunk + 300);

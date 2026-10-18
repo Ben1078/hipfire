@@ -6,9 +6,10 @@
 //!
 //! The `#[ignore]`d tests need a HIP GPU, a discrete narrow-link card and the
 //! canonical MQ4 Flash-Next artifact named by `HIPFIRE_SLOWLINK_HW_MODEL`.
-//! Placement is the loader's own: the S1 admission's joint placement (at
-//! least ten resident layers, the rest host-mapped); the tests refuse to run
-//! when the profile was not admitted.
+//! Placement is the loader's own: the S1 admission's joint placement (the
+//! largest resident layer count that actually fits, ten preferred but never a
+//! floor, the rest host-mapped); the tests refuse to run when the profile was
+//! not admitted or its scalar admission witness is not a maximal-fits proof.
 //! They force the route through the one production switch
 //! (`HIPFIRE_QWEN4_SLOWLINK_PREFILL=1`, set before the first config read) and
 //! run only inside a fabric hold with `--test-threads=1`:
@@ -126,13 +127,30 @@ fn load(purpose: Purpose) -> Hw {
         eos_token,
         slowlink_profile,
         resident_layers,
+        num_layers,
         placement,
         ..
     } = slowlink_load_bundle(&mut gpu, &model, MAX_SEQ, None, purpose).expect("load");
     assert!(
-        slowlink_profile && resident_layers >= MIN_RESIDENT_LAYERS as usize,
+        slowlink_profile,
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
     );
+    // No resident floor: the actual count must be the maximal count that fits
+    // (selected fits, one more does not, a host layer remains), judged from
+    // the scalar witness of the shared quote against the bundle's own counts.
+    {
+        let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
+        let witness = admission_witness(profile);
+        let bad = admission_witness_problems(
+            Some(&witness),
+            &admission_actual(Some(profile), resident_layers, num_layers),
+        );
+        assert!(
+            bad.is_empty(),
+            "the admission is not a maximal-fits proof: {bad:?}\nwitness: {witness}"
+        );
+        println!("S1 admission witness: {witness}");
+    }
     // The bundle's actual admitted profile must be this purpose's, at exactly
     // the tile the loader derives for it.
     let (admitted_purpose, tile) = {
@@ -434,4 +452,42 @@ fn slowlink_receipt_product_hardware_limits_name_the_admitted_purpose_tile() {
     }
     // The shape-agnostic default stays only for historical units.
     assert!(validate(Some(&receipt(1536)), Expect::LayerMajor, &Limits::default()).is_empty());
+}
+
+/// Adaptive residency has no resident floor: nine, zero and eleven resident
+/// layers close on the trunk and validate; ten is only the preferred count.
+#[test]
+fn slowlink_receipt_adaptive_resident_counts_validate_without_a_floor() {
+    let receipt = |resident: u64| {
+        let host = TRUNK_LAYERS - resident;
+        let bytes = host * COLD_BYTES_PER_HOST_LAYER;
+        json!({
+            "schema": RECEIPT_SCHEMA, "route": "layer-major", "selected_by": "env1", "bypass_reason": null,
+            "entry_pos": 0, "prompt_rows": 3400, "windows": [{"start": 0, "rows": 3400}], "launch_cuts": [],
+            "tile_rows": 768, "retained_scratch_rows": 768, "sweeps": 1,
+            "resident_layers": resident, "host_layers": host,
+            "host_expert_bytes_total": bytes, "submitted_bytes": bytes,
+            "useful_bytes": bytes / 2, "unused_prefetched_bytes": bytes / 2,
+            "reserve": {"tile": 1u64 << 30, "arena": 1u64 << 29, "ring": 167_772_160u64,
+                        "lookahead": 1_336_000_000u64, "tables": 1u64 << 20, "total": 4_000_000_000u64},
+            "spans_ms": {"wall": 1.0, "copy": 0.5, "compute": 0.5, "route_barrier": 0.0, "nonexpert": 0.1},
+            "overlap": {"cross_layer_intersections": 1, "cross_layer_overlap_ms": 1.0, "copy_idle_ms": 0.0,
+                        "page_full_stalls": 0, "copy_starved_stalls": 0},
+            "peak_vram_bytes": 1,
+        })
+    };
+    let limits = Limits {
+        expected_tile_rows: Some(768),
+        ..Limits::default()
+    };
+    for resident in [0u64, 9, 10, 11] {
+        let bad = validate(Some(&receipt(resident)), Expect::LayerMajor, &limits);
+        assert!(bad.is_empty(), "resident {resident}: {bad:?}");
+    }
+    // Counts that do not close on the trunk, and no host layer at all, fail.
+    let mut open = receipt(9);
+    open["host_layers"] = json!(38);
+    assert!(!validate(Some(&open), Expect::LayerMajor, &limits).is_empty());
+    assert!(!validate(Some(&receipt(TRUNK_LAYERS)), Expect::LayerMajor, &limits).is_empty());
+    assert_eq!(PREFERRED_RESIDENT_LAYERS, 10);
 }

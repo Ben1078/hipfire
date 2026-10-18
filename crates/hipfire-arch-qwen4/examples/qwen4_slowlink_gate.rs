@@ -199,11 +199,15 @@ fn admitted_from(
 /// read back from the loaded bundle's own profile (`None` stays `null`: a failed
 /// or declined load never reports an expected value as admitted). The primitive
 /// cell runs at the primitive purpose's tile and is kernel correctness only;
-/// every other cell is a product-shape claim at the product tile.
+/// every other cell is a product-shape claim at the product tile. `admission`
+/// is the actual placement's witness (`null` until a profile was admitted);
+/// the manifest's resident count is reference data and is never labelled
+/// observed.
 fn s1_profile_evidence(
     purpose: AdmissionPurpose,
     manifest: &Value,
     admitted: Option<(&str, u64)>,
+    admission: Option<&Value>,
 ) -> Value {
     let primitive = purpose == AdmissionPurpose::PrimitiveSelftest;
     json!({
@@ -213,6 +217,12 @@ fn s1_profile_evidence(
         "admitted_tile_rows": admitted.map(|a| a.1),
         "manifest_product_tile_rows": manifest_profile_tile(manifest, PROFILE_PRODUCT),
         "manifest_primitive_tile_rows": manifest_profile_tile(manifest, PROFILE_PRIMITIVE),
+        "manifest_resident_expert_layers_reference": {
+            "role": PROJECTION_ROLE_REFERENCE,
+            "product": manifest_profile_u64(manifest, PROFILE_PRODUCT, "resident_expert_layers"),
+            "primitive_selftest": manifest_profile_u64(manifest, PROFILE_PRIMITIVE, "resident_expert_layers"),
+        },
+        "admission": admission,
         "qualification": if primitive {
             "kernel correctness only, at the primitive purpose's tile; not a product-shape qualification"
         } else {
@@ -2660,7 +2670,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         // Expected only: nothing is admitted until a load succeeds.
         out.insert(
             "s1_profile".into(),
-            s1_profile_evidence(purpose, &manifest, None),
+            s1_profile_evidence(purpose, &manifest, None, None),
         );
         progress.record("profile", out["s1_profile"].clone());
         let mut fixture = fixture;
@@ -2700,15 +2710,39 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         );
         progress.record("load_end", out["load"].clone());
         // The placement the load actually made: a forced layer-major run needs
-        // the S1 admission's joint placement (>= 10 resident layers); the
+        // the S1 admission's joint placement, proved by the scalar witness of
+        // the shared quote (the largest count that fits, a host layer
+        // remaining; ten resident layers is PREFERRED, information only). The
         // incumbent arm must not carry a profile.
         let mut placement_problems = Vec::new();
         let profile_now = loaded.bundle.slowlink_profile();
         let admitted_tile = profile_now.map(|p| p.tile_rows as u64);
+        let admission = profile_now.map(admission_witness);
+        let weight_delta: Option<Result<i128, String>> = profile_now.map(|p| {
+            layer_payload_bytes(p)
+                .ok_or_else(|| "resident layer bytes are below the layer's backing slack".to_string())
+                .and_then(|payload| {
+                    reference_weight_delta(&manifest, profile, loaded.resident_layers as u64, payload)
+                })
+        });
+        let accounting = profile_now.map(|p| {
+            placement_accounting(
+                &manifest,
+                profile,
+                loaded.resident_layers as u64,
+                loaded.num_layers as u64,
+                layer_payload_bytes(p),
+            )
+        });
         // The same bundle profile feeds the evidence and the load.placement row.
         out.insert(
             "s1_profile".into(),
-            s1_profile_evidence(purpose, &manifest, admitted_from(profile_now)),
+            s1_profile_evidence(
+                purpose,
+                &manifest,
+                admitted_from(profile_now),
+                admission.as_ref(),
+            ),
         );
         progress.record("profile_admitted", out["s1_profile"].clone());
         match args.route {
@@ -2720,21 +2754,25 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                     ));
                 }
                 // The actual admitted profile against the sealed ledger of this
-                // cell's purpose: purpose, tile, window and resident layers.
+                // cell's purpose: purpose, tile and window. The sealed resident
+                // count is reference data and is not compared.
                 placement_problems.extend(profile_load_problems(
                     &manifest,
                     profile,
                     profile_now.map_or("none", |p| purpose_name(p.purpose)),
                     admitted_tile,
                     profile_now.map(|p| p.window_rows as u64),
-                    profile_now.map(|p| p.resident_layers as u64),
                 ));
-                if (loaded.resident_layers as u64) < MIN_RESIDENT_LAYERS {
-                    placement_problems.push(format!(
-                        "resident layers {} < {MIN_RESIDENT_LAYERS}",
-                        loaded.resident_layers
-                    ));
-                }
+                // No resident floor: the actual count must be maximal-fits.
+                placement_problems.extend(admission_witness_problems(
+                    admission.as_ref(),
+                    &AdmissionActual {
+                        resident_layers: Some(loaded.resident_layers as u64),
+                        trunk_layers: Some(loaded.num_layers as u64),
+                        snapshot_budget_bytes: profile_now
+                            .map(|p| p.device_snapshot_budget_bytes),
+                    },
+                ));
             }
             Expect::Incumbent => {
                 if loaded.slowlink_profile {
@@ -2757,6 +2795,10 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                    "admitted_purpose": admitted_from(profile_now).map(|a| a.0),
                    "admitted_tile_rows": admitted_tile,
                    "admitted_device_snapshot_budget_bytes": profile_now.map(|p| p.device_snapshot_budget_bytes),
+                   "admission": admission,
+                   "preferred_resident_layers": PREFERRED_RESIDENT_LAYERS,
+                   "preferred_note": "ten resident layers is PREFERRED, information only: the count is the largest that fits, proven by the admission witness",
+                   "placement_accounting": accounting,
                    "granule_census": profile_now.map_or(Value::Null, profile_granule_evidence),
                    "arena_census": arena_census,
                    "pressure_host_policy": usage_json(loaded.bundle.session_cache())["pressure_host_policy"].clone()}),
@@ -2848,7 +2890,12 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                 "memory_observations".into(),
                 memory_diagnostic(
                     &samples,
-                    memory_ledger(&manifest, purpose_name(load_purpose(args.mode))),
+                    memory_ledger(&manifest, purpose_name(load_purpose(args.mode)))
+                        .and_then(|ledger| match &weight_delta {
+                            Some(Ok(delta)) => ledger.at_actual_placement(*delta),
+                            Some(Err(error)) => Err(error.clone()),
+                            None => Ok(ledger),
+                        }),
                 ),
             );
         } else {
@@ -3260,6 +3307,8 @@ mod slowlink_receipt_tests {
     #[test]
     fn slowlink_receipt_residency_tile_scratch_and_cold_bytes_are_enforced() {
         for (key, value) in [
+            // The counts must close on the trunk: 9 resident + 38 host, or 10
+            // resident + 39 host, is not a placement of the 48 layers.
             ("resident_layers", json!(9)),
             ("host_layers", json!(39)),
             ("tile_rows", json!(8192)),
@@ -3276,6 +3325,46 @@ mod slowlink_receipt_tests {
         let mut r = receipt();
         r["useful_bytes"] = json!(51_000_000_000u64);
         assert!(!problems(&r).is_empty(), "useful above submitted");
+    }
+
+    /// A layer-major receipt of `resident` resident layers on the 48-layer
+    /// trunk: the host layers carry the per-layer bound's bytes.
+    fn adaptive_receipt(resident: u64) -> Value {
+        let host = TRUNK_LAYERS - resident;
+        let bytes = host * COLD_BYTES_PER_HOST_LAYER;
+        let mut r = receipt();
+        r["resident_layers"] = json!(resident);
+        r["host_layers"] = json!(host);
+        r["host_expert_bytes_total"] = json!(bytes);
+        r["submitted_bytes"] = json!(bytes);
+        r["useful_bytes"] = json!(bytes / 2);
+        r["unused_prefetched_bytes"] = json!(bytes / 2);
+        r
+    }
+
+    #[test]
+    fn slowlink_receipt_has_no_resident_floor_nor_host_layer_cap() {
+        // Nine (fewer than the preferred ten), ten, eleven, zero and one host
+        // layer all pass when the counts close on the trunk; ten is data.
+        assert_eq!(PREFERRED_RESIDENT_LAYERS, 10);
+        for resident in [0u64, 1, 9, 10, 11, 40, 47] {
+            let r = adaptive_receipt(resident);
+            let bad = problems(&r);
+            assert!(bad.is_empty(), "resident {resident}: {bad:?}");
+        }
+        // All layers resident leaves nothing to stream: not a layer-major claim.
+        let all = adaptive_receipt(TRUNK_LAYERS);
+        assert!(problems(&all).iter().any(|m| m.contains("host_layers 0")));
+        // The per-host-layer byte bound scales with the actual host layers.
+        let mut r = adaptive_receipt(9);
+        let bound = 39 * COLD_BYTES_PER_HOST_LAYER;
+        r["host_expert_bytes_total"] = json!(bound + 1);
+        r["submitted_bytes"] = json!(bound + 1);
+        assert!(problems(&r).iter().any(|m| m.contains("host layer(s)")));
+        // Counts that do not close on the trunk are an accounting error at any N.
+        let mut r = adaptive_receipt(9);
+        r["host_layers"] = json!(38);
+        assert!(problems(&r).iter().any(|m| m.contains("trunk layers")));
     }
 
     #[test]
@@ -3343,6 +3432,7 @@ mod slowlink_receipt_tests {
         let core = weights + census + extras;
         json!({
             "purpose": purpose, "tile_rows": tile, "resident_expert_layers": 10,
+            "projection_role": "reference",
             "window_rows": 16384, "page_count": 18,
             "device_weights_bytes": weights,
             "s1_tile_census_bytes": census,
@@ -5724,8 +5814,28 @@ mod slowlink_receipt_tests {
         let mut core = manifest();
         core["memory_ledger"]["profiles"]["product"]["device_core_bytes"] = json!(GIB);
         assert!(!profile_shape_problems(&core).is_empty());
+        // The sealed resident count is reference data: zero, nine or eleven
+        // are all valid counts, one that leaves no host layer is not.
+        for reference in [0u64, 9, 11] {
+            let mut ok = manifest();
+            ok["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] =
+                json!(reference);
+            assert!(profile_shape_problems(&ok).is_empty(), "reference {reference}");
+        }
+        let mut all_resident = manifest();
+        all_resident["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] =
+            json!(TRUNK_LAYERS);
+        assert!(!profile_shape_problems(&all_resident).is_empty());
+        let mut unlabelled = manifest();
+        unlabelled["memory_ledger"]["profiles"]["product"]["projection_role"] = json!("observed");
+        assert!(profile_shape_problems(&unlabelled)
+            .iter()
+            .any(|p| p.contains("reference data")));
         let mut few = manifest();
-        few["memory_ledger"]["profiles"]["product"]["resident_expert_layers"] = json!(9);
+        few["memory_ledger"]["profiles"]["product"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projection_role");
         assert!(!profile_shape_problems(&few).is_empty());
         let mut window = manifest();
         window["memory_ledger"]["profiles"]["product"]["window_rows"] = json!(8192);
@@ -5848,14 +5958,7 @@ mod slowlink_receipt_tests {
     #[test]
     fn slowlink_receipt_actual_admitted_profile_must_match_the_sealed_profile() {
         let m = manifest();
-        let ok = profile_load_problems(
-            &m,
-            PROFILE_PRODUCT,
-            "product",
-            Some(768),
-            Some(16384),
-            Some(10),
-        );
+        let ok = profile_load_problems(&m, PROFILE_PRODUCT, "product", Some(768), Some(16384));
         assert!(ok.is_empty(), "{ok:?}");
         let ok = profile_load_problems(
             &m,
@@ -5863,24 +5966,20 @@ mod slowlink_receipt_tests {
             "primitive_selftest",
             Some(512),
             Some(16384),
-            Some(10),
         );
         assert!(ok.is_empty(), "{ok:?}");
         // A product cell whose bundle admitted the primitive profile, another
-        // tile, another window, other resident layers or no profile at all fails.
-        for (purpose, tile, window, resident) in [
-            ("primitive_selftest", Some(768), Some(16384), Some(10)),
-            ("product", Some(512), Some(16384), Some(10)),
-            ("product", Some(1536), Some(16384), Some(10)),
-            ("product", Some(768), Some(8192), Some(10)),
-            ("product", Some(768), Some(16384), Some(11)),
-            ("product", None, None, None),
+        // tile, another window or no profile at all fails. The resident count
+        // is not compared: the sealed count is reference data.
+        for (purpose, tile, window) in [
+            ("primitive_selftest", Some(768), Some(16384)),
+            ("product", Some(512), Some(16384)),
+            ("product", Some(1536), Some(16384)),
+            ("product", Some(768), Some(8192)),
+            ("product", None, None),
         ] {
-            let bad = profile_load_problems(&m, PROFILE_PRODUCT, purpose, tile, window, resident);
-            assert!(
-                !bad.is_empty(),
-                "{purpose} {tile:?} {window:?} {resident:?}"
-            );
+            let bad = profile_load_problems(&m, PROFILE_PRODUCT, purpose, tile, window);
+            assert!(!bad.is_empty(), "{purpose} {tile:?} {window:?}");
         }
     }
 
@@ -5889,16 +5988,17 @@ mod slowlink_receipt_tests {
         let m = manifest();
         // Before a successful load nothing is admitted: expected values are
         // never reported as admitted.
-        let primitive = s1_profile_evidence(AdmissionPurpose::PrimitiveSelftest, &m, None);
+        let primitive = s1_profile_evidence(AdmissionPurpose::PrimitiveSelftest, &m, None, None);
         assert_eq!(primitive["expected_purpose"], "primitive_selftest");
         assert_eq!(primitive["expected_tile_rows"], 512);
         assert!(primitive["admitted_purpose"].is_null());
         assert!(primitive["admitted_tile_rows"].is_null());
+        assert!(primitive["admission"].is_null());
         assert!(primitive["qualification"]
             .as_str()
             .unwrap()
             .contains("not a product-shape"));
-        let product = s1_profile_evidence(AdmissionPurpose::Product, &m, None);
+        let product = s1_profile_evidence(AdmissionPurpose::Product, &m, None, None);
         assert_eq!(product["expected_purpose"], "product");
         assert_eq!(product["expected_tile_rows"], 768);
         assert!(product["admitted_purpose"].is_null());
@@ -5908,19 +6008,290 @@ mod slowlink_receipt_tests {
             .as_str()
             .unwrap()
             .contains("product-shape claim"));
+        // The manifest's resident count is labelled reference, never observed.
+        let reference = &product["manifest_resident_expert_layers_reference"];
+        assert_eq!(reference["role"], "reference");
+        assert_eq!(reference["product"], 10);
         // After a load the admitted values are the bundle's own, whatever was
         // expected (a mismatch is visible, not papered over).
         let admitted = s1_profile_evidence(
             AdmissionPurpose::Product,
             &m,
             Some(("primitive_selftest", 512)),
+            None,
         );
         assert_eq!(admitted["expected_purpose"], "product");
         assert_eq!(admitted["admitted_purpose"], "primitive_selftest");
         assert_eq!(admitted["admitted_tile_rows"], 512);
-        let ok = s1_profile_evidence(AdmissionPurpose::Product, &m, Some(("product", 768)));
+        let witness = admission_witness_json(&quote(POST_INIT, Some(PRE_INIT), 9));
+        let ok = s1_profile_evidence(
+            AdmissionPurpose::Product,
+            &m,
+            Some(("product", 768)),
+            Some(&witness),
+        );
         assert_eq!(ok["admitted_purpose"], "product");
         assert_eq!(ok["admitted_tile_rows"], 768);
+        assert_eq!(ok["admission"], witness);
+    }
+
+    // ── adaptive admission witness ───────────────────────────────────────
+    //
+    // SYNTHETIC accounting fixture: the two free samples are the j1811
+    // progress samples (before initialization / after it); the layer cost,
+    // non-expert bytes and joint reserve are round numbers chosen so that
+    // nine resident layers is the maximal count at the post-initialization
+    // sample and ten at the reference sample. It is test data for the
+    // validator, not the real model's quote (that is the shared Rust emit).
+
+    const PRE_INIT: u64 = 25_713_180_672;
+    const POST_INIT: u64 = 25_560_088_576;
+    const LAYER_COST: u64 = 1_342_177_280;
+    const NON_EXPERT: u64 = 8_589_934_592;
+    const JOINT_RESERVE: u64 = 3_598_381_184;
+
+    fn base_needed(n: u64) -> u128 {
+        NON_EXPERT as u128 + n as u128 * LAYER_COST as u128 + JOINT_RESERVE as u128
+    }
+
+    fn quote(free: u64, before: Option<u64>, n: u64) -> AdmissionScalars {
+        let needed = base_needed(n);
+        AdmissionScalars {
+            free_before_initialization: before,
+            free_at_admission: free,
+            observed_initialization: before.map(|b| b.saturating_sub(free)),
+            non_expert: NON_EXPERT,
+            resident_layer: LAYER_COST,
+            joint_reserve: JOINT_RESERVE,
+            trunk_layers: 48,
+            resident_layers: n,
+            needed,
+            slack: free as i128 - needed as i128,
+            preferred_deficit: u64::try_from(base_needed(10).saturating_sub(free as u128)).unwrap(),
+        }
+    }
+
+    fn actual_of(s: &AdmissionScalars) -> AdmissionActual {
+        AdmissionActual {
+            resident_layers: Some(s.resident_layers),
+            trunk_layers: Some(48),
+            snapshot_budget_bytes: u64::try_from(s.slack).ok(),
+        }
+    }
+
+    fn judged(s: &AdmissionScalars) -> Vec<String> {
+        admission_witness_problems(Some(&admission_witness_json(s)), &actual_of(s))
+    }
+
+    fn tampered(s: &AdmissionScalars, key: &str, edit: impl FnOnce(&mut Value)) -> Vec<String> {
+        let mut w = admission_witness_json(s);
+        edit(&mut w[key]);
+        admission_witness_problems(Some(&w), &actual_of(s))
+    }
+
+    fn base_free(n: u64, extra: u64) -> u64 {
+        u64::try_from(base_needed(n)).unwrap() + extra
+    }
+
+    #[test]
+    fn slowlink_receipt_adaptive_admission_accepts_the_maximal_count_at_n9_n10_and_n0() {
+        // N9 at the fresh post-initialization sample: the measured interval
+        // loss is explicit, ten is preferred (a 50,000,000 B deficit is
+        // information, not a rejection) and nine is maximal.
+        let n9 = quote(POST_INIT, Some(PRE_INIT), 9);
+        assert_eq!(n9.observed_initialization, Some(153_092_096));
+        assert_eq!(n9.preferred_deficit, 50_000_000);
+        assert_eq!(judged(&n9), Vec::<String>::new());
+        let w = admission_witness_json(&n9);
+        assert_eq!(w["memory_basis"], "post_initialization_actual");
+        assert_eq!(w["initialization_charged_via_free"], true);
+        assert_eq!(w["preferred_resident_layers"], 10);
+        assert_eq!(w["resident_layers"], 9);
+        assert_eq!(w["free_at_admission_bytes"], POST_INIT);
+        assert_eq!(w["free_before_initialization_bytes"], PRE_INIT);
+        // N10 at the reference sample (no initialization loss).
+        let n10 = quote(PRE_INIT, Some(PRE_INIT), 10);
+        assert_eq!(n10.preferred_deficit, 0);
+        assert_eq!(n10.observed_initialization, Some(0));
+        assert_eq!(judged(&n10), Vec::<String>::new());
+        // N0 is a valid count when the base fits and host layers remain.
+        let n0 = quote(base_free(0, 100), None, 0);
+        assert_eq!(n0.slack, 100);
+        assert_eq!(judged(&n0), Vec::<String>::new());
+        // Exact and one-byte boundaries at 9: exact fit keeps 9; one byte
+        // short of the next layer stays 9; the next layer's exact cost is 10.
+        for (extra, n) in [
+            (0u64, 9u64),
+            (LAYER_COST - 1, 9),
+            (LAYER_COST, 10),
+            (LAYER_COST + 1, 10),
+        ] {
+            let s = quote(base_free(9, extra), None, n);
+            assert_eq!(judged(&s), Vec::<String>::new(), "extra {extra} n {n}");
+        }
+        // A larger count than ten is data too, when the actual free supports it.
+        assert_eq!(
+            judged(&quote(base_free(11, 5), None, 11)),
+            Vec::<String>::new()
+        );
+        // A fresh free above the earlier sample invents no positive loss:
+        // the observed interval is 0 (or absent); a positive one is forged.
+        let gained = quote(PRE_INIT, Some(POST_INIT), 10);
+        assert_eq!(gained.observed_initialization, Some(0));
+        assert_eq!(judged(&gained), Vec::<String>::new());
+        let mut absent = gained;
+        absent.observed_initialization = None;
+        assert_eq!(judged(&absent), Vec::<String>::new());
+        let mut invented = gained;
+        invented.observed_initialization = Some(1);
+        assert!(!judged(&invented).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_adaptive_admission_refuses_nonmaximal_oversubscribed_and_all_resident() {
+        // Nine claimed where ten also fits: not maximal.
+        let nonmax = quote(base_free(9, LAYER_COST), None, 9);
+        assert!(judged(&nonmax).iter().any(|m| m.contains("not maximal")));
+        assert!(judged(&quote(base_free(0, LAYER_COST), None, 0))
+            .iter()
+            .any(|m| m.contains("not maximal")));
+        // Ten claimed at the post-initialization sample: oversubscribed.
+        let over = quote(POST_INIT, Some(PRE_INIT), 10);
+        assert!(over.slack < 0);
+        assert!(judged(&over).iter().any(|m| m.contains("oversubscribed")));
+        // The base does not fit: no count, not even zero, is a valid fit.
+        let no_base = quote(base_free(0, 0) - 1, None, 0);
+        assert_eq!(no_base.slack, -1);
+        assert!(judged(&no_base).iter().any(|m| m.contains("oversubscribed")));
+        // Every layer resident leaves no host layer: an S1 profile is not claimed.
+        let all = quote(base_free(48, 5), None, 48);
+        assert!(judged(&all).iter().any(|m| m.contains("no host layer")));
+        // The bundle's own counts and the snapshot allowance must be the
+        // witness's.
+        let n9 = quote(POST_INIT, Some(PRE_INIT), 9);
+        let w = admission_witness_json(&n9);
+        let slack = u64::try_from(n9.slack).unwrap();
+        for actual in [
+            AdmissionActual { resident_layers: Some(10), ..actual_of(&n9) },
+            AdmissionActual { resident_layers: None, ..actual_of(&n9) },
+            AdmissionActual { trunk_layers: Some(47), ..actual_of(&n9) },
+            AdmissionActual { trunk_layers: None, ..actual_of(&n9) },
+            AdmissionActual { snapshot_budget_bytes: Some(slack + 1), ..actual_of(&n9) },
+            AdmissionActual { snapshot_budget_bytes: None, ..actual_of(&n9) },
+        ] {
+            assert!(
+                !admission_witness_problems(Some(&w), &actual).is_empty(),
+                "{actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slowlink_receipt_adaptive_admission_refuses_missing_and_tampered_witnesses() {
+        assert!(!admission_witness_problems(None, &AdmissionActual::default()).is_empty());
+        assert!(
+            !admission_witness_problems(Some(&Value::Null), &AdmissionActual::default()).is_empty()
+        );
+        assert!(!admission_witness_problems(Some(&json!([])), &AdmissionActual::default())
+            .is_empty());
+        let n9 = quote(POST_INIT, Some(PRE_INIT), 9);
+        let w = admission_witness_json(&n9);
+        let keys: Vec<String> = w.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), 14, "{keys:?}");
+        for key in &keys {
+            let mut missing = w.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                !admission_witness_problems(Some(&missing), &actual_of(&n9)).is_empty(),
+                "removing {key} must fail"
+            );
+            assert!(
+                !tampered(&n9, key, |v| *v = Value::Null).is_empty(),
+                "nulling {key} must fail"
+            );
+        }
+        // Every integer forged one byte (layer) either way is caught by the
+        // independent recomputation.
+        for key in [
+            "free_at_admission_bytes",
+            "non_expert_bytes",
+            "resident_layer_bytes",
+            "joint_reserve_bytes",
+            "trunk_layers",
+            "resident_layers",
+            "preferred_resident_layers",
+            "needed_bytes",
+            "slack_bytes",
+            "preferred_deficit_bytes",
+        ] {
+            for step in [1i64, -1] {
+                let bad = tampered(&n9, key, |v| {
+                    let n = v.as_i64().unwrap();
+                    *v = json!(n + step);
+                });
+                assert!(!bad.is_empty(), "{key} {step:+} must fail");
+            }
+        }
+        // A forged zero preferred deficit, a forged positive initialization
+        // loss and a forged fresh-free basis all fail.
+        assert!(!tampered(&n9, "preferred_deficit_bytes", |v| *v = json!(0)).is_empty());
+        assert!(!tampered(&n9, "observed_initialization_bytes", |v| *v = json!(0)).is_empty());
+        assert!(!tampered(&n9, "free_before_initialization_bytes", |v| *v = json!(PRE_INIT + 1))
+            .is_empty());
+        assert!(!tampered(&n9, "memory_basis", |v| *v = json!("pre_load")).is_empty());
+        assert!(!tampered(&n9, "initialization_charged_via_free", |v| *v = json!(false)).is_empty());
+        assert!(!tampered(&n9, "initialization_charged_via_free", |v| *v = json!("true")).is_empty());
+        // A witness that claims N10 against a nine-layer quote's free fails.
+        let mut forged = admission_witness_json(&n9);
+        forged["resident_layers"] = json!(10);
+        forged["needed_bytes"] = json!(u64::try_from(base_needed(10)).unwrap());
+        forged["slack_bytes"] = json!(0);
+        assert!(!admission_witness_problems(Some(&forged), &actual_of(&n9)).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_manifest_reference_count_never_masquerades_as_the_actual_placement() {
+        let m = manifest();
+        assert_eq!(manifest_profile_u64(&m, PROFILE_PRODUCT, "resident_expert_layers"), Some(10));
+        // An actual nine-layer admission is valid against a ten-layer reference.
+        assert!(
+            profile_load_problems(&m, PROFILE_PRODUCT, "product", Some(768), Some(16384))
+                .is_empty()
+        );
+        let payload = LAYER_COST - 4096;
+        let acc = placement_accounting(&m, PROFILE_PRODUCT, 9, 48, Some(payload));
+        assert_eq!(acc["reference"]["role"], "reference");
+        assert_eq!(acc["reference"]["resident_expert_layers"], 10);
+        assert_eq!(acc["actual"]["resident_layers"], 9);
+        assert_eq!(acc["actual"]["host_layers"], 39);
+        assert_eq!(acc["actual"]["weights_delta_vs_reference_bytes"], -(payload as i64));
+        assert_eq!(acc["actual"]["device_weights_bytes"], 20 * GIB - payload);
+        let ref_owned = manifest_profile_u64(&m, PROFILE_PRODUCT, "device_owned_bytes").unwrap();
+        assert_eq!(acc["actual"]["device_owned_bytes"], ref_owned - payload);
+        assert!(acc["actual"]["error"].is_null());
+        assert_eq!(acc["reference"]["device_weights_bytes"], 20 * GIB);
+        // Equal counts move nothing; a larger actual count moves up.
+        let same = placement_accounting(&m, PROFILE_PRODUCT, 10, 48, Some(payload));
+        assert_eq!(same["actual"]["device_weights_bytes"], 20 * GIB);
+        let up = placement_accounting(&m, PROFILE_PRODUCT, 11, 48, Some(payload));
+        assert_eq!(up["actual"]["device_weights_bytes"], 20 * GIB + payload);
+        // An unknown layer payload invents no number.
+        let unknown = placement_accounting(&m, PROFILE_PRODUCT, 9, 48, None);
+        assert!(unknown["actual"]["device_weights_bytes"].is_null());
+        assert!(unknown["actual"]["error"].is_string());
+        // The memory ledger moves to the actual placement and still sums.
+        let mut with_root = manifest();
+        with_root["memory_ledger"]["census_basis"] = json!("basis");
+        with_root["memory_ledger"]["owned_host_bytes"] = json!(80 * GIB);
+        let ledger = memory_ledger(&with_root, PROFILE_PRIMITIVE).unwrap();
+        let moved = ledger.at_actual_placement(-(payload as i128)).unwrap();
+        assert_eq!(moved.owned_device_bytes, ledger.owned_device_bytes - payload);
+        assert_eq!(moved.decomposition.weights, ledger.decomposition.weights - payload);
+        assert_eq!(moved.decomposition.committed_sum(), Some(moved.owned_device_bytes));
+        assert!(moved.census_basis.contains("ACTUAL"));
+        assert!(ledger
+            .at_actual_placement(-(ledger.owned_device_bytes as i128) - 1)
+            .is_err());
     }
 
     fn temp_args(dir: &Path, mode: &str, route: &str) -> Args {
@@ -5966,7 +6337,12 @@ mod slowlink_receipt_tests {
             let mut evidence = serde_json::Map::new();
             evidence.insert(
                 "s1_profile".into(),
-                s1_profile_evidence(purpose, &manifest(), Some((purpose_name(purpose), tile))),
+                s1_profile_evidence(
+                    purpose,
+                    &manifest(),
+                    Some((purpose_name(purpose), tile)),
+                    None,
+                ),
             );
             let (status, bytes) = final_report(&args, &checks, &evidence, &log).unwrap();
             assert_eq!(status, "pass");
@@ -6005,7 +6381,7 @@ mod slowlink_receipt_tests {
         let mut evidence = serde_json::Map::new();
         evidence.insert(
             "s1_profile".into(),
-            s1_profile_evidence(AdmissionPurpose::Product, &manifest(), None),
+            s1_profile_evidence(AdmissionPurpose::Product, &manifest(), None, None),
         );
         let (status, bytes) = final_report(&args, &checks, &evidence, &log).unwrap();
         assert_eq!(status, "incomplete");

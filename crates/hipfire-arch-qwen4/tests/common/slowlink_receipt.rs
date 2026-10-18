@@ -19,13 +19,20 @@ use serde_json::{json, Value};
 pub const RECEIPT_SCHEMA: &str = "hipfire.qwen4.slowlink_receipt.v1";
 pub const FIXTURE_SCHEMA: &str = "hipfire.qwen4.slowlink_fixture.v1";
 
-/// Main's rulings: at least ten resident layers, at most 38 host layers, a
-/// mixer tile of at most 1,536 rows, one payload sweep per window.
-pub const MIN_RESIDENT_LAYERS: u64 = 10;
-pub const MAX_HOST_LAYERS: u64 = 38;
+/// Main's rulings: a mixer tile of at most 1,536 rows, one payload sweep per
+/// window. Residency is ADAPTIVE: the loader keeps the largest number of
+/// resident layers that actually fits beside the 512 MiB safety margin and the
+/// 1 GiB runtime budget. There is no resident-layer floor and no host-layer
+/// cap; ten resident layers is only the PREFERRED count (information, never a
+/// gate) and the maximal-fits proof is [`admission_witness_problems`].
+pub const PREFERRED_RESIDENT_LAYERS: u64 = 10;
+/// Trunk layers of the MQ4 fixture model: model data used to tie
+/// `resident_layers + host_layers`, not a placement rule.
+pub const TRUNK_LAYERS: u64 = 48;
 pub const MAX_TILE_ROWS: u64 = 1536;
-/// 10 resident / 38 host layers of the MQ4 fixture, expert payload bytes.
-pub const COLD_BYTES_LIMIT: u64 = 50_803_507_200;
+/// Upper bound of the expert payload bytes one host layer of the MQ4 fixture
+/// holds (50,803,507,200 B over 38 host layers when ten stay resident).
+pub const COLD_BYTES_PER_HOST_LAYER: u64 = 1_336_934_400;
 /// Two 32-expert slots plus one 512-expert lookahead store of MQ4 payload
 /// (~1.401 GiB); the 159 MiB ring alone is not the charged reserve.
 pub const MIN_RING_LOOKAHEAD_BYTES: u64 = 1_503_238_553;
@@ -62,10 +69,13 @@ impl Expect {
 
 #[derive(Clone, Debug)]
 pub struct Limits {
-    pub min_resident_layers: u64,
-    pub max_host_layers: u64,
+    /// Trunk layers: a layer-major receipt must report
+    /// `resident_layers + host_layers == trunk_layers` with at least one host
+    /// layer. Model data, never a resident floor.
+    pub trunk_layers: u64,
     pub max_tile_rows: u64,
-    pub cold_bytes_limit: u64,
+    /// Upper bound of expert payload bytes per host layer.
+    pub cold_bytes_per_host_layer: u64,
     pub min_ring_lookahead_bytes: u64,
     /// The request must have run as exactly one admitted window.
     pub require_single_window: bool,
@@ -81,10 +91,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            min_resident_layers: MIN_RESIDENT_LAYERS,
-            max_host_layers: MAX_HOST_LAYERS,
+            trunk_layers: TRUNK_LAYERS,
             max_tile_rows: MAX_TILE_ROWS,
-            cold_bytes_limit: COLD_BYTES_LIMIT,
+            cold_bytes_per_host_layer: COLD_BYTES_PER_HOST_LAYER,
             min_ring_lookahead_bytes: MIN_RING_LOOKAHEAD_BYTES,
             require_single_window: false,
             require_overlap: false,
@@ -328,23 +337,27 @@ pub fn validate(receipt: Option<&Value>, expect: Expect, limits: &Limits) -> Vec
     }
     let resident = u64_at(r, "resident_layers").unwrap_or(0);
     let host = u64_at(r, "host_layers").unwrap_or(u64::MAX);
-    if resident < limits.min_resident_layers {
+    // Placement accounting, not a floor: the two counts must close on the
+    // trunk and a host layer must remain (an all-resident load bypasses S1
+    // and never claims a layer-major receipt).
+    if resident.checked_add(host) != Some(limits.trunk_layers) {
         bad.push(format!(
-            "resident_layers {resident} < {}",
-            limits.min_resident_layers
+            "resident_layers {resident} + host_layers {host} != the {} trunk layers",
+            limits.trunk_layers
         ));
     }
-    if host > limits.max_host_layers {
-        bad.push(format!("host_layers {host} > {}", limits.max_host_layers));
+    if host == 0 {
+        bad.push("host_layers 0: no layer streams, so a layer-major route is not claimable".into());
     }
     let host_bytes = u64_at(r, "host_expert_bytes_total").unwrap_or(u64::MAX);
     let submitted = u64_at(r, "submitted_bytes").unwrap_or(u64::MAX);
     let useful = u64_at(r, "useful_bytes").unwrap_or(u64::MAX);
     let sweeps = u64_at(r, "sweeps").unwrap_or(0);
-    if host_bytes > limits.cold_bytes_limit {
+    let host_bound = host.saturating_mul(limits.cold_bytes_per_host_layer);
+    if host_bytes > host_bound {
         bad.push(format!(
-            "host_expert_bytes_total {host_bytes} > cold limit {}",
-            limits.cold_bytes_limit
+            "host_expert_bytes_total {host_bytes} > {host_bound} ({host} host layer(s) at most {} B each)",
+            limits.cold_bytes_per_host_layer
         ));
     }
     if sweeps == 0 || submitted > host_bytes.saturating_mul(sweeps) {
@@ -2017,10 +2030,11 @@ pub fn manifest_profile_tile(manifest: &Value, profile: &str) -> Option<u64> {
     manifest_profile_u64(manifest, profile, "tile_rows")
 }
 
-/// Strictly positive integers of every profile ledger.
-const PROFILE_POSITIVE_KEYS: [&str; 11] = [
+/// Strictly positive integers of every profile ledger. `resident_expert_layers`
+/// is deliberately absent: it is the REFERENCE projection's count (an integer,
+/// zero is a valid count), never a target the loaded placement must equal.
+const PROFILE_POSITIVE_KEYS: [&str; 10] = [
     "tile_rows",
-    "resident_expert_layers",
     "window_rows",
     "page_count",
     "device_weights_bytes",
@@ -2034,7 +2048,7 @@ const PROFILE_POSITIVE_KEYS: [&str; 11] = [
 
 /// Shape and arithmetic of both sealed profile ledgers: every field present,
 /// the purpose equal to the profile name, tile within the historical bound and
-/// distinct between the profiles, the resident floor and the full window,
+/// distinct between the profiles, the reference placement and the full window,
 /// `core = weights + tile census + extras`, `owned = core + sequential diag`,
 /// no diagnostic reserve on the product profile and one on the primitive, and
 /// the root `device_owned_bytes` equal to the MAX of the two owned figures.
@@ -2061,6 +2075,21 @@ pub fn profile_shape_problems(manifest: &Value) -> Vec<String> {
                 profile_path(profile, "sequential_diag_bytes")
             ));
         }
+        if at("resident_expert_layers").is_none() {
+            complete = false;
+            bad.push(format!(
+                "manifest {} missing or not an integer (reference projection count)",
+                profile_path(profile, "resident_expert_layers")
+            ));
+        }
+        if get(manifest, &profile_path(profile, "projection_role")).and_then(Value::as_str)
+            != Some(PROJECTION_ROLE_REFERENCE)
+        {
+            bad.push(format!(
+                "manifest {} is not {PROJECTION_ROLE_REFERENCE:?}: the sealed placement is declared reference data, not a target",
+                profile_path(profile, "projection_role")
+            ));
+        }
         bad.extend(profile_terms_problems(manifest, profile, true));
         bad.extend(profile_terms_problems(manifest, profile, false));
         if get(manifest, &profile_path(profile, "purpose")).and_then(Value::as_str) != Some(profile)
@@ -2084,9 +2113,9 @@ pub fn profile_shape_problems(manifest: &Value) -> Vec<String> {
                 profile_path(profile, "tile_rows")
             ));
         }
-        if resident < MIN_RESIDENT_LAYERS {
+        if resident >= TRUNK_LAYERS {
             bad.push(format!(
-                "manifest {} {resident} < {MIN_RESIDENT_LAYERS}",
+                "manifest {} {resident} leaves no host layer of the {TRUNK_LAYERS}-layer trunk",
                 profile_path(profile, "resident_expert_layers")
             ));
         }
@@ -2239,15 +2268,23 @@ pub fn profile_admission_problems(manifest: &Value, product: u64, primitive: u64
     bad
 }
 
+/// The role every sealed profile declares for its placement figures
+/// (`resident_expert_layers`, `device_weights_bytes`, `device_owned_bytes`,
+/// the census): the projection the manifest generator made at ITS free-memory
+/// reference. It is reference data, never observed and never a target that
+/// rejects a valid adaptive placement.
+pub const PROJECTION_ROLE_REFERENCE: &str = "reference";
+
 /// What the load actually admitted (the bundle's profile) against the sealed
-/// profile it was chosen from.
+/// profile it was chosen from: the purpose, the tile and the window. The
+/// resident count is NOT compared: the sealed count is reference data, and the
+/// actual count is proved by [`admission_witness_problems`].
 pub fn profile_load_problems(
     manifest: &Value,
     profile: &str,
     admitted_purpose: &str,
     admitted_tile: Option<u64>,
     admitted_window: Option<u64>,
-    admitted_resident: Option<u64>,
 ) -> Vec<String> {
     let mut bad = Vec::new();
     if admitted_purpose != profile {
@@ -2258,7 +2295,6 @@ pub fn profile_load_problems(
     for (key, actual) in [
         ("tile_rows", admitted_tile),
         ("window_rows", admitted_window),
-        ("resident_expert_layers", admitted_resident),
     ] {
         let sealed = manifest_profile_u64(manifest, profile, key);
         if actual.is_none() || actual != sealed {
@@ -2269,6 +2305,388 @@ pub fn profile_load_problems(
         }
     }
     bad
+}
+
+// ── adaptive admission witness ─────────────────────────────────────────
+//
+// The loader keeps the LARGEST resident layer count that fits (ten is only
+// preferred). The load placement detail carries a scalar witness of the
+// shared admission quote (`PlacementBudget` at the selected count); this
+// module judges it independently from the scalars alone: the selected count
+// must fit, one more resident layer must not, at least one host layer must
+// remain, and the count and snapshot allowance must be the bundle's own. The
+// shared Rust projection generates the witness; no second selection policy
+// lives here.
+
+/// Basis of the free-memory sample the quote was made from: the FRESH
+/// post-initialization `hipMemGetInfo`, never the gate's earlier `pre_load`.
+pub const ADMISSION_MEMORY_BASIS: &str = "post_initialization_actual";
+
+/// The scalars of the shared quote at the selected resident count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionScalars {
+    pub free_before_initialization: Option<u64>,
+    pub free_at_admission: u64,
+    pub observed_initialization: Option<u64>,
+    pub non_expert: u64,
+    /// Backed device cost of one resident layer (payload + backing slack).
+    pub resident_layer: u64,
+    pub joint_reserve: u64,
+    pub trunk_layers: u64,
+    pub resident_layers: u64,
+    /// `PlacementBudget::needed_bytes_for(resident_layers)`.
+    pub needed: u128,
+    /// `PlacementBudget::slack_bytes_at(resident_layers)`.
+    pub slack: i128,
+    /// `PlacementBudget::preferred_deficit_bytes()`.
+    pub preferred_deficit: u64,
+}
+
+/// The witness JSON. A figure outside the JSON integer range serializes as
+/// `null`, which the validator refuses.
+pub fn admission_witness_json(s: &AdmissionScalars) -> Value {
+    json!({
+        "free_before_initialization_bytes": s.free_before_initialization,
+        "free_at_admission_bytes": s.free_at_admission,
+        "observed_initialization_bytes": s.observed_initialization,
+        "non_expert_bytes": s.non_expert,
+        "resident_layer_bytes": s.resident_layer,
+        "joint_reserve_bytes": s.joint_reserve,
+        "trunk_layers": s.trunk_layers,
+        "resident_layers": s.resident_layers,
+        "preferred_resident_layers": PREFERRED_RESIDENT_LAYERS,
+        "needed_bytes": u64::try_from(s.needed).ok(),
+        "slack_bytes": i64::try_from(s.slack).ok(),
+        "preferred_deficit_bytes": s.preferred_deficit,
+        "memory_basis": ADMISSION_MEMORY_BASIS,
+        "initialization_charged_via_free": true,
+    })
+}
+
+/// The scalar admission witness of a loaded bundle's profile, read from the
+/// SAME shared quote the loader admitted with (`profile.placement`, the
+/// post-initialization `PlacementBudget` at the selected count): never the
+/// gate's `pre_load` sample and never a hand calculation. The independent
+/// judge is [`admission_witness_problems`].
+pub fn admission_witness(
+    profile: &hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile,
+) -> Value {
+    let budget = &profile.placement;
+    let selected = profile.resident_layers;
+    admission_witness_json(&AdmissionScalars {
+        free_before_initialization: budget.memory.pre_init_free_bytes,
+        free_at_admission: budget.memory.free_bytes,
+        observed_initialization: budget.memory.observed_initialization_bytes(),
+        non_expert: budget.non_expert_bytes,
+        resident_layer: budget.resident_layer_bytes,
+        joint_reserve: budget.reserve_bytes,
+        trunk_layers: budget.trunk_layers as u64,
+        resident_layers: selected as u64,
+        needed: budget.needed_bytes_for(selected),
+        slack: budget.slack_bytes_at(selected),
+        preferred_deficit: budget.preferred_deficit_bytes(),
+    })
+}
+
+/// Payload bytes of one resident layer (the backed layer cost less its own
+/// backing slack), the unit the reference weights move by.
+pub fn layer_payload_bytes(
+    profile: &hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile,
+) -> Option<u64> {
+    profile
+        .placement
+        .resident_layer_bytes
+        .checked_sub(profile.granule.layer)
+}
+
+/// The bundle's own facts, to be tied to the witness.
+pub fn admission_actual(
+    profile: Option<&hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile>,
+    resident_layers: usize,
+    trunk_layers: usize,
+) -> AdmissionActual {
+    AdmissionActual {
+        resident_layers: Some(resident_layers as u64),
+        trunk_layers: Some(trunk_layers as u64),
+        snapshot_budget_bytes: profile.map(|p| p.device_snapshot_budget_bytes),
+    }
+}
+
+/// What the loaded bundle itself reports, to be tied to the witness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionActual {
+    /// The bundle's actual resident layer count.
+    pub resident_layers: Option<u64>,
+    /// The model's trunk layer count.
+    pub trunk_layers: Option<u64>,
+    /// The admitted profile's `device_snapshot_budget_bytes`.
+    pub snapshot_budget_bytes: Option<u64>,
+}
+
+const WITNESS_INTEGERS: [&str; 10] = [
+    "free_at_admission_bytes",
+    "non_expert_bytes",
+    "resident_layer_bytes",
+    "joint_reserve_bytes",
+    "trunk_layers",
+    "resident_layers",
+    "preferred_resident_layers",
+    "needed_bytes",
+    "slack_bytes",
+    "preferred_deficit_bytes",
+];
+
+fn witness_int(w: &Value, key: &str) -> Option<i128> {
+    let v = w.get(key)?;
+    v.as_u64()
+        .map(i128::from)
+        .or_else(|| v.as_i64().map(i128::from))
+}
+
+/// Every reason the admission witness is not a proof of a valid, maximal,
+/// actual placement; empty means proven. A missing, partial or forged witness
+/// never passes.
+pub fn admission_witness_problems(witness: Option<&Value>, actual: &AdmissionActual) -> Vec<String> {
+    let Some(w) = witness.filter(|w| w.is_object()) else {
+        return vec![
+            "admission witness missing: the actual placement is not proved maximal-fits".into(),
+        ];
+    };
+    let mut bad = Vec::new();
+    let mut vals = std::collections::BTreeMap::new();
+    for key in WITNESS_INTEGERS {
+        match witness_int(w, key) {
+            Some(v) if v >= 0 || key == "slack_bytes" => {
+                vals.insert(key, v);
+            }
+            _ => bad.push(format!(
+                "admission.{key} missing or not an integer (non-negative except slack_bytes)"
+            )),
+        }
+    }
+    for key in [
+        "free_before_initialization_bytes",
+        "observed_initialization_bytes",
+    ] {
+        match w.get(key) {
+            Some(Value::Null) => {}
+            Some(v) if v.as_u64().is_some() => {}
+            _ => bad.push(format!("admission.{key} missing (unsigned integer or null)")),
+        }
+    }
+    if w.get("memory_basis").and_then(Value::as_str) != Some(ADMISSION_MEMORY_BASIS) {
+        bad.push(format!(
+            "admission.memory_basis {:?} is not {ADMISSION_MEMORY_BASIS:?}: the quote must be made from the fresh post-initialization free",
+            w.get("memory_basis")
+        ));
+    }
+    if w.get("initialization_charged_via_free") != Some(&Value::Bool(true)) {
+        bad.push(
+            "admission.initialization_charged_via_free is not true: initialization must be charged once, through the lower actual free"
+                .into(),
+        );
+    }
+    if !bad.is_empty() {
+        return bad;
+    }
+    let at = |key: &str| vals[key];
+    let (free, non_expert, layer, reserve) = (
+        at("free_at_admission_bytes") as u128,
+        at("non_expert_bytes") as u128,
+        at("resident_layer_bytes") as u128,
+        at("joint_reserve_bytes") as u128,
+    );
+    let (trunk, n) = (at("trunk_layers") as u128, at("resident_layers") as u128);
+    if at("preferred_resident_layers") != i128::from(PREFERRED_RESIDENT_LAYERS) {
+        bad.push(format!(
+            "admission.preferred_resident_layers {} != {PREFERRED_RESIDENT_LAYERS}",
+            at("preferred_resident_layers")
+        ));
+    }
+    if layer == 0 {
+        bad.push("admission.resident_layer_bytes is 0: maximality is unprovable".into());
+        return bad;
+    }
+    let needed_at = |count: u128| {
+        layer
+            .checked_mul(count)
+            .and_then(|b| b.checked_add(non_expert))
+            .and_then(|b| b.checked_add(reserve))
+    };
+    let (Some(needed), Some(needed_next), Some(needed_preferred)) = (
+        needed_at(n),
+        needed_at(n + 1),
+        needed_at(u128::from(PREFERRED_RESIDENT_LAYERS)),
+    ) else {
+        bad.push("admission quote arithmetic overflows".into());
+        return bad;
+    };
+    if needed as i128 != at("needed_bytes") {
+        bad.push(format!(
+            "admission.needed_bytes {} != non_expert + {n} * resident_layer + reserve = {needed}",
+            at("needed_bytes")
+        ));
+    }
+    if needed > free {
+        bad.push(format!(
+            "admission oversubscribed: {n} resident layers need {needed} B but only {free} B were free at admission"
+        ));
+    } else if free as i128 - needed as i128 != at("slack_bytes") {
+        bad.push(format!(
+            "admission.slack_bytes {} != free {free} - needed {needed}",
+            at("slack_bytes")
+        ));
+    }
+    if n >= trunk {
+        bad.push(format!(
+            "admission claims {n} resident of {trunk} trunk layers: no host layer remains, so an S1 profile must not be claimed (all-resident bypass)"
+        ));
+    }
+    if needed_next <= free {
+        bad.push(format!(
+            "admission is not maximal: {} resident layers would also fit ({needed_next} B <= {free} B free)",
+            n + 1
+        ));
+    }
+    let deficit = needed_preferred.saturating_sub(free);
+    if deficit as i128 != at("preferred_deficit_bytes") {
+        bad.push(format!(
+            "admission.preferred_deficit_bytes {} != the {PREFERRED_RESIDENT_LAYERS}-layer deficit {deficit} (information only, never a rejection)",
+            at("preferred_deficit_bytes")
+        ));
+    }
+    let before = w
+        .get("free_before_initialization_bytes")
+        .and_then(Value::as_u64);
+    let observed = w
+        .get("observed_initialization_bytes")
+        .and_then(Value::as_u64);
+    let observed_ok = match before {
+        None => observed.is_none(),
+        Some(b) if u128::from(b) >= free => observed == Some(b - free as u64),
+        // The fresh free exceeds the earlier sample: the actual free stays
+        // authoritative and no positive initialization loss is invented.
+        Some(_) => matches!(observed, None | Some(0)),
+    };
+    if !observed_ok {
+        bad.push(format!(
+            "admission.observed_initialization_bytes {observed:?} != the measured interval before {before:?} - after {free}"
+        ));
+    }
+    match actual.resident_layers {
+        Some(r) if u128::from(r) == n => {}
+        other => bad.push(format!(
+            "admission.resident_layers {n} != the bundle's actual resident layers {other:?}"
+        )),
+    }
+    match actual.trunk_layers {
+        Some(t) if u128::from(t) == trunk => {}
+        other => bad.push(format!(
+            "admission.trunk_layers {trunk} != the loaded model's trunk layers {other:?}"
+        )),
+    }
+    match actual.snapshot_budget_bytes {
+        Some(s) if i128::from(s) == at("slack_bytes") => {}
+        other => bad.push(format!(
+            "the profile's snapshot allowance {other:?} != the quote's slack {} at the selected count",
+            at("slack_bytes")
+        )),
+    }
+    bad
+}
+
+/// Device bytes the actual placement holds beyond (or below) the reference
+/// projection: `(actual resident - reference resident) * payload bytes of one
+/// resident layer`. The census, extras and diagnostics do not depend on the
+/// resident count.
+pub fn reference_weight_delta(
+    manifest: &Value,
+    profile: &str,
+    actual_resident: u64,
+    layer_payload_bytes: u64,
+) -> Result<i128, String> {
+    let reference = manifest_profile_u64(manifest, profile, "resident_expert_layers").ok_or(
+        format!(
+            "manifest {} missing",
+            profile_path(profile, "resident_expert_layers")
+        ),
+    )?;
+    (i128::from(actual_resident) - i128::from(reference))
+        .checked_mul(i128::from(layer_payload_bytes))
+        .ok_or_else(|| "placement accounting delta overflows".to_string())
+}
+
+fn shifted(base: u64, delta: i128) -> Option<u64> {
+    u64::try_from(i128::from(base).checked_add(delta)?).ok()
+}
+
+/// The reference projection and the ACTUAL placement, side by side. The
+/// reference is manifest data (labelled as such); the actual figures are the
+/// reference moved by the measured resident-count difference at the actual
+/// layer payload, never presented as observed memory.
+pub fn placement_accounting(
+    manifest: &Value,
+    profile: &str,
+    actual_resident: u64,
+    trunk_layers: u64,
+    layer_payload_bytes: Option<u64>,
+) -> Value {
+    let reference = |key: &str| manifest_profile_u64(manifest, profile, key);
+    let delta = layer_payload_bytes
+        .ok_or_else(|| "the actual layer payload bytes are unknown".to_string())
+        .and_then(|p| reference_weight_delta(manifest, profile, actual_resident, p));
+    let (weights, owned, delta_json, error) = match (&delta, reference("device_weights_bytes"), reference("device_owned_bytes")) {
+        (Ok(d), Some(w), Some(o)) => (
+            shifted(w, *d),
+            shifted(o, *d),
+            i64::try_from(*d).ok(),
+            None,
+        ),
+        (Err(e), _, _) => (None, None, None, Some(e.clone())),
+        _ => (
+            None,
+            None,
+            None,
+            Some("manifest reference weights/owned bytes missing".to_string()),
+        ),
+    };
+    json!({
+        "reference": {
+            "role": PROJECTION_ROLE_REFERENCE,
+            "note": "the sealed manifest's projection at its own free-memory reference: reference data, not observed and not a target",
+            "resident_expert_layers": reference("resident_expert_layers"),
+            "device_weights_bytes": reference("device_weights_bytes"),
+            "device_owned_bytes": reference("device_owned_bytes"),
+        },
+        "actual": {
+            "basis": "reference moved by (actual - reference resident layers) * actual layer payload bytes; census, extras and diagnostics are independent of the resident count",
+            "resident_layers": actual_resident,
+            "host_layers": trunk_layers.saturating_sub(actual_resident),
+            "resident_layer_payload_bytes": layer_payload_bytes,
+            "weights_delta_vs_reference_bytes": delta_json,
+            "device_weights_bytes": weights,
+            "device_owned_bytes": owned,
+            "error": error,
+        },
+    })
+}
+
+impl MemoryLedger {
+    /// The ledger of the ACTUAL placement: weights and owned device bytes
+    /// moved by `delta` (see [`reference_weight_delta`]). A figure that would
+    /// leave the u64 range refuses.
+    pub fn at_actual_placement(&self, delta: i128) -> Result<MemoryLedger, String> {
+        let mut out = self.clone();
+        out.owned_device_bytes = shifted(self.owned_device_bytes, delta)
+            .ok_or("actual owned device bytes leave the u64 range")?;
+        out.decomposition.weights = shifted(self.decomposition.weights, delta)
+            .ok_or("actual device weight bytes leave the u64 range")?;
+        out.census_basis = format!(
+            "{}; weights and owned device bytes moved to the ACTUAL placement by {delta} B",
+            self.census_basis
+        );
+        Ok(out)
+    }
 }
 
 // ── manifest identity ──────────────────────────────────────────────────
