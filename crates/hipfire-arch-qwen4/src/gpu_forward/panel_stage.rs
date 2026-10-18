@@ -3146,9 +3146,8 @@ mod slowlink_ring {
         /// the projection)` from the scalar metadata alone: independent of every
         /// table the layout code consumes.
         fn decode(&self, addr: usize) -> Option<(usize, Proj, usize)> {
-            let within = |base: usize, bytes: usize| {
-                addr.checked_sub(base).filter(|rel| *rel < bytes)
-            };
+            let within =
+                |base: usize, bytes: usize| addr.checked_sub(base).filter(|rel| *rel < bytes);
             match *self {
                 Self::Aggregate { cpu_g, cpu_d, .. } => {
                     if let Some(rel) = within(cpu_g, REAL_E * REAL_G) {
@@ -3182,7 +3181,11 @@ mod slowlink_ring {
         assert_eq!(sources.num_experts(), REAL_E);
         assert_eq!(
             sources.host_ranges().len(),
-            if matches!(kind, RealKind::Aggregate { .. }) { 2 } else { 1 }
+            if matches!(kind, RealKind::Aggregate { .. }) {
+                2
+            } else {
+                1
+            }
         );
 
         let spec = PanelPoolSpec::uniform(2, 16, 32, REAL_E, REAL_G, REAL_D, 0, 0).unwrap();
@@ -3217,7 +3220,10 @@ mod slowlink_ring {
             for run in &layout.runs {
                 assert_eq!(run.src % EXTENT_ALIGN, 0);
                 assert_eq!(run.dst % EXTENT_ALIGN, 0);
-                assert!(kind.decode(run.src).is_some(), "run start outside the sources");
+                assert!(
+                    kind.decode(run.src).is_some(),
+                    "run start outside the sources"
+                );
                 assert!(
                     kind.decode(run.src + run.len - 1).is_some(),
                     "run end outside the sources"
@@ -3259,8 +3265,15 @@ mod slowlink_ring {
                     let entry = usize::try_from(table[id]).unwrap();
                     let offset = entry.checked_sub(page_base).expect("entry below the page");
                     assert_eq!(offset % EXTENT_ALIGN, 0, "expert {id} {proj:?} unaligned");
-                    assert!(offset + len <= layout.used, "expert {id} {proj:?} past the payload");
-                    assert_eq!(resolve(offset), Some((id, proj, 0)), "expert {id} {proj:?} start");
+                    assert!(
+                        offset + len <= layout.used,
+                        "expert {id} {proj:?} past the payload"
+                    );
+                    assert_eq!(
+                        resolve(offset),
+                        Some((id, proj, 0)),
+                        "expert {id} {proj:?} start"
+                    );
                     assert_eq!(
                         resolve(offset + len - 1),
                         Some((id, proj, len - 1)),
@@ -3312,7 +3325,11 @@ mod slowlink_ring {
         };
         assert!(overrun.is_err(), "an extent past its range was accepted");
         drop(sources);
-        assert_eq!(Arc::strong_count(&owner), 1, "the owner is released with the sources");
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the owner is released with the sources"
+        );
     }
 
     #[test]
@@ -3367,8 +3384,12 @@ mod slowlink_ring {
         }
         // An aggregate alias table handed to the slab constructor (and the
         // converse) falls outside the declared range and is refused.
-        let RealKind::Aggregate { alias_g, .. } = agg else { unreachable!() };
-        let RealKind::Slab { cpu, .. } = slab else { unreachable!() };
+        let RealKind::Aggregate { alias_g, .. } = agg else {
+            unreachable!()
+        };
+        let RealKind::Slab { cpu, .. } = slab else {
+            unreachable!()
+        };
         // SAFETY: construction must fail.
         let wrong = unsafe {
             LayerExpertSources::from_alias(
