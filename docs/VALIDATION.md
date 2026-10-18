@@ -433,6 +433,54 @@ not an actual driver figure; GPU-pool parked bytes are counted as used. This is
 a headroom product question and does not select a driver explanation. A
 missing cell is `incomplete`, not a pass.
 
+Hold 1 attempt 4 (`j1778`) corrected the proof, not the gates, and S1 stays
+default OFF. Its primitive cell passed, but the state cell failed S1
+initialization on the route-region allocation and then ran the incumbent until
+the 720 s state cap expired, losing every in-memory timing and memory/cache
+observation; seconds cannot be apportioned from that run. The source fixes
+recorded since, each proved on the CPU only: the placement census and the
+runtime now read one shared capability predicate for the model-lifetime
+BF16-to-F16 weight shadows (the census had charged them on exact gfx1201 only,
+so gfx1100 charged 0 of the real artifact's 1,298,923,520 B; the existing
+512-row threshold and cold-owner bound are unchanged); S1 admission evaluates
+(tile, resident layers) jointly and keeps the >=10 resident floor, the 1,536
+tile bound, the full 16,384-row window and the lookahead charge; every admitted
+S1 owner (page ring, route region, HC arena, window scratch, boundary stages)
+is bound once at the selected load and requests only consume it, an allocation
+failure being a named load failure that reports whether cleanup parked or
+quarantined the owners; and the packaged `tensor_ops` index now lists the
+supported Q8 exports, each indexed symbol being checked against the compiled
+object's exports. No new env or config knob, no cache reservation or eviction
+path and no lowered floor, window or lookahead came with them; the packaged
+index legitimately differs from the legacy runtime cache hash. No
+performance claim follows from any of this.
+
+Durable gate progress. Every `qwen4_slowlink_gate` run appends bounded JSONL
+records to `<output>.progress.jsonl` (no new flag), each written and
+`sync_data`-flushed as it is observed, so a SIGTERM, timeout or crash keeps
+what ran: `case_start`/`case_end` and `repeat_start`/`repeat_end` per state
+prompt (a repeat carries its raw receipts, the compact per-call window list,
+wall time, state and final-logit digests, the determinism comparison with the
+first repeat and the session-cache occupancy and eviction counter), the
+primitive cases one at a time (each raw report, independent), named
+`stage_*`/`phase_*` records that keep apart the prompt repeats, the
+marker-boundary restores, the strict 16K restores, the failure injections, the
+bounded head scoring and the natural-prompt replay/eager decode, every check
+row, the error text, and the existing `pre_load`/`post_load`/`end` point
+samples (plus a `load_failed` or `run_failed` point when the GPU is still owned
+after a failure; it is not the HIP free at the failing allocation, which the
+gate does not observe). Each record has UTC and a monotonic offset that the
+stderr progress echo repeats, for aligning the untimestamped stderr and the
+sampler. The sidecar is evidence only and is never promoted. `--output` is
+written once, atomically (temporary file, fsync, rename), and only a complete
+run reaches `pass`: an aborted or panicking run writes `incomplete` with the
+error and a summary of the sidecar in which the last completed repeat, the one
+in flight and every unexecuted required check are named, never filled in. A
+sidecar write error fails the required check `progress.durability`. The legacy
+`perf` cell keeps its informational timing path unchanged and persists only its
+envelope. The CPU filter `slowlink_receipt` covers the progress, torn-tail,
+corruption, write-error and atomic-publish cases.
+
 ### Flash-Next product-default receipts (perf claims)
 
 A Flash-Next (`qwen3.8:flash-next`) perf claim MUST state the startup

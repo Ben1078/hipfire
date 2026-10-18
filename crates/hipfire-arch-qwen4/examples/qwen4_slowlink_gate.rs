@@ -35,6 +35,21 @@
 //! makes the run `incomplete`, never `pass`; the exit status is 0 only for
 //! `pass`.
 //!
+//! Durable progress: every run appends bounded JSONL records to the sidecar
+//! `<output>.progress.jsonl` (no new flag; written with `sync_data` the moment
+//! each is observed) so a SIGTERM, timeout or crash keeps the case/repeat
+//! start and end, each completed repeat's raw receipts, determinism digests,
+//! wall time, session-cache occupancy/evictions, the existing
+//! `pre_load`/`post_load`/`end` point samples (plus a `load_failed` or
+//! `run_failed` point when a failure leaves the GPU owned), every check row
+//! and the error text. Records carry UTC and a monotonic offset that stderr
+//! progress echoes repeat. The sidecar is evidence only, never a verdict:
+//! `--output` is written once, atomically, and only a complete run reaches
+//! `pass`; an aborted run writes `incomplete` with a summary of the sidecar
+//! and a missing case is never filled in. A sidecar write error fails the
+//! required check `progress.durability`. The legacy `perf` cell keeps its
+//! informational, unchanged timing path and persists only its envelope.
+//!
 //! Modes:
 //! * `primitives` — the production panel transport, dispatch and ordered
 //!   combine self-test (payload/table identity, repeated epochs at the same
@@ -100,6 +115,7 @@ fn required_check_ids(mode: Mode, fixture: &Fixture, route: Expect) -> Vec<Strin
     };
     required.push("identity.manifest".to_string());
     required.push("load.placement".to_string());
+    required.push("progress.durability".to_string());
     required
 }
 
@@ -355,6 +371,26 @@ fn mem_sample(gpu: &Gpu, label: &str, smaps: bool) -> Value {
     counters_json(label, method, &read_proc_counters(smaps), device)
 }
 
+/// Persist one already-taken gate point sample immediately. These are the
+/// existing phase points (hipMemGetInfo total-free plus `/proc`), never an
+/// allocator observation, and a failure point is not the HIP free at the
+/// allocation that failed.
+fn persist_memory(
+    progress: &ProgressLog,
+    phase: &str,
+    sample: &Value,
+    sampler: Option<&ProcSampler>,
+) {
+    progress.record(
+        "memory",
+        json!({
+            "phase": phase, "sample": sample,
+            "sampler_max": sampler.map(ProcSampler::snapshot),
+            "scope": "gate phase point sample; not an allocator observation and not the HIP free at any allocation",
+        }),
+    );
+}
+
 /// The sampler reads the (costly) `/proc/self/smaps` on every this-many reads.
 const SAMPLER_SMAPS_EVERY: u64 = 20;
 
@@ -406,6 +442,19 @@ impl ProcSampler {
         sample["samples"] = json!(guard.0);
         sample
     }
+
+    /// The running maxima so far, without stopping the thread.
+    fn snapshot(&self) -> Value {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sample = counters_json(
+            SAMPLER_LABEL,
+            "background sampler running maxima at a progress record; not a final or continuous peak",
+            &guard.1,
+            None,
+        );
+        sample["samples"] = json!(guard.0);
+        sample
+    }
 }
 
 struct Ctx {
@@ -419,6 +468,8 @@ struct Ctx {
     route: Expect,
     /// Labeled phase memory samples ([`mem_sample`]).
     mem: Vec<Value>,
+    /// The durable progress sidecar.
+    progress: ProgressLog,
 }
 
 impl Ctx {
@@ -553,6 +604,25 @@ fn receipts_json(receipts: &[Option<Value>]) -> Value {
     )
 }
 
+/// The actual windows each call of a request ran, compactly: route, entry,
+/// rows, the receipt's own window list and tile. Activations and digests of
+/// state are never logged here; the raw receipts stay in `receipts`.
+fn window_summary(receipts: &[Option<Value>]) -> Value {
+    Value::Array(
+        receipts
+            .iter()
+            .map(|receipt| match receipt {
+                None => Value::Null,
+                Some(r) => json!({
+                    "route": r["route"], "entry_pos": r["entry_pos"],
+                    "prompt_rows": r["prompt_rows"], "windows": r["windows"],
+                    "launch_cuts": r["launch_cuts"], "tile_rows": r["tile_rows"],
+                }),
+            })
+            .collect(),
+    )
+}
+
 fn greedy(ctx: &mut Ctx, count: usize) -> Result<(Vec<u32>, &'static str), String> {
     let row = gpu_error(ctx.gpu.download_f32(&ctx.logits), "download prompt logits")?;
     if row.iter().any(|v| !v.is_finite()) {
@@ -576,12 +646,113 @@ fn greedy(ctx: &mut Ctx, count: usize) -> Result<(Vec<u32>, &'static str), Strin
 
 // ── primitives ─────────────────────────────────────────────────────────
 
-fn run_primitives(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String, Value>) {
-    let result = ctx
-        .bundle
-        .slowlink_primitive_selftest(&mut ctx.gpu, &PRIMITIVE_CASES)
-        .map_err(|error| error.to_string());
-    record_primitives(checks, out, result);
+fn run_primitives(
+    ctx: &mut Ctx,
+    checks: &mut Checks,
+    out: &mut serde_json::Map<String, Value>,
+    sampler: Option<&ProcSampler>,
+) {
+    // Each case is invoked alone (the facade already isolates cases) so its
+    // raw report is durable the moment it finishes. A refusal before any case
+    // ran is ONE `primitive.init` failure; a later refusal is that case's own
+    // error and the cases after it stay unproved. It is never cloned.
+    let mut reports: Vec<Value> = Vec::new();
+    for name in PRIMITIVE_CASES {
+        let case_id = format!("primitive.{name}");
+        ctx.progress.record("case_start", json!({"case": case_id}));
+        let started = Instant::now();
+        let result = ctx
+            .bundle
+            .slowlink_primitive_selftest(&mut ctx.gpu, &[name])
+            .map_err(|error| error.to_string());
+        let wall_s = started.elapsed().as_secs_f64();
+        let (case, stop) = match result {
+            Ok(report) => (
+                report["cases"]
+                    .as_array()
+                    .and_then(|cases| cases.iter().find(|c| c["name"] == name))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        primitive_error(name, "the self-test report did not carry this case")
+                    }),
+                false,
+            ),
+            Err(error) if reports.is_empty() => {
+                ctx.progress.record(
+                    "case_end",
+                    json!({
+                        "case": case_id, "status": "init_error", "error": error,
+                        "wall_s": wall_s, "cache_usage": ctx.cache_usage(),
+                        "sampler_max": sampler.map(ProcSampler::snapshot),
+                    }),
+                );
+                record_primitives(checks, out, Err(error));
+                ctx.progress.checks(checks);
+                return;
+            }
+            Err(error) => {
+                out.insert("selftest_error".into(), json!(error));
+                (
+                    primitive_error(
+                        name,
+                        &format!("slow-link primitive {name:?} could not run: {error}"),
+                    ),
+                    true,
+                )
+            }
+        };
+        ctx.progress.record(
+            "case_end",
+            json!({
+                "case": case_id, "status": case["status"], "mismatches": case["mismatches"],
+                "report": case, "wall_s": wall_s, "cache_usage": ctx.cache_usage(),
+                "sampler_max": sampler.map(ProcSampler::snapshot),
+            }),
+        );
+        judge_primitive(checks, name, &case);
+        ctx.progress.checks(checks);
+        reports.push(case);
+        if stop {
+            break;
+        }
+    }
+    out.insert("selftest".into(), json!({"cases": reports}));
+}
+
+/// One case's own error report: names the case, carries no mismatch count.
+fn primitive_error(name: &str, reason: &str) -> Value {
+    json!({
+        "name": name, "status": "error", "mismatches": Value::Null,
+        "detail": {"error": reason},
+    })
+}
+
+/// Judges one case from its own report alone (never another case's).
+/// `status:"pass"` with `mismatches == 0` passes; `status:"error"`
+/// (`mismatches:null`, `detail.error` the reason) fails only that case with
+/// its own error text and no invented mismatch count; anything else fails
+/// only that case.
+fn judge_primitive(checks: &mut Checks, name: &str, case: &Value) {
+    let key = format!("primitive.{name}");
+    match case["status"].as_str() {
+        Some("pass") if case["mismatches"].as_u64() == Some(0) => checks.pass(&key, case.clone()),
+        Some("error") => {
+            let reason = match case["detail"]["error"].as_str() {
+                Some(error) => format!("case error: {error}"),
+                None => "case error with no detail.error text".to_string(),
+            };
+            checks.fail(&key, reason, case.clone())
+        }
+        status => checks.fail(
+            &key,
+            format!(
+                "case did not pass with zero mismatches (status {}, mismatches {})",
+                status.unwrap_or("absent"),
+                case["mismatches"]
+            ),
+            case.clone(),
+        ),
+    }
 }
 
 /// Records a self-test result without ever cloning one failure onto several cases.
@@ -613,31 +784,10 @@ fn record_primitives(
     out.insert("selftest".into(), report.clone());
     let cases = report["cases"].as_array().cloned().unwrap_or_default();
     for name in PRIMITIVE_CASES {
-        let key = format!("primitive.{name}");
         let Some(case) = cases.iter().find(|c| c["name"] == name) else {
             continue; // missing stays missing: the run is incomplete
         };
-        match case["status"].as_str() {
-            Some("pass") if case["mismatches"].as_u64() == Some(0) => {
-                checks.pass(&key, case.clone())
-            }
-            Some("error") => {
-                let reason = match case["detail"]["error"].as_str() {
-                    Some(error) => format!("case error: {error}"),
-                    None => "case error with no detail.error text".to_string(),
-                };
-                checks.fail(&key, reason, case.clone())
-            }
-            status => checks.fail(
-                &key,
-                format!(
-                    "case did not pass with zero mismatches (status {}, mismatches {})",
-                    status.unwrap_or("absent"),
-                    case["mismatches"]
-                ),
-                case.clone(),
-            ),
-        }
+        judge_primitive(checks, name, case);
     }
 }
 
@@ -671,20 +821,63 @@ fn same_run(a: &Observation, b: &Observation) -> Vec<String> {
 fn prompt_check(ctx: &mut Ctx, checks: &mut Checks, report: &mut Vec<Value>, index: usize) {
     let prompt = ctx.fixture.prompts[index].clone();
     let id = prompt.id.clone();
+    let case = format!("state.{id}");
     let mut runs: Vec<Observation> = Vec::new();
+    ctx.progress.record(
+        "case_start",
+        json!({
+            "case": case, "kind": prompt.kind, "rows": prompt.prompt_ids.len(),
+            "entry": prompt.entry, "launch_cuts": prompt.launch_cuts,
+            "repeats": ctx.fixture.repeats,
+        }),
+    );
     for repeat in 0..ctx.fixture.repeats {
+        ctx.progress
+            .record("repeat_start", json!({"case": case, "repeat": repeat}));
+        let start = ProgressLog::stamp(ctx.progress.now());
         match observe(ctx, &prompt.prompt_ids, prompt.entry, &prompt.launch_cuts) {
-            Ok(run) => runs.push(run),
+            Ok(run) => {
+                ctx.progress.record(
+                    "repeat_end",
+                    json!({
+                        "case": case, "repeat": repeat, "status": "ok", "start": start,
+                        "wall_s": run.wall_s, "calls": run.receipts.len(),
+                        "windows": window_summary(&run.receipts),
+                        "receipts": receipts_json(&run.receipts),
+                        "state_digest": run.state["combined"],
+                        "logits_digest": run.logits["combined"],
+                        "top1": run.logits["per_row"][0]["top1"],
+                        "determinism_vs_first_repeat": runs.first().map(|first| same_run(first, &run)),
+                        "cache_usage": ctx.cache_usage(),
+                    }),
+                );
+                runs.push(run);
+            }
             Err(error) => {
+                ctx.progress.record(
+                    "repeat_end",
+                    json!({
+                        "case": case, "repeat": repeat, "status": "error", "start": start,
+                        "error": error, "cache_usage": ctx.cache_usage(),
+                    }),
+                );
+                // The repeats that did complete stay in the failure's detail.
+                let detail = json!({
+                    "failed_repeat": repeat,
+                    "completed_repeats": runs.iter().map(|r| json!({
+                        "state": r.state["combined"], "final_logits": r.logits["combined"],
+                        "wall_s": r.wall_s,
+                    })).collect::<Vec<_>>(),
+                });
                 checks.fail(
                     &format!("state.{id}.route_receipt"),
                     format!("repeat {repeat}: {error}"),
-                    Value::Null,
+                    detail.clone(),
                 );
                 checks.fail(
                     &format!("state.{id}.repeat_determinism"),
                     format!("repeat {repeat}: {error}"),
-                    Value::Null,
+                    detail,
                 );
                 return;
             }
@@ -953,14 +1146,33 @@ fn boundary_cases(
         .collect();
     // Cold references first: their own captures are cleared below, so the
     // restore cases only ever read the whole-prompt prefill's snapshots.
+    ctx.progress.record(
+        "phase_start",
+        json!({"stage": "state.restore.marker_boundary", "phase": "cold_references",
+               "cuts": cuts, "extended_rows": extended.iter().map(Vec::len).collect::<Vec<_>>()}),
+    );
     let mut colds: Vec<Result<Cold, String>> = Vec::new();
     for ids in &extended {
         let cold = gpu_error(ctx.bundle.reset(&mut ctx.gpu), "reset")
             .and_then(|()| cold_commit(ctx, ids, 0));
         colds.push(cold);
     }
+    ctx.progress.record(
+        "phase_end",
+        json!({"stage": "state.restore.marker_boundary", "phase": "cold_references",
+               "failed": colds.iter().filter(|c| c.is_err()).count(),
+               "windows": window_summary(
+                   &colds.iter().map(|c| c.as_ref().ok().and_then(|c| c.receipt.clone())).collect::<Vec<_>>()
+               ),
+               "cache_usage": ctx.cache_usage()}),
+    );
     ctx.bundle.session_clear(&mut ctx.gpu);
     let cleared = ctx.cache_usage();
+    ctx.progress.record(
+        "phase_start",
+        json!({"stage": "state.restore.marker_boundary", "phase": "whole_prompt_capture",
+               "rows": boundary.prompt_ids.len()}),
+    );
     let capture = (|| -> Result<(Option<Value>, Value), String> {
         gpu_error(ctx.bundle.reset(&mut ctx.gpu), "reset")?;
         let before = ctx.cache_usage();
@@ -1010,6 +1222,7 @@ fn boundary_cases(
         capture_problems.clone(),
         capture_detail.clone(),
     );
+    ctx.progress.checks(checks);
     detail.push(json!({"capture": capture_detail}));
     let mut reused = Vec::new();
     let mut verified: Vec<(usize, bool)> = Vec::new();
@@ -1019,6 +1232,10 @@ fn boundary_cases(
         .collect();
     let mut divergent_all = Vec::new();
     for (index, &cut) in cuts.iter().enumerate() {
+        ctx.progress.record(
+            "case_start",
+            json!({"case": format!("state.boundary.{cut}.restore"), "extended_rows": extended[index].len()}),
+        );
         let case = boundary_case(ctx, cut, &extended[index], &colds[index]);
         if let Some(rows) = case.reused {
             reused.push((cut, rows));
@@ -1028,6 +1245,7 @@ fn boundary_cases(
             case.restore.clone(),
             case.detail.clone(),
         );
+        ctx.progress.checks(checks);
         restore_all.extend(case.restore.iter().map(|p| format!("cut {cut}: {p}")));
         divergent_all.extend(case.divergent.iter().map(|p| format!("cut {cut}: {p}")));
         if !case.executed {
@@ -1058,6 +1276,7 @@ fn boundary_cases(
         divergent_all,
         json!({"continuation_rows": ctx.fixture.continuation_ids.len(), "decode": RESTORE_DECODE}),
     );
+    ctx.progress.checks(checks);
 }
 
 /// Strict 16K boundary snapshots: ONE whole `prefill_final` of the 16384-row
@@ -1101,14 +1320,33 @@ fn boundary16k_checks(ctx: &mut Ctx, checks: &mut Checks, detail: &mut Vec<Value
         .iter()
         .map(|&cut| ids[..cut].iter().chain(&ids[16384..]).copied().collect())
         .collect();
+    ctx.progress.record(
+        "phase_start",
+        json!({"stage": "state.restore.boundary16k", "phase": "cold_references",
+               "cuts": cuts, "extended_rows": extended.iter().map(Vec::len).collect::<Vec<_>>()}),
+    );
     let mut colds: Vec<Result<Cold, String>> = Vec::new();
     for ext in &extended {
         let cold = gpu_error(ctx.bundle.reset(&mut ctx.gpu), "reset")
             .and_then(|()| cold_commit(ctx, ext, 0));
         colds.push(cold);
     }
+    ctx.progress.record(
+        "phase_end",
+        json!({"stage": "state.restore.boundary16k", "phase": "cold_references",
+               "failed": colds.iter().filter(|c| c.is_err()).count(),
+               "windows": window_summary(
+                   &colds.iter().map(|c| c.as_ref().ok().and_then(|c| c.receipt.clone())).collect::<Vec<_>>()
+               ),
+               "cache_usage": ctx.cache_usage()}),
+    );
     ctx.bundle.session_clear(&mut ctx.gpu);
     let cleared = ctx.cache_usage();
+    ctx.progress.record(
+        "phase_start",
+        json!({"stage": "state.restore.boundary16k", "phase": "whole_16k_capture",
+               "rows": ids.len()}),
+    );
     let capture = (|| -> Result<(Option<Value>, Value), String> {
         gpu_error(ctx.bundle.reset(&mut ctx.gpu), "reset")?;
         let before = ctx.cache_usage();
@@ -1154,9 +1392,14 @@ fn boundary16k_checks(ctx: &mut Ctx, checks: &mut Checks, detail: &mut Vec<Value
         capture_problems.clone(),
         capture_detail.clone(),
     );
+    ctx.progress.checks(checks);
     detail.push(json!({"boundary16k_capture": capture_detail}));
     let mut verified = Vec::new();
     for (index, &cut) in cuts.iter().enumerate() {
+        ctx.progress.record(
+            "case_start",
+            json!({"case": format!("state.boundary16k.{cut}.restore"), "extended_rows": extended[index].len()}),
+        );
         let case = boundary_case(ctx, cut, &extended[index], &colds[index]);
         let mut problems: Vec<String> = case.restore.clone();
         problems.extend(case.divergent.iter().cloned());
@@ -1169,17 +1412,13 @@ fn boundary16k_checks(ctx: &mut Ctx, checks: &mut Checks, detail: &mut Vec<Value
             problems,
             case.detail.clone(),
         );
+        ctx.progress.checks(checks);
         detail.push(json!({"boundary16k_case": case.detail}));
     }
     detail.push(json!({
         "boundary16k_largest_verified_restore_cut": largest_verified_cut(&verified),
         "cache_usage_final": ctx.cache_usage(),
     }));
-}
-
-fn restore_checks(ctx: &mut Ctx, checks: &mut Checks, detail: &mut Vec<Value>) {
-    marker_boundary_checks(ctx, checks, detail);
-    boundary16k_checks(ctx, checks, detail);
 }
 
 fn marker_boundary_checks(ctx: &mut Ctx, checks: &mut Checks, detail: &mut Vec<Value>) {
@@ -1237,6 +1476,7 @@ fn injection_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut Vec<Value>) {
     let entry = prompt.entry;
     for point in FAILURE_POINTS {
         let name = format!("state.inject.{point}");
+        ctx.progress.record("case_start", json!({"case": name}));
         let outcome = (|| -> Result<(Vec<String>, Value), String> {
             let mut bad = Vec::new();
             // A clean reference of the whole resumed request and of the entry.
@@ -1315,6 +1555,7 @@ fn injection_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut Vec<Value>) {
             }
             Err(e) => checks.fail(&name, e, Value::Null),
         }
+        ctx.progress.checks(checks);
     }
 }
 
@@ -1398,9 +1639,24 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
         // Replay arm first: it fixes how many warm tokens the controller took.
         let armed = ctx.gpu.replay.configure_model_default(true);
         gpu_error(ctx.bundle.reset(&mut ctx.gpu), "reset")?;
-        drive(ctx, &prompt.prompt_ids, 0, &[])?;
+        ctx.progress.record(
+            "phase_start",
+            json!({"stage": "state.decode", "phase": "natural_prefill_replay_arm",
+                   "rows": prompt.prompt_ids.len()}),
+        );
+        let receipts = drive(ctx, &prompt.prompt_ids, 0, &[])?;
+        ctx.progress.record(
+            "phase_end",
+            json!({"stage": "state.decode", "phase": "natural_prefill_replay_arm",
+                   "windows": window_summary(&receipts), "cache_usage": ctx.cache_usage()}),
+        );
         let row = gpu_error(ctx.gpu.download_f32(&ctx.logits), "download")?;
         let mut pending = Some(hipfire_runtime::llama::argmax(&row));
+        ctx.progress.record(
+            "phase_start",
+            json!({"stage": "state.decode", "phase": "replay_warm_and_measured_decode",
+                   "warm_limit": REPLAY_WARM_LIMIT, "measured_tokens": measured}),
+        );
         let mut replay_ids = Vec::new();
         let mut warm = 0usize;
         while ctx.gpu.replay.state() != rdna_compute::replay::ReplayState::Ready
@@ -1425,6 +1681,12 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
             replay_ids.push(t);
         }
         let observation = ctx.gpu.replay.replay_observation();
+        ctx.progress.record(
+            "phase_end",
+            json!({"stage": "state.decode", "phase": "replay_warm_and_measured_decode",
+                   "warm_tokens": warm, "replay_state": state_after_warm,
+                   "observed_count": observation.count, "observed_failed": observation.failed}),
+        );
         let mut replay_bad = Vec::new();
         if state_after_warm != "Ready" {
             replay_bad.push(format!("retained body not Ready after {warm} warm token(s): {state_after_warm} (configure_model_default returned {armed})"));
@@ -1438,8 +1700,19 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
         // Eager arm: the same prompt, the same number of tokens.
         ctx.gpu.replay.configure_model_default(false);
         gpu_error(ctx.bundle.reset(&mut ctx.gpu), "reset")?;
-        drive(ctx, &prompt.prompt_ids, 0, &[])?;
+        ctx.progress.record(
+            "phase_start",
+            json!({"stage": "state.decode", "phase": "natural_prefill_and_eager_decode",
+                   "rows": prompt.prompt_ids.len(), "tokens": replay_ids.len()}),
+        );
+        let receipts = drive(ctx, &prompt.prompt_ids, 0, &[])?;
         let (eager_ids, _) = greedy(ctx, replay_ids.len())?;
+        ctx.progress.record(
+            "phase_end",
+            json!({"stage": "state.decode", "phase": "natural_prefill_and_eager_decode",
+                   "windows": window_summary(&receipts), "tokens": eager_ids.len(),
+                   "cache_usage": ctx.cache_usage()}),
+        );
         let mut eager_bad = Vec::new();
         if eager_ids.is_empty() || eager_ids.iter().any(|&t| t as usize >= ctx.vocab) {
             eager_bad.push("eager decode produced no valid ids".to_string());
@@ -1512,31 +1785,71 @@ fn state_required(fixture: &Fixture, route: Expect) -> Vec<String> {
     names
 }
 
+/// One named stage of the state cell with its start/end and check rows
+/// persisted around it.
+fn stage(
+    ctx: &mut Ctx,
+    checks: &mut Checks,
+    name: &str,
+    body: impl FnOnce(&mut Ctx, &mut Checks),
+) {
+    ctx.progress.record(
+        "stage_start",
+        json!({"stage": name, "cache_usage": ctx.cache_usage()}),
+    );
+    body(ctx, checks);
+    ctx.progress.record(
+        "stage_end",
+        json!({"stage": name, "cache_usage": ctx.cache_usage()}),
+    );
+    ctx.progress.checks(checks);
+}
+
 fn run_state(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String, Value>) {
     let mut prompts = Vec::new();
     for index in 0..ctx.fixture.prompts.len() {
+        let case = format!("state.{}", ctx.fixture.prompts[index].id);
         prompt_check(ctx, checks, &mut prompts, index);
+        ctx.progress.record(
+            "case_end",
+            json!({"case": case, "cache_usage": ctx.cache_usage()}),
+        );
+        ctx.progress.checks(checks);
     }
     out.insert("prompts".into(), Value::Array(prompts));
+    // The marker-boundary and strict-16K restore phases are separate stages
+    // so a partial log shows which one was in flight; `evidence.restore`
+    // stays one array.
     let mut restore = Vec::new();
-    restore_checks(ctx, checks, &mut restore);
+    stage(ctx, checks, "state.restore.marker_boundary", |ctx, checks| {
+        marker_boundary_checks(ctx, checks, &mut restore);
+    });
+    stage(ctx, checks, "state.restore.boundary16k", |ctx, checks| {
+        boundary16k_checks(ctx, checks, &mut restore);
+    });
     out.insert("restore".into(), Value::Array(restore));
-    if ctx.route == Expect::LayerMajor {
-        let mut injections = Vec::new();
-        injection_checks(ctx, checks, &mut injections);
-        out.insert("injections".into(), Value::Array(injections));
-    } else {
-        for point in FAILURE_POINTS {
-            checks.skip(
-                &format!("state.inject.{point}"),
-                "the incumbent route has no S1 transaction to inject into",
-            );
+    stage(ctx, checks, "state.injection", |ctx, checks| {
+        if ctx.route == Expect::LayerMajor {
+            let mut injections = Vec::new();
+            injection_checks(ctx, checks, &mut injections);
+            out.insert("injections".into(), Value::Array(injections));
+        } else {
+            for point in FAILURE_POINTS {
+                checks.skip(
+                    &format!("state.inject.{point}"),
+                    "the incumbent route has no S1 transaction to inject into",
+                );
+            }
         }
-    }
-    let mut head = Vec::new();
-    head_rows_check(ctx, checks, &mut head);
-    out.insert("head".into(), Value::Array(head));
-    decode_checks(ctx, checks, out);
+    });
+    stage(ctx, checks, "state.head_rows", |ctx, checks| {
+        let mut head = Vec::new();
+        head_rows_check(ctx, checks, &mut head);
+        out.insert("head".into(), Value::Array(head));
+    });
+    stage(ctx, checks, "state.decode", |ctx, checks| {
+        decode_checks(ctx, checks, out)
+    });
 }
 
 // ── product ────────────────────────────────────────────────────────────
@@ -1547,6 +1860,7 @@ fn run_product(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<Str
         let prompt = ctx.fixture.prompts[index].clone();
         let id = prompt.id.clone();
         let name = format!("product.{id}");
+        ctx.progress.record("case_start", json!({"case": name}));
         let result = (|| -> Result<(Vec<String>, Value), String> {
             let obs = observe(ctx, &prompt.prompt_ids, prompt.entry, &prompt.launch_cuts)?;
             let (ids, finish) = greedy(ctx, ctx.fixture.decode_tokens)?;
@@ -1582,11 +1896,28 @@ fn run_product(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<Str
         })();
         match result {
             Ok((bad, record)) => {
+                ctx.progress.record(
+                    "case_end",
+                    json!({
+                        "case": name, "status": "ok", "evidence": record,
+                        "cache_usage": ctx.cache_usage(),
+                    }),
+                );
                 records.push(record.clone());
                 checks.push(&name, bad, json!({"id": id}));
             }
-            Err(e) => checks.fail(&name, e, Value::Null),
+            Err(e) => {
+                ctx.progress.record(
+                    "case_end",
+                    json!({
+                        "case": name, "status": "error", "error": e,
+                        "cache_usage": ctx.cache_usage(),
+                    }),
+                );
+                checks.fail(&name, e, Value::Null)
+            }
         }
+        ctx.progress.checks(checks);
     }
     out.insert("records".into(), Value::Array(records));
     out.insert(
@@ -1708,15 +2039,47 @@ fn product_required(fixture: &Fixture) -> Vec<String> {
 
 // ── driver ─────────────────────────────────────────────────────────────
 
-fn write_report(path: &Path, report: &Value) -> Result<(), String> {
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(report).map_err(|e| e.to_string())? + "\n",
-    )
-    .map_err(|e| format!("write {}: {e}", path.display()))
+fn report_bytes(report: &Value) -> Result<Vec<u8>, String> {
+    Ok((serde_json::to_string_pretty(report).map_err(|e| e.to_string())? + "\n").into_bytes())
 }
 
-fn run(args: &Args) -> Result<bool, String> {
+/// The report is published atomically and durably, or the write fails.
+fn write_report(path: &Path, report: &Value) -> Result<(), String> {
+    write_atomic(path, &report_bytes(report)?)
+}
+
+/// The complete final report of a run that reached its end, its status and
+/// bytes. Nothing partial passes through here: `status` is `Checks::status`,
+/// which is `pass` only when every required check executed and none failed.
+fn final_report(
+    args: &Args,
+    checks: &Checks,
+    evidence: &serde_json::Map<String, Value>,
+    progress: &ProgressLog,
+) -> Result<(String, Vec<u8>), String> {
+    let summary = checks.json();
+    let status = summary["status"].as_str().unwrap_or("fail").to_string();
+    let report = json!({
+        "schema": REPORT_SCHEMA,
+        "mode": args.mode.name(),
+        "route": args.route.name(),
+        "status": status,
+        "model": args.model, "fixture": args.fixture, "manifest": args.manifest,
+        "fixture_sha256": file_sha256(&args.fixture)?,
+        "manifest_sha256": file_sha256(&args.manifest)?,
+        "checks": summary,
+        "evidence": evidence,
+        "progress": {
+            "schema": PROGRESS_SCHEMA,
+            "sidecar": progress_path(&args.output),
+            "records_before_final": progress.records(),
+            "time_sources": PROGRESS_TIME_SOURCES,
+        },
+    });
+    Ok((status, report_bytes(&report)?))
+}
+
+fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     let fixture_json = read_json(&args.fixture)?;
     let fixture = Fixture::parse(&fixture_json)?;
     let manifest = read_json(&args.manifest)?;
@@ -1743,13 +2106,24 @@ fn run(args: &Args) -> Result<bool, String> {
     let model_size = std::fs::metadata(&args.model)
         .map_err(|e| format!("stat {}: {e}", args.model.display()))?
         .len();
+    // The required list is durable before any GPU work, so a partial run's
+    // missing cases are named from it, never inferred.
+    let required = required_check_ids(args.mode, &fixture, args.route);
+    let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
+    let mut checks = Checks::new(&required_refs);
+    progress.record(
+        "plan",
+        json!({"mode": args.mode.name(), "route": args.route.name(), "required": required}),
+    );
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     // Baseline sample: after the HIP context exists, before any model allocation.
     // Only the primitive cell (Hold 1's first cell) runs the heavy telemetry:
     // the smaps/fdinfo background sampler and the non-gating census diagnostic.
     // Timed and quality cells keep their previous pipeline (point diagnostics).
     let heavy_memory = args.mode == Mode::Primitives;
-    let mut mem_samples = vec![mem_sample(&gpu, "pre_load", heavy_memory)];
+    let pre_load = mem_sample(&gpu, "pre_load", heavy_memory);
+    persist_memory(progress, "pre_load", &pre_load, None);
+    let mut mem_samples = vec![pre_load];
     let sampler = heavy_memory.then(ProcSampler::start);
     let identity_problems = manifest_problems(
         &manifest,
@@ -1759,26 +2133,39 @@ fn run(args: &Args) -> Result<bool, String> {
             gpu_arch: gpu.arch.clone(),
         },
     );
-    let required = required_check_ids(args.mode, &fixture, args.route);
-    let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
-    let mut checks = Checks::new(&required_refs);
     checks.push(
         "identity.manifest",
         identity_problems.clone(),
         json!({"binary_sha256": observed_binary, "model_size_bytes": model_size, "gpu_arch": gpu.arch,
                "model_sha256_verified": false, "note": "model sha256 is pinned by the manifest and not recomputed (125 GB)"}),
     );
+    progress.checks(&checks);
     let mut out = serde_json::Map::new();
     if identity_problems.is_empty() {
         let mut fixture = fixture;
         let session_cache = (args.mode == Mode::State).then_some(fixture.session_cache_bytes);
-        let loaded = slowlink_load_bundle(
+        progress.record(
+            "load_start",
+            json!({"max_seq": fixture.max_seq, "session_cache_bytes": session_cache}),
+        );
+        let loaded = match slowlink_load_bundle(
             &mut gpu,
             &args.model,
             fixture.max_seq,
             session_cache,
             load_purpose(args.mode),
-        )?;
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                // What the process still holds after the failed load, taken
+                // while the GPU is still owned. Not the HIP free at the
+                // failing allocation.
+                let sample = mem_sample(&gpu, "load_failed", heavy_memory);
+                persist_memory(progress, "load_failed", &sample, sampler.as_ref());
+                progress.record("load_error", json!({"error": error}));
+                return Err(error);
+            }
+        };
         let vocab = loaded.vocab;
         out.insert(
             "load".into(),
@@ -1789,6 +2176,7 @@ fn run(args: &Args) -> Result<bool, String> {
                 "vocab": vocab, "max_seq": fixture.max_seq,
             }),
         );
+        progress.record("load_end", out["load"].clone());
         // The placement the load actually made: a forced layer-major run needs
         // the S1 admission's joint placement (>= 10 resident layers); the
         // incumbent arm must not carry a profile.
@@ -1820,6 +2208,14 @@ fn run(args: &Args) -> Result<bool, String> {
             json!({"placement": loaded.placement, "resident_layers": loaded.resident_layers,
                    "host_mapped_tensors": loaded.host_mapped_tensors, "slowlink_profile": loaded.slowlink_profile}),
         );
+        progress.checks(&checks);
+        // A failure from here on still owns the GPU: its point sample is
+        // persisted before the error leaves the run.
+        let run_failed = |gpu: &Gpu, error: String| {
+            let sample = mem_sample(gpu, "run_failed", heavy_memory);
+            persist_memory(progress, "run_failed", &sample, sampler.as_ref());
+            error
+        };
         // Natural-text prompts are tokenized with the artifact's own tokenizer.
         for prompt in fixture.prompts.iter_mut() {
             if let Some(text) = &prompt.text {
@@ -1827,16 +2223,24 @@ fn run(args: &Args) -> Result<bool, String> {
                 if prompt.prompt_ids.is_empty()
                     || prompt.prompt_ids.len() + fixture.decode_tokens + 1 > fixture.max_seq
                 {
-                    return Err(format!(
-                        "natural prompt {} tokenizes to {} ids, outside 1..max_seq",
-                        prompt.id,
-                        prompt.prompt_ids.len()
+                    return Err(run_failed(
+                        &gpu,
+                        format!(
+                            "natural prompt {} tokenizes to {} ids, outside 1..max_seq",
+                            prompt.id,
+                            prompt.prompt_ids.len()
+                        ),
                     ));
                 }
             }
         }
-        let logits = gpu.zeros(&[vocab], DType::F32).map_err(|e| e.to_string())?;
-        mem_samples.push(mem_sample(&gpu, "post_load", sampler.is_some()));
+        let logits = match gpu.zeros(&[vocab], DType::F32) {
+            Ok(logits) => logits,
+            Err(e) => return Err(run_failed(&gpu, e.to_string())),
+        };
+        let post_load = mem_sample(&gpu, "post_load", sampler.is_some());
+        persist_memory(progress, "post_load", &post_load, sampler.as_ref());
+        mem_samples.push(post_load);
         let mut ctx = Ctx {
             gpu,
             bundle: loaded.bundle,
@@ -1847,17 +2251,30 @@ fn run(args: &Args) -> Result<bool, String> {
             fixture,
             route: args.route,
             mem: mem_samples,
+            progress: progress.clone(),
         };
+        progress.record(
+            "stage_start",
+            json!({"stage": args.mode.name(), "cache_usage": ctx.cache_usage()}),
+        );
         match args.mode {
-            Mode::Primitives => run_primitives(&mut ctx, &mut checks, &mut out),
+            Mode::Primitives => run_primitives(&mut ctx, &mut checks, &mut out, sampler.as_ref()),
             Mode::State => run_state(&mut ctx, &mut checks, &mut out),
             Mode::Product => run_product(&mut ctx, &mut checks, &mut out),
             Mode::Perf => run_perf(&mut ctx, &mut checks, &mut out),
         }
+        progress.record(
+            "stage_end",
+            json!({"stage": args.mode.name(), "cache_usage": ctx.cache_usage()}),
+        );
+        progress.checks(&checks);
         if let Some(sampler) = sampler {
             // The primitive cell (Hold 1's first cell) only: the heavy sampler.
             // Its census residual is recorded as a non-gating diagnostic.
             ctx.sample_memory("end");
+            if let Some(end) = ctx.mem.last() {
+                persist_memory(progress, "end", end, Some(&sampler));
+            }
             let mut samples = std::mem::take(&mut ctx.mem);
             samples.push(sampler.finish());
             out.insert(
@@ -1869,12 +2286,18 @@ fn run(args: &Args) -> Result<bool, String> {
             // no smaps, no census requirement. Three light point diagnostics,
             // taken outside any timed region, are recorded and never judged.
             let mut samples = std::mem::take(&mut ctx.mem);
-            samples.push(mem_sample(&ctx.gpu, "end", false));
+            let end = mem_sample(&ctx.gpu, "end", false);
+            persist_memory(progress, "end", &end, None);
+            samples.push(end);
             out.insert(
                 "memory_diagnostics".into(),
                 json!({"required": false, "samples": samples}),
             );
         }
+        progress.record(
+            "cache",
+            json!({"phase": "end", "usage": ctx.cache_usage()}),
+        );
         let peak = ctx
             .gpu
             .hip
@@ -1896,27 +2319,66 @@ fn run(args: &Args) -> Result<bool, String> {
                 Value::Null,
             );
         }
+        progress.checks(&checks);
     }
-    let summary = checks.json();
-    let status = summary["status"].as_str().unwrap_or("fail").to_string();
-    let report = json!({
-        "schema": REPORT_SCHEMA,
-        "mode": args.mode.name(),
-        "route": args.route.name(),
-        "status": status,
-        "model": args.model, "fixture": args.fixture, "manifest": args.manifest,
-        "fixture_sha256": file_sha256(&args.fixture)?,
-        "manifest_sha256": file_sha256(&args.manifest)?,
-        "checks": summary,
-        "evidence": out,
-    });
-    write_report(&args.output, &report)?;
+    // The sidecar's own durability is a required check: a lost record is a
+    // gate failure, never silent. The final record carries the report's
+    // digest; if THAT record cannot be written the report is rebuilt failing.
+    checks.push(
+        "progress.durability",
+        progress.durability_problems(),
+        json!({"sidecar": progress_path(&args.output), "records": progress.records()}),
+    );
+    let durable_before_final = progress.error().is_none();
+    let (mut status, mut bytes) = final_report(args, &checks, &out, progress)?;
+    progress.record(
+        "final",
+        json!({
+            "status": status, "report": args.output,
+            "report_sha256": format!("{:x}", Sha256::digest(&bytes)),
+        }),
+    );
+    if let (true, Some(error)) = (durable_before_final, progress.error()) {
+        checks.fail(
+            "progress.durability",
+            format!("the final record was not durable: {error}"),
+            Value::Null,
+        );
+        (status, bytes) = final_report(args, &checks, &out, progress)?;
+    }
+    write_atomic(&args.output, &bytes)?;
     eprintln!(
         "qwen4_slowlink_gate: {} {} -> {status}",
         args.mode.name(),
         args.route.name()
     );
     Ok(status == "pass")
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// An aborted run's report: always `incomplete`, with the error and a summary
+/// of the durable sidecar (never a pass, never filled-in cases).
+fn aborted_report(args: &Args, error: &str, progress: Option<&ProgressLog>) -> Value {
+    let sidecar = progress_path(&args.output);
+    let summary = match std::fs::read_to_string(&sidecar) {
+        Ok(text) => progress_summary(&text),
+        Err(e) => json!({"unreadable": format!("read {}: {e}", sidecar.display())}),
+    };
+    json!({
+        "schema": REPORT_SCHEMA, "mode": args.mode.name(), "route": args.route.name(),
+        "status": "incomplete", "error": error,
+        "progress": {
+            "schema": PROGRESS_SCHEMA, "sidecar": sidecar,
+            "write_error": progress.and_then(|p| p.error()), "summary": summary,
+        },
+    })
 }
 
 fn main() {
@@ -1932,16 +2394,42 @@ fn main() {
             std::process::exit(2);
         }
     };
-    match run(&args) {
+    let mut clock = system_clock();
+    let (started_ms, _) = clock();
+    let run_id = format!("{}-{started_ms}", std::process::id());
+    let progress = match ProgressLog::open_file(&progress_path(&args.output), run_id, true) {
+        Ok(progress) => progress,
+        Err(e) => {
+            // No durable progress is a gate failure before any GPU work.
+            eprintln!("qwen4_slowlink_gate: {e}");
+            if let Err(w) = write_report(&args.output, &aborted_report(&args, &e, None)) {
+                eprintln!("qwen4_slowlink_gate: {w}");
+            }
+            std::process::exit(1);
+        }
+    };
+    progress.record(
+        "run_start",
+        json!({
+            "mode": args.mode.name(), "route": args.route.name(), "pid": std::process::id(),
+            "model": args.model, "fixture": args.fixture, "manifest": args.manifest,
+            "output": args.output, "output_preexisting": args.output.exists(),
+            "report_schema": REPORT_SCHEMA, "time_sources": PROGRESS_TIME_SOURCES,
+        }),
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&args, &progress)))
+        .unwrap_or_else(|payload| Err(format!("gate panicked: {}", panic_message(&*payload))));
+    match outcome {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(e) => {
-            // A setup failure still leaves a report: nothing ran, so INCOMPLETE.
-            let report = json!({
-                "schema": REPORT_SCHEMA, "mode": args.mode.name(), "route": args.route.name(),
-                "status": "incomplete", "error": e,
-            });
-            let _ = write_report(&args.output, &report);
+            // An aborted run still leaves a report: it did not finish, so
+            // INCOMPLETE, and the error is written through first.
+            progress.record("abort", json!({"error": e}));
+            if let Err(w) = write_report(&args.output, &aborted_report(&args, &e, Some(&progress)))
+            {
+                eprintln!("qwen4_slowlink_gate: {w}");
+            }
             eprintln!("qwen4_slowlink_gate: {e}");
             std::process::exit(1);
         }
@@ -3297,9 +3785,10 @@ mod slowlink_receipt_tests {
                 assert!(ids.iter().any(|n| n == "load.placement"), "{mode:?}");
             }
         }
-        // The primitive cell: exactly the cases plus identity and load.
+        // The primitive cell: exactly the cases plus identity, load and the
+        // sidecar's own durability.
         let ids = required_check_ids(Mode::Primitives, &fixture, Expect::LayerMajor);
-        assert_eq!(ids.len(), PRIMITIVE_CASES.len() + 2);
+        assert_eq!(ids.len(), PRIMITIVE_CASES.len() + 3);
         for case in PRIMITIVE_CASES {
             assert!(ids.contains(&format!("primitive.{case}")), "{case}");
         }
@@ -3379,5 +3868,396 @@ mod slowlink_receipt_tests {
         let mut checks = Checks::new(&["primitive.x"]);
         checks.pass("primitive.x", Value::Null);
         assert_eq!(checks.status(), "pass");
+    }
+
+    // ── durable progress ───────────────────────────────────────────────
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type SharedLines = Rc<RefCell<Vec<String>>>;
+
+    struct MemSink {
+        lines: SharedLines,
+        fail_at: Option<usize>,
+    }
+
+    impl ProgressSink for MemSink {
+        fn append(&mut self, line: &str) -> std::io::Result<()> {
+            if Some(self.lines.borrow().len()) == self.fail_at {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "no space left on device",
+                ));
+            }
+            self.lines.borrow_mut().push(line.to_string());
+            Ok(())
+        }
+    }
+
+    /// A log over memory with a deterministic clock: record `n` (1-based) is at
+    /// 2024-02-29T12:34:56Z + n s and `7 n` ns monotonic.
+    fn memory_log(fail_at: Option<usize>) -> (ProgressLog, SharedLines) {
+        let lines: SharedLines = Rc::new(RefCell::new(Vec::new()));
+        let mut tick = 0u64;
+        let clock: ProgressClock = Box::new(move || {
+            tick += 1;
+            (1_709_210_096_000 + tick * 1000, tick * 7)
+        });
+        let sink = MemSink {
+            lines: Rc::clone(&lines),
+            fail_at,
+        };
+        let log = ProgressLog::new(Box::new(sink), clock, "run-a".into(), false);
+        (log, lines)
+    }
+
+    fn log_text(lines: &SharedLines) -> String {
+        lines.borrow().concat()
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slowlink-progress-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn required_names() -> Vec<&'static str> {
+        vec![
+            "state.p512.route_receipt",
+            "state.p512.repeat_determinism",
+            "identity.manifest",
+            "progress.durability",
+        ]
+    }
+
+    /// A run killed inside repeat 1 of its first case: one completed repeat,
+    /// one in flight, one executed check.
+    fn partial_log(final_claims_pass: bool) -> String {
+        let (log, lines) = memory_log(None);
+        log.record("run_start", json!({"mode": "state"}));
+        log.record("plan", json!({"required": required_names()}));
+        log.record("memory", json!({"phase": "pre_load"}));
+        log.record("case_start", json!({"case": "state.p512", "repeats": 3}));
+        log.record("repeat_start", json!({"case": "state.p512", "repeat": 0}));
+        log.record(
+            "repeat_end",
+            json!({"case": "state.p512", "repeat": 0, "status": "ok", "wall_s": 1.5,
+                   "state_digest": "aa", "logits_digest": "bb"}),
+        );
+        log.record("check", json!({"name": "identity.manifest", "status": "pass"}));
+        log.record("repeat_start", json!({"case": "state.p512", "repeat": 1}));
+        if final_claims_pass {
+            log.record("final", json!({"status": "pass", "report_sha256": "ff"}));
+        }
+        log_text(&lines)
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_utc_and_sidecar_path_are_exact() {
+        assert_eq!(utc_rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(utc_rfc3339(1_000_000_000_000), "2001-09-09T01:46:40.000Z");
+        assert_eq!(utc_rfc3339(1_709_210_096_789), "2024-02-29T12:34:56.789Z");
+        assert_eq!(utc_rfc3339(1_782_864_000_000), "2026-07-01T00:00:00.000Z");
+        assert_eq!(
+            progress_path(Path::new("/r/state.json")),
+            PathBuf::from("/r/state.json.progress.jsonl")
+        );
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_record_is_one_timed_line_and_reserved_keys_win() {
+        let (log, lines) = memory_log(None);
+        log.record(
+            "repeat_end",
+            json!({"case": "state.p512", "repeat": 0, "seq": 99, "event": "forged", "run_id": "x"}),
+        );
+        let text = log_text(&lines);
+        assert_eq!(text.matches('\n').count(), 1, "one record is one line");
+        assert!(text.ends_with('\n'));
+        let record: Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(record["schema"], PROGRESS_SCHEMA);
+        assert_eq!(record["seq"], 0);
+        assert_eq!(record["event"], "repeat_end");
+        assert_eq!(record["run_id"], "run-a");
+        assert_eq!(record["utc"], "2024-02-29T12:34:57.000Z");
+        assert_eq!(record["unix_ms"], 1_709_210_097_000u64);
+        assert_eq!(record["mono_ns"], 7);
+        assert_eq!(record["case"], "state.p512");
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_write_error_is_sticky_and_fails_durability() {
+        let (log, lines) = memory_log(Some(1));
+        log.record("run_start", json!({}));
+        assert!(log.durability_problems().is_empty());
+        log.record("repeat_end", json!({"case": "c", "repeat": 0}));
+        let error = log.error().expect("the failed write is kept");
+        assert!(error.contains("repeat_end"), "{error}");
+        assert!(error.contains("no space left"), "{error}");
+        // Nothing after a lost record is written as if the log were intact.
+        log.record("repeat_end", json!({"case": "c", "repeat": 1}));
+        assert_eq!(lines.borrow().len(), 1);
+        assert_eq!(log.records(), 1);
+        let mut checks = Checks::new(&["progress.durability"]);
+        checks.push(
+            "progress.durability",
+            log.durability_problems(),
+            Value::Null,
+        );
+        assert_eq!(checks.status(), "fail");
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_checks_are_written_once_each_in_order() {
+        let (log, lines) = memory_log(None);
+        let mut checks = Checks::new(&["a", "b"]);
+        checks.pass("a", json!({"x": 1}));
+        log.checks(&checks);
+        log.checks(&checks);
+        checks.fail("b", "boom", Value::Null);
+        log.checks(&checks);
+        let records: Vec<Value> = log_text(&lines)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "each row exactly once");
+        assert_eq!(
+            (records[0]["name"].as_str(), records[0]["status"].as_str()),
+            (Some("a"), Some("pass"))
+        );
+        assert_eq!(
+            (records[1]["name"].as_str(), records[1]["reason"].as_str()),
+            (Some("b"), Some("boom"))
+        );
+        assert!(records.iter().all(|r| r["event"] == "check"));
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_partial_summary_keeps_progress_and_never_passes() {
+        for claims_pass in [false, true] {
+            let summary = progress_summary(&partial_log(claims_pass));
+            // A killed run is incomplete even if a final record is present.
+            assert_eq!(summary["status"], "incomplete", "{claims_pass}");
+            assert_eq!(summary["promotable"], false);
+            assert_eq!(summary["run_id"], "run-a");
+            assert_eq!(summary["torn_tail"], false);
+            assert_eq!(summary["seq_contiguous"], true);
+            assert_eq!(summary["memory_phases"], json!(["pre_load"]));
+            let case = &summary["cases"]["state.p512"];
+            assert_eq!(case["repeats_completed"], 1);
+            assert_eq!(case["in_flight_repeat"], 1);
+            assert_eq!(case["last_completed"]["state_digest"], "aa");
+            assert_eq!(case["last_completed"]["wall_s"], 1.5);
+            // Unexecuted required checks are named, not filled in.
+            assert_eq!(
+                summary["missing_required"],
+                json!([
+                    "state.p512.route_receipt",
+                    "state.p512.repeat_determinism",
+                    "progress.durability"
+                ])
+            );
+            assert_eq!(summary["failed_checks"], json!([]));
+        }
+        let with_final = progress_summary(&partial_log(true));
+        assert_eq!(with_final["final_recorded"]["status"], "pass");
+        assert_eq!(with_final["status"], "incomplete");
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_torn_tail_is_dropped_and_the_last_repeat_is_kept() {
+        let full = partial_log(false);
+        for torn in [
+            &full[..full.len() - 10],
+            full.trim_end_matches('\n'), // newline lost: the record is suspect
+        ] {
+            let summary = progress_summary(torn);
+            assert_eq!(summary["torn_tail"], true);
+            assert_eq!(summary["last_event"], "check");
+            assert_eq!(summary["cases"]["state.p512"]["repeats_completed"], 1);
+            assert_eq!(summary["cases"]["state.p512"]["in_flight_repeat"], Value::Null);
+            assert_eq!(summary["status"], "incomplete");
+        }
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_corrupt_middle_line_is_never_interpreted() {
+        let mut lines: Vec<String> = partial_log(false).lines().map(String::from).collect();
+        lines[4] = "{\"schema\":\"hipfire.qwen4.slowlink_gate.progress.v1\",\"seq\":4,".into();
+        let summary = progress_summary(&(lines.join("\n") + "\n"));
+        assert_eq!(summary["corrupt_lines"], json!([5]));
+        assert_eq!(summary["seq_contiguous"], false);
+        assert_ne!(summary["status"], "pass");
+        // The corrupted repeat_start is not guessed back: repeat 0 has an end
+        // but no valid start, repeat 1 is still the one in flight.
+        assert_eq!(summary["cases"]["state.p512"]["in_flight_repeat"], 1);
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_recorded_failure_is_a_fail_not_an_incomplete() {
+        let (log, lines) = memory_log(None);
+        log.record("run_start", json!({}));
+        log.record("plan", json!({"required": required_names()}));
+        let mut checks = Checks::new(&required_names());
+        checks.pass("identity.manifest", Value::Null);
+        checks.fail("state.p512.route_receipt", "repeat 1: hipMalloc failed", Value::Null);
+        log.checks(&checks);
+        let summary = progress_summary(&log_text(&lines));
+        assert_eq!(summary["status"], "fail");
+        assert_eq!(summary["failed_checks"], json!(["state.p512.route_receipt"]));
+        assert_eq!(
+            summary["missing_required"],
+            json!(["state.p512.repeat_determinism", "progress.durability"])
+        );
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_reopen_seals_a_torn_line_and_summarizes_the_new_run() {
+        let dir = scratch_dir("seal");
+        let path = dir.join("out.json.progress.jsonl");
+        std::fs::write(
+            &path,
+            "{\"schema\":\"hipfire.qwen4.slowlink_gate.progress.v1\",\"seq\":0,\"ev",
+        )
+        .unwrap();
+        let log = ProgressLog::open_file(&path, "run-b".into(), false).unwrap();
+        log.record("run_start", json!({}));
+        log.record("abort", json!({"error": "load: out of memory"}));
+        assert!(log.error().is_none());
+        let summary = progress_summary(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(summary["run_id"], "run-b");
+        assert_eq!(summary["corrupt_lines"], json!([1]));
+        assert_eq!(summary["torn_tail"], false);
+        assert_eq!(summary["run_start_seen"], true);
+        assert_eq!(summary["seq_contiguous"], true);
+        assert_eq!(summary["records"], 2);
+        assert_eq!(summary["error"], "load: out of memory");
+        assert_eq!(summary["status"], "incomplete");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let missing = Path::new("/nonexistent-slowlink-dir/x.progress.jsonl");
+        let error = ProgressLog::open_file(missing, "run-c".into(), false)
+            .err()
+            .expect("an unwritable sidecar is an error before any GPU work");
+        assert!(error.contains("open progress sidecar"), "{error}");
+    }
+
+    #[test]
+    fn slowlink_receipt_write_atomic_replaces_whole_files_and_leaves_no_temporary() {
+        let dir = scratch_dir("atomic");
+        let path = dir.join("report.json");
+        write_atomic(&path, b"old").unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        // A failed publish (the target is a non-empty directory) is an error
+        // and removes its temporary file.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join("inner")).unwrap();
+        let error = write_atomic(&blocked, b"x").unwrap_err();
+        assert!(error.contains("blocked"), "{error}");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["blocked", "report.json"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn slowlink_receipt_aborted_report_is_incomplete_and_carries_the_sidecar_summary() {
+        let dir = scratch_dir("abort");
+        let output = dir.join("state.json");
+        let arg = |s: &str| s.to_string();
+        let args = parse_args([
+            arg("--model"), arg("/m"), arg("--fixture"), arg("/f"), arg("--manifest"),
+            arg("/man"), arg("--output"), output.to_string_lossy().into_owned(),
+            arg("--mode"), arg("state"), arg("--route"), arg("layer-major"),
+        ])
+        .unwrap();
+        // No sidecar yet: the report says so rather than inventing one.
+        let bare = aborted_report(&args, "setup failed", None);
+        assert_eq!(bare["status"], "incomplete");
+        assert!(bare["progress"]["summary"]["unreadable"].is_string());
+        std::fs::write(progress_path(&output), partial_log(false)).unwrap();
+        let report = aborted_report(&args, "timed out", None);
+        assert_eq!(report["status"], "incomplete");
+        assert_eq!(report["error"], "timed out");
+        assert_eq!(
+            report["progress"]["summary"]["cases"]["state.p512"]["repeats_completed"],
+            1
+        );
+        assert!(report.get("checks").is_none(), "no verdict rows are invented");
+        write_report(&output, &report).unwrap();
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(written["status"], "incomplete");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_durability_is_required_and_a_partial_run_is_incomplete() {
+        let fixture = Fixture::parse(&fixture()).unwrap();
+        for mode in [Mode::Primitives, Mode::State, Mode::Product, Mode::Perf] {
+            let ids = required_check_ids(mode, &fixture, Expect::LayerMajor);
+            assert!(ids.iter().any(|n| n == "progress.durability"), "{mode:?}");
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let mut checks = Checks::new(&refs);
+            for id in ids.iter().filter(|n| *n != "progress.durability") {
+                checks.pass(id, Value::Null);
+            }
+            assert_eq!(checks.status(), "incomplete", "{mode:?}");
+            assert_eq!(checks.missing(), ["progress.durability"]);
+            checks.pass("progress.durability", Value::Null);
+            assert_eq!(checks.status(), "pass", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn slowlink_receipt_primitive_later_error_fails_only_its_case_and_leaves_the_rest_unproved() {
+        let ids: Vec<String> = PRIMITIVE_CASES
+            .iter()
+            .map(|case| format!("primitive.{case}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut checks = Checks::new(&refs);
+        for name in &PRIMITIVE_CASES[..2] {
+            judge_primitive(&mut checks, name, &case_report(name, "pass"));
+        }
+        let third = PRIMITIVE_CASES[2];
+        judge_primitive(
+            &mut checks,
+            third,
+            &primitive_error(third, "slow-link primitive could not run: stream lost"),
+        );
+        assert_eq!(checks.status(), "fail");
+        let failed = rows(&checks)
+            .into_iter()
+            .filter(|r| r["status"] == "fail")
+            .count();
+        assert_eq!(failed, 1, "the exception is not cloned onto other cases");
+        assert_eq!(checks.missing().len(), PRIMITIVE_CASES.len() - 3);
+        let r = row(&checks, &format!("primitive.{third}"));
+        assert!(r["reason"].as_str().unwrap().contains("stream lost"));
+        assert!(r["detail"]["mismatches"].is_null());
+    }
+
+    #[test]
+    fn slowlink_receipt_progress_window_summary_keeps_only_the_windows_and_never_invents_one() {
+        let receipt = json!({
+            "route": "layer-major", "entry_pos": 0, "prompt_rows": 16384,
+            "windows": [[0, 16384]], "launch_cuts": [], "tile_rows": 1536,
+            "spans_ms": {"copy": 1.0}, "cache_usage": {"pool_bytes": 1},
+        });
+        let summary = window_summary(&[Some(receipt), None]);
+        assert_eq!(summary[0]["windows"], json!([[0, 16384]]));
+        assert_eq!(summary[0]["tile_rows"], 1536);
+        assert!(summary[0].get("spans_ms").is_none());
+        assert!(summary[0].get("cache_usage").is_none());
+        assert!(summary[1].is_null(), "a missing receipt stays missing");
     }
 }

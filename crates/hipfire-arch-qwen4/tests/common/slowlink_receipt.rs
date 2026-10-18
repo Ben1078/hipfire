@@ -498,6 +498,12 @@ impl Checks {
             .collect()
     }
 
+    /// Every row recorded so far, in order (the durable progress log writes
+    /// each exactly once, as it is observed).
+    pub fn rows(&self) -> &[Value] {
+        &self.rows
+    }
+
     pub fn json(&self) -> Value {
         json!({
             "status": self.status(),
@@ -506,6 +512,421 @@ impl Checks {
             "checks": self.rows,
         })
     }
+}
+
+// ── durable gate progress ──────────────────────────────────────────────
+//
+// A bounded JSONL sidecar (`<output>.progress.jsonl`) holds the evidence a
+// SIGTERM, timeout or crash would otherwise lose: each line is one record,
+// written with a single `write_all` and `sync_data` the moment it is
+// observed. The sidecar is evidence only: it can never be promoted. Only a
+// complete final report (`write_atomic`) carries a verdict, and a summary
+// of a partial sidecar is `incomplete` (or `fail` if a failure was already
+// observed), never `pass`; a required check that never ran stays listed as
+// missing rather than being filled in.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+pub const PROGRESS_SCHEMA: &str = "hipfire.qwen4.slowlink_gate.progress.v1";
+pub const PROGRESS_SUMMARY_SCHEMA: &str = "hipfire.qwen4.slowlink_gate.progress_summary.v1";
+pub const PROGRESS_SUFFIX: &str = ".progress.jsonl";
+/// Where each record's times come from, recorded in `run_start` so the log can
+/// be aligned with the sampler and the untimestamped stderr stream.
+pub const PROGRESS_TIME_SOURCES: &str = "utc/unix_ms: SystemTime::now (CLOCK_REALTIME) when the record is built; mono_ns: std::time::Instant (CLOCK_MONOTONIC on Linux) elapsed since the log was opened; every stderr progress echo prints the same utc and mono_ns; the background sampler has no timestamps, its running maxima are embedded in a record and take that record's times";
+
+/// The sidecar next to `output`: `<output file name>.progress.jsonl`.
+pub fn progress_path(output: &Path) -> PathBuf {
+    let mut name = output.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(PROGRESS_SUFFIX);
+    output.with_file_name(name)
+}
+
+/// `unix_ms` as `YYYY-MM-DDTHH:MM:SS.mmmZ` (proleptic Gregorian, UTC).
+pub fn utc_rfc3339(unix_ms: u64) -> String {
+    let (secs, ms) = (unix_ms / 1000, unix_ms % 1000);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil-from-days (H. Hinnant): shift the epoch to 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{ms:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// `(unix_ms, mono_ns)`: realtime for UTC, monotonic since the log opened.
+pub type ProgressClock = Box<dyn FnMut() -> (u64, u64)>;
+
+pub fn system_clock() -> ProgressClock {
+    let opened = std::time::Instant::now();
+    Box::new(move || {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        (unix_ms, opened.elapsed().as_nanos() as u64)
+    })
+}
+
+/// One complete line (with its `\n`) appended durably, or an error.
+pub trait ProgressSink {
+    fn append(&mut self, line: &str) -> std::io::Result<()>;
+}
+
+struct FileSink(std::fs::File);
+
+impl ProgressSink for FileSink {
+    fn append(&mut self, line: &str) -> std::io::Result<()> {
+        self.0.write_all(line.as_bytes())?;
+        self.0.sync_data()
+    }
+}
+
+/// fsync the directory holding `path` so a new/renamed entry is durable.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+struct ProgressInner {
+    sink: Box<dyn ProgressSink>,
+    clock: ProgressClock,
+    run_id: String,
+    seq: u64,
+    error: Option<String>,
+    flushed_rows: usize,
+    echo: bool,
+}
+
+/// Single-threaded shared handle to the sidecar (the gate's one process-local
+/// log; the background sampler never touches it). The FIRST write error is
+/// kept, printed and is sticky: later records are not attempted, and the gate
+/// turns it into the failed required check `progress.durability`.
+#[derive(Clone)]
+pub struct ProgressLog(Rc<RefCell<ProgressInner>>);
+
+impl ProgressLog {
+    pub fn new(
+        sink: Box<dyn ProgressSink>,
+        clock: ProgressClock,
+        run_id: String,
+        echo: bool,
+    ) -> Self {
+        Self(Rc::new(RefCell::new(ProgressInner {
+            sink,
+            clock,
+            run_id,
+            seq: 0,
+            error: None,
+            flushed_rows: 0,
+            echo,
+        })))
+    }
+
+    /// Open (append, never truncate) the sidecar at `path`. A torn last line
+    /// left by an earlier killed run is sealed with a newline first so it can
+    /// never swallow this run's first record.
+    pub fn open_file(path: &Path, run_id: String, echo: bool) -> Result<Self, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let fail = |what: &str, e: std::io::Error| format!("{what} {}: {e}", path.display());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(|e| fail("open progress sidecar", e))?;
+        let len = file
+            .metadata()
+            .map_err(|e| fail("stat progress sidecar", e))?
+            .len();
+        if len > 0 {
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::End(-1))
+                .and_then(|_| file.read_exact(&mut last))
+                .map_err(|e| fail("read progress sidecar tail", e))?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")
+                    .map_err(|e| fail("seal torn progress sidecar line", e))?;
+            }
+        }
+        file.sync_all()
+            .and_then(|()| sync_parent(path))
+            .map_err(|e| fail("sync progress sidecar", e))?;
+        Ok(Self::new(Box::new(FileSink(file)), system_clock(), run_id, echo))
+    }
+
+    /// The current `(unix_ms, mono_ns)` of this log's clock.
+    pub fn now(&self) -> (u64, u64) {
+        (self.0.borrow_mut().clock)()
+    }
+
+    /// A `(unix_ms, mono_ns)` as the `{utc, unix_ms, mono_ns}` JSON stamp.
+    pub fn stamp((unix_ms, mono_ns): (u64, u64)) -> Value {
+        json!({"utc": utc_rfc3339(unix_ms), "unix_ms": unix_ms, "mono_ns": mono_ns})
+    }
+
+    /// Append one record `{schema, run_id, seq, event, utc, unix_ms, mono_ns,
+    /// ..fields}` durably. On a write error the log goes sticky-failed.
+    pub fn record(&self, event: &str, fields: Value) {
+        let mut inner = self.0.borrow_mut();
+        if inner.error.is_some() {
+            return;
+        }
+        let (unix_ms, mono_ns) = (inner.clock)();
+        let mut object = match fields {
+            Value::Object(map) => map,
+            Value::Null => serde_json::Map::new(),
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("value".into(), other);
+                map
+            }
+        };
+        let utc = utc_rfc3339(unix_ms);
+        let seq = inner.seq;
+        object.insert("schema".into(), json!(PROGRESS_SCHEMA));
+        object.insert("run_id".into(), json!(inner.run_id));
+        object.insert("seq".into(), json!(seq));
+        object.insert("event".into(), json!(event));
+        object.insert("utc".into(), json!(utc));
+        object.insert("unix_ms".into(), json!(unix_ms));
+        object.insert("mono_ns".into(), json!(mono_ns));
+        let written = serde_json::to_string(&Value::Object(object))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            .and_then(|mut line| {
+                line.push('\n');
+                inner.sink.append(&line)
+            });
+        match written {
+            Ok(()) => {
+                inner.seq += 1;
+                if inner.echo {
+                    eprintln!("qwen4_slowlink_gate: progress #{seq} {event} utc={utc} mono_ns={mono_ns}");
+                }
+            }
+            Err(e) => {
+                let message = format!("progress record #{seq} ({event}) was not durably written: {e}");
+                eprintln!("qwen4_slowlink_gate: FAIL progress.durability: {message}");
+                inner.error = Some(message);
+            }
+        }
+    }
+
+    /// Write every `checks` row not yet written, as a `check` record each.
+    pub fn checks(&self, checks: &Checks) {
+        let start = self.0.borrow().flushed_rows;
+        for row in checks.rows().iter().skip(start) {
+            self.record("check", row.clone());
+        }
+        self.0.borrow_mut().flushed_rows = checks.rows().len();
+    }
+
+    /// The first write error, if any.
+    pub fn error(&self) -> Option<String> {
+        self.0.borrow().error.clone()
+    }
+
+    /// Records durably written so far.
+    pub fn records(&self) -> u64 {
+        self.0.borrow().seq
+    }
+
+    /// Problems for the required `progress.durability` check.
+    pub fn durability_problems(&self) -> Vec<String> {
+        self.error().into_iter().collect()
+    }
+}
+
+/// Write `bytes` to `path` atomically and durably: temporary sibling, fsync,
+/// rename, fsync of the directory. A failure removes the temporary file and
+/// leaves `path` as it was; the caller must treat it as a gate failure.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let temporary = path.with_file_name(name);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        sync_parent(path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("write {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CaseProgress {
+    completed: u64,
+    failed: u64,
+    in_flight: Option<u64>,
+    last_completed: Value,
+    last_error: Value,
+}
+
+/// What a (possibly truncated, crashed or corrupted) sidecar proves. Only the
+/// LAST run in the file is summarized. A torn final line (no newline) is
+/// dropped and flagged; a complete line that is not a valid record is
+/// `corrupt_lines` and is never interpreted. The status is `fail` only when a
+/// failed check row was durably recorded and otherwise `incomplete`: the
+/// sidecar can never say `pass`, and the verdict of a finished run is the
+/// atomically written report alone (`final_recorded` only names its digest).
+pub fn progress_summary(text: &str) -> Value {
+    let mut segments: Vec<&str> = text.split('\n').collect();
+    let torn_tail = segments.pop().filter(|tail| !tail.is_empty()).is_some();
+    let mut records: Vec<Value> = Vec::new();
+    let mut corrupt_lines: Vec<usize> = Vec::new();
+    for (index, line) in segments.iter().enumerate() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value)
+                if value["schema"] == PROGRESS_SCHEMA
+                    && value["seq"].is_u64()
+                    && value["event"].is_string()
+                    && value["run_id"].is_string() =>
+            {
+                records.push(value)
+            }
+            _ => corrupt_lines.push(index + 1),
+        }
+    }
+    let run_id = records
+        .iter()
+        .rev()
+        .find(|r| r["event"] == "run_start")
+        .or_else(|| records.last())
+        .map(|r| r["run_id"].clone())
+        .unwrap_or(Value::Null);
+    let run: Vec<&Value> = records.iter().filter(|r| r["run_id"] == run_id).collect();
+    let run_start_seen = run.iter().any(|r| r["event"] == "run_start");
+    let seq_contiguous = run
+        .iter()
+        .enumerate()
+        .all(|(i, r)| r["seq"].as_u64() == Some(i as u64));
+    let mut cases: BTreeMap<String, CaseProgress> = BTreeMap::new();
+    let mut executed: BTreeMap<String, bool> = BTreeMap::new(); // name -> failed
+    let mut required: Vec<String> = Vec::new();
+    let mut memory_phases: Vec<String> = Vec::new();
+    let mut error = Value::Null;
+    let mut final_event = Value::Null;
+    for record in &run {
+        let case_key = record["case"].as_str().map(str::to_string);
+        match record["event"].as_str().unwrap_or("") {
+            "plan" => {
+                required = record["required"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+            }
+            "repeat_start" => {
+                if let Some(key) = case_key {
+                    cases.entry(key).or_default().in_flight = record["repeat"].as_u64();
+                }
+            }
+            "repeat_end" => {
+                if let Some(key) = case_key {
+                    let case = cases.entry(key).or_default();
+                    if case.in_flight == record["repeat"].as_u64() {
+                        case.in_flight = None;
+                    }
+                    if record["status"] == "ok" {
+                        case.completed += 1;
+                        case.last_completed = json!({
+                            "repeat": record["repeat"], "wall_s": record["wall_s"],
+                            "state_digest": record["state_digest"],
+                            "logits_digest": record["logits_digest"],
+                            "utc": record["utc"], "mono_ns": record["mono_ns"],
+                        });
+                    } else {
+                        case.failed += 1;
+                        case.last_error = json!({"repeat": record["repeat"], "error": record["error"]});
+                    }
+                }
+            }
+            "check" => {
+                if let (Some(name), Some(status)) =
+                    (record["name"].as_str(), record["status"].as_str())
+                {
+                    if status == "pass" || status == "fail" {
+                        let failed = executed.entry(name.to_string()).or_insert(false);
+                        *failed |= status == "fail";
+                    }
+                }
+            }
+            "memory" => {
+                if let Some(phase) = record["phase"].as_str() {
+                    memory_phases.push(phase.to_string());
+                }
+            }
+            "abort" | "load_error" => error = record["error"].clone(),
+            "final" => {
+                final_event = json!({
+                    "status": record["status"], "report_sha256": record["report_sha256"],
+                    "utc": record["utc"],
+                })
+            }
+            _ => {}
+        }
+    }
+    let failed_checks: Vec<&String> = executed
+        .iter()
+        .filter(|(_, failed)| **failed)
+        .map(|(name, _)| name)
+        .collect();
+    let missing_required: Vec<&String> = required
+        .iter()
+        .filter(|name| !executed.contains_key(*name))
+        .collect();
+    let cases_json: serde_json::Map<String, Value> = cases
+        .into_iter()
+        .map(|(key, case)| {
+            (
+                key,
+                json!({
+                    "repeats_completed": case.completed, "repeats_failed": case.failed,
+                    "in_flight_repeat": case.in_flight,
+                    "last_completed": case.last_completed, "last_error": case.last_error,
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "schema": PROGRESS_SUMMARY_SCHEMA,
+        "status": if failed_checks.is_empty() { "incomplete" } else { "fail" },
+        "promotable": false,
+        "run_id": run_id,
+        "records": run.len(),
+        "run_start_seen": run_start_seen,
+        "seq_contiguous": seq_contiguous,
+        "corrupt_lines": corrupt_lines,
+        "torn_tail": torn_tail,
+        "last_event": run.last().map_or(Value::Null, |r| r["event"].clone()),
+        "last_utc": run.last().map_or(Value::Null, |r| r["utc"].clone()),
+        "last_mono_ns": run.last().map_or(Value::Null, |r| r["mono_ns"].clone()),
+        "cases": cases_json,
+        "memory_phases": memory_phases,
+        "failed_checks": failed_checks,
+        "missing_required": missing_required,
+        "error": error,
+        "final_recorded": final_event,
+    })
 }
 
 // ── fixture ────────────────────────────────────────────────────────────
