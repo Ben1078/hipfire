@@ -358,7 +358,7 @@ pub fn link_verdict(link: HostLink) -> Result<f64, SlowlinkDecline> {
 /// The window route of a manifest, from the REAL artifact layout and never a
 /// default: a slab layer arena in the manifest is the sealed expert-slab route
 /// ([`WindowRoute::SlabIu4`], A4 sidecars); stacked per-layer expert tensors
-/// are the aggregate route ([`WindowRoute::AggregateWmma`], window F16
+/// are the aggregate route ([`WindowRoute::Aggregate`], window F16
 /// activations). The dispatch side refuses any tile whose own sealed route
 /// differs from this declaration, so a wrong declaration cannot run.
 pub fn window_route_of(weights: &[hipfire_runtime::weight_manifest::WeightEntry]) -> WindowRoute {
@@ -368,7 +368,7 @@ pub fn window_route_of(weights: &[hipfire_runtime::weight_manifest::WeightEntry]
     {
         WindowRoute::SlabIu4
     } else {
-        WindowRoute::AggregateWmma
+        WindowRoute::Aggregate
     }
 }
 
@@ -727,6 +727,15 @@ impl PromptArenaLayout {
 pub const S1_K1_TAIL_ROWS: usize =
     (S1_MAX_BOUNDARY_SNAPSHOTS + 2) * rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
 
+/// Window rows of the aggregate route's F32-tail tiles (the 2..511-row
+/// prefill tiles of cut heads and tails, which stay inside the same window
+/// and lease): the dispatch bound `k1_rows + tail_rows < AGGREGATE_PANEL_ROWS`
+/// less the decode rows. The slab route has none. A plan whose F32-tail rows
+/// exceed this is a pre-mutation bypass; the layout charges only 40 B per row
+/// for the tail ids.
+pub const S1_AGGREGATE_TAIL_ROWS: usize =
+    hipfire_dispatch::pipeline::slowlink_prefill::AGGREGATE_PANEL_ROWS - 1 - S1_K1_TAIL_ROWS;
+
 /// The dispatch crate's route-storage dimensions of a window of `rows` rows.
 pub fn route_dims(
     geometry: &ModelGeometry,
@@ -739,6 +748,10 @@ pub fn route_dims(
         mi: geometry.moe_intermediate,
         shared_intermediate: geometry.shared_intermediate,
         k1_rows: S1_K1_TAIL_ROWS,
+        tail_rows: match geometry.route {
+            WindowRoute::SlabIu4 => 0,
+            WindowRoute::Aggregate => S1_AGGREGATE_TAIL_ROWS,
+        },
         route: geometry.route,
     }
 }
@@ -2331,6 +2344,101 @@ mod tests {
         assert!(projected_without < MARGIN);
     }
 
+    /// The REAL artifact is the aggregate route: the same measured j1761 inputs
+    /// keep exactly ten layers at tile 1,536 with 18 pages on it too, product
+    /// and primitive self-test, beside the aggregate census (A4 sidecars
+    /// replaced by the window F16 activations, plus the F32-tail ids). The
+    /// aggregate owned total follows D's layout exactly; no figure here is a
+    /// second copy of its arithmetic.
+    #[test]
+    fn slowlink_residency_j1761_aggregate_route_keeps_ten_layers() {
+        use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        use rdna_compute::tensor_ops::QsaKvFormat;
+        const MARGIN: u64 = 536_870_912;
+        let config = crate::config::compact_test_config();
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+        workspace[0].1 = 47_559_944;
+        let reserve = AutoReserve::new(
+            Some(5_517_207_808),
+            ReserveCensus {
+                qsa_context: 281_149_440,
+                state: 68_514_080,
+                forward: 1_839_888_260,
+                f16_shadows: 0,
+                workspace,
+                qsa_selector: 0,
+                mtp: 0,
+                gather: 0,
+                runtime: 0,
+            },
+        )
+        .unwrap();
+        let geometry = ModelGeometry::from_config(&config, WindowRoute::Aggregate).unwrap();
+        let stage = crate::state::Qwen4State::session_fixed_stage_bytes(&config, format).unwrap();
+        let selftest = diagnostic_budget_bytes(
+            &geometry,
+            AdmissionPurpose::PrimitiveSelftest,
+            GATE_UP_LAYER,
+            DOWN_LAYER,
+        )
+        .unwrap();
+        for (label, diagnostic) in [("product", 0u64), ("primitive selftest", selftest)] {
+            let profile = admit(&AdmissionInputs {
+                geometry,
+                free: 25_713_180_672,
+                non_expert: 5_364_055_296,
+                layer_expert_bytes: 1_336_934_400,
+                gate_up_layer_bytes: GATE_UP_LAYER,
+                down_layer_bytes: DOWN_LAYER,
+                trunk_layers: config.num_hidden_layers,
+                base_reserve: reserve.placement_bytes(true),
+                baseline_layers: 0,
+                fixed_state_bytes: stage,
+                pending_save_bytes: 0,
+                diagnostic_bytes: diagnostic,
+                base_runtime_reserved_bytes: reserve.census.runtime,
+                checkpoint_stride_rows: 8192,
+                window_rows: S1_WINDOW_ROWS,
+                link_gbps: 7.09,
+            })
+            .unwrap_or_else(|decline| panic!("{label} must admit on the aggregate route: {decline}"));
+            assert_eq!(profile.resident_layers, 10, "{label}");
+            assert_eq!(profile.tile_rows, 1536, "{label}");
+            assert_eq!(profile.pages.total_pages(), 18, "{label}");
+            assert_eq!(profile.census.a4_sidecars, 0, "{label}");
+            let layout = hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(
+                &profile.route_dims(),
+            )
+            .unwrap();
+            assert_eq!(layout.route(), WindowRoute::Aggregate);
+            assert_eq!(profile.census.route_storage, layout.total_bytes() as u64);
+            assert_eq!(
+                profile.census.route_storage
+                    + profile.census.a4_sidecars
+                    + profile.census.group_scatter,
+                layout.charged_bytes() as u64
+            );
+            // The 512 MiB margin still sits on top of the whole reserve: ten
+            // layers fit beside it.
+            let reserve_total = reserve.placement_bytes(true)
+                + profile.census.total().unwrap()
+                + MARGIN;
+            assert!(
+                profile.resident_layers as u64 * 1_336_934_400
+                    + 5_364_055_296
+                    + reserve_total
+                    <= 25_713_180_672,
+                "{label}"
+            );
+        }
+    }
+
     /// The generic runtime budget supplements what the base reserve already
     /// charges and never doubles it: the combined runtime reservation (the
     /// base census's `runtime` plus the S1 `runtime_overhead` term) is exactly
@@ -2697,13 +2805,13 @@ mod tests {
             "model.language_model.layers.0{}",
             crate::expert_arena::ARENA_SUFFIX
         ))];
-        assert_eq!(window_route_of(&aggregate), WindowRoute::AggregateWmma);
+        assert_eq!(window_route_of(&aggregate), WindowRoute::Aggregate);
         assert_eq!(window_route_of(&slab), WindowRoute::SlabIu4);
         // An empty manifest has no arena: stacked tensors are the layout.
-        assert_eq!(window_route_of(&[]), WindowRoute::AggregateWmma);
+        assert_eq!(window_route_of(&[]), WindowRoute::Aggregate);
 
         let config = crate::config::compact_test_config();
-        for route in [WindowRoute::SlabIu4, WindowRoute::AggregateWmma] {
+        for route in [WindowRoute::SlabIu4, WindowRoute::Aggregate] {
             let geometry = ModelGeometry::from_config(&config, route).unwrap();
             assert_eq!(geometry.route, route);
             assert_eq!(route_dims(&geometry, 16384).route, route);
@@ -2731,10 +2839,20 @@ mod tests {
                 WindowRoute::SlabIu4 => {
                     assert!(layout.a4_sidecar_bytes() > 0);
                 }
-                WindowRoute::AggregateWmma => {
+                WindowRoute::Aggregate => {
                     assert_eq!(layout.a4_sidecar_bytes(), 0);
                     assert_eq!(layout.x_f16_bytes(), 16384 * 2560 * 2);
                     assert_eq!(layout.x_f16_bytes(), 83_886_080);
+                    // D's final numbers at k1 48, tail bound 1999: the tail ids
+                    // are inside total_bytes (40 B per tail row, 256-aligned).
+                    assert_eq!(layout.tail_ids_bytes() % 256, 0);
+                    assert!(layout.tail_ids_bytes() >= 40 * S1_AGGREGATE_TAIL_ROWS);
+                    assert_eq!(
+                        layout.charged_bytes() as u64,
+                        route_storage_bytes(&geometry, 16384).unwrap()
+                            + a4_sidecar_bytes(&geometry, 16384).unwrap()
+                            + group_scatter_bytes(&geometry, 16384).unwrap()
+                    );
                 }
             }
         }

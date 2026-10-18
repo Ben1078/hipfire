@@ -7542,7 +7542,7 @@ mod qwen4_slowlink_tests {
             moe_intermediate: 640,
             shared_intermediate: 640,
             // The real MQ4 artifact is the stacked-expert aggregate layout.
-            route: s1::WindowRoute::AggregateWmma,
+            route: s1::WindowRoute::Aggregate,
         }
     }
 
