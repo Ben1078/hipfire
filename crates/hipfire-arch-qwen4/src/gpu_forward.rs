@@ -3916,7 +3916,6 @@ pub(crate) struct Qwen4ExpertStage {
 /// and the layer-ahead weight schedule ([`crate::slowlink_prefill`]).
 pub(crate) mod panel_stage;
 pub(crate) mod slab_stage;
-mod slab_stage;
 
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
