@@ -1076,7 +1076,8 @@ pub fn census_of(
             "boundary state",
         )
         .and_then(|stages| checked_add(stages, inputs.pending_save_bytes, "boundary state"))?,
-        runtime_overhead: S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(inputs.base_runtime_reserved_bytes),
+        runtime_overhead: S1_RUNTIME_OVERHEAD_BYTES
+            .saturating_sub(inputs.base_runtime_reserved_bytes),
         diagnostic: inputs.diagnostic_bytes,
     };
     Ok((pages, arena, census))
@@ -2151,7 +2152,9 @@ mod tests {
     /// 15,432,896 B of free remain.
     #[test]
     fn slowlink_residency_j1761_admission_keeps_ten_layers_and_projects_the_margin() {
-        use crate::expert_residency::{auto_vram_layers, AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        use crate::expert_residency::{
+            auto_vram_layers, AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT,
+        };
         use rdna_compute::tensor_ops::QsaKvFormat;
         const FREE_PRELOAD: u64 = 25_713_180_672;
         const NON_EXPERT: u64 = 5_364_055_296;
@@ -2314,7 +2317,15 @@ mod tests {
         const CAPABLE_RUNTIME: u64 = 1_476_395_008;
         let non_runtime = 2_237_111_724u64;
         let config = crate::config::compact_test_config();
-        for base_runtime in [0, 512 * MIB, GIB - 1, GIB, GIB + 1, CAPABLE_RUNTIME, 2 * GIB] {
+        for base_runtime in [
+            0,
+            512 * MIB,
+            GIB - 1,
+            GIB,
+            GIB + 1,
+            CAPABLE_RUNTIME,
+            2 * GIB,
+        ] {
             // The base reserve really carries the credited runtime bytes.
             let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
             workspace[0].1 = non_runtime;
