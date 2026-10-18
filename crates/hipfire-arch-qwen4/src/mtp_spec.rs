@@ -9194,12 +9194,14 @@ pub(crate) fn native_mtp_request_allocation_sizes(
         u64::try_from(hidden_row).ok()?,
     ];
     if let Some((gdn, ring_rows)) = row_capture {
-        sizes.extend(crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
-            config,
-            gdn,
-            ring_rows.max(rows),
-            config.n_linear_layers(),
-        )?);
+        sizes.extend(
+            crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
+                config,
+                gdn,
+                ring_rows.max(rows),
+                config.n_linear_layers(),
+            )?,
+        );
     }
     if batched_fill {
         sizes.extend(MtpAppendScratch::allocation_sizes(
@@ -9248,7 +9250,12 @@ mod tests {
         let config = crate::config::compact_test_config();
         for chunk_rows in [1usize, 4, 512, 768, 1536, 8192] {
             for drafts in [1usize, 3, 7, 63] {
-                for capture in [None, Some((G::Q8, 2)), Some((G::Q8Ef, 8)), Some((G::F32, 65))] {
+                for capture in [
+                    None,
+                    Some((G::Q8, 2)),
+                    Some((G::Q8Ef, 8)),
+                    Some((G::F32, 65)),
+                ] {
                     for fill in [false, true] {
                         let sizes = native_mtp_request_allocation_sizes(
                             &config, 4096, chunk_rows, drafts, capture, fill,
@@ -9291,14 +9298,7 @@ mod tests {
             }
         }
         assert_eq!(
-            native_mtp_request_allocation_sizes(
-                &config,
-                4096,
-                usize::MAX,
-                3,
-                None,
-                true
-            ),
+            native_mtp_request_allocation_sizes(&config, 4096, usize::MAX, 3, None, true),
             None
         );
         for rows in [usize::MAX, usize::MAX / 2, 1usize << 62] {
@@ -9343,11 +9343,13 @@ mod tests {
             )?;
             let (mut sizes, scratch) =
                 crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(&config, context, head)?;
-            sizes.extend(if scratch.iter().sum::<u64>() > request.iter().sum::<u64>() {
-                scratch
-            } else {
-                request
-            });
+            sizes.extend(
+                if scratch.iter().sum::<u64>() > request.iter().sum::<u64>() {
+                    scratch
+                } else {
+                    request
+                },
+            );
             Some(sizes)
         };
         for context in mtp_contexts() {

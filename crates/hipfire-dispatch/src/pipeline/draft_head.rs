@@ -330,15 +330,7 @@ impl DraftHead {
             } else {
                 &self.rotation
             };
-            hip(gpu.topk8_rescore_k2560(
-                &self.logits,
-                ranked,
-                order,
-                head,
-                x,
-                partial,
-                top1_out,
-            ))?;
+            hip(gpu.topk8_rescore_k2560(&self.logits, ranked, order, head, x, partial, top1_out))?;
         } else {
             execute_argmax(gpu, &self.logits, top1_out, 1, ranked)?;
         }

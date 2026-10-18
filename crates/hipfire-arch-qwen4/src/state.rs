@@ -1796,10 +1796,7 @@ fn committed_context_arena_bytes(
     }
     let (rows, tokens) = if spec.key.ends_with(".pooled_keys") || spec.key.ends_with(".pooled_bf16")
     {
-        (
-            geometry.pooled_capacity,
-            context.tokens.div_ceil(ratio),
-        )
+        (geometry.pooled_capacity, context.tokens.div_ceil(ratio))
     } else if spec.key.ends_with(".f16_keys") || spec.key.ends_with(".f16_values") {
         (
             qsa_f16_arena_rows(context.max_seq),
@@ -3627,7 +3624,10 @@ impl Qwen4State {
         // Each layer's allocations are checked once; the layer count is not
         // multiplied out so an overflowing total still refuses.
         let layer = ring.checked_add(inputs)?.checked_add(recurrence)?;
-        gdn_layers.checked_mul(layer)?.checked_add(output)?.checked_add(table)?;
+        gdn_layers
+            .checked_mul(layer)?
+            .checked_add(output)?
+            .checked_add(table)?;
         let mut sizes = Vec::with_capacity(3 * gdn_layers + 2);
         for _ in 0..gdn_layers {
             sizes.extend([ring, inputs, recurrence]);
@@ -4825,7 +4825,11 @@ mod tests {
                 let plan = state_tensor_plan(&config, &format, 1024, &geometry, &map).unwrap();
                 let part = |suffixes: &[&str]| -> Vec<u64> {
                     plan.iter()
-                        .filter(|spec| suffixes.iter().any(|s| spec.key.ends_with(s) || spec.key == *s))
+                        .filter(|spec| {
+                            suffixes
+                                .iter()
+                                .any(|s| spec.key.ends_with(s) || spec.key == *s)
+                        })
                         .map(|spec| (spec.elements * spec.dtype.size()) as u64)
                         .collect()
                 };
@@ -4863,7 +4867,11 @@ mod tests {
         let config = crate::config::compact_test_config();
         let layers = config.n_linear_layers();
         let value_heads = config.linear_num_value_heads;
-        for gdn in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
+        for gdn in [
+            GdnStateFormat::F32,
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+        ] {
             let format = Qwen4StateFormat {
                 gdn,
                 ..Qwen4StateFormat::F32
@@ -4886,11 +4894,12 @@ mod tests {
                 }
                 assert_eq!(sizes.len(), 3 * layers + 2);
                 let (ring, inputs, recurrence) = (
-                    (2 * rows * gdn.storage().state_bytes(
-                        value_heads,
-                        config.linear_key_head_dim,
-                        config.linear_value_head_dim,
-                    )) as u64,
+                    (2 * rows
+                        * gdn.storage().state_bytes(
+                            value_heads,
+                            config.linear_key_head_dim,
+                            config.linear_value_head_dim,
+                        )) as u64,
                     (rows * qkv * 4) as u64,
                     (rows * (qkv + 2 * value_heads) * 4) as u64,
                 );
@@ -4915,7 +4924,12 @@ mod tests {
                 );
             }
             assert_eq!(
-                Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, usize::MAX / 2, layers),
+                Qwen4State::row_capture_allocation_sizes_scoped(
+                    &config,
+                    gdn,
+                    usize::MAX / 2,
+                    layers
+                ),
                 None
             );
             assert_eq!(

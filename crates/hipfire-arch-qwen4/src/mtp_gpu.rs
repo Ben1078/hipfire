@@ -2290,7 +2290,10 @@ impl Qwen4MtpGpu {
         let (policy, layout) = draft_head_config(config);
         let (draft, draft_scratch) = DraftHead::allocation_sizes(head_dtype, layout, policy)?;
         let widen = |sizes: Vec<usize>| -> Option<Vec<u64>> {
-            sizes.into_iter().map(|bytes| u64::try_from(bytes).ok()).collect()
+            sizes
+                .into_iter()
+                .map(|bytes| u64::try_from(bytes).ok())
+                .collect()
         };
         let mut resident = MtpGpuScratch::allocation_sizes(config)?;
         resident.extend(MtpGpuState::allocation_sizes(config, context)?);
@@ -3595,8 +3598,14 @@ mod tests {
                 MtpAppendScratch::device_bytes(&config, rows, id_rows)
             );
         }
-        assert_eq!(MtpAppendScratch::allocation_sizes(&config, usize::MAX, 1), None);
-        assert_eq!(MtpAppendScratch::allocation_sizes(&config, 1, usize::MAX), None);
+        assert_eq!(
+            MtpAppendScratch::allocation_sizes(&config, usize::MAX, 1),
+            None
+        );
+        assert_eq!(
+            MtpAppendScratch::allocation_sizes(&config, 1, usize::MAX),
+            None
+        );
         assert_eq!(MtpAppendScratch::device_bytes(&config, usize::MAX, 1), None);
     }
 
@@ -3676,7 +3685,13 @@ mod tests {
             Qwen4ContextCommit::legacy(4096),
             Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, 2 << 20),
         ] {
-            for head in [DType::BF16, DType::Q8_0, DType::MQ6G256V2, DType::MQ5G256V2, DType::F32] {
+            for head in [
+                DType::BF16,
+                DType::Q8_0,
+                DType::MQ6G256V2,
+                DType::MQ5G256V2,
+                DType::F32,
+            ] {
                 let (resident, scratch) =
                     Qwen4MtpGpu::allocation_sizes(&config, &context, head).unwrap();
                 assert_eq!(

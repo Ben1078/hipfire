@@ -4583,8 +4583,16 @@ mod slowlink_panel_tests {
             let slab = PromptRouteLayout::new(&dims(rows)).unwrap();
             let aggregate = PromptRouteLayout::new(&aggregate_dims(rows, 0, 0)).unwrap();
             let [gate_up, down, scatter] = slab.scratch_allocation_sizes();
-            assert_eq!(gate_up, (2560 / A4_BLOCK_K) * rows * A4_RECORD_BYTES, "{rows}");
-            assert_eq!(down, (640 / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES, "{rows}");
+            assert_eq!(
+                gate_up,
+                (2560 / A4_BLOCK_K) * rows * A4_RECORD_BYTES,
+                "{rows}"
+            );
+            assert_eq!(
+                down,
+                (640 / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES,
+                "{rows}"
+            );
             assert_eq!(
                 scatter,
                 rdna_compute::scratch::qwen4_moe_group_layout(rows * K_TOP, 512).bytes

@@ -3853,19 +3853,20 @@ impl Qwen4MoeLayerRuntime {
     /// pointer tables, one device pointer per expert each.
     pub(crate) fn device_bytes(config: &Qwen4Config) -> Option<usize> {
         let tables = Self::allocation_sizes(config)?;
-        usize::try_from(tables.iter().try_fold(0u64, |total, &b| total.checked_add(b))?).ok()
+        usize::try_from(
+            tables
+                .iter()
+                .try_fold(0u64, |total, &b| total.checked_add(b))?,
+        )
+        .ok()
     }
 
     /// [`Self::device_bytes`] per allocation: the gate/up and the down
     /// pointer table, `num_experts` 8-byte pointers each (omitted when the
     /// profile has no experts).
     pub(crate) fn allocation_sizes(config: &Qwen4Config) -> Option<Vec<u64>> {
-        let table = u64::try_from(
-            config
-                .num_experts
-                .checked_mul(std::mem::size_of::<u64>())?,
-        )
-        .ok()?;
+        let table =
+            u64::try_from(config.num_experts.checked_mul(std::mem::size_of::<u64>())?).ok()?;
         // The charge is two tables; doubling must not overflow either.
         table.checked_mul(2)?;
         Some(if table == 0 {
@@ -12017,7 +12018,10 @@ mod tests {
     fn allocation_sizes_refuse_zero_rows_and_overflow_like_the_byte_query() {
         let config = fn_config();
         for mode in [Mode::Full, Mode::FnSymGfx1201] {
-            assert_eq!(super::qwen4_forward_allocation_sizes(&config, 0, mode), None);
+            assert_eq!(
+                super::qwen4_forward_allocation_sizes(&config, 0, mode),
+                None
+            );
             assert_eq!(qwen4_forward_device_bytes(&config, 0, mode), None);
             let mut huge = config.clone();
             huge.vocab_size = usize::MAX;
