@@ -2399,6 +2399,10 @@ mod tests {
             DOWN_LAYER,
         )
         .unwrap();
+        // The dispatch suite over the aggregate route (largest F32-tail call,
+        // 511 rows) stays below the transport's reserve, which is therefore
+        // the budget; no exact suite figure is pinned for this route.
+        assert_eq!(selftest, 217_821_184);
         for (label, diagnostic) in [("product", 0u64), ("primitive selftest", selftest)] {
             let profile = admit(&AdmissionInputs {
                 geometry,
