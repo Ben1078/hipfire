@@ -30,7 +30,7 @@
 //! * K2 prefill: [`Gpu::qwen4_slab_tile_masks`] splits the grouped tile ids by
 //!   codec with the table-driven mask: the builder `ep_tile_mask_pm_<arch>` (gfx1100, gfx1201), or on
 //!   gfx1151 its hipcc twin `qwen4_slab_tile_mask` (same law, same ids out); gfx1100 down
-//!   sidecars come from [`Gpu::qwen4_moe_rotate128_i4_slab`] (K3).
+//!   sidecars come from [`Gpu::qwen4_moe_rotate128_i4`] (K3).
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::gemv::WideTwinFamily;
@@ -1490,6 +1490,7 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result?;
+        self.moe_route_census.a4_down_producer += 1;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(
             reservation,
         ))
@@ -2018,22 +2019,6 @@ impl Gpu {
         )?;
         self.take_device_wait_error()?;
         Ok((a, b))
-    }
-
-    /// Sealed-slab down A4 producer: the sealed expert-slab arch gate
-    /// ([`slab_arch_kernels`]) then [`Gpu::qwen4_moe_rotate128_i4`] (the descriptor's producer:
-    /// K3 on gfx1100, hipcc on gfx1201 and gfx1151). Removed once the slab callers call
-    /// [`Gpu::qwen4_moe_rotate128_i4`] directly.
-    pub fn qwen4_moe_rotate128_i4_slab(
-        &mut self,
-        h: &GpuTensor,
-        sorted: &GpuTensor,
-        k: usize,
-        grouped_rows: usize,
-        total_slots: usize,
-    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
-        self.slab_kernels("qwen4_moe_rotate128_i4_slab")?;
-        self.qwen4_moe_rotate128_i4(h, sorted, k, grouped_rows, total_slots)
     }
 }
 

@@ -1298,6 +1298,9 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
+    /// no locking, bumped after a successful launch submission.
+    pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -2188,6 +2191,7 @@ impl Gpu {
             flags,
             arch_caps,
             device_id: id,
+            moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),

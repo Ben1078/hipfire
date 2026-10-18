@@ -3076,7 +3076,9 @@ impl Gpu {
             k,
             grouped_rows,
             bf16_out,
-        )
+        )?;
+        self.moe_route_census.f16_wmma_down += 1;
+        Ok(())
     }
 
     /// F16 WMMA grouped QT53 down (gfx1151, K % 128 == 0) over F16 X

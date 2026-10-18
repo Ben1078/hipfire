@@ -47765,7 +47765,9 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"
             }),
             if x4 { 64 } else { 16 },
-        )
+        )?;
+        self.moe_route_census.f16_wmma_gate_up += 1;
+        Ok(())
     }
 
     /// Qwen4 fixed top-10 grouped qt44 gate/up entry.  Keep the indexed
@@ -48323,6 +48325,51 @@ pub enum MoeSymIu4DownProducer {
         symbol: &'static str,
         k: usize,
     },
+}
+
+/// Monotonic per-[`Gpu`] census of the launches the aggregate MoE route submits, for the S1
+/// receipt: each launch routed through the counted launchers is one tick, eager or recorded
+/// into a capture, never a graph replay. Plain counters; [`MoeRouteLaunchCensus::since`] turns
+/// two reads into a window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MoeRouteLaunchCensus {
+    /// Aggregate IU4 gate/up GEMM launches ([`Gpu::gemm_qwen4_moe_gate_up_silu_iu4_sym`]).
+    pub sym_iu4_gate_up: u64,
+    /// Aggregate IU4 down GEMM launches ([`Gpu::gemm_qwen4_moe_down_iu4_sym`]).
+    pub sym_iu4_down: u64,
+    /// Gate/up A4 producer launches ([`Gpu::qwen4_moe_rotate256_i4`]).
+    pub a4_gate_producer: u64,
+    /// Down A4 producer launches ([`Gpu::qwen4_moe_rotate128_i4`], hipcc and embedded K3).
+    pub a4_down_producer: u64,
+    /// Aggregate F16 WMMA grouped gate/up launches
+    /// ([`Gpu::gemm_mq4g256v2_moe_grouped_top10_silu_bf16out`]).
+    pub f16_wmma_gate_up: u64,
+    /// Aggregate F16 WMMA grouped down launches
+    /// ([`Gpu::gemm_mq4g128v2_moe_grouped_top10_xf16`]).
+    pub f16_wmma_down: u64,
+}
+
+impl MoeRouteLaunchCensus {
+    /// Field-wise saturating difference `self - earlier`.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            sym_iu4_gate_up: self.sym_iu4_gate_up.saturating_sub(earlier.sym_iu4_gate_up),
+            sym_iu4_down: self.sym_iu4_down.saturating_sub(earlier.sym_iu4_down),
+            a4_gate_producer: self.a4_gate_producer.saturating_sub(earlier.a4_gate_producer),
+            a4_down_producer: self.a4_down_producer.saturating_sub(earlier.a4_down_producer),
+            f16_wmma_gate_up: self.f16_wmma_gate_up.saturating_sub(earlier.f16_wmma_gate_up),
+            f16_wmma_down: self.f16_wmma_down.saturating_sub(earlier.f16_wmma_down),
+        }
+    }
+
+    /// One aggregate IU4 GEMM launch (`down` selects the counter).
+    pub(crate) fn count_sym_iu4(&mut self, down: bool) {
+        if down {
+            self.sym_iu4_down += 1;
+        } else {
+            self.sym_iu4_gate_up += 1;
+        }
+    }
 }
 
 /// The per-arch header checker (`zp == -8 * sc`, finite): hipcc module key, source and entry.
@@ -48966,6 +49013,12 @@ impl Gpu {
         moe_sym_iu4_kernel(&self.arch_caps, crate::expert_capabilities::QT_MQ4_XTS)
     }
 
+    /// Monotonic launch census of the aggregate MoE route since this `Gpu` was created
+    /// ([`MoeRouteLaunchCensus`]); window it with [`MoeRouteLaunchCensus::since`].
+    pub fn moe_route_launch_census(&self) -> MoeRouteLaunchCensus {
+        self.moe_route_census
+    }
+
     fn qwen4_moe_sym_require(&self, what: &str) -> HipResult<&'static MoeSymIu4Kernel> {
         self.qwen4_moe_sym_kernel().ok_or_else(|| {
             hip_bridge::HipError::new(
@@ -49181,27 +49234,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.qwen4_moe_sym_require("reserve_qwen4_moe_sym")?;
         self.reserve_qwen4_moe_sym_scratch(max_rows, k_top, experts, hidden, intermediate)
-    }
-
-    /// Sealed-slab scratch reserve: the sealed expert-slab arch gate
-    /// ([`crate::slab_moe::slab_arch_kernels`]) then [`Gpu::reserve_qwen4_moe_sym`]
-    /// (descriptor-gated; the arch-neutral scratch growth). Removed once the slab
-    /// callers call [`Gpu::reserve_qwen4_moe_sym`] directly.
-    pub fn reserve_qwen4_moe_sym_slab(
-        &mut self,
-        max_rows: usize,
-        k_top: usize,
-        experts: usize,
-        hidden: usize,
-        intermediate: usize,
-    ) -> HipResult<()> {
-        if crate::slab_moe::slab_arch_kernels(&self.arch).is_none() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("reserve_qwen4_moe_sym_slab: the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only, got {}", self.arch),
-            ));
-        }
-        self.reserve_qwen4_moe_sym(max_rows, k_top, experts, hidden, intermediate)
     }
 
     fn reserve_qwen4_moe_sym_scratch(
@@ -49523,26 +49555,9 @@ impl Gpu {
         }
         crate::moe::require_span(x, &[rows, k, 4], "qwen4_moe_rotate256_i4 activations")?;
         let reservation = self.reserve_int4_mmq(k, rows)?;
-        self.rotate_x_mq_i4_batched(x, None, None, reservation, k, rows)
-    }
-
-    /// Sealed-slab gate/up A4 producer: the sealed expert-slab arch gate
-    /// ([`crate::slab_moe::slab_arch_kernels`]) then [`Gpu::qwen4_moe_rotate256_i4`]
-    /// (the descriptor's producer, under its C2 refusal on gfx1100). Removed once
-    /// the slab callers call [`Gpu::qwen4_moe_rotate256_i4`] directly.
-    pub fn qwen4_moe_rotate256_i4_slab(
-        &mut self,
-        x: &GpuTensor,
-        k: usize,
-        rows: usize,
-    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
-        if crate::slab_moe::slab_arch_kernels(&self.arch).is_none() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("qwen4_moe_rotate256_i4_slab: the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only, got {}", self.arch),
-            ));
-        }
-        self.qwen4_moe_rotate256_i4(x, k, rows)
+        let prepared = self.rotate_x_mq_i4_batched(x, None, None, reservation, k, rows)?;
+        self.moe_route_census.a4_gate_producer += 1;
+        Ok(prepared)
     }
 
     /// Down A4 producer: grouped BF16 SwiGLU rows `h` `[grouped_rows, k]`
@@ -49662,6 +49677,7 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result?;
+        self.moe_route_census.a4_down_producer += 1;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(
             reservation,
         ))
@@ -50215,7 +50231,7 @@ impl Gpu {
         let kernel = self.qwen4_moe_sym_require(what)?;
         let h = usize::from(host_mapped);
         if kernel.tiles_per_cta[h] == 1 {
-            return self.qwen4_moe_sym_nt1_gemm(
+            self.qwen4_moe_sym_nt1_gemm(
                 [kernel.module, kernel.entries[h][usize::from(down)]],
                 kernel.image,
                 down,
@@ -50223,7 +50239,9 @@ impl Gpu {
                 xp,
                 dims,
                 4,
-            );
+            )?;
+            self.moe_route_census.count_sym_iu4(down);
+            return Ok(());
         }
         let pm = moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM);
         // Row blocks per workgroup: the down symbol and grid.x both come from
@@ -50284,13 +50302,61 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        result
+        result?;
+        self.moe_route_census.count_sym_iu4(down);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moe_route_launch_census_default_and_since() {
+        let zero = MoeRouteLaunchCensus::default();
+        assert_eq!(
+            zero,
+            MoeRouteLaunchCensus {
+                sym_iu4_gate_up: 0,
+                sym_iu4_down: 0,
+                a4_gate_producer: 0,
+                a4_down_producer: 0,
+                f16_wmma_gate_up: 0,
+                f16_wmma_down: 0,
+            }
+        );
+        let earlier = MoeRouteLaunchCensus {
+            sym_iu4_gate_up: 1,
+            sym_iu4_down: 2,
+            a4_gate_producer: 3,
+            a4_down_producer: 4,
+            f16_wmma_gate_up: 5,
+            f16_wmma_down: 6,
+        };
+        let mut later = earlier;
+        later.count_sym_iu4(false);
+        later.count_sym_iu4(true);
+        later.count_sym_iu4(true);
+        later.a4_gate_producer += 10;
+        later.f16_wmma_down += 7;
+        let window = later.since(earlier);
+        assert_eq!(
+            window,
+            MoeRouteLaunchCensus {
+                sym_iu4_gate_up: 1,
+                sym_iu4_down: 2,
+                a4_gate_producer: 10,
+                a4_down_producer: 0,
+                f16_wmma_gate_up: 0,
+                f16_wmma_down: 7,
+            }
+        );
+        assert_eq!(later.since(later), zero);
+        // Field-wise saturating: a reversed window never wraps.
+        assert_eq!(earlier.since(later), zero);
+        assert_eq!(zero.since(earlier), zero);
+    }
 
     #[test]
     fn qwen4_prefill_ksplit_bytes_known_and_checked() {
