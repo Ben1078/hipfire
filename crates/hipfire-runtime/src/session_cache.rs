@@ -7164,6 +7164,13 @@ mod tests {
             host_budget_bytes: 1 << 30,
             device_budget_bytes: resident + pool,
         };
+        // Owned device bytes are charged in the same unit as the granule:
+        // payload at granule 1, whole granules at the real granule.
+        let owned_payload = Owned {
+            device: resident,
+            host: 0,
+            host_pool: 0,
+        };
         let owned = Owned {
             device: backing(resident, GRANULE),
             host: 0,
@@ -7172,7 +7179,7 @@ mod tests {
         // Payload accounting would let the second owner in; physical backing
         // does not, so padding cannot spend the safety margin.
         assert_eq!(
-            plan_placement(&policy, pool, owned, Some(1), true, || Some(true)),
+            plan_placement(&policy, pool, owned_payload, Some(1), true, || Some(true)),
             Ok(Tier::Device)
         );
         assert_eq!(
@@ -7243,6 +7250,22 @@ mod tests {
         cache.commit();
         assert!(cache.device_backing(GRANULE) >= backing(pool, GRANULE));
         assert!(cache.device_backing(GRANULE) <= pool + GRANULE + backing(resident, GRANULE));
+        // The published pool is charged conservatively (payload plus a whole
+        // granule less one byte of padding per snapshot), never exactly: the
+        // device budget accepts at that bound and refuses one byte below it.
+        let conservative = backing(resident, GRANULE) + pool + (GRANULE - 1);
+        assert_eq!(cache.device_backing(GRANULE), conservative);
+        cache.backing_granule = Some(GRANULE);
+        for (budget, want) in [
+            (conservative + GRANULE, Tier::Device),
+            (conservative + GRANULE - 1, Tier::Host),
+        ] {
+            cache.enable_pressure_host_snapshots(PressureHostSnapshotPolicy {
+                host_budget_bytes: HUGE,
+                device_budget_bytes: budget,
+            });
+            assert_eq!(cache.pick_tier(1, true, || Some(true)), Ok(want));
+        }
         // Granule unknown: payload is reported and no device placement is made.
         cache.backing_granule = None;
         assert_eq!(cache.owned().device, cache.usage().device_total_bytes());
