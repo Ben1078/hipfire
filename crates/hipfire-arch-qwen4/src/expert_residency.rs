@@ -1611,6 +1611,160 @@ pub fn f16_shadow_granule_slack(
     granule_slack_total(sizes, granule)
 }
 
+/// Byte alignment of every member of a weight arena root: the existing
+/// device allocation alignment ([`crate::slowlink_admission::S1_ALIGN`]).
+pub const WEIGHT_ARENA_ALIGNMENT: usize = 256;
+
+/// Smallest device allocation the planner will request for a root (a
+/// root cap and every root request are at least this).
+pub const WEIGHT_ARENA_MIN_ROOT_BYTES: usize = 256;
+
+fn arena_bytes(name: &str, bytes: u64) -> Result<usize, String> {
+    usize::try_from(bytes).map_err(|_| format!("arena member '{name}' of {bytes} B overflows usize"))
+}
+
+/// The members of the weight arena family: exactly the entries
+/// [`resident_split`] counts as non-expert (resident, not an external row
+/// table, not a tied alias, not a routed expert), each at its own
+/// `bytes_of` payload. CPU-only metadata records are not manifest entries
+/// and never appear.
+pub fn weight_arena_members(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<Vec<(String, usize)>, String> {
+    let mut members = Vec::new();
+    for entry in weights {
+        if entry.residency.is_external()
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+            || is_routed_expert(&entry.name)
+        {
+            continue;
+        }
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        members.push((entry.name.clone(), arena_bytes(&entry.name, bytes)?));
+    }
+    Ok(members)
+}
+
+/// The members of the F16 shadow arena family: exactly
+/// [`f16_shadow_bytes`]'s owners (the one shared predicate), each at its
+/// `2 * rows * cols` shadow allocation.
+pub fn f16_shadow_arena_members(
+    weights: &[WeightEntry],
+    num_layers: usize,
+) -> Result<Vec<(String, usize)>, String> {
+    let mut members = Vec::new();
+    for entry in weights {
+        if is_f16_shadow_owner(entry, num_layers, &|_| true, true) {
+            members.push((
+                entry.name.clone(),
+                arena_bytes(&entry.name, f16_shadow_entry_bytes(entry)?)?,
+            ));
+        }
+    }
+    Ok(members)
+}
+
+/// The two-family root plan of one load's weights, built once and shared by
+/// the census, the allocator and the F16 shadow cache. Each root is bounded
+/// by the largest existing eligible allocation of either family (never below
+/// [`WEIGHT_ARENA_MIN_ROOT_BYTES`]): a root never asks the device for more
+/// contiguous memory than the incumbent's biggest single tensor did.
+/// `shadow_capable` is the device's own F16 shadow predicate
+/// (`Gpu::qwen4_f16_shadow_capable`); without it no shadow ever exists and the
+/// shadow family is empty. `granule_bytes` is the device's allocation granule
+/// from its single query.
+pub fn model_weight_arena_plan(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    num_layers: usize,
+    shadow_capable: bool,
+    granule_bytes: usize,
+) -> Result<std::sync::Arc<rdna_compute::byte_arena::ModelWeightArenaPlan>, String> {
+    use rdna_compute::byte_arena::{ModelWeightArenaPlan, NamedByteArenaPlan};
+    if granule_bytes == 0 {
+        return Err("weight arena plan: the device allocation granule is zero".to_string());
+    }
+    let weight_members = weight_arena_members(weights, bytes_of)?;
+    let shadow_members = if shadow_capable {
+        f16_shadow_arena_members(weights, num_layers)?
+    } else {
+        Vec::new()
+    };
+    let max_root_bytes = weight_members
+        .iter()
+        .chain(&shadow_members)
+        .map(|member| member.1)
+        .max()
+        .unwrap_or(0)
+        .max(WEIGHT_ARENA_MIN_ROOT_BYTES);
+    let plan = ModelWeightArenaPlan {
+        weights: NamedByteArenaPlan::new(weight_members, WEIGHT_ARENA_ALIGNMENT, max_root_bytes)
+            .map_err(|error| format!("weight arena plan: weights: {error}"))?,
+        f16_shadows: NamedByteArenaPlan::new(
+            shadow_members,
+            WEIGHT_ARENA_ALIGNMENT,
+            max_root_bytes,
+        )
+        .map_err(|error| format!("weight arena plan: F16 shadows: {error}"))?,
+        granule_bytes,
+    };
+    plan.validate()
+        .map_err(|error| format!("weight arena plan: {error}"))?;
+    Ok(std::sync::Arc::new(plan))
+}
+
+/// Granule slack of the provided arena plan, `(weights, F16 shadows)`: each
+/// family's root BACKING (every root request rounded up to the granule once)
+/// minus the LOGICAL payload the census charges ([`resident_split`]'s
+/// non-expert bytes and [`f16_shadow_bytes`]). The plan is only read, never
+/// rebuilt; it must describe this manifest (its logical payloads equal the
+/// census payloads) and the same `granule`. The shadow term is 0 unless
+/// `charge_shadows` (the reserve charges them).
+pub fn weight_arena_granule_slack(
+    arenas: &rdna_compute::byte_arena::ModelWeightArenaPlan,
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    num_layers: usize,
+    charge_shadows: bool,
+    granule: u64,
+) -> Result<(u64, u64), String> {
+    if u64::try_from(arenas.granule_bytes).ok() != Some(granule) {
+        return Err(format!(
+            "weight arena plan granule {} B differs from the census granule {granule} B",
+            arenas.granule_bytes
+        ));
+    }
+    let granule_bytes = arenas.granule_bytes;
+    let family = |plan: &rdna_compute::byte_arena::NamedByteArenaPlan,
+                  payload: u64,
+                  what: &str|
+     -> Result<u64, String> {
+        let logical = plan.logical_bytes()?;
+        if logical != payload {
+            return Err(format!(
+                "weight arena plan {what} hold {logical} B but the manifest census charges {payload} B"
+            ));
+        }
+        plan.backing_bytes(granule_bytes)?
+            .checked_sub(logical)
+            .ok_or_else(|| format!("weight arena plan {what} backing is below its payload"))
+    };
+    let weight_payload = resident_split(weights, bytes_of)?.0;
+    let weight_slack = family(&arenas.weights, weight_payload, "weights")?;
+    let shadow_slack = if charge_shadows {
+        family(
+            &arenas.f16_shadows,
+            f16_shadow_bytes(weights, num_layers)?,
+            "F16 shadows",
+        )?
+    } else {
+        0
+    };
+    Ok((weight_slack, shadow_slack))
+}
+
 /// What [`base_granule_slack`] reads: the same load facts
 /// [`placement_inputs`] read, plus the reserve it returned.
 pub struct GranuleSlackArgs<'a> {
@@ -1633,6 +1787,12 @@ pub struct GranuleSlackArgs<'a> {
     /// selector terms.
     pub reserve: AutoReserve,
     pub granule: u64,
+    /// The provided two-family root plan. `Some`: weights and F16 shadows
+    /// are charged their root backing minus the logical payload, never
+    /// rebuilt here ([`weight_arena_granule_slack`]). `None`: the individual
+    /// allocation counterfactual ([`weight_granule_slack`],
+    /// [`f16_shadow_granule_slack`]).
+    pub weight_arenas: Option<&'a rdna_compute::byte_arena::ModelWeightArenaPlan>,
 }
 
 /// The granule slack of one load's base reserve ([`GranuleSlack`]), from the
@@ -1657,6 +1817,7 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
         chunk_rows,
         reserve,
         granule,
+        weight_arenas,
     } = args;
     let census_context =
         crate::Qwen4ContextCommit::new(*backend, *max_seq, *max_seq, *vmm_granularity);
@@ -1706,13 +1867,28 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
         ],
         *granule,
     )?;
+    let charge_shadows = reserve.census.f16_shadows > 0;
+    let (weights_slack, f16_shadows_slack) = match weight_arenas {
+        Some(arenas) => weight_arena_granule_slack(
+            arenas,
+            weights,
+            bytes_of,
+            config.num_hidden_layers,
+            charge_shadows,
+            *granule,
+        )?,
+        None => (
+            weight_granule_slack(weights, bytes_of, *granule)?,
+            if charge_shadows {
+                f16_shadow_granule_slack(weights, config.num_hidden_layers, *granule)?
+            } else {
+                0
+            },
+        ),
+    };
     Ok(GranuleSlack {
-        weights: weight_granule_slack(weights, bytes_of, *granule)?,
-        f16_shadows: if reserve.census.f16_shadows > 0 {
-            f16_shadow_granule_slack(weights, config.num_hidden_layers, *granule)?
-        } else {
-            0
-        },
+        weights: weights_slack,
+        f16_shadows: f16_shadows_slack,
         forward: granule_slack_total(forward, *granule)?,
         state: granule_slack_total(state, *granule)?,
         workspace: granule_slack_total(

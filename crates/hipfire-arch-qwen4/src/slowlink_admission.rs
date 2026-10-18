@@ -1990,11 +1990,58 @@ pub struct SingleDeviceLoad<'a> {
     pub purpose: AdmissionPurpose,
 }
 
+/// The two-family weight arena plan of a single-device S1 load: the resident
+/// non-expert weights ([`crate::expert_residency::resident_split`]'s entries)
+/// and the lazy F16 shadow owners the placement census charges, one shared
+/// canonical root plan with every root bounded by the manifest's largest
+/// existing eligible allocation. Roles and the shadow predicate come from
+/// the manifest and the device's own shadow capability
+/// (`Gpu::qwen4_f16_shadow_capable`); no quant, card or host name gates it.
+///
+/// This is the ONE device allocation-granule query of an S1 load (an
+/// unanswered query refuses the load rather than modelling no rounding);
+/// the census and the allocator read the plan's `granule_bytes` afterwards.
+/// Built only where S1 selection asks for facts (never on the fast, UMA,
+/// unmeasured or non-S1 paths), then borrowed by
+/// [`single_device_facts_with_arenas`] and passed unchanged to the weight
+/// fulfillment.
+pub fn single_device_arena_plan(
+    load: &SingleDeviceLoad<'_>,
+) -> Result<std::sync::Arc<rdna_compute::byte_arena::ModelWeightArenaPlan>, String> {
+    let granule_bytes = load
+        .gpu
+        .vmm_recommended_granularity()
+        .map_err(|error| format!("qwen4: device allocation granularity: {error}"))?;
+    crate::expert_residency::model_weight_arena_plan(
+        load.weights,
+        load.bytes_of,
+        load.config.num_hidden_layers,
+        load.gpu.qwen4_f16_shadow_capable(),
+        granule_bytes,
+    )
+    .map_err(|error| format!("qwen4: {error}"))
+}
+
+/// Exact [`LoadFacts`] of a single-device discrete load from one fresh
+/// [`single_device_arena_plan`]: the print-memory and CPU callers' entry. A
+/// load that allocates weights hands its own retained plan to
+/// [`single_device_facts_with_arenas`] instead.
+pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<'a>, String> {
+    let arenas = single_device_arena_plan(load)?;
+    single_device_facts_with_arenas(load, &arenas)
+}
+
 /// Exact [`LoadFacts`] of a single-device discrete load: free device memory,
 /// and the reserve at the S1 tile and at the incumbent placement chunk, both
 /// from [`crate::expert_residency::placement_inputs`] (the product's own
-/// bottom-up census; no second convention).
-pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<'a>, String> {
+/// bottom-up census; no second convention). The weights and F16 shadows are
+/// charged the root backing of the PROVIDED `arenas` minus their unchanged
+/// logical payload; the plan is never rebuilt here and its granule is the
+/// census granule.
+pub fn single_device_facts_with_arenas<'a>(
+    load: &SingleDeviceLoad<'a>,
+    arenas: &rdna_compute::byte_arena::ModelWeightArenaPlan,
+) -> Result<LoadFacts<'a>, String> {
     let (free, _) = load
         .gpu
         .device_mem_info()
@@ -2005,18 +2052,14 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
     // runtime charge is the credit the S1 runtime budget supplements.
     let tile_reserve = single_device_reserve(load, purpose_tile_rows(load.purpose))?;
     // The device's own allocation granule (`crate::expert_residency::granule_slack`
-    // documents the backing model); an unanswered query refuses the load
-    // rather than silently modelling no rounding.
-    let granule_bytes = load
-        .gpu
-        .vmm_recommended_granularity()
-        .map_err(|error| format!("qwen4: device allocation granularity: {error}"))?
-        as u64;
+    // documents the backing model), read once by the plan's factory.
+    let granule_bytes = arenas.granule_bytes as u64;
     let base_slack = single_device_granule_slack(
         load,
         purpose_tile_rows(load.purpose),
         &tile_reserve,
         granule_bytes,
+        Some(arenas),
     )?;
     // One boundary stage's own part allocations (`allocate_prompt_stages`
     // makes one `zeros` per session fixed part), from the state's own list.
@@ -2080,12 +2123,15 @@ fn single_device_reserve(
 
 /// The base reserve's per-owner granule slack at `chunk_rows`
 /// ([`crate::expert_residency::base_granule_slack`]): the load's own manifest,
-/// state and forward plan, and the reserve [`single_device_reserve`] returned.
+/// state and forward plan, the reserve [`single_device_reserve`] returned and,
+/// when given, the provided weight arena plan (`None`: individual weight and
+/// shadow allocations).
 fn single_device_granule_slack(
     load: &SingleDeviceLoad<'_>,
     chunk_rows: usize,
     reserve: &crate::expert_residency::AutoReserve,
     granule_bytes: u64,
+    weight_arenas: Option<&rdna_compute::byte_arena::ModelWeightArenaPlan>,
 ) -> Result<crate::expert_residency::GranuleSlack, String> {
     crate::expert_residency::base_granule_slack(&crate::expert_residency::GranuleSlackArgs {
         gpu: load.gpu,
@@ -2102,6 +2148,7 @@ fn single_device_granule_slack(
         chunk_rows,
         reserve: *reserve,
         granule: granule_bytes,
+        weight_arenas,
     })
 }
 
@@ -2115,12 +2162,14 @@ pub fn single_device_tile_frontier(
     load: &SingleDeviceLoad<'_>,
     link_gbps: f64,
 ) -> Result<Vec<FrontierPoint>, String> {
-    let facts = single_device_facts(load)?;
+    let arenas = single_device_arena_plan(load)?;
+    let facts = single_device_facts_with_arenas(load, &arenas)?;
     let inputs = load_admission_inputs(&facts, link_gbps).map_err(|decline| decline.to_string())?;
     let granule_bytes = inputs.granule.granule_bytes;
     tile_frontier(&inputs, |tile_rows| {
         let reserve = single_device_reserve(load, tile_rows)?;
-        let slack = single_device_granule_slack(load, tile_rows, &reserve, granule_bytes)?;
+        let slack =
+            single_device_granule_slack(load, tile_rows, &reserve, granule_bytes, Some(&*arenas))?;
         Ok((reserve, slack))
     })
 }
@@ -4977,5 +5026,712 @@ mod tests {
             "SLOWLINK_GRANULE_FRONTIER {}",
             serde_json::to_string(&rows).unwrap()
         );
+    }
+
+    /// The bounded two-family weight arenas on the REAL Flash-Next artifact
+    /// metadata (`rdna-compute`'s `jit-g0/header-flash-next.json`, header
+    /// SHA-256 8703bb16…, the artifact of the j1778/j1786 holds) and the closed
+    /// 291-owner shadow fixture. No product count is hard-coded where the
+    /// metadata derives it; the independent reference model below is plain
+    /// next-fit over the canonical bytewise-name order.
+    mod slowlink_arena {
+        use super::*;
+        use crate::expert_residency as residency;
+        use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
+        use rdna_compute::byte_arena::{ModelWeightArenaPlan, NamedByteArenaPlan};
+        use rdna_compute::DType;
+        use std::collections::HashMap;
+
+        const ALIAS_NAME: &str = "model.arena_fixture.tied_alias.weight";
+
+        /// The real manifest's roles, with an independent expectation list.
+        struct Fixture {
+            weights: Vec<WeightEntry>,
+            sizes: HashMap<String, u64>,
+            /// Name and bytes of every resident non-expert tensor, read straight
+            /// from the header (not through the code under test).
+            resident: Vec<(String, u64)>,
+            external: Vec<String>,
+            experts: Vec<String>,
+            cpu_metadata: Vec<(String, u64)>,
+        }
+
+        impl Fixture {
+            fn bytes_of(&self) -> impl Fn(&WeightEntry) -> Option<u64> + '_ {
+                |entry| self.sizes.get(&entry.name).copied()
+            }
+
+            fn largest(&self) -> u64 {
+                self.resident.iter().map(|member| member.1).max().unwrap()
+            }
+        }
+
+        fn dtype_of(tag: u64) -> DType {
+            match tag {
+                3 => DType::Q8_0,
+                16 => DType::BF16,
+                44 => DType::MQ4G256V2,
+                47 => DType::MQ6G256V2,
+                53 => DType::MQ4G128V2,
+                other => panic!("header fixture quant tag {other} has no test mapping"),
+            }
+        }
+
+        fn fixture() -> Fixture {
+            let header: serde_json::Value = serde_json::from_str(include_str!(
+                "../../rdna-compute/tests/fixtures/jit-g0/header-flash-next.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                header["header_sha256"],
+                "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
+            );
+            let mut fixture = Fixture {
+                weights: Vec::new(),
+                sizes: HashMap::new(),
+                resident: Vec::new(),
+                external: Vec::new(),
+                experts: Vec::new(),
+                cpu_metadata: Vec::new(),
+            };
+            for tensor in header["tensors"].as_array().unwrap() {
+                let name = tensor["name"].as_str().unwrap().to_owned();
+                let tag = tensor["quant_tag"].as_u64().unwrap();
+                let bytes = tensor["data_size"].as_u64().unwrap();
+                let shape: Vec<usize> = tensor["shape"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|dim| dim.as_u64().unwrap() as usize)
+                    .collect();
+                if tag == 54 {
+                    // The exact I64 PLE records: CPU metadata, never a
+                    // `WeightEntry` (see `MetadataTensor`).
+                    fixture.cpu_metadata.push((name, bytes));
+                    continue;
+                }
+                let mut entry =
+                    WeightEntry::model(name.clone(), shape.clone(), dtype_of(tag), ShardPolicy::Replicate);
+                entry.layer = name
+                    .strip_prefix("model.language_model.layers.")
+                    .and_then(|rest| rest.split_once('.'))
+                    .and_then(|(layer, _)| layer.parse().ok());
+                let expert = name.ends_with(".mlp.experts.gate_up_proj")
+                    || name.ends_with(".mlp.experts.down_proj");
+                if name.contains(".ngram_embedding.shard_") {
+                    entry = entry.external_rows(shape[1] / 32 * 34, shape[0]);
+                    fixture.external.push(name.clone());
+                } else if expert {
+                    fixture.experts.push(name.clone());
+                } else {
+                    fixture.resident.push((name.clone(), bytes));
+                }
+                fixture.sizes.insert(name, bytes);
+                fixture.weights.push(entry);
+            }
+            // A tied alias owns no payload; give it a size above every real
+            // tensor so any leak into the cap or the roots is visible.
+            let alias_bytes = fixture.largest() * 2;
+            fixture.weights.push(WeightEntry::model(
+                ALIAS_NAME,
+                vec![248_320, 2_560],
+                DType::Q8_0,
+                ShardPolicy::Tied {
+                    source: "model.language_model.embed_tokens.weight".to_string(),
+                },
+            ));
+            fixture.sizes.insert(ALIAS_NAME.to_string(), alias_bytes);
+            fixture
+        }
+
+        fn plan_of(fixture: &Fixture, granule: usize) -> ModelWeightArenaPlan {
+            let layers = crate::config::compact_test_config().num_hidden_layers;
+            let plan = residency::model_weight_arena_plan(
+                &fixture.weights,
+                fixture.bytes_of(),
+                layers,
+                true,
+                granule,
+            )
+            .unwrap();
+            ModelWeightArenaPlan::clone(&plan)
+        }
+
+        /// Plain next-fit reference over the canonical bytewise-name order:
+        /// 256 B member alignment, a member that would cross `cap` opens a new
+        /// root, a root request is its end offset (at least 256).
+        fn reference_roots(members: &[(String, u64)], cap: u64) -> Vec<u64> {
+            let mut sorted: Vec<&(String, u64)> = members.iter().collect();
+            sorted.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+            let mut roots = Vec::new();
+            let (mut end, mut count) = (0u64, 0usize);
+            for (_, bytes) in sorted {
+                if count > 0 && end.next_multiple_of(256) + bytes > cap {
+                    roots.push(end.max(256));
+                    end = 0;
+                    count = 0;
+                }
+                end = end.next_multiple_of(256) + bytes;
+                count += 1;
+            }
+            if count > 0 {
+                roots.push(end.max(256));
+            }
+            roots
+        }
+
+        fn shadow_members(fixture: &Fixture) -> Vec<(String, u64)> {
+            let layers = crate::config::compact_test_config().num_hidden_layers;
+            residency::f16_shadow_arena_members(&fixture.weights, layers)
+                .unwrap()
+                .into_iter()
+                .map(|(name, bytes)| (name, bytes as u64))
+                .collect()
+        }
+
+        fn assert_family(plan: &NamedByteArenaPlan, expected: &[(String, u64)], cap: u64) {
+            assert_eq!(plan.alignment, 256);
+            assert_eq!(plan.max_root_bytes as u64, cap);
+            assert_eq!(plan.members.len(), expected.len());
+            assert!(plan
+                .members
+                .windows(2)
+                .all(|pair| pair[0].name.as_bytes() < pair[1].name.as_bytes()));
+            let sizes: HashMap<&str, u64> = expected
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), *bytes))
+                .collect();
+            let mut previous: Option<(usize, usize)> = None;
+            for span in &plan.members {
+                assert_eq!(span.bytes as u64, sizes[span.name.as_str()], "{}", span.name);
+                assert_eq!(span.offset % 256, 0, "{}", span.name);
+                assert!(span.offset + span.bytes <= plan.roots[span.root], "{}", span.name);
+                if let Some((root, end)) = previous.filter(|(root, _)| *root == span.root) {
+                    assert_eq!(root, span.root);
+                    assert!(span.offset >= end, "{} overlaps its neighbour", span.name);
+                }
+                previous = Some((span.root, span.offset + span.bytes));
+            }
+            let requests: Vec<u64> = plan.roots.iter().map(|root| *root as u64).collect();
+            assert_eq!(requests, reference_roots(expected, cap));
+            assert!(requests.iter().all(|root| (256..=cap).contains(root)));
+            assert_eq!(
+                plan.logical_bytes().unwrap(),
+                expected.iter().map(|member| member.1).sum::<u64>()
+            );
+        }
+
+        /// The canonical 9 + 2 roots of the real artifact, each request the
+        /// reference next-fit's, the cap the largest existing eligible
+        /// allocation, and the closed shadow fixture's owners equal the
+        /// header-derived shadow members.
+        #[test]
+        fn slowlink_arena_real_metadata_canonical_roots_and_requests() {
+            let fixture = fixture();
+            let granule = 2 * MIB as usize;
+            let plan = plan_of(&fixture, granule);
+            plan.validate().unwrap();
+            assert_eq!(plan.granule_bytes, granule);
+
+            let cap = fixture.largest();
+            assert_eq!(
+                cap, fixture.sizes["model.language_model.embed_tokens.weight"],
+                "the token embedding is the largest existing eligible allocation"
+            );
+            assert!(fixture.sizes[ALIAS_NAME] > cap, "the alias must not set the cap");
+            assert_family(&plan.weights, &fixture.resident, cap);
+            let shadows = shadow_members(&fixture);
+            assert_family(&plan.f16_shadows, &shadows, cap);
+
+            assert_eq!(plan.weights.roots.len(), 9);
+            assert_eq!(plan.f16_shadows.roots.len(), 2);
+            assert_eq!(plan.weights.logical_bytes().unwrap(), J1778_NON_EXPERT);
+            assert_eq!(plan.f16_shadows.logical_bytes().unwrap(), J1778_SHADOWS);
+
+            // The closed 291-owner fixture names exactly these shadows.
+            let tsv: Vec<(String, usize)> = residency::f16_shadow_arena_members(
+                &residency::j1778_bf16_manifest(),
+                crate::config::compact_test_config().num_hidden_layers,
+            )
+            .unwrap();
+            let planned: Vec<(String, usize)> = plan
+                .f16_shadows
+                .members
+                .iter()
+                .map(|span| (span.name.clone(), span.bytes))
+                .collect();
+            let mut tsv_sorted = tsv;
+            tsv_sorted.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+            assert_eq!(planned, tsv_sorted);
+            assert_eq!(
+                residency::f16_shadow_bytes(&fixture.weights, 48),
+                Ok(J1778_SHADOWS)
+            );
+        }
+
+        /// Per root, the census backing equals the backing of the exact
+        /// allocator capacity; an oversized reused buffer or a wrong root
+        /// count is refused instead of being treated as equal.
+        #[test]
+        fn slowlink_arena_per_root_census_backing_equals_actual_exact_capacity() {
+            let fixture = fixture();
+            let granule = 2 * MIB as usize;
+            let plan = plan_of(&fixture, granule);
+            for (family, roots_expected) in [(&plan.weights, 9usize), (&plan.f16_shadows, 2)] {
+                assert_eq!(family.roots.len(), roots_expected);
+                let census = family.backing_bytes(granule).unwrap();
+                let by_hand: u64 = family
+                    .roots
+                    .iter()
+                    .map(|root| (*root as u64).next_multiple_of(granule as u64))
+                    .sum();
+                assert_eq!(census, by_hand);
+                // Exact capacity model: the allocator returns what was asked.
+                let exact: Vec<usize> = family.roots.clone();
+                assert_eq!(family.validate_capacities(&exact, granule), Ok(census));
+                for (index, root) in family.roots.iter().enumerate() {
+                    let mut actual = exact.clone();
+                    actual[index] = *root + 1;
+                    assert!(
+                        family.validate_capacities(&actual, granule).is_err(),
+                        "oversized root {index} must be rejected"
+                    );
+                    actual[index] = root - 1;
+                    assert!(family.validate_capacities(&actual, granule).is_err());
+                }
+                assert!(family
+                    .validate_capacities(&exact[..exact.len() - 1], granule)
+                    .is_err());
+                assert!(family.backing_bytes(0).is_err());
+            }
+            assert_eq!(plan.weights.backing_bytes(granule), Ok(5_375_000_576));
+            assert_eq!(plan.f16_shadows.backing_bytes(granule), Ok(1_300_234_240));
+        }
+
+        fn base_slack_at(
+            tile: usize,
+            weights: u64,
+            f16_shadows: u64,
+        ) -> residency::GranuleSlack {
+            let granule = 2 * MIB;
+            let config = crate::config::compact_test_config();
+            let reserve = j1778_reserve_at(tile);
+            let context = crate::Qwen4ContextCommit::new(
+                crate::Qwen4KvBackend::Legacy,
+                J1778_MAX_SEQ,
+                J1778_MAX_SEQ,
+                1,
+            );
+            let forward = crate::gpu_forward::qwen4_forward_allocation_sizes(
+                &config,
+                tile,
+                crate::gpu_forward::Qwen4ForwardScratchMode::Full,
+            )
+            .unwrap();
+            let state = crate::state::Qwen4State::device_allocation_sizes(
+                &config,
+                j1778_state_format(),
+                &context,
+            )
+            .unwrap();
+            let workspace: Vec<u64> = reserve
+                .census
+                .workspace
+                .iter()
+                .map(|term| term.1)
+                .filter(|bytes| *bytes > 0)
+                .collect();
+            residency::GranuleSlack {
+                weights,
+                f16_shadows,
+                forward: residency::granule_slack_total(forward, granule).unwrap(),
+                state: residency::granule_slack_total(state, granule).unwrap(),
+                workspace: residency::granule_slack_total(workspace, granule).unwrap(),
+                native_mtp: 0,
+                qsa_workspace: residency::granule_slack_total(
+                    [reserve.census.gather, reserve.census.qsa_selector],
+                    granule,
+                )
+                .unwrap(),
+            }
+        }
+
+        /// The real j1786 inputs (aggregate route) at every rung of a purpose
+        /// with the given weight and shadow slack, as the loader's admission
+        /// reads them.
+        fn frontier(
+            purpose: AdmissionPurpose,
+            weights: u64,
+            f16_shadows: u64,
+        ) -> (AdmissionInputs, Vec<FrontierPoint>) {
+            let granule = 2 * MIB;
+            let boundary_stage_slack = residency::granule_slack_total(
+                crate::state::Qwen4State::session_fixed_part_sizes(
+                    &crate::config::compact_test_config(),
+                    j1778_state_format(),
+                )
+                .unwrap(),
+                granule,
+            )
+            .unwrap();
+            let payload_only = j1778_inputs(WindowRoute::Aggregate, purpose, J1778_PRELOAD_FREE);
+            let inputs = AdmissionInputs {
+                granule: GranuleInputs {
+                    granule_bytes: granule,
+                    base: base_slack_at(purpose_tile_rows(purpose), weights, f16_shadows),
+                    boundary_stage_slack,
+                },
+                ..payload_only
+            };
+            let points = tile_frontier(&inputs, |tile| {
+                Ok((j1778_reserve_at(tile), base_slack_at(tile, weights, f16_shadows)))
+            })
+            .unwrap();
+            (inputs, points)
+        }
+
+        fn selected(points: &[FrontierPoint]) -> &FrontierPoint {
+            let mut selected = points.iter().filter(|point| point.selected);
+            let point = selected.next().expect("a selected tile");
+            assert!(selected.next().is_none());
+            point
+        }
+
+        /// With the canonical plan's root backing charged, the product 768-row
+        /// tile keeps N=10 with exactly 48,509,588 B of slack and the
+        /// primitive 512-row tile (217,821,184 B diagnostic) 113,608,212 B,
+        /// on the SAME real inputs, the unchanged 1 GiB runtime budget and
+        /// 512 MiB safety margin, tiles and N. The historical individual
+        /// allocation charge is the named counterfactual: it declines by the
+        /// exact deficit, and the two differ by the recovered bytes only.
+        #[test]
+        fn slowlink_arena_n10_product_768_and_primitive_512_on_real_j1786_inputs() {
+            let fixture = fixture();
+            let granule = 2 * MIB;
+            let layers = crate::config::compact_test_config().num_hidden_layers;
+            let plan = plan_of(&fixture, granule as usize);
+            let (weights_arena, shadows_arena) = residency::weight_arena_granule_slack(
+                &plan,
+                &fixture.weights,
+                fixture.bytes_of(),
+                layers,
+                true,
+                granule,
+            )
+            .unwrap();
+            assert_eq!((weights_arena, shadows_arena), (10_945_280, 1_310_720));
+            // The historical counterfactual: one allocation per owner.
+            let weights_individual =
+                residency::weight_granule_slack(&fixture.weights, fixture.bytes_of(), granule)
+                    .unwrap();
+            let shadows_individual =
+                residency::f16_shadow_granule_slack(&fixture.weights, layers, granule).unwrap();
+            assert_eq!(weights_individual, 635_740_160);
+            assert_eq!(shadows_individual, 387_186_688);
+            let recovered =
+                weights_individual + shadows_individual - weights_arena - shadows_arena;
+            assert_eq!(recovered, 1_010_670_848);
+
+            for (purpose, tile, slack, payload_only) in [
+                (
+                    AdmissionPurpose::Product,
+                    768usize,
+                    48_509_588i128,
+                    J1778_AGG_PRODUCT_SLACK[3],
+                ),
+                (
+                    AdmissionPurpose::PrimitiveSelftest,
+                    512usize,
+                    113_608_212i128,
+                    J1778_AGG_PRIMITIVE_SLACK[4],
+                ),
+            ] {
+                assert_eq!(purpose_tile_rows(purpose), tile);
+                let (arena_inputs, arena_points) = frontier(purpose, weights_arena, shadows_arena);
+                let (individual_inputs, individual_points) =
+                    frontier(purpose, weights_individual, shadows_individual);
+                let point = selected(&arena_points);
+                assert_eq!(point.tile_rows, tile);
+                assert_eq!(point.slack_for(10), slack, "{purpose:?}");
+                assert!(point.admits(), "{purpose:?}");
+                assert_eq!(point.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
+                assert_eq!(point.safety_margin, EXPERT_MARGIN);
+                if purpose == AdmissionPurpose::PrimitiveSelftest {
+                    assert_eq!(arena_inputs.diagnostic_bytes, J1778_PRIMITIVE_DIAGNOSTIC);
+                    assert_eq!(point.census.diagnostic, J1778_PRIMITIVE_DIAGNOSTIC);
+                }
+                let profile = admit(&arena_inputs).unwrap();
+                assert_eq!(profile.tile_rows, tile);
+                assert_eq!(profile.resident_layers, S1_MIN_RESIDENT_LAYERS);
+
+                // Same tiles and base reserves, only the two granule terms move.
+                assert_eq!(arena_points.len(), individual_points.len());
+                for (arena, individual) in arena_points.iter().zip(&individual_points) {
+                    assert_eq!(arena.tile_rows, individual.tile_rows);
+                    assert_eq!(arena.base_reserve, individual.base_reserve);
+                    assert_eq!(arena.census, individual.census);
+                    assert_eq!(arena.safety_margin, individual.safety_margin);
+                    assert_eq!(
+                        individual.slack_for(10) + i128::from(recovered),
+                        arena.slack_for(10),
+                        "tile {}",
+                        arena.tile_rows
+                    );
+                }
+
+                let counterfactual = selected(&individual_points);
+                assert_eq!(
+                    counterfactual.slack_for(10),
+                    payload_only
+                        - i128::from(counterfactual.granule.total().unwrap())
+                        - 10 * i128::from(counterfactual.granule.layer),
+                    "{purpose:?}: the historical individual frontier is unchanged"
+                );
+                assert_eq!(counterfactual.slack_for(10), slack - i128::from(recovered));
+                assert!(!counterfactual.admits(), "{purpose:?}");
+                match admit(&individual_inputs) {
+                    Err(SlowlinkDecline::Deficit(deficit)) => {
+                        assert_eq!(
+                            i128::from(deficit.deficit_bytes),
+                            -counterfactual.slack_for(10),
+                            "{purpose:?}"
+                        );
+                    }
+                    other => panic!("{purpose:?}: individual allocations must decline: {other:?}"),
+                }
+            }
+        }
+
+        /// The factory's roles are `resident_split`'s non-expert entries: CPU
+        /// metadata records (not manifest entries), tied aliases, external row
+        /// tables and routed experts never become members; the resident
+        /// payload equals `resident_split`'s.
+        #[test]
+        fn slowlink_arena_roles_exclude_cpu_metadata_aliases_externals_and_experts() {
+            let fixture = fixture();
+            let plan = plan_of(&fixture, 2 * MIB as usize);
+            assert_eq!(fixture.cpu_metadata.len(), 3);
+            assert_eq!(
+                fixture.cpu_metadata.iter().map(|record| record.1).sum::<u64>(),
+                280
+            );
+            assert!(!fixture.external.is_empty() && !fixture.experts.is_empty());
+            for (name, _) in &fixture.cpu_metadata {
+                assert!(plan.weights.member(name).is_none(), "{name}");
+                assert!(plan.f16_shadows.member(name).is_none(), "{name}");
+            }
+            for name in fixture.external.iter().chain(&fixture.experts) {
+                assert!(plan.weights.member(name).is_none(), "{name}");
+                assert!(plan.f16_shadows.member(name).is_none(), "{name}");
+            }
+            assert!(plan.weights.member(ALIAS_NAME).is_none());
+            assert!(plan.f16_shadows.member(ALIAS_NAME).is_none());
+            // Every resident non-expert tensor is a weight member, and every
+            // shadow owner is one of them.
+            for (name, bytes) in &fixture.resident {
+                assert_eq!(plan.weights.member(name).unwrap().bytes as u64, *bytes, "{name}");
+            }
+            assert_eq!(plan.weights.members.len(), fixture.resident.len());
+            for span in &plan.f16_shadows.members {
+                assert!(plan.weights.member(&span.name).is_some(), "{}", span.name);
+            }
+            assert_eq!(
+                residency::resident_split(&fixture.weights, fixture.bytes_of()).unwrap().0,
+                plan.weights.logical_bytes().unwrap()
+            );
+            // A device that cannot shadow plans no shadow member at all.
+            let layers = crate::config::compact_test_config().num_hidden_layers;
+            let uncapable = residency::model_weight_arena_plan(
+                &fixture.weights,
+                fixture.bytes_of(),
+                layers,
+                false,
+                2 * MIB as usize,
+            )
+            .unwrap();
+            assert!(uncapable.f16_shadows.members.is_empty());
+            assert!(uncapable.f16_shadows.roots.is_empty());
+            assert_eq!(uncapable.weights, plan.weights);
+        }
+
+        /// The slack is the provided plan's root backing minus the unchanged
+        /// logical payload, only for what the reserve charges, and refuses a
+        /// plan that is not this manifest's or not at this granule.
+        #[test]
+        fn slowlink_arena_slack_is_root_backing_minus_the_logical_payload() {
+            let fixture = fixture();
+            let granule = 2 * MIB;
+            let layers = crate::config::compact_test_config().num_hidden_layers;
+            let plan = plan_of(&fixture, granule as usize);
+            let slack = |plan: &ModelWeightArenaPlan, charge: bool, granule: u64| {
+                residency::weight_arena_granule_slack(
+                    plan,
+                    &fixture.weights,
+                    fixture.bytes_of(),
+                    layers,
+                    charge,
+                    granule,
+                )
+            };
+            assert_eq!(
+                slack(&plan, true, granule),
+                Ok((
+                    plan.weights.backing_bytes(granule as usize).unwrap() - J1778_NON_EXPERT,
+                    plan.f16_shadows.backing_bytes(granule as usize).unwrap() - J1778_SHADOWS,
+                ))
+            );
+            // Shadows the reserve does not charge add nothing.
+            assert_eq!(slack(&plan, false, granule), Ok((10_945_280, 0)));
+            // A different granule than the plan's is refused, not re-rounded.
+            assert!(slack(&plan, true, granule + 4096)
+                .unwrap_err()
+                .contains("granule"));
+            // A plan of another manifest (one weight missing; shadows absent
+            // while charged) never reproduces the census payload.
+            let mut short = fixture.weights.clone();
+            short.retain(|entry| entry.name != "model.language_model.embed_tokens.weight");
+            let other = residency::model_weight_arena_plan(
+                &short,
+                |entry| fixture.sizes.get(&entry.name).copied(),
+                layers,
+                true,
+                granule as usize,
+            )
+            .unwrap();
+            assert!(slack(&other, true, granule)
+                .unwrap_err()
+                .contains("census charges"));
+            let no_shadows = residency::model_weight_arena_plan(
+                &fixture.weights,
+                fixture.bytes_of(),
+                layers,
+                false,
+                granule as usize,
+            )
+            .unwrap();
+            assert!(slack(&no_shadows, true, granule)
+                .unwrap_err()
+                .contains("census charges"));
+        }
+
+        /// Overflow, the 256 B cap floor, the default (no weights) plan, the
+        /// missing-size and zero-granule refusals, and the unchanged Copy
+        /// semantics and non-S1 laziness of the admission types.
+        #[test]
+        fn slowlink_arena_overflow_cap_default_fast_uma_and_unmeasured_are_unchanged() {
+            use std::cell::Cell;
+            fn is_copy<T: Copy>() {}
+            is_copy::<AdmissionInputs>();
+            is_copy::<SlowlinkProfile>();
+
+            let layers = crate::config::compact_test_config().num_hidden_layers;
+            let entry = |name: &str| {
+                WeightEntry::model(name, vec![4, 4], DType::BF16, ShardPolicy::Replicate)
+            };
+            let granule = 2 * MIB as usize;
+            // Overflow: a payload whose rounded backing exceeds u64 refuses
+            // before any allocation, with a named error.
+            let huge = vec![entry("model.huge.weight")];
+            let overflowed = residency::model_weight_arena_plan(
+                &huge,
+                |_| Some(u64::MAX),
+                layers,
+                true,
+                granule,
+            )
+            .and_then(|plan| {
+                residency::weight_arena_granule_slack(
+                    &plan,
+                    &huge,
+                    |_| Some(u64::MAX),
+                    layers,
+                    true,
+                    granule as u64,
+                )
+            });
+            assert!(overflowed.is_err(), "{overflowed:?}");
+            // A missing payload size, and a zero granule, refuse.
+            assert!(
+                residency::model_weight_arena_plan(&huge, |_| None, layers, true, granule)
+                    .unwrap_err()
+                    .contains("no payload size")
+            );
+            assert!(
+                residency::model_weight_arena_plan(&huge, |_| Some(10), layers, true, 0)
+                    .unwrap_err()
+                    .contains("granule")
+            );
+            // The cap never falls below 256 B and every root asks for at least
+            // that.
+            let small: Vec<WeightEntry> = (0..4).map(|i| entry(&format!("w{i}"))).collect();
+            let tiny = residency::model_weight_arena_plan(
+                &small,
+                |_| Some(10),
+                layers,
+                true,
+                granule,
+            )
+            .unwrap();
+            assert_eq!(tiny.weights.max_root_bytes, 256);
+            assert_eq!(tiny.weights.roots, vec![256; 4]);
+            // No weights, no roots and no backing.
+            let empty =
+                residency::model_weight_arena_plan(&[], |_| Some(10), layers, true, granule)
+                    .unwrap();
+            assert!(empty.weights.roots.is_empty() && empty.f16_shadows.roots.is_empty());
+            assert_eq!(empty.weights.backing_bytes(granule), Ok(0));
+            empty.validate().unwrap();
+
+            // Fast, UMA, unmeasured, explicit-layer and non-S1 loads never ask
+            // for facts, so they never build the plan or query the granule; an
+            // incumbent charge set carries no arena term.
+            let built = Cell::new(false);
+            let facts = || -> Result<LoadFacts<'static>, String> {
+                built.set(true);
+                Err("the arena plan must not be built".to_string())
+            };
+            for load in [
+                LoadShape {
+                    unified_memory: true,
+                    ..shape()
+                },
+                LoadShape {
+                    explicit_vram_layers: true,
+                    ..shape()
+                },
+            ] {
+                assert_eq!(
+                    select_load_profile(
+                        SlowlinkMode::Force,
+                        &load,
+                        || unreachable!("probed"),
+                        facts
+                    ),
+                    Ok(None)
+                );
+            }
+            for mode in [SlowlinkMode::Off, SlowlinkMode::Auto] {
+                assert_eq!(
+                    select_load_profile(mode, &shape(), || unreachable!("probed"), facts),
+                    Ok(None)
+                );
+            }
+            for link in [
+                HostLink::Unified,
+                HostLink::Unmeasured,
+                HostLink::Discrete { gbps: 16.0 },
+                HostLink::Discrete { gbps: 26.0 },
+            ] {
+                assert_eq!(
+                    select_load_profile(SlowlinkMode::Force, &shape(), || link, facts),
+                    Ok(None),
+                    "{link:?}"
+                );
+            }
+            assert!(!built.get());
+            let payload_only = admit(&inputs(free_for(&inputs(0), 10))).unwrap();
+            assert_eq!(payload_only.granule, GranuleCharge::default());
+            assert_eq!(GranuleInputs::default().granule_bytes, 0);
+        }
     }
 }
