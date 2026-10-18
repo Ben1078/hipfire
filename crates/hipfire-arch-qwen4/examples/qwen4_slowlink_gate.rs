@@ -1979,9 +1979,7 @@ mod slowlink_receipt_tests {
         }
     }
 
-    fn primitive_rows(
-        statuses: &[&str],
-    ) -> (Checks, serde_json::Map<String, Value>, Vec<String>) {
+    fn primitive_rows(statuses: &[&str]) -> (Checks, serde_json::Map<String, Value>, Vec<String>) {
         let ids: Vec<String> = PRIMITIVE_CASES
             .iter()
             .map(|case| format!("primitive.{case}"))
@@ -1999,7 +1997,10 @@ mod slowlink_receipt_tests {
     }
 
     fn rows(checks: &Checks) -> Vec<Value> {
-        checks.json()["checks"].as_array().cloned().unwrap_or_default()
+        checks.json()["checks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn row(checks: &Checks, name: &str) -> Value {
@@ -2068,7 +2069,11 @@ mod slowlink_receipt_tests {
         assert_eq!(checks.status(), "fail");
         let all = rows(&checks);
         let fails: Vec<&Value> = all.iter().filter(|r| r["status"] == "fail").collect();
-        assert_eq!(fails.len(), 1, "one initialization failure, not one per case");
+        assert_eq!(
+            fails.len(),
+            1,
+            "one initialization failure, not one per case"
+        );
         assert_eq!(fails[0]["name"], "primitive.init");
         assert_eq!(
             checks.missing().len(),
