@@ -3899,7 +3899,7 @@ mod tests {
     }
 
     /// Emits the ACTUAL chosen profiles of the real j1778 fixture (purpose
-    /// `Product` at 768 and `PrimitiveSelftest` at 512, both routes), each with
+    /// `Product` at 768 and `PrimitiveSelftest` at 512, all three window routes), each with
     /// its full base-census breakdown (forward, state, QSA context, workspace,
     /// F16 weight shadow), the S1 owned terms and arena, the diagnostic,
     /// runtime and safety budgets and the N=10 needed/free/slack, as one JSON
@@ -3908,7 +3908,11 @@ mod tests {
     #[test]
     fn slowlink_residency_j1778_emits_the_chosen_profiles_with_the_full_base_breakdown() {
         let mut profiles = Vec::new();
-        for route in [WindowRoute::Aggregate, WindowRoute::SlabIu4] {
+        for route in [
+            WindowRoute::Aggregate,
+            WindowRoute::SlabIu4,
+            WindowRoute::AggregateSymIu4,
+        ] {
             for purpose in [
                 AdmissionPurpose::Product,
                 AdmissionPurpose::PrimitiveSelftest,
