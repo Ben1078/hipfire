@@ -177,7 +177,11 @@ pub(crate) struct PromptByteCensus {
 }
 
 impl PromptByteCensus {
-    /// Sum of every device term but the forward's own tile scratch.
+    /// Sum of every device term but the forward's own tile scratch: the
+    /// physical allocation, equal to the profile's
+    /// [`crate::slowlink_admission::SlowlinkCensus::owned_total`]. The admission's runtime-overhead and
+    /// diagnostic budget terms are reservations, never allocations, and are
+    /// not in this sum (`SlowlinkProfile::reserve_bytes` carries them).
     pub(crate) fn total(&self) -> Option<u64> {
         [
             self.hc_streams,
@@ -3006,7 +3010,8 @@ pub(crate) fn primitive_selftest(
 mod slowlink_prompt {
     use super::*;
     use crate::slowlink_admission::{
-        admit, AdmissionInputs, ModelGeometry, S1_TILE_ROWS, S1_WINDOW_ROWS,
+        admit, AdmissionInputs, ModelGeometry, S1_RUNTIME_OVERHEAD_BYTES, S1_TILE_ROWS,
+        S1_WINDOW_ROWS,
     };
     use rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS;
 
@@ -3016,6 +3021,11 @@ mod slowlink_prompt {
 
     /// The admitted profile of a Flash-Next MQ4 load with ample memory.
     pub(super) fn profile() -> SlowlinkProfile {
+        profile_with_diagnostic(0)
+    }
+
+    /// [`profile`] with the Hold 1 diagnostic budget `diagnostic_bytes`.
+    fn profile_with_diagnostic(diagnostic_bytes: u64) -> SlowlinkProfile {
         let geometry = ModelGeometry::from_config(&crate::config::compact_test_config()).unwrap();
         admit(&AdmissionInputs {
             geometry,
@@ -3029,7 +3039,7 @@ mod slowlink_prompt {
             baseline_layers: 10,
             fixed_state_bytes: 64 * MIB,
             pending_save_bytes: 4 * 2560 * 4,
-            diagnostic_bytes: 0,
+            diagnostic_bytes,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -3548,6 +3558,47 @@ mod slowlink_prompt {
             "the admitted arena holds the window's tagged spans plus one tile of view slack"
         );
         assert!(census.total().is_some());
+    }
+
+    /// The physical prompt census is the allocation layouts' total whatever
+    /// budget the admission reserves beside them: the runtime-overhead and
+    /// diagnostic terms are in the full reserve, never in the census.
+    #[test]
+    fn slowlink_prompt_census_stays_the_owned_total_beside_budget_terms() {
+        const DIAGNOSTIC: u64 = 300 * MIB;
+        let budgeted = profile_with_diagnostic(DIAGNOSTIC);
+        assert_eq!(budgeted.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
+        assert_eq!(budgeted.census.diagnostic, DIAGNOSTIC);
+        let plan = plan_prompt_verdict(&PromptPlanInputs {
+            profile: &budgeted,
+            entry_pos: 0,
+            rows: 16384,
+            cuts: &[],
+            routing: &gfx1100_routing,
+            few_row_limit: 8,
+        })
+        .unwrap()
+        .expect("a qualified request plans");
+        let physical = prompt_bytes(&plan).unwrap().total().unwrap();
+        let owned = budgeted.census.owned_total().unwrap();
+        let budget = S1_RUNTIME_OVERHEAD_BYTES + DIAGNOSTIC;
+        assert_eq!(physical, owned, "allocations are the owned layouts only");
+        assert_eq!(
+            budgeted.reserve_bytes().unwrap(),
+            owned + budget,
+            "the full reserve carries both budget terms"
+        );
+        assert_eq!(
+            budgeted.reserve_bytes().unwrap(),
+            budgeted.census.total().unwrap()
+        );
+        assert_eq!(budgeted.census.owned_terms().len(), 7);
+        assert_eq!(budgeted.census.terms().len(), 9);
+        assert_eq!(
+            physical,
+            profile().census.owned_total().unwrap(),
+            "the diagnostic budget moves no allocation"
+        );
     }
 
     #[test]
