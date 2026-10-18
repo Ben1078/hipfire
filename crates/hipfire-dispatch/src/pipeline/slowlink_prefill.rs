@@ -3057,7 +3057,9 @@ pub mod selftest {
         limits: PanelLimits,
         seed: u64,
     ) -> Result<PrimitiveReport, DispatchError> {
-        diag_scope(gpu, |gpu| k1_tail_cohort_body(gpu, call, binding, limits, seed))
+        diag_scope(gpu, |gpu| {
+            k1_tail_cohort_body(gpu, call, binding, limits, seed)
+        })
     }
 
     fn k1_tail_cohort_body(
@@ -3334,7 +3336,9 @@ pub mod selftest {
         limits: PanelLimits,
         seed: u64,
     ) -> Result<PrimitiveReport, DispatchError> {
-        diag_scope(gpu, |gpu| zero_row_panel_body(gpu, call, binding, limits, seed))
+        diag_scope(gpu, |gpu| {
+            zero_row_panel_body(gpu, call, binding, limits, seed)
+        })
     }
 
     fn zero_row_panel_body(
@@ -3575,7 +3579,11 @@ mod slowlink_panel_tests {
         .unwrap_err();
         assert!(format!("{err:?}").contains("stream wait failed"));
         assert_eq!(dev.log, ["body", "sync"], "no drain after a failed wait");
-        assert_eq!((dev.parked, dev.returned), (64, 0), "work may still read the buffers");
+        assert_eq!(
+            (dev.parked, dev.returned),
+            (64, 0),
+            "work may still read the buffers"
+        );
         // Both failures are reported; still nothing is freed.
         let mut dev = FakeDev {
             sync_fails: true,
@@ -3608,7 +3616,10 @@ mod slowlink_panel_tests {
         }
         assert_eq!(dev.returned, sizes.iter().map(|s| s + s / 2).sum::<usize>());
         let without_drain: usize = sizes.iter().map(|s| s + s / 2).sum();
-        assert!(without_drain > 2 * sizes[0], "the parked sum is what the drain removes");
+        assert!(
+            without_drain > 2 * sizes[0],
+            "the parked sum is what the drain removes"
+        );
     }
 
     #[test]
@@ -3732,13 +3743,18 @@ mod slowlink_panel_tests {
     #[test]
     fn slowlink_panel_suite_bytes_of_one_case_equal_its_own_ledger() {
         let g = real_identity();
-        let one = suite_diagnostic_bytes(&[DiagCase::CanonicalCombine], &g, PanelLimits::S1)
-            .unwrap();
+        let one =
+            suite_diagnostic_bytes(&[DiagCase::CanonicalCombine], &g, PanelLimits::S1).unwrap();
         // The canonical-combine fixture runs no window: no Gpu scratch, no growth.
         assert_eq!(one.persistent, ScratchSlots::default());
         assert_eq!(one.growth_transient, 0);
         assert_eq!(one.device_total(), one.case_local_device_peak);
-        assert!(suite_diagnostic_bytes(&[], &g, PanelLimits::S1).unwrap().device_total() == 0);
+        assert!(
+            suite_diagnostic_bytes(&[], &g, PanelLimits::S1)
+                .unwrap()
+                .device_total()
+                == 0
+        );
     }
 
     #[test]
