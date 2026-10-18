@@ -4486,7 +4486,9 @@ mod slowlink_panel_tests {
         let limits = PanelLimits::S1;
         let decode = diagnostic_bytes(DiagCase::DecodeTailCohort, &g, limits).unwrap();
         // Grouped padding spreads over every expert: 640 slots + 15 * 512 pad rows = 8,320.
-        assert_eq!(decode.device_peak, 2_012_120, "{:?}", decode.device_parts);
+        // The previous 2,012,120 plus the cohort's 512 count words (2,048 B): the window
+        // region is 1,659,392 B with them.
+        assert_eq!(decode.device_peak, 2_014_168, "{:?}", decode.device_parts);
         assert_eq!(decode.host_peak, 99_041_064, "{:?}", decode.host_parts);
         let canary = diagnostic_bytes(
             DiagCase::WithinExpertCanary,
@@ -4725,10 +4727,14 @@ mod slowlink_panel_tests {
         assert!(PromptRouteLayout::new(&aggregate_dims(8, 4, 4)).is_ok());
         // Cohort slot counts are one word an expert beside the K2 counts (no packing bound).
         assert!(PromptRouteLayout::new(&aggregate_dims(4096, 1, 2047)).is_ok());
+        // The slab K1 cohort has no packed-field cap either (its counts are their own words):
+        // it may fill the whole window and only cannot exceed it.
         let mut k1 = dims(4096);
-        k1.k1_rows = 204;
-        assert!(PromptRouteLayout::new(&k1).is_ok());
         k1.k1_rows = 205;
+        assert!(PromptRouteLayout::new(&k1).is_ok());
+        k1.k1_rows = 4096;
+        assert!(PromptRouteLayout::new(&k1).is_ok());
+        k1.k1_rows = 4097;
         assert!(PromptRouteLayout::new(&k1).is_err());
     }
 
