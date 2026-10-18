@@ -6743,10 +6743,21 @@ mod tests {
         // overwrite WMMA twins `gemm_mq4g256v2_overwrite_wmma_gfx12` and
         // `gemm_mq4g256v2_overwrite_wmma_gfx12_vt` (default draft lm_head and
         // projections; the 27B draft cold-compiled them) are additional to P0's 92. Existing
-        // module digests above remain unchanged.
+        // module digests above remain unchanged. Those 158 are the pre-S1 inventory; the S1
+        // slow-link kernels add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
+        // in the digest fixture), each its own isolated source.
+        const PRE_S1_ADDED_SINCE_P0: usize = 158;
+        const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
+        for module in S1_ADDED_MODULES {
+            assert!(by_name.contains_key(module), "missing S1 module {module}");
+            assert!(
+                !expected.lines().any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
-            count + 158,
+            count + PRE_S1_ADDED_SINCE_P0 + S1_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
