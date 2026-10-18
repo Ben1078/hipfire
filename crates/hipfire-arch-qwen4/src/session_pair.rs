@@ -1227,10 +1227,8 @@ impl Qwen4Bundle {
             .hc_count
             .checked_mul(self.config.hidden_size)
             .ok_or_else(|| BundleError::Forward("MTP pending backup width overflow".into()))?;
-        self.slowlink.pending_save = Some(
-            gpu.zeros(&[width], DType::F32)
-                .map_err(BundleError::Hip)?,
-        );
+        self.slowlink.pending_save =
+            Some(gpu.zeros(&[width], DType::F32).map_err(BundleError::Hip)?);
         Ok(())
     }
 

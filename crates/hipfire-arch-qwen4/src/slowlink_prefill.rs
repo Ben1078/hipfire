@@ -1061,12 +1061,7 @@ impl SlowlinkRuntime {
             streams,
             ..
         } = self;
-        free_runtime_parts(
-            gpu,
-            Some(ring),
-            Some(schedule),
-            vec![route_region, streams],
-        )
+        free_runtime_parts(gpu, Some(ring), Some(schedule), vec![route_region, streams])
     }
 }
 
@@ -1215,7 +1210,12 @@ fn reserve_window_scratch(gpu: &mut Gpu, args: WindowScratchArgs) -> Result<(), 
             gpu.reserve_qwen4_moe_group_scratch(args.rows, dsp::K_TOP, args.experts)
         }
     }
-    .map_err(|error| format!("window scratch growth to {} rows failed: {error}", args.rows))
+    .map_err(|error| {
+        format!(
+            "window scratch growth to {} rows failed: {error}",
+            args.rows
+        )
+    })
 }
 
 /// The validated, still-unallocated shape of one forward's runtime: everything
@@ -2248,8 +2248,7 @@ fn runtime_gate(runtime_bound: bool, declined: Option<&str>) -> Result<(), Strin
     }
     if !runtime_bound {
         return Err(
-            "the slow-link runtime was not bound at load (requests never construct it)"
-                .to_string(),
+            "the slow-link runtime was not bound at load (requests never construct it)".to_string(),
         );
     }
     Ok(())
@@ -3882,7 +3881,8 @@ pub(crate) fn primitive_selftest(
 mod slowlink_prompt {
     use super::*;
     use crate::slowlink_admission::{
-        admit, AdmissionInputs, ModelGeometry, S1_AGGREGATE_TAIL_ROWS, S1_K1_TAIL_ROWS,
+        admit, admit_at_tile, AdmissionInputs, AdmissionPurpose, ModelGeometry,
+        S1_AGGREGATE_TAIL_ROWS, S1_K1_TAIL_ROWS, S1_PRIMITIVE_TILE_ROWS, S1_PRODUCT_TILE_ROWS,
         S1_RUNTIME_OVERHEAD_BYTES, S1_TILE_ROWS, S1_WINDOW_ROWS,
     };
     use rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS;
@@ -3891,7 +3891,13 @@ mod slowlink_prompt {
     const GATE_UP_LAYER: u64 = 512 * 1_740_800;
     const DOWN_LAYER: u64 = 512 * 870_400;
 
-    /// The admitted profile of a Flash-Next MQ4 load with ample memory.
+    /// The HISTORICAL counterfactual profile: the maximum legal 1536-row tile
+    /// ([`S1_TILE_ROWS`]) on a Flash-Next MQ4 load with ample memory. The
+    /// numeric class fixtures below (ten 1536-row tiles, 15,360-row windows,
+    /// cuts at 1536/1537) declare THIS tile as their intent; it is admitted
+    /// through [`admit_at_tile`] (arena and census recomputed at that tile),
+    /// never by editing `profile.tile_rows` of another profile. The ACTUAL
+    /// shipped tiles are [`product_profile_on`] and [`primitive_profile_on`].
     pub(super) fn profile() -> SlowlinkProfile {
         profile_with_budgets(0, 0)
     }
@@ -3909,17 +3915,18 @@ mod slowlink_prompt {
         )
     }
 
-    /// [`profile_with_budgets`] admitted FRESH on the artifact route `route`: the
+    /// The fixture's admission inputs on the artifact route `route`: the
     /// geometry names the route before the census is computed, so every
     /// route-dependent byte is that route's own layout.
-    pub(super) fn profile_on(
+    fn fixture_inputs(
         route: dsp::WindowRoute,
+        purpose: AdmissionPurpose,
         diagnostic_bytes: u64,
         base_runtime_reserved_bytes: u64,
-    ) -> SlowlinkProfile {
+    ) -> AdmissionInputs {
         let geometry =
             ModelGeometry::from_config(&crate::config::compact_test_config(), route).unwrap();
-        admit(&AdmissionInputs {
+        AdmissionInputs {
             geometry,
             free: 40 << 30,
             non_expert: 5_364_000_000,
@@ -3936,8 +3943,49 @@ mod slowlink_prompt {
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
-        })
-        .expect("a 40 GiB load admits S1")
+            purpose,
+        }
+    }
+
+    /// [`profile_with_budgets`] admitted FRESH on the artifact route `route` at
+    /// the explicit 1536 counterfactual tile.
+    pub(super) fn profile_on(
+        route: dsp::WindowRoute,
+        diagnostic_bytes: u64,
+        base_runtime_reserved_bytes: u64,
+    ) -> SlowlinkProfile {
+        admit_at_tile(
+            &fixture_inputs(
+                route,
+                AdmissionPurpose::Product,
+                diagnostic_bytes,
+                base_runtime_reserved_bytes,
+            ),
+            S1_TILE_ROWS,
+        )
+        .expect("a 40 GiB load admits S1 at the 1536 counterfactual tile")
+    }
+
+    /// The ACTUAL product profile (`AdmissionPurpose::Product`, the 768-row
+    /// tile) through the one purpose-driven [`admit`].
+    pub(super) fn product_profile_on(route: dsp::WindowRoute) -> SlowlinkProfile {
+        let profile = admit(&fixture_inputs(route, AdmissionPurpose::Product, 0, 0))
+            .expect("a 40 GiB load admits the product S1 profile");
+        assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
+        profile
+    }
+
+    /// The ACTUAL primitive-purpose profile (the 512-row tile).
+    pub(super) fn primitive_profile_on(route: dsp::WindowRoute) -> SlowlinkProfile {
+        let profile = admit(&fixture_inputs(
+            route,
+            AdmissionPurpose::PrimitiveSelftest,
+            0,
+            0,
+        ))
+        .expect("a 40 GiB load admits the primitive S1 profile");
+        assert_eq!(profile.tile_rows, S1_PRIMITIVE_TILE_ROWS);
+        profile
     }
 
     /// The incumbent's decisions on a gfx1100-class tile: the routing rows are
@@ -3959,7 +4007,8 @@ mod slowlink_prompt {
         }
     }
 
-    /// [`plan_prompt_verdict`] of a request on a profile admitted FRESH on `route`.
+    /// [`plan_prompt_verdict`] of a request on a profile admitted FRESH on `route`
+    /// at the explicit 1536 counterfactual tile.
     pub(super) fn plan_on(
         route: dsp::WindowRoute,
         entry: usize,
@@ -3968,8 +4017,27 @@ mod slowlink_prompt {
         routing: &dyn Fn(usize) -> TileRouting,
         few_row_limit: usize,
     ) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
+        plan_for_profile(
+            &profile_on(route, 0, 0),
+            entry,
+            rows,
+            cuts,
+            routing,
+            few_row_limit,
+        )
+    }
+
+    /// [`plan_prompt_verdict`] of a request on an explicit `profile`.
+    pub(super) fn plan_for_profile(
+        profile: &SlowlinkProfile,
+        entry: usize,
+        rows: usize,
+        cuts: &[usize],
+        routing: &dyn Fn(usize) -> TileRouting,
+        few_row_limit: usize,
+    ) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
         plan_prompt_verdict(&PromptPlanInputs {
-            profile: &profile_on(route, 0, 0),
+            profile,
             entry_pos: entry,
             rows,
             cuts,
@@ -5204,6 +5272,162 @@ mod slowlink_prompt {
         assert_eq!(broken.unused_bytes(), None);
         assert!(receipt_of(&[broken])["unused_prefetched_bytes"].is_null());
     }
+
+    // ── the ACTUAL shipped tiles: product 768, primitive-purpose 512 ──────
+    //
+    // The numeric class fixtures above declare the 1536 counterfactual
+    // ([`profile`]); these prove the same planner structure on the profiles
+    // `admit` really returns, with arena and census recomputed at the tile.
+
+    const BOTH_ROUTES: [dsp::WindowRoute; 2] =
+        [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::Aggregate];
+
+    /// The window layout of `window` validated against `profile`, its tagged
+    /// stream spans inside the arena with one tile of BF16 view slack, and its
+    /// census equal to the allocation layouts.
+    fn assert_window_fits_profile(profile: &SlowlinkProfile, plan: &Qwen4PromptPlan) {
+        validate_window_layouts(profile, plan).unwrap();
+        let wide = profile.geometry.hc_count * profile.geometry.hidden;
+        let slack = (profile.tile_rows * wide * 2) as u64;
+        for window in &plan.windows {
+            window_route_layout(profile, window.rows, window.k1_rows, window.tail_rows).unwrap();
+            assert!(
+                window.stream_bytes + slack <= profile.arena.total_bytes,
+                "the window's tagged HC spans plus one tile of slack fit the admitted arena"
+            );
+        }
+        let census = prompt_bytes(plan).unwrap();
+        assert_eq!(census.route_storage, profile.census.route_storage);
+        assert_eq!(census.hc_streams, profile.arena.total_bytes);
+        assert!(plan.tiles.iter().all(|t| t.rows <= profile.tile_rows));
+    }
+
+    #[test]
+    fn slowlink_prompt_actual_product_tile_768_runs_16384_native_wmma_with_a_final_256_f32_tile() {
+        for route in BOTH_ROUTES {
+            let profile = product_profile_on(route);
+            assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
+            assert_eq!(profile.tile_rows, 768);
+            assert_eq!(profile.window_rows, 16384, "the full 16,384-row window");
+            let plan = plan_for_profile(&profile, 0, 16384, &[], &gfx1100_routing, 8)
+                .unwrap()
+                .expect("the product tile plans a full window");
+            let rows: Vec<usize> = plan.tiles.iter().map(|t| t.rows).collect();
+            assert_eq!(
+                rows,
+                [vec![768; 21], vec![256]].concat(),
+                "{route:?}: 21 native 768-row tiles then the final 256-row tile"
+            );
+            assert_eq!(plan.windows.len(), 1, "{route:?}: one full 16,384-row window");
+            assert_eq!(plan.windows[0].rows, 16384);
+            // 768 rows is at or above the WMMA minimum: BF16 streams, K2.
+            for tile in &plan.tiles[..21] {
+                assert!(tile.routing.bf16_streams, "{route:?}");
+                assert_eq!(tile_cohort(route, tile.routing.route_rows, 8), TileCohort::K2);
+            }
+            // 256 rows is below it: an F32-stream tile.
+            let last = plan.tiles.last().unwrap();
+            assert_eq!(last.rows, 256);
+            assert!(!last.routing.bf16_streams, "{route:?}: the final tile is F32");
+            let window = &plan.windows[0];
+            match route {
+                dsp::WindowRoute::Aggregate => {
+                    assert_eq!(
+                        tile_cohort(route, 256, 8),
+                        TileCohort::F32Tail,
+                        "the final 256 rows are an aggregate F32 tail"
+                    );
+                    assert_eq!((window.k1_rows, window.tail_rows), (0, 256));
+                    assert_eq!(plan.tail_rows_max, 256);
+                    assert!(plan.tail_rows_max <= S1_AGGREGATE_TAIL_ROWS);
+                }
+                dsp::WindowRoute::SlabIu4 => {
+                    assert_eq!(tile_cohort(route, 256, 8), TileCohort::K2);
+                    assert_eq!((window.k1_rows, window.tail_rows), (0, 0));
+                }
+            }
+            assert_eq!(plan.k1_rows_max, 0);
+            assert_chronology(&plan);
+            assert_window_fits_profile(&profile, &plan);
+        }
+    }
+
+    #[test]
+    fn slowlink_prompt_actual_primitive_tile_512_is_all_native_wmma_over_a_full_window() {
+        for route in BOTH_ROUTES {
+            let profile = primitive_profile_on(route);
+            assert_eq!(profile.tile_rows, S1_PRIMITIVE_TILE_ROWS);
+            assert_eq!(profile.tile_rows, 512);
+            let plan = plan_for_profile(&profile, 0, 16384, &[], &gfx1100_routing, 8)
+                .unwrap()
+                .expect("the primitive tile plans a full window");
+            assert_eq!(
+                plan.tiles.iter().map(|t| t.rows).collect::<Vec<_>>(),
+                vec![512; 32],
+                "{route:?}"
+            );
+            assert!(plan.tiles.iter().all(|t| t.routing.bf16_streams));
+            assert_eq!((plan.k1_rows_max, plan.tail_rows_max), (0, 0));
+            assert_eq!(plan.windows.len(), 1);
+            assert_chronology(&plan);
+            assert_window_fits_profile(&profile, &plan);
+        }
+    }
+
+    #[test]
+    fn slowlink_prompt_actual_tiles_recompute_arena_and_census_not_just_the_tile() {
+        for route in BOTH_ROUTES {
+            let counterfactual = profile_on(route, 0, 0);
+            let product = product_profile_on(route);
+            let primitive = primitive_profile_on(route);
+            assert_eq!(counterfactual.tile_rows, S1_TILE_ROWS);
+            // The HC arena is sized by the tile: a smaller tile is a smaller
+            // arena, so the explicit 1536 counterfactual is a distinct admission,
+            // never the actual profile with a patched `tile_rows`.
+            assert!(primitive.arena.total_bytes < product.arena.total_bytes);
+            assert!(product.arena.total_bytes < counterfactual.arena.total_bytes);
+            // Window-sized owners do not depend on the tile.
+            for actual in [&product, &primitive] {
+                assert_eq!(actual.census.route_storage, counterfactual.census.route_storage);
+                assert_eq!(actual.census.group_scatter, counterfactual.census.group_scatter);
+                assert_eq!(actual.census.a4_sidecars, counterfactual.census.a4_sidecars);
+                assert_eq!(actual.window_rows, counterfactual.window_rows);
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_prompt_actual_tiles_keep_the_mandatory_boundary_chronology() {
+        // Cuts 3, 4, 1536, 1537 and 8192 with a 9000-row request: the same
+        // chronology as the 1536 fixtures, on the actual tiles.
+        let cuts = [3, 4, 1536, 1537, 8192];
+        for route in BOTH_ROUTES {
+            for profile in [product_profile_on(route), primitive_profile_on(route)] {
+                let plan = plan_for_profile(&profile, 0, 9000, &cuts, &gfx1100_routing, 8)
+                    .unwrap()
+                    .expect("the mandatory boundary request plans");
+                assert_chronology(&plan);
+                assert_eq!(plan.windows.len(), 2, "{route:?}: the fifth cut ends window one");
+                assert_eq!(plan.windows[0].end_position(), 8192);
+                assert_eq!(plan.windows[0].cuts, vec![3, 4, 1536, 1537]);
+                assert_eq!(plan.windows[1].position, 8192);
+                assert!(plan.windows[1].cuts.is_empty());
+                for &cut in &cuts {
+                    assert!(
+                        plan.tiles.iter().any(|t| t.end_position() == cut),
+                        "{route:?}/{}: cut {cut} is a tile end",
+                        profile.tile_rows
+                    );
+                    assert!(plan
+                        .tiles
+                        .iter()
+                        .all(|t| !(t.position < cut && cut < t.end_position())));
+                }
+                assert!(plan.tiles.iter().all(|t| t.rows <= profile.tile_rows));
+                assert_window_fits_profile(&profile, &plan);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5701,10 +5925,16 @@ mod slowlink_overlap {
 /// real allocation steps, their charge and their cleanup disposition.
 #[cfg(test)]
 mod slowlink_eager_load {
-    use super::slowlink_prompt::profile_on;
+    use super::slowlink_prompt::{primitive_profile_on, product_profile_on};
     use super::*;
 
     const ROUTES: [dsp::WindowRoute; 2] = [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::Aggregate];
+
+    /// The two ACTUAL admitted profiles of `route`: product (768-row tile) and
+    /// primitive-purpose (512-row tile).
+    fn actual_profiles(route: dsp::WindowRoute) -> [SlowlinkProfile; 2] {
+        [product_profile_on(route), primitive_profile_on(route)]
+    }
 
     /// A device with a byte capacity: owners allocate their census charge,
     /// cleanup either returns them (in reverse) or quarantines them.
@@ -5723,7 +5953,7 @@ mod slowlink_eager_load {
     impl ModelDevice {
         fn new(route: dsp::WindowRoute, capacity: u64) -> Self {
             Self {
-                profile: profile_on(route, 0, 0),
+                profile: product_profile_on(route),
                 capacity,
                 live: Vec::new(),
                 quarantined: Vec::new(),
@@ -5762,7 +5992,10 @@ mod slowlink_eager_load {
         fn unwind(&mut self, bound: &[LoadOwner]) -> String {
             assert_eq!(
                 bound,
-                self.live.iter().map(|(owner, _)| *owner).collect::<Vec<_>>(),
+                self.live
+                    .iter()
+                    .map(|(owner, _)| *owner)
+                    .collect::<Vec<_>>(),
                 "the unwind covers exactly the owners that were bound"
             );
             if self.drain_fails {
@@ -5787,14 +6020,19 @@ mod slowlink_eager_load {
 
     #[test]
     fn slowlink_eager_load_owners_cover_every_census_term_once() {
-        for route in ROUTES {
-            let profile = profile_on(route, 0, 0);
+        for (route, profile) in ROUTES
+            .into_iter()
+            .flat_map(|route| actual_profiles(route).map(move |profile| (route, profile)))
+        {
             let owned: u64 = profile.census.owned_terms().iter().map(|(_, b)| b).sum();
             let bound: u64 = LOAD_OWNERS
                 .iter()
                 .map(|owner| load_owner_charge(&profile, *owner))
                 .sum();
-            assert_eq!(bound, owned, "{route:?}: every charged region has one owner");
+            assert_eq!(
+                bound, owned,
+                "{route:?}: every charged region has one owner"
+            );
             let mut seen = LOAD_OWNERS.to_vec();
             seen.dedup();
             assert_eq!(seen.len(), LOAD_OWNERS.len());
@@ -5809,8 +6047,10 @@ mod slowlink_eager_load {
 
     #[test]
     fn slowlink_eager_load_window_scratch_args_are_the_census_bytes() {
-        for route in ROUTES {
-            let profile = profile_on(route, 0, 0);
+        for (route, profile) in ROUTES
+            .into_iter()
+            .flat_map(|route| actual_profiles(route).map(move |profile| (route, profile)))
+        {
             let args = window_scratch_args(&profile);
             assert_eq!(args.rows, profile.window_rows);
             let group =
@@ -5837,7 +6077,13 @@ mod slowlink_eager_load {
     fn slowlink_eager_load_owns_every_charged_region_before_the_first_short_incumbent() {
         for route in ROUTES {
             let mut dev = ModelDevice::new(route, 0);
-            let owned: u64 = dev.profile.census.owned_terms().iter().map(|(_, b)| b).sum();
+            let owned: u64 = dev
+                .profile
+                .census
+                .owned_terms()
+                .iter()
+                .map(|(_, b)| b)
+                .sum();
             let incumbent = 3 << 30;
             dev.capacity = owned + incumbent;
             bind_load_owners(&mut dev).expect("the charged owners fit the charged capacity");
@@ -5902,8 +6148,14 @@ mod slowlink_eager_load {
                 let error = bind_load_owners(&mut dev).unwrap_err();
                 assert!(error.contains(&format!("{failing:?}")), "{error}");
                 assert!(error.contains("out of memory"), "{error}");
-                assert!(error.contains("cleanup: released to the device pool"), "{error}");
-                assert!(dev.live.is_empty(), "{route:?}/{failing:?}: nothing stays live");
+                assert!(
+                    error.contains("cleanup: released to the device pool"),
+                    "{error}"
+                );
+                assert!(
+                    dev.live.is_empty(),
+                    "{route:?}/{failing:?}: nothing stays live"
+                );
                 assert!(dev.quarantined.is_empty());
                 assert!(!dev.transaction_begun, "no S1 transaction began");
                 let released: Vec<_> = dev

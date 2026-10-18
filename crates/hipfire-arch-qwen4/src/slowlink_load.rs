@@ -359,9 +359,7 @@ fn load_inner(
             Ok(()) => "bundle released to the device pool".to_string(),
             Err(free) => format!("bundle teardown reported {free}"),
         };
-        return Err(format!(
-            "qwen4 forward setup failed: {error}; {teardown}"
-        ));
+        return Err(format!("qwen4 forward setup failed: {error}; {teardown}"));
     }
     if let Some(domain) = cache_domain {
         let cache = hipfire_runtime::session_cache::SessionCache::new(
