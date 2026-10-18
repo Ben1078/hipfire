@@ -70,6 +70,29 @@ const A4_RECORD_BYTES: usize = 72;
 /// Width of the A4 sidecar block (`k / 128` records per row).
 const A4_BLOCK_K: usize = 128;
 
+/// The three Gpu grow-only scratch needs `[a4_gate_up, a4_down, group_scatter]` of a window of
+/// `rows` tokens: the IU4 A4 sidecars (`0, 0` on the aggregate route, which quantizes nothing)
+/// and the grouped-scatter layout. One expression for the route layout's census and the
+/// selftest's ledger.
+fn window_scratch_sizes(
+    route: WindowRoute,
+    hidden: usize,
+    mi: usize,
+    n_exp: usize,
+    rows: usize,
+) -> [usize; 3] {
+    let (a4_gate_up, a4_down) = if route == WindowRoute::Aggregate {
+        (0, 0)
+    } else {
+        (
+            (hidden / A4_BLOCK_K) * rows * A4_RECORD_BYTES,
+            (mi / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES,
+        )
+    };
+    let group_scatter = rdna_compute::scratch::qwen4_moe_group_layout(rows * K_TOP, n_exp).bytes;
+    [a4_gate_up, a4_down, group_scatter]
+}
+
 fn bail(message: impl std::fmt::Display) -> DispatchError {
     DispatchError::Hip(format!("slowlink layer-major prefill: {message}"))
 }
@@ -411,12 +434,7 @@ impl PromptRouteLayout {
     /// ([`Self::x_f16_bytes`]) and its panel-local F16 down input fits the F16 X scratch the
     /// tile's own rotation already reserves.
     pub fn a4_sidecar_bytes(&self) -> usize {
-        let d = &self.dims;
-        if d.route == WindowRoute::Aggregate {
-            return 0;
-        }
-        let gate_up = (d.hidden / A4_BLOCK_K) * d.rows * A4_RECORD_BYTES;
-        let down = (d.mi / A4_BLOCK_K) * d.rows * K_TOP * A4_RECORD_BYTES;
+        let [gate_up, down, _] = self.scratch_allocation_sizes();
         gate_up + down
     }
 
@@ -458,7 +476,18 @@ impl PromptRouteLayout {
     /// 1536-row tile's own scatter scratch may already be reserved (this is the full size, not
     /// the net growth).
     pub fn group_scatter_bytes(&self) -> usize {
-        rdna_compute::scratch::qwen4_moe_group_layout(self.dims.rows * K_TOP, self.dims.n_exp).bytes
+        self.scratch_allocation_sizes()[2]
+    }
+
+    /// The three Gpu grow-only scratch buffers a full window reserves, in order
+    /// `[a4_gate_up, a4_down, group_scatter]`: each ONE `Gpu` scratch slot grown to exactly this
+    /// many bytes (`grow_scratch_buffer` mallocs exactly `needed`, no rounding or doubling).
+    /// The A4 pair is `0, 0` on the aggregate route. Their sum is
+    /// `charged_bytes() - total_bytes()`; [`Self::a4_sidecar_bytes`] is the first two and
+    /// [`Self::group_scatter_bytes`] the third.
+    pub fn scratch_allocation_sizes(&self) -> [usize; 3] {
+        let d = &self.dims;
+        window_scratch_sizes(d.route, d.hidden, d.mi, d.n_exp, d.rows)
     }
 
     /// Everything the window charges: the route region, the A4 sidecars and the grouped-scatter
@@ -3206,19 +3235,12 @@ pub mod selftest {
 
     /// The three Gpu grow-only scratch needs of a window of `rows` tokens.
     fn window_scratch(g: &DiagGeometry, rows: usize) -> ScratchSlots {
+        let [a4_gate_up, a4_down, group_scatter] =
+            window_scratch_sizes(g.route, g.hidden, g.mi, g.n_exp, rows);
         ScratchSlots {
-            a4_gate_up: if g.route == WindowRoute::Aggregate {
-                0
-            } else {
-                (g.hidden / A4_BLOCK_K) * rows * A4_RECORD_BYTES
-            },
-            a4_down: if g.route == WindowRoute::Aggregate {
-                0
-            } else {
-                (g.mi / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES
-            },
-            group_scatter: rdna_compute::scratch::qwen4_moe_group_layout(rows * K_TOP, g.n_exp)
-                .bytes,
+            a4_gate_up,
+            a4_down,
+            group_scatter,
         }
     }
 
@@ -4553,6 +4575,33 @@ mod slowlink_panel_tests {
         let tile = PromptRouteLayout::new(&dims(1536)).unwrap();
         assert_eq!(tile.group_scatter_bytes(), 309_248);
         assert!(tile.group_scatter_bytes() < l.group_scatter_bytes());
+    }
+
+    #[test]
+    fn slowlink_panel_scratch_allocation_sizes_are_the_three_grow_only_slots() {
+        for rows in [1usize, 16, 1536, 1537, 16_384] {
+            let slab = PromptRouteLayout::new(&dims(rows)).unwrap();
+            let aggregate = PromptRouteLayout::new(&aggregate_dims(rows, 0, 0)).unwrap();
+            let [gate_up, down, scatter] = slab.scratch_allocation_sizes();
+            assert_eq!(gate_up, (2560 / A4_BLOCK_K) * rows * A4_RECORD_BYTES, "{rows}");
+            assert_eq!(down, (640 / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES, "{rows}");
+            assert_eq!(
+                scatter,
+                rdna_compute::scratch::qwen4_moe_group_layout(rows * K_TOP, 512).bytes
+            );
+            assert_eq!(slab.a4_sidecar_bytes(), gate_up + down);
+            assert_eq!(slab.group_scatter_bytes(), scatter);
+            assert_eq!(
+                slab.scratch_allocation_sizes().iter().sum::<usize>(),
+                slab.charged_bytes() - slab.total_bytes()
+            );
+            // The aggregate route quantizes nothing: only the scatter scratch.
+            assert_eq!(aggregate.scratch_allocation_sizes(), [0, 0, scatter]);
+            assert_eq!(
+                aggregate.scratch_allocation_sizes().iter().sum::<usize>(),
+                aggregate.charged_bytes() - aggregate.total_bytes()
+            );
+        }
     }
 
     #[test]
