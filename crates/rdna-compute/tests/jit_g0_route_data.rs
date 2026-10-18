@@ -352,15 +352,22 @@ fn measured_q8_route_symbols_are_in_the_packaged_index() {
                 );
             }
         }
-        if q8.is_empty() {
-            // This arch's recorded trace requested no Q8 tensor_ops symbol (gfx1151's
-            // flash-next fixture). Nothing is asserted from an unrecorded trace; its Q8
-            // capability is the source-export closure in `kernel_registry` tests.
-            assert_eq!(arch, "gfx1151", "{arch}: fixture lost its Q8 route symbols");
-            continue;
+        // Each arch's fixture records its own Q8 requests. gfx1151's trace is a pre-failure
+        // observation (its native prefill never ran), so it recorded only the two GDN state
+        // codecs; gfx1100/gfx1201 recorded the Q8 KV paths too. Nothing is asserted that an
+        // arch's trace did not record: its remaining Q8 capability is the source-export
+        // closure in the `kernel_registry` tests.
+        assert!(!q8.is_empty(), "{arch}: fixture records no Q8 tensor_ops route symbols");
+        if arch != "gfx1151" {
+            for kv in [
+                "indexed_attention_decode_prologue_q8",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_attention_q8_batched",
+            ] {
+                assert!(q8.contains(kv), "{arch}: fixture lost recorded {kv}");
+            }
         }
         covered += 1;
-        assert!(q8.len() >= 4, "{arch}: too few Q8 tensor_ops route symbols");
         for symbol in q8 {
             assert!(
                 tensor_ops.symbols.contains(&symbol),
@@ -368,6 +375,5 @@ fn measured_q8_route_symbols_are_in_the_packaged_index() {
             );
         }
     }
-    // Recorded Q8 traces: gfx1100 and gfx1201 (gfx1151 recorded none).
-    assert_eq!(covered, 2);
+    assert_eq!(covered, 3);
 }
