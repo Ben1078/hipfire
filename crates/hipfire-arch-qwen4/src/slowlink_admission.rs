@@ -729,12 +729,13 @@ pub const S1_K1_TAIL_ROWS: usize =
 
 /// Window rows of the aggregate route's F32-tail tiles (the 2..511-row
 /// prefill tiles of cut heads and tails, which stay inside the same window
-/// and lease): the dispatch bound `k1_rows + tail_rows < AGGREGATE_PANEL_ROWS`
-/// less the decode rows. The slab route has none. A plan whose F32-tail rows
-/// exceed this is a pre-mutation bypass; the layout charges only 40 B per row
-/// for the tail ids.
-pub const S1_AGGREGATE_TAIL_ROWS: usize =
-    hipfire_dispatch::pipeline::slowlink_prefill::AGGREGATE_PANEL_ROWS - 1 - S1_K1_TAIL_ROWS;
+/// and lease): at most one per cut segment head or tail, i.e. the same
+/// `(4 interior cuts + 2) * 511 = 3066` rows the HC-stream arena already
+/// bounds ([`S1_F32_STREAM_ROWS`], one definition). The slab route has none.
+/// The layout charges only 40 B per row for the tail ids; a plan whose
+/// F32-tail rows exceed this is a pre-mutation bypass. The dispatch layout
+/// must accept this worst case rather than the census narrowing to its bound.
+pub const S1_AGGREGATE_TAIL_ROWS: usize = S1_F32_STREAM_ROWS;
 
 /// The dispatch crate's route-storage dimensions of a window of `rows` rows.
 pub fn route_dims(
@@ -747,6 +748,9 @@ pub fn route_dims(
         n_exp: geometry.num_experts,
         mi: geometry.moe_intermediate,
         shared_intermediate: geometry.shared_intermediate,
+        // The conservative 48 on both routes (decode rows only on the
+        // aggregate route; at most 6 are possible, 48 stays below the
+        // dispatch packing bound beside the 3,066 tail rows).
         k1_rows: S1_K1_TAIL_ROWS,
         tail_rows: match geometry.route {
             WindowRoute::SlabIu4 => 0,
@@ -2843,8 +2847,8 @@ mod tests {
                     assert_eq!(layout.a4_sidecar_bytes(), 0);
                     assert_eq!(layout.x_f16_bytes(), 16384 * 2560 * 2);
                     assert_eq!(layout.x_f16_bytes(), 83_886_080);
-                    // D's final numbers at k1 48, tail bound 1999: the tail ids
-                    // are inside total_bytes (40 B per tail row, 256-aligned).
+                    // The tail ids are inside total_bytes (40 B per tail row,
+                    // 256-aligned) at the full 3,066-row worst case.
                     assert_eq!(layout.tail_ids_bytes() % 256, 0);
                     assert!(layout.tail_ids_bytes() >= 40 * S1_AGGREGATE_TAIL_ROWS);
                     assert_eq!(
