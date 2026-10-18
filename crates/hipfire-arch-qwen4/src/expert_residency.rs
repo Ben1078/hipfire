@@ -1588,9 +1588,7 @@ pub fn weight_granule_slack(
         {
             continue;
         }
-        sizes.push(
-            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?,
-        );
+        sizes.push(bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?);
     }
     granule_slack_total(sizes, granule)
 }
@@ -1620,7 +1618,8 @@ pub const WEIGHT_ARENA_ALIGNMENT: usize = 256;
 pub const WEIGHT_ARENA_MIN_ROOT_BYTES: usize = 256;
 
 fn arena_bytes(name: &str, bytes: u64) -> Result<usize, String> {
-    usize::try_from(bytes).map_err(|_| format!("arena member '{name}' of {bytes} B overflows usize"))
+    usize::try_from(bytes)
+        .map_err(|_| format!("arena member '{name}' of {bytes} B overflows usize"))
 }
 
 /// The members of the weight arena family: exactly the entries

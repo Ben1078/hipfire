@@ -1236,13 +1236,11 @@ impl SlowlinkProfile {
     /// The one number placement charges for this profile besides its layers.
     pub fn reserve_bytes(&self) -> Result<u64, String> {
         self.census.total().and_then(|census| {
-            self.granule
-                .total()
-                .and_then(|granule| {
-                    census
-                        .checked_add(granule)
-                        .ok_or_else(|| "slow-link prefill reserve overflows".to_string())
-                })
+            self.granule.total().and_then(|granule| {
+                census
+                    .checked_add(granule)
+                    .ok_or_else(|| "slow-link prefill reserve overflows".to_string())
+            })
         })
     }
 
@@ -1373,13 +1371,11 @@ fn joint_placement(
             census
                 .total()
                 .and_then(|bytes| {
-                    granule
-                        .total()
-                        .and_then(|slack| {
-                            bytes.checked_add(slack).ok_or_else(|| {
-                                "slow-link prefill reserve overflows".to_string()
-                            })
-                        })
+                    granule.total().and_then(|slack| {
+                        bytes
+                            .checked_add(slack)
+                            .ok_or_else(|| "slow-link prefill reserve overflows".to_string())
+                    })
                 })
                 .map(|bytes| charges.with_slowlink(bytes))
         })
@@ -3294,7 +3290,10 @@ mod tests {
         assert_eq!(deficit.resident_layers, 9);
         assert_eq!(deficit.deficit_bytes, 200_000_000 - 156_567_700);
         let points = tile_frontier(&product, |tile| {
-            Ok((j1778_reserve_at(tile), crate::expert_residency::GranuleSlack::default()))
+            Ok((
+                j1778_reserve_at(tile),
+                crate::expert_residency::GranuleSlack::default(),
+            ))
         })
         .unwrap();
         let selected: Vec<_> = points.iter().filter(|point| point.selected).collect();
@@ -3406,7 +3405,10 @@ mod tests {
             ] {
                 let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
                 let points = tile_frontier(&inputs, |tile| {
-                    Ok((j1778_reserve_at(tile), crate::expert_residency::GranuleSlack::default()))
+                    Ok((
+                        j1778_reserve_at(tile),
+                        crate::expert_residency::GranuleSlack::default(),
+                    ))
                 })
                 .unwrap();
                 assert_eq!(points.len(), 5);
@@ -4681,10 +4683,7 @@ mod tests {
         // wrapped budget.
         let mut tight = with_granule(inputs(0));
         tight.free = 1 << 30;
-        assert!(matches!(
-            admit(&tight),
-            Err(SlowlinkDecline::Deficit(_))
-        ));
+        assert!(matches!(admit(&tight), Err(SlowlinkDecline::Deficit(_))));
     }
 
     /// The device snapshot budget is exactly the free memory left after the
@@ -4730,9 +4729,12 @@ mod tests {
             Err(SlowlinkDecline::Deficit(_))
         ));
         assert_eq!(
-            admit(&AdmissionInputs { free: edge, ..probe })
-                .unwrap()
-                .device_snapshot_budget_bytes,
+            admit(&AdmissionInputs {
+                free: edge,
+                ..probe
+            })
+            .unwrap()
+            .device_snapshot_budget_bytes,
             0
         );
     }
@@ -4758,12 +4760,8 @@ mod tests {
                 ..shape()
             },
         ] {
-            let outcome = select_load_profile(
-                SlowlinkMode::Force,
-                &load,
-                || unreachable!("probed"),
-                facts,
-            );
+            let outcome =
+                select_load_profile(SlowlinkMode::Force, &load, || unreachable!("probed"), facts);
             assert_eq!(outcome, Ok(None));
         }
         for link in [HostLink::Unified, HostLink::Discrete { gbps: 26.0 }] {
@@ -4772,7 +4770,10 @@ mod tests {
                 Ok(None)
             );
         }
-        assert!(!built.get(), "no granule facts for a load that cannot select");
+        assert!(
+            !built.get(),
+            "no granule facts for a load that cannot select"
+        );
         let incumbent = PlacementCharges::new(LAYER, false).unwrap();
         assert_eq!(incumbent.slowlink, 0);
         assert_eq!(incumbent.reserve(123).unwrap(), 123 + incumbent.margin);
@@ -4912,9 +4913,7 @@ mod tests {
                 );
                 assert_eq!(
                     point.slack_for(10),
-                    payload_slack[index]
-                        - i128::from(total)
-                        - 10 * i128::from(point.granule.layer),
+                    payload_slack[index] - i128::from(total) - 10 * i128::from(point.granule.layer),
                     "{route:?} {purpose:?} tile {}",
                     point.tile_rows
                 );
@@ -4944,7 +4943,9 @@ mod tests {
             let tile = purpose_tile_rows(purpose);
             let inputs_layer_slack = census_of(&inputs)
                 .map(|(pages, arena, census)| {
-                    granule_charge(&inputs, &pages, &arena, &census).unwrap().layer
+                    granule_charge(&inputs, &pages, &arena, &census)
+                        .unwrap()
+                        .layer
                 })
                 .unwrap();
             let reserve = inputs.base_reserve
@@ -5110,8 +5111,12 @@ mod tests {
                     fixture.cpu_metadata.push((name, bytes));
                     continue;
                 }
-                let mut entry =
-                    WeightEntry::model(name.clone(), shape.clone(), dtype_of(tag), ShardPolicy::Replicate);
+                let mut entry = WeightEntry::model(
+                    name.clone(),
+                    shape.clone(),
+                    dtype_of(tag),
+                    ShardPolicy::Replicate,
+                );
                 entry.layer = name
                     .strip_prefix("model.language_model.layers.")
                     .and_then(|rest| rest.split_once('.'))
@@ -5203,9 +5208,18 @@ mod tests {
                 .collect();
             let mut previous: Option<(usize, usize)> = None;
             for span in &plan.members {
-                assert_eq!(span.bytes as u64, sizes[span.name.as_str()], "{}", span.name);
+                assert_eq!(
+                    span.bytes as u64,
+                    sizes[span.name.as_str()],
+                    "{}",
+                    span.name
+                );
                 assert_eq!(span.offset % 256, 0, "{}", span.name);
-                assert!(span.offset + span.bytes <= plan.roots[span.root], "{}", span.name);
+                assert!(
+                    span.offset + span.bytes <= plan.roots[span.root],
+                    "{}",
+                    span.name
+                );
                 if let Some((root, end)) = previous.filter(|(root, _)| *root == span.root) {
                     assert_eq!(root, span.root);
                     assert!(span.offset >= end, "{} overlaps its neighbour", span.name);
@@ -5238,7 +5252,10 @@ mod tests {
                 cap, fixture.sizes["model.language_model.embed_tokens.weight"],
                 "the token embedding is the largest existing eligible allocation"
             );
-            assert!(fixture.sizes[ALIAS_NAME] > cap, "the alias must not set the cap");
+            assert!(
+                fixture.sizes[ALIAS_NAME] > cap,
+                "the alias must not set the cap"
+            );
             assert_family(&plan.weights, &fixture.resident, cap);
             let shadows = shadow_members(&fixture);
             assert_family(&plan.f16_shadows, &shadows, cap);
@@ -5308,11 +5325,7 @@ mod tests {
             assert_eq!(plan.f16_shadows.backing_bytes(granule), Ok(1_300_234_240));
         }
 
-        fn base_slack_at(
-            tile: usize,
-            weights: u64,
-            f16_shadows: u64,
-        ) -> residency::GranuleSlack {
+        fn base_slack_at(tile: usize, weights: u64, f16_shadows: u64) -> residency::GranuleSlack {
             let granule = 2 * MIB;
             let config = crate::config::compact_test_config();
             let reserve = j1778_reserve_at(tile);
@@ -5384,7 +5397,10 @@ mod tests {
                 ..payload_only
             };
             let points = tile_frontier(&inputs, |tile| {
-                Ok((j1778_reserve_at(tile), base_slack_at(tile, weights, f16_shadows)))
+                Ok((
+                    j1778_reserve_at(tile),
+                    base_slack_at(tile, weights, f16_shadows),
+                ))
             })
             .unwrap();
             (inputs, points)
@@ -5428,8 +5444,7 @@ mod tests {
                 residency::f16_shadow_granule_slack(&fixture.weights, layers, granule).unwrap();
             assert_eq!(weights_individual, 635_740_160);
             assert_eq!(shadows_individual, 387_186_688);
-            let recovered =
-                weights_individual + shadows_individual - weights_arena - shadows_arena;
+            let recovered = weights_individual + shadows_individual - weights_arena - shadows_arena;
             assert_eq!(recovered, 1_010_670_848);
 
             for (purpose, tile, slack, payload_only) in [
@@ -5512,7 +5527,11 @@ mod tests {
             let plan = plan_of(&fixture, 2 * MIB as usize);
             assert_eq!(fixture.cpu_metadata.len(), 3);
             assert_eq!(
-                fixture.cpu_metadata.iter().map(|record| record.1).sum::<u64>(),
+                fixture
+                    .cpu_metadata
+                    .iter()
+                    .map(|record| record.1)
+                    .sum::<u64>(),
                 280
             );
             assert!(!fixture.external.is_empty() && !fixture.experts.is_empty());
@@ -5529,14 +5548,20 @@ mod tests {
             // Every resident non-expert tensor is a weight member, and every
             // shadow owner is one of them.
             for (name, bytes) in &fixture.resident {
-                assert_eq!(plan.weights.member(name).unwrap().bytes as u64, *bytes, "{name}");
+                assert_eq!(
+                    plan.weights.member(name).unwrap().bytes as u64,
+                    *bytes,
+                    "{name}"
+                );
             }
             assert_eq!(plan.weights.members.len(), fixture.resident.len());
             for span in &plan.f16_shadows.members {
                 assert!(plan.weights.member(&span.name).is_some(), "{}", span.name);
             }
             assert_eq!(
-                residency::resident_split(&fixture.weights, fixture.bytes_of()).unwrap().0,
+                residency::resident_split(&fixture.weights, fixture.bytes_of())
+                    .unwrap()
+                    .0,
                 plan.weights.logical_bytes().unwrap()
             );
             // A device that cannot shadow plans no shadow member at all.
@@ -5664,14 +5689,9 @@ mod tests {
             // The cap never falls below 256 B and every root asks for at least
             // that.
             let small: Vec<WeightEntry> = (0..4).map(|i| entry(&format!("w{i}"))).collect();
-            let tiny = residency::model_weight_arena_plan(
-                &small,
-                |_| Some(10),
-                layers,
-                true,
-                granule,
-            )
-            .unwrap();
+            let tiny =
+                residency::model_weight_arena_plan(&small, |_| Some(10), layers, true, granule)
+                    .unwrap();
             assert_eq!(tiny.weights.max_root_bytes, 256);
             assert_eq!(tiny.weights.roots, vec![256; 4]);
             // No weights, no roots and no backing.
