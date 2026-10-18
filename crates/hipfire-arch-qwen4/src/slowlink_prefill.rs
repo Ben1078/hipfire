@@ -3021,11 +3021,15 @@ mod slowlink_prompt {
 
     /// The admitted profile of a Flash-Next MQ4 load with ample memory.
     pub(super) fn profile() -> SlowlinkProfile {
-        profile_with_diagnostic(0)
+        profile_with_budgets(0, 0)
     }
 
-    /// [`profile`] with the Hold 1 diagnostic budget `diagnostic_bytes`.
-    fn profile_with_diagnostic(diagnostic_bytes: u64) -> SlowlinkProfile {
+    /// [`profile`] with the Hold 1 diagnostic budget `diagnostic_bytes` and the
+    /// runtime overhead `base_runtime_reserved_bytes` the base reserve already holds.
+    fn profile_with_budgets(
+        diagnostic_bytes: u64,
+        base_runtime_reserved_bytes: u64,
+    ) -> SlowlinkProfile {
         let geometry = ModelGeometry::from_config(&crate::config::compact_test_config()).unwrap();
         admit(&AdmissionInputs {
             geometry,
@@ -3040,6 +3044,7 @@ mod slowlink_prompt {
             fixed_state_bytes: 64 * MIB,
             pending_save_bytes: 4 * 2560 * 4,
             diagnostic_bytes,
+            base_runtime_reserved_bytes,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -3562,43 +3567,47 @@ mod slowlink_prompt {
 
     /// The physical prompt census is the allocation layouts' total whatever
     /// budget the admission reserves beside them: the runtime-overhead and
-    /// diagnostic terms are in the full reserve, never in the census.
+    /// diagnostic terms are in the full reserve, never in the census, and a
+    /// runtime overhead the base reserve already holds only shrinks the
+    /// supplement, never an allocation.
     #[test]
     fn slowlink_prompt_census_stays_the_owned_total_beside_budget_terms() {
         const DIAGNOSTIC: u64 = 300 * MIB;
-        let budgeted = profile_with_diagnostic(DIAGNOSTIC);
-        assert_eq!(budgeted.census.runtime_overhead, S1_RUNTIME_OVERHEAD_BYTES);
-        assert_eq!(budgeted.census.diagnostic, DIAGNOSTIC);
-        let plan = plan_prompt_verdict(&PromptPlanInputs {
-            profile: &budgeted,
-            entry_pos: 0,
-            rows: 16384,
-            cuts: &[],
-            routing: &gfx1100_routing,
-            few_row_limit: 8,
-        })
-        .unwrap()
-        .expect("a qualified request plans");
-        let physical = prompt_bytes(&plan).unwrap().total().unwrap();
-        let owned = budgeted.census.owned_total().unwrap();
-        let budget = S1_RUNTIME_OVERHEAD_BYTES + DIAGNOSTIC;
-        assert_eq!(physical, owned, "allocations are the owned layouts only");
-        assert_eq!(
-            budgeted.reserve_bytes().unwrap(),
-            owned + budget,
-            "the full reserve carries both budget terms"
-        );
-        assert_eq!(
-            budgeted.reserve_bytes().unwrap(),
-            budgeted.census.total().unwrap()
-        );
-        assert_eq!(budgeted.census.owned_terms().len(), 7);
-        assert_eq!(budgeted.census.terms().len(), 9);
-        assert_eq!(
-            physical,
-            profile().census.owned_total().unwrap(),
-            "the diagnostic budget moves no allocation"
-        );
+        let baseline_owned = profile().census.owned_total().unwrap();
+        for base_runtime in [0, 600 * MIB, S1_RUNTIME_OVERHEAD_BYTES + 476 * MIB] {
+            let budgeted = profile_with_budgets(DIAGNOSTIC, base_runtime);
+            let runtime = S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(base_runtime);
+            assert_eq!(budgeted.census.runtime_overhead, runtime, "{base_runtime}");
+            assert_eq!(budgeted.census.diagnostic, DIAGNOSTIC);
+            let plan = plan_prompt_verdict(&PromptPlanInputs {
+                profile: &budgeted,
+                entry_pos: 0,
+                rows: 16384,
+                cuts: &[],
+                routing: &gfx1100_routing,
+                few_row_limit: 8,
+            })
+            .unwrap()
+            .expect("a qualified request plans");
+            let physical = prompt_bytes(&plan).unwrap().total().unwrap();
+            let owned = budgeted.census.owned_total().unwrap();
+            assert_eq!(physical, owned, "allocations are the owned layouts only");
+            assert_eq!(
+                physical, baseline_owned,
+                "budget terms move no allocation ({base_runtime})"
+            );
+            assert_eq!(
+                budgeted.reserve_bytes().unwrap(),
+                owned + runtime + DIAGNOSTIC,
+                "the full reserve carries both budget terms ({base_runtime})"
+            );
+            assert_eq!(
+                budgeted.reserve_bytes().unwrap(),
+                budgeted.census.total().unwrap()
+            );
+            assert_eq!(budgeted.census.owned_terms().len(), 7);
+            assert_eq!(budgeted.census.terms().len(), 9);
+        }
     }
 
     #[test]
