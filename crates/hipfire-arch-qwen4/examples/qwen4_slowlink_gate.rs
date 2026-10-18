@@ -183,14 +183,29 @@ fn purpose_name(purpose: AdmissionPurpose) -> &'static str {
     }
 }
 
-/// What this cell's profile is, and is not, evidence of. The primitive cell
-/// runs at the primitive purpose's tile and is kernel correctness only; every
-/// other cell is a product-shape claim at the product tile.
-fn s1_profile_evidence(purpose: AdmissionPurpose, manifest: &Value) -> Value {
+/// The actual admission read back from the loaded bundle's profile.
+fn admitted_from(profile: Option<&hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile>) -> Option<(&'static str, u64)> {
+    profile.map(|p| (purpose_name(p.purpose), p.tile_rows as u64))
+}
+
+/// What this cell's profile is, and is not, evidence of. `expected_*` is what
+/// this binary's loader is built to admit for the cell's purpose, known at
+/// startup; `admitted_*` is `null` until a load succeeded and then the values
+/// read back from the loaded bundle's own profile (`None` stays `null`: a failed
+/// or declined load never reports an expected value as admitted). The primitive
+/// cell runs at the primitive purpose's tile and is kernel correctness only;
+/// every other cell is a product-shape claim at the product tile.
+fn s1_profile_evidence(
+    purpose: AdmissionPurpose,
+    manifest: &Value,
+    admitted: Option<(&str, u64)>,
+) -> Value {
     let primitive = purpose == AdmissionPurpose::PrimitiveSelftest;
     json!({
-        "admitted_purpose": purpose_name(purpose),
-        "admitted_tile_rows": purpose_tile_rows(purpose),
+        "expected_purpose": purpose_name(purpose),
+        "expected_tile_rows": purpose_tile_rows(purpose),
+        "admitted_purpose": admitted.map(|a| a.0),
+        "admitted_tile_rows": admitted.map(|a| a.1),
         "manifest_product_tile_rows": manifest_profile_tile(manifest, PROFILE_PRODUCT),
         "manifest_primitive_tile_rows": manifest_profile_tile(manifest, PROFILE_PRIMITIVE),
         "qualification": if primitive {
@@ -2168,7 +2183,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     progress.record(
         "plan",
         json!({"mode": args.mode.name(), "route": args.route.name(), "required": required,
-        "admitted_purpose": purpose_name(load_purpose(args.mode)),
+        "expected_purpose": purpose_name(load_purpose(args.mode)),
         "manifest_profiles": {
             "product_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRODUCT),
             "primitive_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRIMITIVE),
@@ -2212,7 +2227,8 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         let purpose = load_purpose(args.mode);
         let profile = purpose_name(purpose);
         let expected_tile = manifest_profile_tile(&manifest, profile).unwrap_or(0);
-        out.insert("s1_profile".into(), s1_profile_evidence(purpose, &manifest));
+        // Expected only: nothing is admitted until a load succeeds.
+        out.insert("s1_profile".into(), s1_profile_evidence(purpose, &manifest, None));
         progress.record("profile", out["s1_profile"].clone());
         let mut fixture = fixture;
         let session_cache = (args.mode == Mode::State).then_some(fixture.session_cache_bytes);
@@ -2234,6 +2250,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
                 // failing allocation.
                 let sample = mem_sample(&gpu, "load_failed", heavy_memory);
                 persist_memory(progress, "load_failed", &sample, sampler.as_ref());
+                // `s1_profile` still has admitted_* null: nothing was admitted.
                 progress.record("load_error", json!({"error": error}));
                 return Err(error);
             }
@@ -2255,6 +2272,12 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
         let mut placement_problems = Vec::new();
         let profile_now = loaded.bundle.slowlink_profile();
         let admitted_tile = profile_now.map(|p| p.tile_rows as u64);
+        // The same bundle profile feeds the evidence and the load.placement row.
+        out.insert(
+            "s1_profile".into(),
+            s1_profile_evidence(purpose, &manifest, admitted_from(profile_now)),
+        );
+        progress.record("profile_admitted", out["s1_profile"].clone());
         match args.route {
             Expect::LayerMajor => {
                 if !loaded.slowlink_profile || loaded.placement != "slowlink-profile" {
@@ -2291,8 +2314,9 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             placement_problems,
             json!({"placement": loaded.placement, "resident_layers": loaded.resident_layers,
                    "host_mapped_tensors": loaded.host_mapped_tensors, "slowlink_profile": loaded.slowlink_profile,
-                   "admitted_purpose": purpose_name(purpose), "admitted_tile_rows": admitted_tile,
-                   "expected_tile_rows": expected_tile}),
+                   "expected_purpose": purpose_name(purpose), "expected_tile_rows": expected_tile,
+                   "admitted_purpose": admitted_from(profile_now).map(|a| a.0),
+                   "admitted_tile_rows": admitted_tile}),
         );
         progress.checks(&checks);
         // A failure from here on still owns the GPU: its point sample is
@@ -4818,22 +4842,147 @@ mod slowlink_receipt_tests {
     }
 
     #[test]
-    fn slowlink_receipt_profile_evidence_reports_the_primitive_512_as_kernel_only() {
+    fn slowlink_receipt_profile_evidence_separates_expected_from_bundle_admitted() {
         let m = manifest();
-        let primitive = s1_profile_evidence(AdmissionPurpose::PrimitiveSelftest, &m);
-        assert_eq!(primitive["admitted_purpose"], "primitive_selftest");
-        assert_eq!(primitive["admitted_tile_rows"], 512);
+        // Before a successful load nothing is admitted: expected values are
+        // never reported as admitted.
+        let primitive = s1_profile_evidence(AdmissionPurpose::PrimitiveSelftest, &m, None);
+        assert_eq!(primitive["expected_purpose"], "primitive_selftest");
+        assert_eq!(primitive["expected_tile_rows"], 512);
+        assert!(primitive["admitted_purpose"].is_null());
+        assert!(primitive["admitted_tile_rows"].is_null());
         assert!(primitive["qualification"]
             .as_str()
             .unwrap()
             .contains("not a product-shape"));
-        let product = s1_profile_evidence(AdmissionPurpose::Product, &m);
-        assert_eq!(product["admitted_purpose"], "product");
-        assert_eq!(product["admitted_tile_rows"], 768);
+        let product = s1_profile_evidence(AdmissionPurpose::Product, &m, None);
+        assert_eq!(product["expected_purpose"], "product");
+        assert_eq!(product["expected_tile_rows"], 768);
+        assert!(product["admitted_purpose"].is_null());
+        assert!(product["admitted_tile_rows"].is_null());
         assert_eq!(product["manifest_primitive_tile_rows"], 512);
         assert!(product["qualification"]
             .as_str()
             .unwrap()
             .contains("product-shape claim"));
+        // After a load the admitted values are the bundle's own, whatever was
+        // expected (a mismatch is visible, not papered over).
+        let admitted = s1_profile_evidence(
+            AdmissionPurpose::Product,
+            &m,
+            Some(("primitive_selftest", 512)),
+        );
+        assert_eq!(admitted["expected_purpose"], "product");
+        assert_eq!(admitted["admitted_purpose"], "primitive_selftest");
+        assert_eq!(admitted["admitted_tile_rows"], 512);
+        let ok = s1_profile_evidence(AdmissionPurpose::Product, &m, Some(("product", 768)));
+        assert_eq!(ok["admitted_purpose"], "product");
+        assert_eq!(ok["admitted_tile_rows"], 768);
+    }
+
+    fn temp_args(dir: &Path, mode: &str, route: &str) -> Args {
+        let arg = |s: &str| s.to_string();
+        std::fs::write(dir.join("fixture.json"), b"{\"fixture\":1}\n").unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{\"manifest\":1}\n").unwrap();
+        parse_args([
+            arg("--model"),
+            arg("/m.mq4"),
+            arg("--fixture"),
+            dir.join("fixture.json").to_string_lossy().into_owned(),
+            arg("--manifest"),
+            dir.join("manifest.json").to_string_lossy().into_owned(),
+            arg("--output"),
+            dir.join("out.json").to_string_lossy().into_owned(),
+            arg("--mode"),
+            arg(mode),
+            arg("--route"),
+            arg(route),
+        ])
+        .unwrap()
+    }
+
+    /// Serialization only: the real `final_report` over temp files and pure
+    /// `Checks`; no GPU and no hardware result.
+    #[test]
+    fn slowlink_receipt_final_report_serializes_the_handoff_contract() {
+        let dir = scratch_dir("final");
+        for (mode, route, purpose, tile) in [
+            ("primitives", "layer-major", AdmissionPurpose::PrimitiveSelftest, 512u64),
+            ("state", "layer-major", AdmissionPurpose::Product, 768),
+        ] {
+            let args = temp_args(&dir, mode, route);
+            let (log, _lines) = memory_log(None);
+            let mut checks = Checks::new(&["identity.manifest", "progress.durability"]);
+            checks.pass("identity.manifest", Value::Null);
+            checks.pass("progress.durability", Value::Null);
+            let mut evidence = serde_json::Map::new();
+            evidence.insert(
+                "s1_profile".into(),
+                s1_profile_evidence(purpose, &manifest(), Some((purpose_name(purpose), tile))),
+            );
+            let (status, bytes) = final_report(&args, &checks, &evidence, &log).unwrap();
+            assert_eq!(status, "pass");
+            let report: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(report["schema"], "hipfire.qwen4.slowlink_gate.v1");
+            assert_eq!(report["mode"], mode);
+            assert_eq!(report["route"], "layer-major");
+            assert_eq!(report["status"], "pass");
+            for key in ["fixture_sha256", "manifest_sha256"] {
+                let hex = report[key].as_str().unwrap();
+                assert_eq!(hex.len(), 64, "{key}");
+                assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+            assert_eq!(
+                report["fixture_sha256"],
+                file_sha256(&dir.join("fixture.json")).unwrap()
+            );
+            assert_eq!(report["checks"]["status"], "pass");
+            assert_eq!(report["checks"]["missing"], json!([]));
+            assert_eq!(report["progress"]["schema"], PROGRESS_SCHEMA);
+            assert!(report["progress"]["sidecar"]
+                .as_str()
+                .unwrap()
+                .ends_with("out.json.progress.jsonl"));
+            let profile = &report["evidence"]["s1_profile"];
+            assert_eq!(profile["admitted_purpose"], purpose_name(purpose));
+            assert_eq!(profile["admitted_tile_rows"], tile);
+            assert_eq!(profile["expected_tile_rows"], tile);
+        }
+        // An incomplete run (a required check never ran) is never `pass`, and a
+        // run whose load never admitted anything reports null admitted fields.
+        let args = temp_args(&dir, "state", "layer-major");
+        let (log, _lines) = memory_log(None);
+        let mut checks = Checks::new(&["identity.manifest", "load.placement"]);
+        checks.pass("identity.manifest", Value::Null);
+        let mut evidence = serde_json::Map::new();
+        evidence.insert(
+            "s1_profile".into(),
+            s1_profile_evidence(AdmissionPurpose::Product, &manifest(), None),
+        );
+        let (status, bytes) = final_report(&args, &checks, &evidence, &log).unwrap();
+        assert_eq!(status, "incomplete");
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["status"], "incomplete");
+        assert_eq!(report["checks"]["missing"], json!(["load.placement"]));
+        assert!(report["evidence"]["s1_profile"]["admitted_purpose"].is_null());
+        assert!(report["evidence"]["s1_profile"]["admitted_tile_rows"].is_null());
+        assert_eq!(report["evidence"]["s1_profile"]["expected_tile_rows"], 768);
+        // A failed check is `fail`.
+        let mut failed = Checks::new(&["load.placement"]);
+        failed.fail("load.placement", "declined", Value::Null);
+        let (status, _) = final_report(&args, &failed, &serde_json::Map::new(), &log).unwrap();
+        assert_eq!(status, "fail");
+        // An unreadable fixture is an error, never a report with invented hashes.
+        std::fs::remove_file(dir.join("fixture.json")).unwrap();
+        assert!(final_report(&args, &checks, &evidence, &log).is_err());
+        // The aborted report carries no checks, evidence or hashes.
+        let aborted = aborted_report(&args, "load failed: hipMalloc", Some(&log));
+        assert_eq!(aborted["status"], "incomplete");
+        assert_eq!(aborted["mode"], "state");
+        assert_eq!(aborted["route"], "layer-major");
+        for key in ["checks", "evidence", "fixture_sha256", "manifest_sha256"] {
+            assert!(aborted.get(key).is_none(), "{key}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

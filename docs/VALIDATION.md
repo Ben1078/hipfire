@@ -441,7 +441,11 @@ product claim) is a **768-row** tile with at least ten resident layers; the
 **primitive_selftest** profile (`--mode primitives`) is a **512-row** tile that
 funds the self-test diagnostic inside the reserve. The primitive cell therefore
 proves kernel correctness at 512 rows only; it is not a product-shape
-qualification, and its report carries `evidence.s1_profile` saying so. One H1
+qualification, and its report carries `evidence.s1_profile` saying so
+(`expected_purpose`/`expected_tile_rows` from the binary at startup;
+`admitted_purpose`/`admitted_tile_rows` are `null` until a load succeeds and are
+then read back from the loaded bundle's own profile, so a failed or declined load
+never reports an expected value as admitted). One H1
 manifest holds both sealed profiles as full source ledgers,
 `memory_ledger.profiles.product` and `memory_ledger.profiles.primitive_selftest`
 (each: `purpose`, `tile_rows`, `resident_expert_layers`, `window_rows`,
