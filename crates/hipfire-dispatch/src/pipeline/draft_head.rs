@@ -151,21 +151,41 @@ impl DraftHead {
         layout: DraftHeadLayout,
         policy: DraftHeadPolicy,
     ) -> Option<(usize, usize)> {
+        let (resident, scratch) = Self::allocation_sizes(head_dtype, layout, policy)?;
+        let total = |sizes: Vec<usize>| {
+            sizes
+                .into_iter()
+                .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        };
+        Some((total(resident)?, total(scratch)?))
+    }
+
+    /// [`Self::device_bytes`] per allocation: `(resident, load scratch)`, one
+    /// entry per device allocation [`Self::new`] makes, in allocation order
+    /// (the requantized ranking copy, the re-score partial scratch, the F32
+    /// logits, the top-8 output, the F32 rotation row) and, for the scratch,
+    /// the one F32 requant chunk. Zero-byte entries are omitted.
+    pub fn allocation_sizes(
+        head_dtype: DType,
+        layout: DraftHeadLayout,
+        policy: DraftHeadPolicy,
+    ) -> Option<(Vec<usize>, Vec<usize>)> {
         let (copy_format, rescore, _) = plan(head_dtype, layout, policy);
-        let mut resident = layout
-            .vocab
-            .checked_mul(std::mem::size_of::<f32>())?
-            .checked_add(Gpu::TOPK8_OUT_BYTES)?
-            .checked_add(layout.hidden.checked_mul(std::mem::size_of::<f32>())?)?;
-        let mut scratch = 0;
+        let mut resident = Vec::with_capacity(5);
+        let mut scratch = Vec::new();
         if let Some(format) = copy_format {
             let (values, copy) = Gpu::requant_g256_bytes(layout.vocab, layout.hidden, format)?;
-            resident = resident.checked_add(copy)?;
-            scratch = values;
+            resident.push(copy);
+            scratch.push(values);
         }
         if rescore {
-            resident = resident.checked_add(Gpu::TOPK8_PARTIAL_BYTES)?;
+            resident.push(Gpu::TOPK8_PARTIAL_BYTES);
         }
+        resident.push(layout.vocab.checked_mul(std::mem::size_of::<f32>())?);
+        resident.push(Gpu::TOPK8_OUT_BYTES);
+        resident.push(layout.hidden.checked_mul(std::mem::size_of::<f32>())?);
+        resident.retain(|&bytes| bytes > 0);
+        scratch.retain(|&bytes| bytes > 0);
         Some((resident, scratch))
     }
 

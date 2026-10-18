@@ -9126,6 +9126,47 @@ pub fn native_mtp_device_bytes(
         .checked_add(u64::try_from(scratch).ok()?.max(request))
 }
 
+/// [`native_mtp_device_bytes`] per allocation, one entry per device
+/// allocation, same arguments (`max_k` is `drafts`, `batched_fill` is
+/// `fill_scratch`): the resident head allocations
+/// ([`crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes`]) then the allocations
+/// of whichever of the two coexisting alternatives wins the `max` of
+/// `native_mtp_device_bytes` — the head's build scratch (released at attach)
+/// or the first speculative request's ([`native_mtp_request_allocation_sizes`]),
+/// the request on a tie. The entries sum to `native_mtp_device_bytes`.
+pub(crate) fn native_mtp_allocation_sizes(
+    config: &crate::Qwen4Config,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    drafts: usize,
+    head_dtype: rdna_compute::DType,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    fill_scratch: bool,
+) -> Option<Vec<u64>> {
+    let request = native_mtp_request_allocation_sizes(
+        config,
+        context.max_seq,
+        chunk_rows,
+        drafts,
+        row_capture,
+        fill_scratch,
+    )?;
+    let (mut sizes, scratch) =
+        crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(config, context, head_dtype)?;
+    let total = |entries: &[u64]| {
+        entries
+            .iter()
+            .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+    };
+    sizes.extend(if total(&scratch)? > total(&request)? {
+        scratch
+    } else {
+        request
+    });
+    total(&sizes)?;
+    Some(sizes)
+}
+
 /// Rows a native MTP request sizes for windows of up to `max_k` drafts (pass
 /// [`native_mtp_proposal_drafts`], which counts n-gram takeovers): the seed
 /// row plus `max_k` clamped to the widest verify forward
@@ -9150,6 +9191,33 @@ pub fn native_mtp_request_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
+    native_mtp_request_allocation_sizes(
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )?
+    .into_iter()
+    .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+}
+
+/// [`native_mtp_request_bytes`] per allocation: the verify hidden rows, the
+/// pending, row and retained-pending hidden carries (one `hc * hidden` F32
+/// row each), the GDN capture ring's allocations
+/// ([`crate::state::Qwen4State::row_capture_allocation_sizes_scoped`]) and
+/// the batched prompt-fill scratch's
+/// ([`MtpAppendScratch::allocation_sizes`]). Zero-byte entries are omitted;
+/// `None` on overflow.
+pub(crate) fn native_mtp_request_allocation_sizes(
+    config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<Vec<u64>> {
     let rows = native_mtp_window_rows(max_k);
     let hidden_row = config
         .hc_count
@@ -9160,27 +9228,29 @@ pub fn native_mtp_request_bytes(
         chunk_rows,
         crate::npu_trunk::NpuTrunkMode::from_env().ok() == Some(crate::npu_trunk::NpuTrunkMode::On),
     )?;
-    let capture = match row_capture {
-        Some((gdn, ring_rows)) => {
-            crate::state::Qwen4State::row_capture_bytes(config, gdn, ring_rows.max(rows))?
-        }
-        None => 0,
-    };
-    let fill = if batched_fill {
-        MtpAppendScratch::device_bytes(
+    let mut sizes = vec![
+        u64::try_from(verify_rows.checked_mul(hidden_row)?).ok()?,
+        u64::try_from(hidden_row).ok()?,
+        u64::try_from(hidden_row).ok()?,
+        u64::try_from(hidden_row).ok()?,
+    ];
+    if let Some((gdn, ring_rows)) = row_capture {
+        sizes.extend(crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
+            config,
+            gdn,
+            ring_rows.max(rows),
+            config.n_linear_layers(),
+        )?);
+    }
+    if batched_fill {
+        sizes.extend(MtpAppendScratch::allocation_sizes(
             config,
             MTP_FILL_ROWS.min(chunk_rows).max(1),
             chunk_rows.max(1),
-        )?
-    } else {
-        0
-    };
-    let request = verify_rows
-        .checked_add(3)?
-        .checked_mul(hidden_row)?
-        .checked_add(capture)?
-        .checked_add(fill)?;
-    u64::try_from(request).ok()
+        )?);
+    }
+    sizes.retain(|&bytes| bytes > 0);
+    Some(sizes)
 }
 
 #[cfg(any(test, feature = "reference-parity"))]
@@ -9192,6 +9262,168 @@ pub fn mtp_error(error: MtpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mtp_contexts() -> Vec<crate::Qwen4ContextCommit> {
+        use crate::kv_backend::Qwen4KvBackend;
+        let granularity = 2 << 20;
+        vec![
+            crate::Qwen4ContextCommit::legacy(4096),
+            crate::Qwen4ContextCommit::legacy(262_144),
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 8193, 1025, granularity),
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, granularity),
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 8192, granularity),
+        ]
+    }
+
+    fn sum(sizes: &[u64]) -> u64 {
+        sizes.iter().sum()
+    }
+
+    /// The per-allocation request inventory is the byte query's own plan:
+    /// the verify hidden rows, three hidden carries, the capture ring's
+    /// allocations and the fill scratch's, summing to
+    /// `native_mtp_request_bytes`, with overflow refused alike.
+    #[test]
+    fn native_mtp_request_allocation_sizes_sum_to_the_request_bytes() {
+        use crate::GdnStateFormat as G;
+        let config = crate::config::compact_test_config();
+        for chunk_rows in [1usize, 4, 512, 768, 1536, 8192] {
+            for drafts in [1usize, 3, 7, 63] {
+                for capture in [None, Some((G::Q8, 2)), Some((G::Q8Ef, 8)), Some((G::F32, 65))] {
+                    for fill in [false, true] {
+                        let sizes = native_mtp_request_allocation_sizes(
+                            &config, 4096, chunk_rows, drafts, capture, fill,
+                        )
+                        .expect("request inventory");
+                        assert_eq!(
+                            Some(sum(&sizes)),
+                            native_mtp_request_bytes(
+                                &config, 4096, chunk_rows, drafts, capture, fill
+                            ),
+                            "{chunk_rows} {drafts} {capture:?} {fill}"
+                        );
+                        assert!(sizes.iter().all(|&bytes| bytes > 0));
+                        let carry = (config.hc_count * config.hidden_size * 4) as u64;
+                        assert_eq!(sizes[1..4], [carry; 3]);
+                        let ring = capture.map_or(0, |(gdn, rows)| {
+                            crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
+                                &config,
+                                gdn,
+                                rows.max(native_mtp_window_rows(drafts)),
+                                config.n_linear_layers(),
+                            )
+                            .unwrap()
+                            .len()
+                        });
+                        let append = if fill {
+                            MtpAppendScratch::allocation_sizes(
+                                &config,
+                                MTP_FILL_ROWS.min(chunk_rows).max(1),
+                                chunk_rows.max(1),
+                            )
+                            .unwrap()
+                            .len()
+                        } else {
+                            0
+                        };
+                        assert_eq!(sizes.len(), 4 + ring + append, "{capture:?} {fill}");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            native_mtp_request_allocation_sizes(
+                &config,
+                4096,
+                usize::MAX,
+                3,
+                None,
+                true
+            ),
+            None
+        );
+        for rows in [usize::MAX, usize::MAX / 2, 1usize << 62] {
+            assert_eq!(
+                native_mtp_request_allocation_sizes(
+                    &config,
+                    4096,
+                    1536,
+                    3,
+                    Some((crate::GdnStateFormat::Q8, rows)),
+                    false
+                ),
+                None
+            );
+        }
+    }
+
+    /// `native_mtp_allocation_sizes` is the resident head allocations plus
+    /// the allocations of the winning alternative of the byte query's `max`
+    /// (build scratch or first request), summing to `native_mtp_device_bytes`
+    /// for every context commit, chunk, draft count, head dtype and capture.
+    #[test]
+    fn native_mtp_allocation_sizes_sum_to_the_device_bytes() {
+        use crate::GdnStateFormat as G;
+        use rdna_compute::DType;
+        let config = crate::config::compact_test_config();
+        for context in mtp_contexts() {
+            for chunk_rows in [1usize, 4, 512, 768, 1536] {
+                for drafts in [1usize, 3, 63] {
+                    for head in [DType::BF16, DType::Q8_0, DType::MQ6G256V2, DType::F32] {
+                        for capture in [None, Some((G::Q8Ef, 8))] {
+                            for fill in [false, true] {
+                                let sizes = native_mtp_allocation_sizes(
+                                    &config, &context, chunk_rows, drafts, head, capture, fill,
+                                );
+                                let bytes = native_mtp_device_bytes(
+                                    &config, &context, chunk_rows, drafts, head, capture, fill,
+                                );
+                                assert_eq!(
+                                    sizes.as_deref().map(sum),
+                                    bytes,
+                                    "{context:?} {chunk_rows} {drafts} {head:?} {capture:?} {fill}"
+                                );
+                                let Some(sizes) = sizes else { continue };
+                                assert!(sizes.iter().all(|&bytes| bytes > 0));
+                                let (resident, scratch) =
+                                    crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(
+                                        &config, &context, head,
+                                    )
+                                    .unwrap();
+                                let request = native_mtp_request_allocation_sizes(
+                                    &config,
+                                    context.max_seq,
+                                    chunk_rows,
+                                    drafts,
+                                    capture,
+                                    fill,
+                                )
+                                .unwrap();
+                                let tail = if sum(&scratch) > sum(&request) {
+                                    scratch
+                                } else {
+                                    request
+                                };
+                                assert_eq!(sizes, [resident, tail].concat());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            native_mtp_allocation_sizes(
+                &config,
+                &crate::Qwen4ContextCommit::legacy(usize::MAX),
+                1536,
+                3,
+                rdna_compute::DType::BF16,
+                None,
+                false
+            ),
+            None
+        );
+    }
 
     #[test]
     fn head_finish_single_card_keeps_the_seed_row_and_rebuilds_the_rest() {

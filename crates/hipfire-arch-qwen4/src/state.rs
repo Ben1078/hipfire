@@ -1811,7 +1811,19 @@ fn committed_context_arena_bytes(
     if rows == 0 || !bytes.is_multiple_of(rows) {
         return None;
     }
-    context_arena_plan(bytes / rows, rows, context.granularity)
+    vmm_context_arena_mapped_bytes(bytes / rows, rows, tokens, context.granularity)
+}
+
+/// Bytes the shared KV chunk plan maps for the first `tokens` rows of a
+/// VMM context arena of `rows` rows of `row_bytes` bytes, in driver pages of
+/// `granularity` (what `ensure_mapped_capacity` commits).
+pub(crate) fn vmm_context_arena_mapped_bytes(
+    row_bytes: usize,
+    rows: usize,
+    tokens: usize,
+    granularity: usize,
+) -> Option<usize> {
+    context_arena_plan(row_bytes, rows, granularity)
         .ok()?
         .mapped_bytes_for_tokens(tokens)
         .ok()
@@ -2634,18 +2646,31 @@ impl Qwen4State {
         Ok(())
     }
 
-    /// Exact device bytes of ONE slow-link boundary stage: the fixed parts of
-    /// the whole-model session layout (`Self::session_layout` order) with no
-    /// padding. Derived from the same element counts as
-    /// [`Self::device_bytes_scoped`] and the allocations of
-    /// [`Self::new_with_backend_scoped`] (GDN recurrent in the state's own
-    /// storage plus F32 conv per linear layer, one `i32` selection per QSA
-    /// layer, the F32 PLE convolution history and the F32 HC feedback), and
-    /// equal to what `Qwen4Bundle::prompt_txn_stage_bytes` allocates.
+    /// Exact device bytes of ONE slow-link boundary stage: the sum of
+    /// [`Self::session_fixed_part_sizes`], equal to what
+    /// `Qwen4Bundle::prompt_txn_stage_bytes` allocates.
     pub(crate) fn session_fixed_stage_bytes(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
     ) -> Option<u64> {
+        Self::session_fixed_part_sizes(config, format)?
+            .iter()
+            .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+    }
+
+    /// Per-part bytes of ONE slow-link boundary stage, one entry per
+    /// `gpu.zeros` of `Qwen4Bundle::allocate_prompt_stages` (one per fixed
+    /// part of the whole-model session layout, unpadded), in
+    /// [`Self::session_layout`] order: per GDN layer the recurrent in the
+    /// state's own storage and the F32 conv, per QSA layer one `i32`
+    /// selection, then the F32 PLE convolution history (PLE profiles) and the
+    /// F32 HC feedback. Derived from the same element counts as
+    /// [`Self::device_bytes_scoped`]. Zero-byte parts are omitted; `None` on
+    /// overflow.
+    pub(crate) fn session_fixed_part_sizes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+    ) -> Option<Vec<u64>> {
         let f32_bytes = std::mem::size_of::<f32>();
         let recurrent = format
             .gdn
@@ -2680,14 +2705,19 @@ impl Qwen4State {
             .checked_mul(config.hidden_size)?
             .checked_mul(f32_bytes)?;
         let (gdn_layers, qsa_layers) = scope_layer_counts(config, &Qwen4BandScope::single(config));
-        recurrent
-            .checked_add(conv)?
-            .checked_mul(gdn_layers)?
-            .checked_add(selected.checked_mul(qsa_layers)?)?
-            .checked_add(ple)?
-            .checked_add(feedback)
-            .and_then(|bytes| u64::try_from(bytes).ok())
+        let mut sizes = Vec::with_capacity(2 * gdn_layers + qsa_layers + 2);
+        for _ in 0..gdn_layers {
+            sizes.extend([recurrent, conv]);
+        }
+        sizes.extend(std::iter::repeat(selected).take(qsa_layers));
+        sizes.extend([ple, feedback]);
+        sizes
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| u64::try_from(bytes).ok())
+            .collect()
     }
+
     /// A snapshot ticket of this state's arena is outstanding.
     pub(crate) fn snapshot_active(&self) -> bool {
         self.snapshot_arena.active && !self.snapshot_arena.retained
@@ -3547,10 +3577,31 @@ impl Qwen4State {
         rows: usize,
         gdn_layers: usize,
     ) -> Option<usize> {
+        let sizes = Self::row_capture_allocation_sizes_scoped(config, gdn, rows, gdn_layers)?;
+        let total = sizes
+            .iter()
+            .try_fold(0u64, |total, &bytes| total.checked_add(bytes))?;
+        usize::try_from(total).ok()
+    }
+
+    /// [`Self::row_capture_bytes`] per allocation of
+    /// [`Self::ensure_row_capture`], in its allocation order: per GDN layer
+    /// the two-half recurrent ring (storage format), the F32 input rows and
+    /// the F32 recurrence inputs, then the one F32 output block and the
+    /// pointer table (at least one byte; a band with no GDN layer is still
+    /// charged them, as the byte query does). Empty below two rows; `None`
+    /// on overflow.
+    pub(crate) fn row_capture_allocation_sizes_scoped(
+        config: &Qwen4Config,
+        gdn: GdnStateFormat,
+        rows: usize,
+        gdn_layers: usize,
+    ) -> Option<Vec<u64>> {
         if rows < 2 {
-            return Some(0);
+            return Some(Vec::new());
         }
         let value_heads = config.linear_num_value_heads;
+        let f32_bytes = std::mem::size_of::<f32>();
         let ring = gdn
             .storage()
             .state_units(
@@ -3563,21 +3614,30 @@ impl Qwen4State {
         let qkv = (2 * config.linear_num_key_heads)
             .checked_mul(config.linear_key_head_dim)?
             .checked_add(value_heads.checked_mul(config.linear_value_head_dim)?)?;
-        let inputs = rows
-            .checked_mul(qkv)?
-            .checked_add(rows.checked_mul(qkv.checked_add(2 * value_heads)?)?)?
-            .checked_mul(std::mem::size_of::<f32>())?;
+        let inputs = rows.checked_mul(qkv)?.checked_mul(f32_bytes)?;
+        let recurrence = rows
+            .checked_mul(qkv.checked_add(2 * value_heads)?)?
+            .checked_mul(f32_bytes)?;
         let output = rows
             .checked_mul(value_heads * GDN_HEAD_DIM)?
-            .checked_mul(std::mem::size_of::<f32>())?;
-        gdn_layers
-            .checked_mul(ring.checked_add(inputs)?)?
-            .checked_add(output)?
-            .checked_add(
-                gdn_layers
-                    .checked_mul(2 * std::mem::size_of::<u64>())?
-                    .max(1),
-            )
+            .checked_mul(f32_bytes)?;
+        let table = gdn_layers
+            .checked_mul(2 * std::mem::size_of::<u64>())?
+            .max(1);
+        // Each layer's allocations are checked once; the layer count is not
+        // multiplied out so an overflowing total still refuses.
+        let layer = ring.checked_add(inputs)?.checked_add(recurrence)?;
+        gdn_layers.checked_mul(layer)?.checked_add(output)?.checked_add(table)?;
+        let mut sizes = Vec::with_capacity(3 * gdn_layers + 2);
+        for _ in 0..gdn_layers {
+            sizes.extend([ring, inputs, recurrence]);
+        }
+        sizes.extend([output, table]);
+        sizes
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| u64::try_from(bytes).ok())
+            .collect()
     }
 
     /// Allocate the few-row verify rollback points for blocks of up to
@@ -4745,6 +4805,122 @@ mod tests {
                 total(&legacy) - total(&vmm),
                 (committed(&legacy) - committed(&vmm)) * layers,
                 "{name}"
+            );
+        }
+    }
+
+    /// One boundary stage is the fixed parts of the owner's tensor plan in
+    /// session-layout order (per GDN layer recurrent then conv, per QSA
+    /// layer the selection, then PLE conv and hyper feedback), one entry per
+    /// part, summing to the stage-byte query; with and without PLE.
+    #[test]
+    fn session_fixed_part_sizes_follow_the_state_plan() {
+        let base = crate::config::compact_test_config();
+        let mut no_ple = base.clone();
+        no_ple.ple = None;
+        for (label, config) in [("ple", base), ("no ple", no_ple)] {
+            let map = Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).unwrap();
+            for (name, format) in allocation_formats() {
+                let geometry = StateGeometry::new(&config, &format, 1024).unwrap();
+                let plan = state_tensor_plan(&config, &format, 1024, &geometry, &map).unwrap();
+                let part = |suffixes: &[&str]| -> Vec<u64> {
+                    plan.iter()
+                        .filter(|spec| suffixes.iter().any(|s| spec.key.ends_with(s) || spec.key == *s))
+                        .map(|spec| (spec.elements * spec.dtype.size()) as u64)
+                        .collect()
+                };
+                let mut expected = part(&[".recurrent", ".conv"]);
+                expected.extend(part(&[".selected_indices"]));
+                expected.extend(part(&["ple_conv"]));
+                expected.extend(part(&["hyper_feedback"]));
+                expected.retain(|&bytes| bytes > 0);
+                let sizes = Qwen4State::session_fixed_part_sizes(&config, format).unwrap();
+                assert_eq!(sizes, expected, "{label} {name}");
+                assert_eq!(
+                    Qwen4State::session_fixed_stage_bytes(&config, format),
+                    Some(sizes.iter().sum::<u64>()),
+                    "{label} {name}"
+                );
+            }
+        }
+        let mut wide = crate::config::compact_test_config();
+        wide.hidden_size = usize::MAX;
+        assert_eq!(
+            Qwen4State::session_fixed_part_sizes(&wide, Qwen4StateFormat::F32),
+            None
+        );
+        assert_eq!(
+            Qwen4State::session_fixed_stage_bytes(&wide, Qwen4StateFormat::F32),
+            None
+        );
+    }
+
+    /// The verify capture ring's per-allocation inventory against the owner's
+    /// geometry and the byte query: three allocations per GDN layer, the F32
+    /// output block and the pointer table; whole-model and band layer counts.
+    #[test]
+    fn row_capture_allocation_sizes_sum_to_the_byte_query() {
+        let config = crate::config::compact_test_config();
+        let layers = config.n_linear_layers();
+        let value_heads = config.linear_num_value_heads;
+        for gdn in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
+            let format = Qwen4StateFormat {
+                gdn,
+                ..Qwen4StateFormat::F32
+            };
+            let geometry = StateGeometry::new(&config, &format, 1024).unwrap();
+            let history = config.linear_conv_kernel_dim - 1;
+            let qkv = geometry.conv_len / history;
+            for rows in [0usize, 1, 2, 4, 8, 32, 65] {
+                let sizes =
+                    Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, layers)
+                        .unwrap();
+                assert_eq!(
+                    Some(sizes.iter().sum::<u64>()),
+                    Qwen4State::row_capture_bytes(&config, gdn, rows).map(|bytes| bytes as u64),
+                    "{gdn:?} {rows}"
+                );
+                if rows < 2 {
+                    assert!(sizes.is_empty());
+                    continue;
+                }
+                assert_eq!(sizes.len(), 3 * layers + 2);
+                let (ring, inputs, recurrence) = (
+                    (2 * rows * gdn.storage().state_bytes(
+                        value_heads,
+                        config.linear_key_head_dim,
+                        config.linear_value_head_dim,
+                    )) as u64,
+                    (rows * qkv * 4) as u64,
+                    (rows * (qkv + 2 * value_heads) * 4) as u64,
+                );
+                for layer in sizes[..3 * layers].chunks(3) {
+                    assert_eq!(layer, [ring, inputs, recurrence], "{gdn:?} {rows}");
+                }
+                assert_eq!(
+                    sizes[3 * layers..],
+                    [
+                        (rows * value_heads * GDN_HEAD_DIM * 4) as u64,
+                        (layers * 16) as u64
+                    ]
+                );
+            }
+            for band in [0usize, 7] {
+                assert_eq!(
+                    Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, 4, band)
+                        .map(|sizes| sizes.iter().sum::<u64>()),
+                    Qwen4State::row_capture_bytes_scoped(&config, gdn, 4, band)
+                        .map(|bytes| bytes as u64),
+                    "{gdn:?} band {band}"
+                );
+            }
+            assert_eq!(
+                Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, usize::MAX / 2, layers),
+                None
+            );
+            assert_eq!(
+                Qwen4State::row_capture_bytes(&config, gdn, usize::MAX / 2),
+                None
             );
         }
     }

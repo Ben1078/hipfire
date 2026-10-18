@@ -3852,9 +3852,27 @@ impl Qwen4MoeLayerRuntime {
     /// Device bytes [`Self::from_moe`] allocates: the gate/up and down
     /// pointer tables, one device pointer per expert each.
     pub(crate) fn device_bytes(config: &Qwen4Config) -> Option<usize> {
-        config
-            .num_experts
-            .checked_mul(2 * std::mem::size_of::<u64>())
+        let tables = Self::allocation_sizes(config)?;
+        usize::try_from(tables.iter().try_fold(0u64, |total, &b| total.checked_add(b))?).ok()
+    }
+
+    /// [`Self::device_bytes`] per allocation: the gate/up and the down
+    /// pointer table, `num_experts` 8-byte pointers each (omitted when the
+    /// profile has no experts).
+    pub(crate) fn allocation_sizes(config: &Qwen4Config) -> Option<Vec<u64>> {
+        let table = u64::try_from(
+            config
+                .num_experts
+                .checked_mul(std::mem::size_of::<u64>())?,
+        )
+        .ok()?;
+        // The charge is two tables; doubling must not overflow either.
+        table.checked_mul(2)?;
+        Some(if table == 0 {
+            Vec::new()
+        } else {
+            vec![table, table]
+        })
     }
 
     pub(crate) fn free_gpu(mut self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -11972,6 +11990,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The MoE runtime's two pointer tables, one allocation each, summing to
+    /// its byte query; a profile without experts allocates none.
+    #[test]
+    fn moe_runtime_allocation_sizes_are_two_pointer_tables() {
+        use super::Qwen4MoeLayerRuntime as Runtime;
+        let config = fn_config();
+        let table = (config.num_experts * 8) as u64;
+        let sizes = Runtime::allocation_sizes(&config).unwrap();
+        assert_eq!(sizes, [table, table]);
+        assert_eq!(Runtime::device_bytes(&config), Some(2 * table as usize));
+        let mut none = config.clone();
+        none.num_experts = 0;
+        assert_eq!(Runtime::allocation_sizes(&none), Some(Vec::new()));
+        assert_eq!(Runtime::device_bytes(&none), Some(0));
+        let mut huge = config;
+        huge.num_experts = usize::MAX / 8 + 1;
+        assert_eq!(Runtime::allocation_sizes(&huge), None);
+        assert_eq!(Runtime::device_bytes(&huge), None);
     }
 
     #[test]

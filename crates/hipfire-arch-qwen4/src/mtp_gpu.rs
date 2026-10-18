@@ -391,6 +391,16 @@ impl MtpGpuScratch {
             .sum())
     }
 
+    /// [`Self::device_bytes`] per allocation of [`Self::new`], in field
+    /// order; `None` on overflow.
+    pub(crate) fn allocation_sizes(config: &Qwen4Config) -> Option<Vec<u64>> {
+        Self::shapes(config)
+            .ok()?
+            .iter()
+            .map(|&(elements, dtype)| u64::try_from(elements.checked_mul(dtype.size())?).ok())
+            .collect()
+    }
+
     fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, MtpGpuError> {
         let shapes = Self::shapes(config)?;
         let mut allocated = Vec::with_capacity(MTP_SCRATCH_TENSORS);
@@ -609,6 +619,19 @@ impl MtpAppendScratch {
             .try_fold(0usize, |total, &(elements, dtype)| {
                 total.checked_add(elements.checked_mul(dtype.size())?)
             })
+    }
+
+    /// [`Self::device_bytes`] per allocation of [`Self::new`], in field
+    /// order; `None` on overflow.
+    pub(crate) fn allocation_sizes(
+        config: &Qwen4Config,
+        rows: usize,
+        id_rows: usize,
+    ) -> Option<Vec<u64>> {
+        Self::shapes(config, rows, id_rows)?
+            .iter()
+            .map(|&(elements, dtype)| u64::try_from(elements.checked_mul(dtype.size())?).ok())
+            .collect()
     }
 
     pub(crate) fn new(
@@ -1227,6 +1250,68 @@ impl MtpGpuState {
             .committed_layer_bytes(config, QsaKvFormat::F32)?
             .checked_add(carry.checked_mul(2)?)?
             .checked_add(row)
+    }
+
+    /// [`Self::device_bytes`] per allocation of [`Self::new_with_backend`]
+    /// and [`MtpGpuStateSnapshotArena::new`], in that order: the four context
+    /// arenas as `context` commits them (legacy: whole; VMM: each arena's
+    /// mapped pages, pooled keys by `ceil(tokens / compress)` rows), the
+    /// selection, its length word and the wide hidden carry, the target
+    /// boundary-hidden row, then the snapshot backups of the selection, the
+    /// length word and the wide hidden. Zero-byte entries are omitted.
+    pub(crate) fn allocation_sizes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+    ) -> Option<Vec<u64>> {
+        let compress = config.indexer_compress_ratio;
+        if compress == 0 {
+            return None;
+        }
+        let f32_bytes = std::mem::size_of::<f32>();
+        let row = config
+            .hc_count
+            .checked_mul(config.hidden_size)?
+            .checked_mul(f32_bytes)?;
+        let selected = config
+            .qsa_selected_capacity()
+            .checked_mul(std::mem::size_of::<i32>())?;
+        let length = std::mem::size_of::<i32>();
+        let kv_row = QsaKvFormat::F32.kv_row_bytes(config.num_key_value_heads, config.head_dim);
+        let index_row = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)?
+            .checked_mul(QsaKvFormat::F32.index_dtype().size())?;
+        let pooled_rows = context.max_seq.div_ceil(compress);
+        let pooled_tokens = context.tokens.div_ceil(compress);
+        let arena = |row_bytes: usize, rows: usize, tokens: usize| -> Option<usize> {
+            match context.backend {
+                Qwen4KvBackend::Legacy => row_bytes.checked_mul(rows),
+                Qwen4KvBackend::Vmm => crate::state::vmm_context_arena_mapped_bytes(
+                    row_bytes,
+                    rows,
+                    tokens,
+                    context.granularity,
+                ),
+            }
+        };
+        let sizes = [
+            arena(kv_row, context.max_seq, context.tokens)?,
+            arena(kv_row, context.max_seq, context.tokens)?,
+            arena(index_row, context.max_seq, context.tokens)?,
+            arena(index_row, pooled_rows, pooled_tokens)?,
+            selected,
+            length,
+            row,
+            row,
+            selected,
+            length,
+            row,
+        ];
+        sizes
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| u64::try_from(bytes).ok())
+            .collect()
     }
     /// Legacy full-capacity state; see [`Self::new_with_backend`].
     pub(crate) fn new(
@@ -2189,6 +2274,29 @@ impl Qwen4MtpGpu {
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(draft)?;
         Some((resident, scratch))
+    }
+
+    /// [`Self::device_bytes`] per allocation: `(resident, load scratch)`, one
+    /// entry per device allocation [`Self::new_with_backend`] makes and keeps
+    /// (operator scratch, QSA state with its snapshot mirrors, the MoE
+    /// pointer tables, the draft head), and the draft head's build scratch
+    /// released before construction returns. Each side sums to the matching
+    /// `device_bytes` figure; `None` on overflow.
+    pub(crate) fn allocation_sizes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+        head_dtype: DType,
+    ) -> Option<(Vec<u64>, Vec<u64>)> {
+        let (policy, layout) = draft_head_config(config);
+        let (draft, draft_scratch) = DraftHead::allocation_sizes(head_dtype, layout, policy)?;
+        let widen = |sizes: Vec<usize>| -> Option<Vec<u64>> {
+            sizes.into_iter().map(|bytes| u64::try_from(bytes).ok()).collect()
+        };
+        let mut resident = MtpGpuScratch::allocation_sizes(config)?;
+        resident.extend(MtpGpuState::allocation_sizes(config, context)?);
+        resident.extend(Qwen4MoeLayerRuntime::allocation_sizes(config)?);
+        resident.extend(widen(draft)?);
+        Some((resident, widen(draft_scratch)?))
     }
 
     /// MTP head whose QSA context arenas are `backend` storage (admission
@@ -3462,6 +3570,128 @@ mod tests {
     use super::*;
     use crate::config::compact_test_config;
     use crate::state::Qwen4State;
+
+    fn sum(sizes: &[u64]) -> u64 {
+        sizes.iter().sum()
+    }
+
+    /// Operator and fill scratch inventories are their owners' own shape
+    /// tables: one entry per tensor, summing to the byte queries, with the
+    /// append scratch refusing overflow like its byte query.
+    #[test]
+    fn scratch_allocation_sizes_follow_the_shape_tables() {
+        let config = compact_test_config();
+        let sizes = MtpGpuScratch::allocation_sizes(&config).unwrap();
+        assert_eq!(sizes.len(), MTP_SCRATCH_TENSORS);
+        assert_eq!(
+            Some(sum(&sizes) as usize),
+            MtpGpuScratch::device_bytes(&config).ok()
+        );
+        for (rows, id_rows) in [(1usize, 1usize), (1, 1536), (256, 4096), (1024, 1536)] {
+            let sizes = MtpAppendScratch::allocation_sizes(&config, rows, id_rows).unwrap();
+            assert_eq!(sizes.len(), MTP_APPEND_TENSORS);
+            assert_eq!(
+                Some(sum(&sizes) as usize),
+                MtpAppendScratch::device_bytes(&config, rows, id_rows)
+            );
+        }
+        assert_eq!(MtpAppendScratch::allocation_sizes(&config, usize::MAX, 1), None);
+        assert_eq!(MtpAppendScratch::allocation_sizes(&config, 1, usize::MAX), None);
+        assert_eq!(MtpAppendScratch::device_bytes(&config, usize::MAX, 1), None);
+    }
+
+    /// The head state's inventory: four context arenas (legacy whole, VMM
+    /// mapped pages), the carries, and exactly one snapshot backup per
+    /// in-place carry; sums to `MtpGpuState::device_bytes`.
+    #[test]
+    fn state_allocation_sizes_charge_arenas_carries_and_backups_once() {
+        use hipfire_runtime::kv_backend::{
+            KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+        };
+        let config = compact_test_config();
+        let row = (config.hc_count * config.hidden_size * 4) as u64;
+        let selected = (config.qsa_selected_capacity() * 4) as u64;
+        let granularity = 2 << 20;
+        for context in [
+            Qwen4ContextCommit::legacy(1024),
+            Qwen4ContextCommit::legacy(262_144),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 8193, 1025, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 100, 8192, granularity),
+        ] {
+            let sizes = MtpGpuState::allocation_sizes(&config, &context).unwrap();
+            assert_eq!(
+                Some(sum(&sizes) as usize),
+                MtpGpuState::device_bytes(&config, &context),
+                "{context:?}"
+            );
+            // Carries and backups follow the four arenas.
+            assert_eq!(
+                sizes[4..],
+                [selected, 4, row, row, selected, 4, row],
+                "{context:?}"
+            );
+            // The arenas against the owner's plan per stride.
+            let mapped = |row_bytes: usize, rows: usize, tokens: usize| match context.backend {
+                Qwen4KvBackend::Legacy => (row_bytes * rows) as u64,
+                Qwen4KvBackend::Vmm => KvChunkPlan::new(
+                    row_bytes,
+                    rows,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    granularity,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .unwrap()
+                .mapped_bytes_for_tokens(tokens)
+                .unwrap() as u64,
+            };
+            let kv = config.num_key_value_heads * config.head_dim * 4;
+            let index = config.indexer_kv_heads * config.indexer_head_dim * 4;
+            let pooled = context.max_seq.div_ceil(config.indexer_compress_ratio);
+            let pooled_tokens = context.tokens.div_ceil(config.indexer_compress_ratio);
+            assert_eq!(
+                sizes[..4],
+                [
+                    mapped(kv, context.max_seq, context.tokens),
+                    mapped(kv, context.max_seq, context.tokens),
+                    mapped(index, context.max_seq, context.tokens),
+                    mapped(index, pooled, pooled_tokens),
+                ],
+                "{context:?}"
+            );
+        }
+        assert_eq!(
+            MtpGpuState::allocation_sizes(&config, &Qwen4ContextCommit::legacy(usize::MAX)),
+            None
+        );
+    }
+
+    /// Resident and build-scratch inventories of the whole head are the
+    /// operator scratch, state, MoE tables and draft head, and sum to
+    /// `Qwen4MtpGpu::device_bytes` for every head dtype and context commit.
+    #[test]
+    fn head_allocation_sizes_sum_to_the_head_device_bytes() {
+        let config = compact_test_config();
+        for context in [
+            Qwen4ContextCommit::legacy(4096),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, 2 << 20),
+        ] {
+            for head in [DType::BF16, DType::Q8_0, DType::MQ6G256V2, DType::MQ5G256V2, DType::F32] {
+                let (resident, scratch) =
+                    Qwen4MtpGpu::allocation_sizes(&config, &context, head).unwrap();
+                assert_eq!(
+                    Some((sum(&resident) as usize, sum(&scratch) as usize)),
+                    Qwen4MtpGpu::device_bytes(&config, &context, head),
+                    "{head:?} {context:?}"
+                );
+                let mut parts = MtpGpuScratch::allocation_sizes(&config).unwrap();
+                parts.extend(MtpGpuState::allocation_sizes(&config, &context).unwrap());
+                parts.extend(Qwen4MoeLayerRuntime::allocation_sizes(&config).unwrap());
+                assert_eq!(resident[..parts.len()], parts[..]);
+                assert!(resident.iter().chain(&scratch).all(|&bytes| bytes > 0));
+            }
+        }
+    }
 
     /// A capture carries a restorable boundary row only when the row was saved
     /// for exactly the captured position, at any position (a prefill chunk
