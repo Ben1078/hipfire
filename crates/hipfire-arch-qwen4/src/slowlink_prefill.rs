@@ -67,7 +67,7 @@ use crate::program::{
 };
 use crate::slowlink_admission::{
     qualify_request, ArenaField, CaptureKind, RequestBypass, RequestShape, SlowlinkMode,
-    SlowlinkProfile, EXPERTS_PER_PAGE, S1_K1_TAIL_ROWS, S1_MAX_BOUNDARY_SNAPSHOTS,
+    SlowlinkProfile, EXPERTS_PER_PAGE, S1_MAX_BOUNDARY_SNAPSHOTS,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::slowlink_prefill as dsp;
@@ -145,12 +145,140 @@ pub(crate) struct WindowPlan {
     pub(crate) stream_bytes: u64,
     /// Session boundaries strictly inside the window (absolute, ascending).
     pub(crate) cuts: Vec<usize>,
+    /// Window rows of the K1 cohort: slab short tails (route rows within the
+    /// few-row limit) or, on the aggregate route, one-row decode tiles.
+    pub(crate) k1_rows: usize,
+    /// Window rows of aggregate F32-tail tiles (2..512 route rows); 0 on the
+    /// slab route.
+    pub(crate) tail_rows: usize,
 }
 
 impl WindowPlan {
     pub(crate) fn end_position(&self) -> usize {
         self.position + self.rows
     }
+}
+
+/// The resource class of one tile inside its window, read off the tile's
+/// ORIGINAL routing rows (`Gpu::route_rows` under the tile's own scope). This
+/// is resource accounting of the certified original routing, never a second
+/// selector: the dispatch call's own [`dsp::TileKind`] stays authoritative and
+/// the pre-mutation preflight refuses a tile whose sealed call disagrees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TileCohort {
+    /// Window-wide grouped panels: slab K2 or the aggregate F16 WMMA arm.
+    K2,
+    /// The K1 cohort: slab few-row tails, or the aggregate one-row decode.
+    K1,
+    /// An aggregate F32 grouped / indexed-down tail tile (2.. rows below the
+    /// WMMA threshold), run per binding against the same lease.
+    F32Tail,
+}
+
+/// The cohort of a tile of `route_rows` original routing rows on `route`.
+pub(crate) fn tile_cohort(
+    route: dsp::WindowRoute,
+    route_rows: usize,
+    few_row_limit: usize,
+) -> TileCohort {
+    match route {
+        dsp::WindowRoute::SlabIu4 => {
+            if route_rows <= few_row_limit {
+                TileCohort::K1
+            } else {
+                TileCohort::K2
+            }
+        }
+        dsp::WindowRoute::Aggregate => {
+            if route_rows <= 1 {
+                TileCohort::K1
+            } else if route_rows < dsp::AGGREGATE_MIN_TILE_ROWS {
+                TileCohort::F32Tail
+            } else {
+                TileCohort::K2
+            }
+        }
+    }
+}
+
+/// The cohort the dispatch crate's own classification of a sealed call lands in.
+pub(crate) fn kind_cohort(kind: dsp::TileKind) -> TileCohort {
+    match kind {
+        dsp::TileKind::SlabK2 | dsp::TileKind::AggregateWmma => TileCohort::K2,
+        dsp::TileKind::SlabK1Tail | dsp::TileKind::Decode => TileCohort::K1,
+        dsp::TileKind::AggregateF32Tail => TileCohort::F32Tail,
+    }
+}
+
+/// Whether a tile of `route_rows` original routing rows runs its OWN original
+/// call in the panel sweep, registering its operands with the panel scratch:
+/// the one-row decode call, and on the aggregate route each F32-tail call.
+pub(crate) fn registers_operands(
+    route: dsp::WindowRoute,
+    route_rows: usize,
+    few_row_limit: usize,
+) -> bool {
+    route_rows == 1 || tile_cohort(route, route_rows, few_row_limit) == TileCohort::F32Tail
+}
+
+/// The tiles of a window the panel sweep frames: the scratch anchor and every
+/// other tile that registers its operands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SweepTiles {
+    /// The window tile the panel scratch is borrowed from; `None` when the
+    /// window holds one-row decode tiles only (a stand-in anchors it).
+    pub(crate) anchor: Option<usize>,
+    /// Every other tile that registers operands, ascending.
+    pub(crate) cohort: Vec<usize>,
+}
+
+impl SweepTiles {
+    /// The window tiles that register operands: the anchor when it is itself
+    /// a cohort tile (an F32 tail), then the rest. Each appears exactly once.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn registered(
+        &self,
+        tiles: &[TilePlan],
+        route: dsp::WindowRoute,
+        few_row_limit: usize,
+    ) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .anchor
+            .filter(|&ti| registers_operands(route, tiles[ti].routing.route_rows, few_row_limit))
+            .into_iter()
+            .collect();
+        out.extend(self.cohort.iter().copied());
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Pick the anchor and the cohort tiles of a window. The anchor is a prefill
+/// tile (on the aggregate route a WMMA tile when the window has one, else its
+/// first multi-row tile, which may be an F32 tail); the slab route keeps its
+/// first multi-row tile.
+pub(crate) fn sweep_tiles(
+    route: dsp::WindowRoute,
+    tiles: &[TilePlan],
+    few_row_limit: usize,
+) -> SweepTiles {
+    let preferred = if route == dsp::WindowRoute::Aggregate {
+        tiles.iter().position(|tile| {
+            tile_cohort(route, tile.routing.route_rows, few_row_limit) == TileCohort::K2
+        })
+    } else {
+        None
+    };
+    let anchor = preferred.or_else(|| {
+        tiles
+            .iter()
+            .position(|tile| tile.routing.route_rows != 1)
+    });
+    let cohort = (0..tiles.len())
+        .filter(|&ti| Some(ti) != anchor)
+        .filter(|&ti| registers_operands(route, tiles[ti].routing.route_rows, few_row_limit))
+        .collect();
+    SweepTiles { anchor, cohort }
 }
 
 /// Everything the profile charges for a request, from the same layouts the
@@ -211,6 +339,9 @@ pub(crate) struct Qwen4PromptPlan {
     pub(crate) census: PromptByteCensus,
     /// Largest sum of K1 (few-row) tile rows any one window holds.
     pub(crate) k1_rows_max: usize,
+    /// Largest sum of aggregate F32-tail tile rows any one window holds (0 on
+    /// the slab route).
+    pub(crate) tail_rows_max: usize,
 }
 
 impl Qwen4PromptPlan {
@@ -267,6 +398,13 @@ pub(crate) enum PlanBypass {
         rows: usize,
         bound: usize,
     },
+    /// A window's aggregate F32-tail rows exceed what the route storage was
+    /// sized for.
+    F32TailRows {
+        window: usize,
+        rows: usize,
+        bound: usize,
+    },
     /// A window's tagged HC-stream regions (plus the one-tile view slack) do
     /// not fit the admitted arena.
     StreamArena { window: usize, need: u64, have: u64 },
@@ -278,6 +416,10 @@ impl std::fmt::Display for PlanBypass {
             Self::K1TailRows { window, rows, bound } => write!(
                 f,
                 "window {window} holds {rows} few-row tail rows, above the {bound} the route storage admits"
+            ),
+            Self::F32TailRows { window, rows, bound } => write!(
+                f,
+                "window {window} holds {rows} F32 tail rows, above the {bound} the route storage admits"
             ),
             Self::StreamArena { window, need, have } => write!(
                 f,
@@ -294,6 +436,7 @@ pub(crate) fn plan_prompt_verdict(
 ) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
     let profile = inputs.profile;
     let (tile_rows, window_rows) = (profile.tile_rows, profile.window_rows);
+    let admitted = profile.route_dims();
     if inputs.rows == 0 {
         return Err(invalid("slow-link plan has no rows"));
     }
@@ -357,13 +500,17 @@ pub(crate) fn plan_prompt_verdict(
     let mut window_cuts: Vec<usize> = Vec::new();
     let mut k1_rows = 0usize;
     let mut k1_rows_max = 0usize;
+    let mut tail_rows = 0usize;
+    let mut tail_rows_max = 0usize;
     let close = |windows: &mut Vec<WindowPlan>,
                  tiles: &mut Vec<TilePlan>,
                  start_tile: usize,
                  rows: usize,
                  prompt_row: usize,
                  position: usize,
-                 cuts: Vec<usize>| {
+                 cuts: Vec<usize>,
+                 k1_rows: usize,
+                 tail_rows: usize| {
         let index = windows.len();
         for tile in tiles[start_tile..].iter_mut() {
             tile.window = index;
@@ -382,7 +529,28 @@ pub(crate) fn plan_prompt_verdict(
             tiles: start_tile..tiles.len(),
             stream_bytes: 0,
             cuts,
+            k1_rows,
+            tail_rows,
         });
+    };
+    // The cohort capacities are the immutable admitted route dims: a window
+    // whose actual K1 or F32-tail rows exceed them is the incumbent's.
+    let cohort_bypass = |window: usize, k1: usize, tail: usize| -> Option<PlanBypass> {
+        if k1 > admitted.k1_rows {
+            Some(PlanBypass::K1TailRows {
+                window,
+                rows: k1,
+                bound: admitted.k1_rows,
+            })
+        } else if tail > admitted.tail_rows {
+            Some(PlanBypass::F32TailRows {
+                window,
+                rows: tail,
+                bound: admitted.tail_rows,
+            })
+        } else {
+            None
+        }
     };
     for tile in &raw {
         let previous_ended_at_cut = tiles.last().is_some_and(|last| last.ends_at_cut.is_some());
@@ -401,16 +569,16 @@ pub(crate) fn plan_prompt_verdict(
                 window_prompt_row,
                 window_position,
                 std::mem::take(&mut window_cuts),
+                k1_rows,
+                tail_rows,
             );
-            if k1_rows > S1_K1_TAIL_ROWS {
-                return Ok(Err(PlanBypass::K1TailRows {
-                    window: windows.len() - 1,
-                    rows: k1_rows,
-                    bound: S1_K1_TAIL_ROWS,
-                }));
+            if let Some(bypass) = cohort_bypass(windows.len() - 1, k1_rows, tail_rows) {
+                return Ok(Err(bypass));
             }
             k1_rows_max = k1_rows_max.max(k1_rows);
+            tail_rows_max = tail_rows_max.max(tail_rows);
             k1_rows = 0;
+            tail_rows = 0;
             window_start_tile = tiles.len();
             window_rows_used = 0;
             interior_cuts = 0;
@@ -428,8 +596,20 @@ pub(crate) fn plan_prompt_verdict(
             }
         }
         let routing = (inputs.routing)(tile.rows);
-        if routing.route_rows <= inputs.few_row_limit {
-            k1_rows += tile.rows;
+        if routing.route_rows == 0 {
+            return Err(invalid("slow-link tile routes zero rows"));
+        }
+        let overflow = || invalid("slow-link window cohort rows overflow");
+        match tile_cohort(
+            profile.geometry.route,
+            routing.route_rows,
+            inputs.few_row_limit,
+        ) {
+            TileCohort::K2 => {}
+            TileCohort::K1 => k1_rows = k1_rows.checked_add(tile.rows).ok_or_else(overflow)?,
+            TileCohort::F32Tail => {
+                tail_rows = tail_rows.checked_add(tile.rows).ok_or_else(overflow)?
+            }
         }
         let ends_at_cut = tile.ends_at_cut.then_some(window_cuts.len());
         tiles.push(TilePlan {
@@ -455,15 +635,14 @@ pub(crate) fn plan_prompt_verdict(
         window_prompt_row,
         window_position,
         std::mem::take(&mut window_cuts),
+        k1_rows,
+        tail_rows,
     );
-    if k1_rows > S1_K1_TAIL_ROWS {
-        return Ok(Err(PlanBypass::K1TailRows {
-            window: windows.len() - 1,
-            rows: k1_rows,
-            bound: S1_K1_TAIL_ROWS,
-        }));
+    if let Some(bypass) = cohort_bypass(windows.len() - 1, k1_rows, tail_rows) {
+        return Ok(Err(bypass));
     }
     k1_rows_max = k1_rows_max.max(k1_rows);
+    tail_rows_max = tail_rows_max.max(tail_rows);
 
     // The window's HC-stream regions: each tile takes the bytes of its own tag
     // (BF16 = 2 bytes per element, F32 = 4), packed in tile order. The F32-typed
@@ -503,6 +682,7 @@ pub(crate) fn plan_prompt_verdict(
         cuts: inputs.cuts.to_vec(),
         census,
         k1_rows_max,
+        tail_rows_max,
     }))
 }
 
@@ -774,16 +954,64 @@ fn dsp_err(
     move |error| Qwen4GpuForwardError::Dispatch(format!("slow-link {what}: {error:?}"))
 }
 
-/// The route storage layout of one window of `rows` rows: the admitted route
-/// dimensions at the actual window rows, with the admitted K1 tail bound
-/// ([`S1_K1_TAIL_ROWS`]) clamped to them (a window shorter than the bound
-/// cannot hold more K1 rows than it has rows). The runtime region is sized for
-/// the full admitted window, so no layout built here exceeds it.
-fn window_route_layout(profile: &SlowlinkProfile, rows: usize) -> R<dsp::PromptRouteLayout> {
-    let mut dims = profile.route_dims();
-    dims.rows = rows;
-    dims.k1_rows = dims.k1_rows.min(rows);
-    dsp::PromptRouteLayout::new(&dims).map_err(dsp_err("route layout"))
+/// The route storage layout of one window: its ACTUAL rows and the K1 /
+/// F32-tail rows its tiles hold (counted from the plan's original routing,
+/// [`tile_cohort`]), checked against the immutable admitted route dims before
+/// the layout is built. The runtime region is sized for the full admitted
+/// window, so a layout that passes never exceeds it (the census bound is
+/// re-checked here). A zero-row window is refused.
+fn window_route_layout(
+    profile: &SlowlinkProfile,
+    rows: usize,
+    k1_rows: usize,
+    tail_rows: usize,
+) -> R<dsp::PromptRouteLayout> {
+    let admitted = profile.route_dims();
+    if rows == 0 || rows > admitted.rows {
+        return Err(invalid(format!(
+            "slow-link window of {rows} rows is outside the admitted 1..={} rows",
+            admitted.rows
+        )));
+    }
+    if k1_rows > admitted.k1_rows || tail_rows > admitted.tail_rows {
+        return Err(invalid(format!(
+            "slow-link window holds {k1_rows} K1 and {tail_rows} F32 tail rows, the admitted \
+             capacities are {} and {}",
+            admitted.k1_rows, admitted.tail_rows
+        )));
+    }
+    if k1_rows
+        .checked_add(tail_rows)
+        .is_none_or(|cohort| cohort > rows)
+    {
+        return Err(invalid(format!(
+            "slow-link window of {rows} rows cannot hold {k1_rows} K1 + {tail_rows} F32 tail rows"
+        )));
+    }
+    let dims = dsp::PromptRouteDims {
+        rows,
+        k1_rows,
+        tail_rows,
+        ..admitted
+    };
+    let layout = dsp::PromptRouteLayout::new(&dims).map_err(dsp_err("route layout"))?;
+    if layout.total_bytes() as u64 > profile.census.route_storage {
+        return Err(invalid(format!(
+            "slow-link window layout is {} bytes, the admitted census holds {}",
+            layout.total_bytes(),
+            profile.census.route_storage
+        )));
+    }
+    Ok(layout)
+}
+
+/// Every window's actual layout, validated against the admitted profile
+/// BEFORE any mutation or allocation of the request.
+fn validate_window_layouts(profile: &SlowlinkProfile, plan: &Qwen4PromptPlan) -> R<()> {
+    for window in &plan.windows {
+        window_route_layout(profile, window.rows, window.k1_rows, window.tail_rows)?;
+    }
+    Ok(())
 }
 
 // ── runtime ──────────────────────────────────────────────────────────
@@ -1433,12 +1661,19 @@ fn preflight_tiles(
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
                 dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position)
-                    .map(|call| (call.arm_signature(), call.is_k2(), call.window_route()))
+                    .map(|call| {
+                        (
+                            call.arm_signature(),
+                            call.is_k2(),
+                            call.window_route(),
+                            call.tile_kind(),
+                        )
+                    })
                     .map_err(dsp_err("admission"))
             },
         );
         Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-        let (arm, is_k2, route) = result.map_err(|error| {
+        let (arm, is_k2, route, kind) = result.map_err(|error| {
             format!(
                 "tile of {rows} rows (route rows {}): {error}",
                 routing.route_rows
@@ -1449,6 +1684,17 @@ fn preflight_tiles(
                 "tile of {rows} rows (route rows {}): the sealed call's window route is \
                  {route:?} but the admitted profile's census is for {:?}",
                 routing.route_rows, profile.geometry.route
+            ));
+        }
+        // The plan counted this tile's rows toward its window's K1 / F32-tail
+        // capacities from its original routing rows; the sealed call's own
+        // class must be that cohort, else the capacities were not the call's.
+        let expected = tile_cohort(route, routing.route_rows, geo.few_row_limit);
+        if kind_cohort(kind) != expected {
+            return Err(format!(
+                "tile of {rows} rows (route rows {}): the sealed call is {kind:?} but its \
+                 original routing accounts it as {expected:?}",
+                routing.route_rows
             ));
         }
         arms.push((arm, is_k2));
@@ -1555,6 +1801,7 @@ fn select(
     };
     let plan = verdict.map_err(|bypass| bypass.to_string())?;
     prompt_bytes(&plan).map_err(|error| error.to_string())?;
+    validate_window_layouts(&profile, &plan).map_err(|error| error.to_string())?;
     for window in &plan.windows {
         if bundle.prompt_txn_cuts(window.position, window.end_position()) != window.cuts {
             return Err(format!(
@@ -1871,7 +2118,12 @@ impl Run<'_, '_> {
             ));
         }
         let wall = Instant::now();
-        let layout = window_route_layout(&self.profile, w.window.rows)?;
+        let layout = window_route_layout(
+            &self.profile,
+            w.window.rows,
+            w.window.k1_rows,
+            w.window.tail_rows,
+        )?;
         let mut routes = dsp::PromptRouteStorage::from_region(&self.rt.route_region, &layout)
             .map_err(dsp_err("route storage"))?;
         let mut report = WindowReport::default();
@@ -2030,16 +2282,21 @@ impl Run<'_, '_> {
         let inject = self
             .bundle
             .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
-        // The panel scratch is anchored on a prefill tile of the window; every
-        // one-row decode tile (the incumbent's decode call, original arithmetic)
-        // registers its own operands once. A window of decode tiles only has no
-        // prefill tile of its own: its anchor is a stand-in prefill tile of the
-        // admitted tile rows, used only to borrow the shared scratch views (it
-        // is never prepared, so no row reads or writes through it).
-        let decode_tiles: Vec<usize> = (0..w.tiles.len())
-            .filter(|&ti| w.tiles[ti].routing.route_rows == 1)
-            .collect();
-        let anchor_tile = (0..w.tiles.len()).find(|&ti| w.tiles[ti].routing.route_rows != 1);
+        // The panel scratch is anchored on a prefill tile of the window (on the
+        // aggregate route a WMMA tile when the window has one, else its first
+        // multi-row tile, which may itself be an F32-tail tile). Every cohort
+        // tile that runs its own original call registers its own operands
+        // exactly once: each one-row decode tile (the incumbent's decode call)
+        // and, on the aggregate route, each F32-tail tile. A window of decode
+        // tiles only has no prefill tile of its own: its anchor is a stand-in
+        // prefill tile of the admitted tile rows, used only to borrow the
+        // shared scratch views (it is never prepared and never registered, so
+        // no row reads or writes through it).
+        let SweepTiles {
+            anchor: anchor_tile,
+            cohort: cohort_tiles,
+        } = sweep_tiles(self.profile.geometry.route, w.tiles, geo.few_row_limit);
+        let anchor_real = anchor_tile.is_some();
         let stand_in;
         let anchor: &TilePlan = match anchor_tile {
             Some(ti) => &w.tiles[ti],
@@ -2061,7 +2318,7 @@ impl Run<'_, '_> {
             }
         };
         let mut frame_tiles: Vec<&TilePlan> = vec![anchor];
-        frame_tiles.extend(decode_tiles.iter().map(|&ti| &w.tiles[ti]));
+        frame_tiles.extend(cohort_tiles.iter().map(|&ti| &w.tiles[ti]));
         // The K2 panels run under the anchor tile's ambient scope; each decode
         // or K1 step enters its own tile's scope through the hook.
         let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, anchor.rows);
@@ -2074,15 +2331,20 @@ impl Run<'_, '_> {
             &frame_tiles,
             layer,
             |gpu, frames| {
+                // Each call is sealed and admitted under its own tile's scope
+                // (its routing rows), exactly as its route preparation was.
                 let mut sealed = Vec::with_capacity(frames.len());
-                for frame in frames {
-                    let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
-                        return Err(invalid("a host layer's FFN is not MoE"));
-                    };
-                    sealed.push(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?);
+                for (tile, frame) in frame_tiles.iter().zip(frames) {
+                    let (scopes, _) = self.forward.enter_tile_scopes(gpu, tile.rows);
+                    let one = (|| -> R<_> {
+                        let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
+                            return Err(invalid("a host layer's FFN is not MoE"));
+                        };
+                        Ok(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?)
+                    })();
+                    Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                    sealed.push(one?);
                 }
-                // Each call is admitted under its own tile's scope (its routing
-                // rows), exactly as its route preparation was.
                 let mut calls = Vec::with_capacity(sealed.len());
                 for (tile, sealed) in frame_tiles.iter().zip(&sealed) {
                     let (scopes, _) = self.forward.enter_tile_scopes(gpu, tile.rows);
@@ -2093,10 +2355,28 @@ impl Run<'_, '_> {
                 }
                 let mut scratch = dsp::PanelScratch::new(&calls[0], dsp::PanelLimits::S1)
                     .map_err(dsp_err("panel scratch"))?;
-                for call in &calls[1..] {
-                    scratch
-                        .add_decode_tile(call)
-                        .map_err(dsp_err("decode tile"))?;
+                // Each call registers once by its own actual kind, the anchor
+                // included when it is itself a tail tile; the stand-in never.
+                for (index, call) in calls.iter().enumerate() {
+                    if index == 0 && !anchor_real {
+                        continue;
+                    }
+                    match call.tile_kind() {
+                        dsp::TileKind::Decode => scratch
+                            .add_decode_tile(call)
+                            .map_err(dsp_err("decode tile"))?,
+                        dsp::TileKind::AggregateF32Tail => scratch
+                            .add_tail_tile(call)
+                            .map_err(dsp_err("F32 tail tile"))?,
+                        _ if index == 0 => {}
+                        kind => {
+                            return Err(invalid(format!(
+                                "slow-link cohort tile at window row {} sealed as {kind:?}, not a \
+                                 decode or F32-tail call",
+                                call.row0()
+                            )))
+                        }
+                    }
                 }
                 let mut cursor = dsp::OrderedCombineCursor::start(gpu, routes, &panels)
                     .map_err(dsp_err("combine start"))?;
@@ -2798,6 +3078,24 @@ fn dispatch_case(
             let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
             let call = dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position)
                 .map_err(dsp_err("admission"))?;
+            if call.window_route() != profile.geometry.route {
+                return Err(invalid(format!(
+                    "the {name} check sealed a {:?} call but the admitted profile is {:?}",
+                    call.window_route(),
+                    profile.geometry.route
+                )));
+            }
+            // On the aggregate route these checks run on an actual WMMA call
+            // (the admitted tile rows); an F32-tail call never stands in.
+            if profile.geometry.route == dsp::WindowRoute::Aggregate
+                && call.tile_kind() != dsp::TileKind::AggregateWmma
+            {
+                return Err(invalid(format!(
+                    "the {name} check anchors on an actual aggregate WMMA call; the {rows}-row \
+                     tile sealed as {:?}",
+                    call.tile_kind()
+                )));
+            }
             let mut ring = HipRing {
                 ring: &mut rt.ring,
                 schedule: &mut rt.schedule,
@@ -2870,22 +3168,17 @@ fn decode_tail_case(
         limit
     };
     let geo = RunGeo::new(forward, bundle, few_row_limit, profile.geometry.num_experts)?;
-    let layer = geo
-        .band
-        .clone()
-        .find(|&layer| {
-            forward
-                .moe
-                .get(layer)
-                .and_then(Option::as_ref)
-                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check().is_ok())
-        })
-        .ok_or_else(|| {
-            invalid(
-                "the decode tail check needs a device-resident qualified expert layer; this placement has none",
-            )
-        })?;
-    let anchor_rows = dsp::selftest::DECODE_TAIL_ANCHOR_ROWS;
+    let layer = resident_check_layer(forward, &geo, "decode tail")?;
+    // The decode call sits at window row `decode_row0`, beside the dispatch
+    // check's own synthetic K2 tile. The anchor is any actual K2 prefill call
+    // of the layer: the slab route's 64-row K2 tile, the aggregate route's
+    // WMMA tile of the admitted tile rows (a tile below the WMMA threshold is
+    // an F32 tail and refused by the K2 check below).
+    let decode_row0 = dsp::selftest::DECODE_TAIL_ANCHOR_ROWS;
+    let anchor_rows = match profile.geometry.route {
+        dsp::WindowRoute::SlabIu4 => decode_row0,
+        dsp::WindowRoute::Aggregate => profile.tile_rows,
+    };
     let position = bundle.state.position;
     let anchor_tile = TilePlan {
         index: 0,
@@ -2902,11 +3195,11 @@ fn decode_tail_case(
     let decode_tile = TilePlan {
         index: 1,
         window: 0,
-        prompt_row: anchor_rows,
-        window_row: anchor_rows,
+        prompt_row: decode_row0,
+        window_row: decode_row0,
         stream_offset: anchor_rows * geo.wide,
         rows: 1,
-        position: position + anchor_rows,
+        position: position + decode_row0,
         routing: tile_routing(forward, gpu, 1),
         ends_at_cut: None,
         last_in_window: true,
@@ -2921,12 +3214,18 @@ fn decode_tail_case(
         &tiles,
         layer,
         |gpu, frames| {
+            // Each call is sealed and admitted under its own tile's scope.
             let mut sealed = Vec::with_capacity(frames.len());
-            for frame in frames {
-                let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
-                    return Err(invalid("a resident layer's FFN is not MoE"));
-                };
-                sealed.push(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?);
+            for (tile, frame) in tiles.iter().zip(frames) {
+                let (scopes, _) = forward.enter_tile_scopes(gpu, tile.rows);
+                let one = (|| -> R<_> {
+                    let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
+                        return Err(invalid("a resident layer's FFN is not MoE"));
+                    };
+                    Ok(frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?)
+                })();
+                Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                sealed.push(one?);
             }
             let mut calls = Vec::with_capacity(sealed.len());
             for (tile, sealed) in tiles.iter().zip(&sealed) {
@@ -2968,6 +3267,130 @@ fn decode_tail_case(
     )
 }
 
+/// The first device-resident qualified expert layer of the band, the layer a
+/// resident all-expert binding check runs on (`what` names the check).
+fn resident_check_layer(forward: &Qwen4GpuForward, geo: &RunGeo, what: &str) -> R<usize> {
+    geo.band
+        .clone()
+        .find(|&layer| {
+            forward
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check().is_ok())
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "the {what} check needs a device-resident qualified expert layer; this placement has none"
+            ))
+        })
+}
+
+/// Rows of the two aggregate F32-tail calls the cohort check runs: 3 takes the
+/// incumbent's few-row indexed-down arm, 9 (one above the few-row limit of 8)
+/// its F32 grouped-down arm.
+const F32_TAIL_CASE_ROWS: [usize; 2] = [3, 9];
+
+/// The aggregate route's F32-tail cohort: the dispatch crate's `k1_tail_cohort`
+/// over the incumbent's REAL row-0 F32-tail calls of [`F32_TAIL_CASE_ROWS`]
+/// rows, each sealed and admitted under its own tile's actual routing scope the
+/// way the model seals it, on a device-resident qualified layer against its
+/// resident all-expert binding (the router may select any expert; a staged
+/// page cannot hold them all). Every call must be an F32-tail call whose
+/// routing rows land in its named arm.
+fn f32_tail_case(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    rt: &SlowlinkRuntime,
+    profile: &SlowlinkProfile,
+) -> R<Value> {
+    let few_row_limit = {
+        let (scopes, _) = forward.enter_tile_scopes(gpu, profile.tile_rows);
+        let limit = gpu.few_row_limit();
+        Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+        limit
+    };
+    let geo = RunGeo::new(forward, bundle, few_row_limit, profile.geometry.num_experts)?;
+    let layer = resident_check_layer(forward, &geo, "F32 tail cohort")?;
+    let mut details = serde_json::Map::new();
+    for rows in F32_TAIL_CASE_ROWS {
+        let routing = tile_routing(forward, gpu, rows);
+        if tile_cohort(profile.geometry.route, routing.route_rows, few_row_limit)
+            != TileCohort::F32Tail
+            || (rows == F32_TAIL_CASE_ROWS[0]) != (routing.route_rows <= few_row_limit)
+        {
+            return Err(invalid(format!(
+                "the {rows}-row F32 tail check routes {} rows against a few-row limit of \
+                 {few_row_limit}: it does not reach its indexed-down / grouped-down arm",
+                routing.route_rows
+            )));
+        }
+        let tile = TilePlan {
+            index: 0,
+            window: 0,
+            prompt_row: 0,
+            window_row: 0,
+            stream_offset: 0,
+            rows,
+            position: bundle.state.position,
+            routing,
+            ends_at_cut: None,
+            last_in_window: true,
+        };
+        let case = with_tile_frame(
+            forward,
+            bundle,
+            gpu,
+            &rt.streams,
+            &geo,
+            &tile,
+            layer,
+            |gpu, frame| {
+                let (scopes, _) = forward.enter_tile_scopes(gpu, rows);
+                let one = (|| -> R<Value> {
+                    let Qwen4FfnBinding::Moe(moe) = &frame.description.ffn else {
+                        return Err(invalid("a resident layer's FFN is not MoE"));
+                    };
+                    let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
+                    let call = dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, tile.position)
+                        .map_err(dsp_err("admission"))?;
+                    if call.tile_kind() != dsp::TileKind::AggregateF32Tail {
+                        return Err(invalid(format!(
+                            "the {rows}-row F32 tail check sealed as {:?}, not an F32-tail call",
+                            call.tile_kind()
+                        )));
+                    }
+                    let binding = dsp::ExpertPanelBinding::resident(
+                        layer,
+                        geo.num_experts,
+                        moe.expert_gate_up_ptrs,
+                        moe.expert_down_ptrs,
+                    );
+                    let report = dsp::selftest::k1_tail_cohort(
+                        gpu,
+                        &call,
+                        binding,
+                        dsp::PanelLimits::S1,
+                        SELFTEST_SEED,
+                    )
+                    .map_err(dsp_err("primitive"))?;
+                    primitive_case_json("k1_tail_cohort", &report)
+                })();
+                Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+                one
+            },
+        )?;
+        details.insert(format!("rows_{rows}"), case["detail"].clone());
+    }
+    Ok(json!({
+        "name": "k1_tail_cohort",
+        "status": "pass",
+        "mismatches": 0u64,
+        "detail": Value::Object(details),
+    }))
+}
+
 /// One named primitive check on the attached forward's real owners; the
 /// ring is drained and idle afterwards whatever the outcome.
 pub(crate) fn primitive_selftest(
@@ -3002,23 +3425,46 @@ pub(crate) fn primitive_selftest(
         "within_expert_panel_canary" | "zero_row_panel" => {
             dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name)
         }
-        // The few-row cohort is two checks that must BOTH pass: the prefill K1
+        // The few-row cohort is checks that must ALL pass. Slab: the prefill K1
         // tail on a staged host-layer binding, and the incumbent's REAL one-row
         // decode call beside a K2 tile on a resident all-expert binding.
-        "k1_tail_cohort" => dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name)
-            .and_then(|prefill| {
-                decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
-                    json!({
-                        "name": name,
-                        "status": "pass",
-                        "mismatches": 0u64,
-                        "detail": {
-                            "prefill_k1": prefill["detail"],
-                            "decode_tail": decode["detail"],
-                        },
+        // Aggregate: the REAL row-0 F32-tail calls of 3 rows (indexed-down) and
+        // 9 rows (F32 grouped-down) on a resident all-expert binding, and the
+        // same decode call beside an actual WMMA anchor.
+        "k1_tail_cohort" => match profile.geometry.route {
+            dsp::WindowRoute::SlabIu4 => {
+                dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name).and_then(
+                    |prefill| {
+                        decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
+                            json!({
+                                "name": name,
+                                "status": "pass",
+                                "mismatches": 0u64,
+                                "detail": {
+                                    "prefill_k1": prefill["detail"],
+                                    "decode_tail": decode["detail"],
+                                },
+                            })
+                        })
+                    },
+                )
+            }
+            dsp::WindowRoute::Aggregate => {
+                f32_tail_case(forward, &*bundle, gpu, &rt, &profile).and_then(|f32_tail| {
+                    decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
+                        json!({
+                            "name": name,
+                            "status": "pass",
+                            "mismatches": 0u64,
+                            "detail": {
+                                "f32_tail": f32_tail["detail"],
+                                "decode_tail": decode["detail"],
+                            },
+                        })
                     })
                 })
-            }),
+            }
+        },
         other => Err(invalid(format!("unknown slow-link primitive {other:?}"))),
     };
     let drained = rt.ring.drain(&*gpu);
@@ -3033,8 +3479,8 @@ pub(crate) fn primitive_selftest(
 mod slowlink_prompt {
     use super::*;
     use crate::slowlink_admission::{
-        admit, AdmissionInputs, ModelGeometry, S1_RUNTIME_OVERHEAD_BYTES, S1_TILE_ROWS,
-        S1_WINDOW_ROWS,
+        admit, AdmissionInputs, ModelGeometry, S1_AGGREGATE_TAIL_ROWS, S1_K1_TAIL_ROWS,
+        S1_RUNTIME_OVERHEAD_BYTES, S1_TILE_ROWS, S1_WINDOW_ROWS,
     };
     use rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS;
 
@@ -3110,7 +3556,9 @@ mod slowlink_prompt {
         }
     }
 
-    pub(super) fn plan_with(
+    /// [`plan_prompt_verdict`] of a request on a profile admitted FRESH on `route`.
+    pub(super) fn plan_on(
+        route: dsp::WindowRoute,
         entry: usize,
         rows: usize,
         cuts: &[usize],
@@ -3118,13 +3566,44 @@ mod slowlink_prompt {
         few_row_limit: usize,
     ) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
         plan_prompt_verdict(&PromptPlanInputs {
-            profile: &profile(),
+            profile: &profile_on(route, 0, 0),
             entry_pos: entry,
             rows,
             cuts,
             routing,
             few_row_limit,
         })
+    }
+
+    pub(super) fn plan_with(
+        entry: usize,
+        rows: usize,
+        cuts: &[usize],
+        routing: &dyn Fn(usize) -> TileRouting,
+        few_row_limit: usize,
+    ) -> R<Result<Qwen4PromptPlan, PlanBypass>> {
+        plan_on(
+            dsp::WindowRoute::SlabIu4,
+            entry,
+            rows,
+            cuts,
+            routing,
+            few_row_limit,
+        )
+    }
+
+    /// A qualified request on the aggregate route under the gfx1100 routing.
+    fn plan_aggregate(entry: usize, rows: usize, cuts: &[usize]) -> Qwen4PromptPlan {
+        plan_on(
+            dsp::WindowRoute::Aggregate,
+            entry,
+            rows,
+            cuts,
+            &gfx1100_routing,
+            8,
+        )
+        .unwrap()
+        .expect("a qualified aggregate request plans")
     }
 
     /// A resumed request: the session restored 3000 rows, 100 follow.
@@ -3605,43 +4084,87 @@ mod slowlink_prompt {
     }
 
     /// The window route layout the runtime builds for each window, for BOTH
-    /// artifact route kinds, is valid at every window row count: the K1 bound
-    /// is clamped to the window, no owned span exceeds the full admitted
-    /// window's, and an empty window is still refused. CPU layout arithmetic
-    /// only; no kernel or GPU arithmetic is exercised.
+    /// artifact route kinds, from the window's ACTUAL cohort rows, at every
+    /// window row count of the matrix: no owned span exceeds the full
+    /// admitted window's, the full admitted capacities are exactly the
+    /// census, capacities above the admitted ones and an empty window are
+    /// refused. CPU layout arithmetic only; no kernel or GPU arithmetic is
+    /// exercised.
     #[test]
     fn slowlink_prompt_window_route_layout_is_valid_for_every_row_count_on_both_routes() {
-        for route in [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::AggregateWmma] {
+        for route in [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::Aggregate] {
             let profile = profile_on(route, 0, 0);
             assert_eq!(profile.geometry.route, route);
             let full = profile.census.route_storage;
+            let admitted = profile.route_dims();
             for rows in [1usize, 3, 4, 47, 48, 49, 512, 1536, 16384] {
-                let layout = window_route_layout(&profile, rows)
-                    .unwrap_or_else(|error| panic!("{route:?} rows {rows}: {error:?}"));
-                let dims = layout.dims();
-                assert_eq!(dims.rows, rows, "{route:?}");
-                assert_eq!(layout.route(), route, "{route:?} rows {rows}");
-                assert_eq!(
-                    dims.k1_rows,
-                    S1_K1_TAIL_ROWS.min(rows),
-                    "{route:?} rows {rows}: the admitted K1 bound clamped to the window"
-                );
-                assert!(dims.k1_rows > 0 && dims.k1_rows <= dims.rows);
-                assert!(layout.total_bytes() > 0, "{route:?} rows {rows}");
-                assert!(
-                    layout.total_bytes() as u64 <= full,
-                    "{route:?} rows {rows}: {} bytes exceed the admitted {full}",
-                    layout.total_bytes()
-                );
+                let k1_rows = rows.min(S1_K1_TAIL_ROWS);
+                let tail_rows = rows.min(S1_AGGREGATE_TAIL_ROWS);
+                let mut shapes = vec![(0usize, 0usize), (k1_rows, 0)];
+                if route == dsp::WindowRoute::Aggregate {
+                    shapes.push((0, tail_rows));
+                    if rows > 3 {
+                        shapes.push((1, rows.min(S1_AGGREGATE_TAIL_ROWS) - 1));
+                    }
+                }
+                for (k1, tail) in shapes {
+                    let layout = window_route_layout(&profile, rows, k1, tail).unwrap_or_else(
+                        |error| panic!("{route:?} rows {rows} k1 {k1} tail {tail}: {error:?}"),
+                    );
+                    let dims = layout.dims();
+                    assert_eq!(dims.rows, rows, "{route:?}");
+                    assert_eq!(layout.route(), route, "{route:?} rows {rows}");
+                    assert_eq!(
+                        (dims.k1_rows, dims.tail_rows),
+                        (k1, tail),
+                        "{route:?} rows {rows}: the ACTUAL counts, never the admitted bounds"
+                    );
+                    assert!(layout.total_bytes() > 0, "{route:?} rows {rows}");
+                    assert!(
+                        layout.total_bytes() as u64 <= full,
+                        "{route:?} rows {rows}: {} bytes exceed the admitted {full}",
+                        layout.total_bytes()
+                    );
+                }
                 if rows == S1_WINDOW_ROWS {
+                    let layout =
+                        window_route_layout(&profile, rows, admitted.k1_rows, admitted.tail_rows)
+                            .unwrap();
                     assert_eq!(layout.total_bytes() as u64, full, "{route:?}");
                 }
             }
             assert!(
-                window_route_layout(&profile, 0).is_err(),
+                window_route_layout(&profile, 0, 0, 0).is_err(),
                 "{route:?}: a zero-row window is refused"
             );
+            assert!(
+                window_route_layout(&profile, S1_WINDOW_ROWS + 1, 0, 0).is_err(),
+                "{route:?}: a window wider than the admitted one is refused"
+            );
+            assert!(
+                window_route_layout(&profile, 16384, S1_K1_TAIL_ROWS + 1, 0).is_err(),
+                "{route:?}: K1 rows above the admitted capacity are refused"
+            );
+            assert!(
+                window_route_layout(&profile, 3, 1, 3).is_err(),
+                "{route:?}: cohorts cannot hold more rows than the window"
+            );
         }
+        let aggregate = profile_on(dsp::WindowRoute::Aggregate, 0, 0);
+        assert!(
+            window_route_layout(&aggregate, 16384, 0, S1_AGGREGATE_TAIL_ROWS + 1).is_err(),
+            "F32 tail rows above the admitted capacity are refused"
+        );
+        assert!(
+            window_route_layout(
+                &profile_on(dsp::WindowRoute::SlabIu4, 0, 0),
+                16384,
+                0,
+                1
+            )
+            .is_err(),
+            "the slab route has no F32 tail rows"
+        );
     }
 
     /// The census of each route kind is the layout of a profile admitted FRESH
@@ -3649,7 +4172,7 @@ mod slowlink_prompt {
     #[test]
     fn slowlink_prompt_census_of_each_route_is_its_own_fresh_admission() {
         let slab = profile_on(dsp::WindowRoute::SlabIu4, 0, 0);
-        let aggregate = profile_on(dsp::WindowRoute::AggregateWmma, 0, 0);
+        let aggregate = profile_on(dsp::WindowRoute::Aggregate, 0, 0);
         for profile in [&slab, &aggregate] {
             let plan = plan_prompt_verdict(&PromptPlanInputs {
                 profile,
@@ -3672,55 +4195,410 @@ mod slowlink_prompt {
             );
         }
         let wide = aggregate.route_dims();
-        assert_eq!(wide.route, dsp::WindowRoute::AggregateWmma);
+        assert_eq!(wide.route, dsp::WindowRoute::Aggregate);
         assert_eq!(wide.k1_rows, S1_K1_TAIL_ROWS);
+        assert_eq!(wide.tail_rows, S1_AGGREGATE_TAIL_ROWS);
+        assert_eq!(slab.route_dims().tail_rows, 0);
         assert!(
             aggregate.census.route_storage > slab.census.route_storage,
             "the aggregate census carries its own F16 activations and scratch"
         );
     }
 
+    /// The cohort class of a tile is read off its ORIGINAL routing rows on its
+    /// own window route, and the dispatch call's kind lands in the same
+    /// cohort; only the decode and F32-tail calls register their operands.
+    #[test]
+    fn slowlink_prompt_cohort_classes_follow_each_routes_original_routing_rows() {
+        use dsp::WindowRoute::{Aggregate, SlabIu4};
+        assert_eq!(dsp::AGGREGATE_MIN_TILE_ROWS, QWEN4_F16_WMMA_MIN_TOKENS);
+        for (rows, want) in [
+            (1, TileCohort::K1),
+            (2, TileCohort::F32Tail),
+            (3, TileCohort::F32Tail),
+            (8, TileCohort::F32Tail),
+            (9, TileCohort::F32Tail),
+            (511, TileCohort::F32Tail),
+            (512, TileCohort::K2),
+            (1536, TileCohort::K2),
+            (16384, TileCohort::K2),
+        ] {
+            assert_eq!(tile_cohort(Aggregate, rows, 8), want, "aggregate {rows}");
+        }
+        for (rows, want) in [
+            (1, TileCohort::K1),
+            (3, TileCohort::K1),
+            (8, TileCohort::K1),
+            (9, TileCohort::K2),
+            (511, TileCohort::K2),
+            (512, TileCohort::K2),
+            (1536, TileCohort::K2),
+        ] {
+            assert_eq!(tile_cohort(SlabIu4, rows, 8), want, "slab {rows}");
+        }
+        for (kind, want) in [
+            (dsp::TileKind::SlabK2, TileCohort::K2),
+            (dsp::TileKind::AggregateWmma, TileCohort::K2),
+            (dsp::TileKind::SlabK1Tail, TileCohort::K1),
+            (dsp::TileKind::Decode, TileCohort::K1),
+            (dsp::TileKind::AggregateF32Tail, TileCohort::F32Tail),
+        ] {
+            assert_eq!(kind_cohort(kind), want, "{kind:?}");
+        }
+        for rows in [1usize, 3, 511] {
+            assert!(registers_operands(Aggregate, rows, 8), "aggregate {rows}");
+        }
+        for rows in [512usize, 1536] {
+            assert!(!registers_operands(Aggregate, rows, 8), "aggregate {rows}");
+        }
+        assert!(registers_operands(SlabIu4, 1, 8));
+        assert!(!registers_operands(SlabIu4, 3, 8));
+        assert!(!registers_operands(SlabIu4, 1536, 8));
+    }
+
+    /// Every mixture counts the real kind rows of each tile: a window of a
+    /// 3-row F32 tail, a decode row and a 512-row WMMA tile holds 1 K1 and 3
+    /// tail rows on the aggregate route, 4 K1 rows and no tail on the slab
+    /// route (its old few-row semantics); a canonical-promoted tile
+    /// (`route_rows >= 512`) is never an F32 tail whatever its raw rows.
+    #[test]
+    fn slowlink_prompt_window_cohort_rows_count_the_real_kind_of_every_tile() {
+        let cuts = [3, 4];
+        let aggregate = plan_aggregate(0, 516, &cuts);
+        assert_chronology(&aggregate);
+        assert_eq!(
+            aggregate.tiles.iter().map(|t| t.rows).collect::<Vec<_>>(),
+            [3, 1, 512]
+        );
+        assert_eq!(aggregate.windows.len(), 1);
+        let window = &aggregate.windows[0];
+        assert_eq!((window.k1_rows, window.tail_rows), (1, 3));
+        assert_eq!((aggregate.k1_rows_max, aggregate.tail_rows_max), (1, 3));
+        let slab = plan(0, 516, &cuts);
+        assert_eq!(
+            (slab.windows[0].k1_rows, slab.windows[0].tail_rows),
+            (4, 0)
+        );
+        assert_eq!((slab.k1_rows_max, slab.tail_rows_max), (4, 0));
+        let canonical = plan_on(
+            dsp::WindowRoute::Aggregate,
+            0,
+            5000,
+            &[3],
+            &canonical_routing,
+            8,
+        )
+        .unwrap()
+        .expect("plans");
+        assert_eq!(canonical.tiles[0].rows, 3);
+        assert_eq!(
+            canonical.tiles[0].routing.route_rows,
+            QWEN4_F16_WMMA_MIN_TOKENS
+        );
+        assert!(canonical
+            .windows
+            .iter()
+            .all(|w| (w.k1_rows, w.tail_rows) == (0, 0)));
+        assert_eq!((canonical.k1_rows_max, canonical.tail_rows_max), (0, 0));
+        // The per-window sums are the sums of the tiles' own kinds.
+        for (route, plan) in [
+            (dsp::WindowRoute::Aggregate, &aggregate),
+            (dsp::WindowRoute::SlabIu4, &slab),
+            (dsp::WindowRoute::Aggregate, &canonical),
+        ] {
+            for window in &plan.windows {
+                let (mut k1, mut tail) = (0, 0);
+                for tile in plan.window_tiles(window) {
+                    match tile_cohort(route, tile.routing.route_rows, 8) {
+                        TileCohort::K1 => k1 += tile.rows,
+                        TileCohort::F32Tail => tail += tile.rows,
+                        TileCohort::K2 => {}
+                    }
+                }
+                assert_eq!((window.k1_rows, window.tail_rows), (k1, tail));
+            }
+        }
+    }
+
+    /// Pure F32-only and decode-only windows are valid: the layout holds the
+    /// window's actual rows (not the 3,066-row tail bound on a 3-row view, nor
+    /// 3 K1 + 3 tail reserved for an actual 3-row F32 window), stays inside the
+    /// fresh full-window census, and a zero-row window is invalid.
+    #[test]
+    fn slowlink_prompt_pure_f32_and_decode_windows_have_valid_actual_layouts() {
+        let profile = profile_on(dsp::WindowRoute::Aggregate, 0, 0);
+        let f32_only = plan_aggregate(0, 3, &[]);
+        let window = &f32_only.windows[0];
+        assert_eq!((window.rows, window.k1_rows, window.tail_rows), (3, 0, 3));
+        let layout =
+            window_route_layout(&profile, window.rows, window.k1_rows, window.tail_rows).unwrap();
+        assert_eq!(layout.route(), dsp::WindowRoute::Aggregate);
+        assert_eq!(
+            (layout.dims().rows, layout.dims().k1_rows, layout.dims().tail_rows),
+            (3, 0, 3)
+        );
+        assert!(layout.total_bytes() as u64 <= profile.census.route_storage);
+        validate_window_layouts(&profile, &f32_only).unwrap();
+        let decode_only = plan_aggregate(0, 1, &[]);
+        let window = &decode_only.windows[0];
+        assert_eq!((window.rows, window.k1_rows, window.tail_rows), (1, 1, 0));
+        let layout =
+            window_route_layout(&profile, window.rows, window.k1_rows, window.tail_rows).unwrap();
+        assert_eq!(
+            (layout.dims().rows, layout.dims().k1_rows, layout.dims().tail_rows),
+            (1, 1, 0)
+        );
+        assert!(layout.total_bytes() as u64 <= profile.census.route_storage);
+        validate_window_layouts(&profile, &decode_only).unwrap();
+        // The decode-only window has no prefill tile: the sweep frames a
+        // stand-in anchor and registers only the real decode tile.
+        let sweep = sweep_tiles(
+            dsp::WindowRoute::Aggregate,
+            decode_only.window_tiles(&decode_only.windows[0]),
+            8,
+        );
+        assert_eq!(sweep.anchor, None);
+        assert_eq!(sweep.cohort, [0]);
+        assert!(window_route_layout(&profile, 0, 0, 0).is_err());
+    }
+
+    /// A valid long window of 14,843 rows cut at 511, 2558, 4605 and 6652 is
+    /// ONE aggregate window holding five 511-row F32 tails (2,555 rows, above
+    /// the old 1,999 / 2,047 limits, inside the admitted 3,066) and eight
+    /// 1,536-row WMMA tiles: no bypass, no retile. Every original exit, F32
+    /// HC tag and operand registration occurs exactly once (the WMMA tile
+    /// anchors, so no tail is registered twice) and no decode tile exists.
+    #[test]
+    fn slowlink_prompt_five_f32_tails_of_a_long_window_stay_one_aggregate_window() {
+        let cuts = [511, 2558, 4605, 6652];
+        let plan = plan_aggregate(0, 14843, &cuts);
+        assert_chronology(&plan);
+        assert_eq!(plan.windows.len(), 1);
+        assert_eq!(
+            plan.tiles.iter().map(|t| t.rows).collect::<Vec<_>>(),
+            [
+                vec![511],
+                vec![1536, 511],
+                vec![1536, 511],
+                vec![1536, 511],
+                vec![1536; 5],
+                vec![511]
+            ]
+            .concat()
+        );
+        let window = &plan.windows[0];
+        assert_eq!(window.cuts, cuts);
+        assert_eq!((window.k1_rows, window.tail_rows), (0, 2555));
+        assert!(window.tail_rows > 1999 && window.tail_rows <= S1_AGGREGATE_TAIL_ROWS);
+        let tiles = plan.window_tiles(window);
+        let tails: Vec<usize> = (0..tiles.len()).filter(|&i| tiles[i].rows == 511).collect();
+        assert_eq!(tails.len(), 5);
+        assert_eq!(tiles.iter().filter(|t| t.rows == 1536).count(), 8);
+        // Original exits: every tile end once, every cut among them once.
+        let exits = plan.launch_cuts();
+        assert_eq!(exits.len(), plan.tiles.len());
+        for cut in cuts {
+            assert_eq!(exits.iter().filter(|&&exit| exit == cut).count(), 1);
+        }
+        assert_eq!(exits.last(), Some(&14843));
+        // F32 HC tags on the tails, BF16 on the WMMA tiles.
+        for tile in &plan.tiles {
+            assert_eq!(tile.routing, gfx1100_routing(tile.rows));
+            assert_eq!(tile.routing.bf16_streams, tile.rows == 1536);
+        }
+        // Operand registration: the first WMMA tile anchors, each tail is
+        // registered once, nothing is a decode tile.
+        let sweep = sweep_tiles(dsp::WindowRoute::Aggregate, tiles, 8);
+        assert_eq!(sweep.anchor, Some(1));
+        assert_eq!(sweep.cohort, tails);
+        assert_eq!(
+            sweep.registered(tiles, dsp::WindowRoute::Aggregate, 8),
+            tails
+        );
+        assert!(tiles.iter().all(|tile| tile.routing.route_rows != 1));
+        // The layout of the actual window and the independent cohort-count
+        // array (no 2,047 / 4,095 limit): the full admitted worst case too.
+        let profile = profile_on(dsp::WindowRoute::Aggregate, 0, 0);
+        let layout = window_route_layout(&profile, window.rows, 0, 2555).unwrap();
+        assert_eq!(layout.dims().tail_rows, 2555);
+        assert!(window_route_layout(
+            &profile,
+            S1_WINDOW_ROWS,
+            S1_K1_TAIL_ROWS,
+            S1_AGGREGATE_TAIL_ROWS
+        )
+        .is_ok());
+        validate_window_layouts(&profile, &plan).unwrap();
+    }
+
+    /// The mandatory 9,000-row boundary request cut at 3, 4, 1536, 1537 and
+    /// 8192 keeps the incumbent's chronology: the fifth boundary ends the
+    /// first (budgeted) window, whose 3- and 511-row F32 tails and two 1-row
+    /// decode tiles are counted from the real kinds and register once each
+    /// around the 1,532-row WMMA anchor; the second window is pure WMMA.
+    #[test]
+    fn slowlink_prompt_boundary_9000_keeps_f32_tails_and_decode_rows_in_their_windows() {
+        let cuts = [3, 4, 1536, 1537, 8192];
+        let plan = plan_aggregate(0, 9000, &cuts);
+        assert_chronology(&plan);
+        assert_eq!(
+            plan.tiles.iter().map(|t| t.rows).collect::<Vec<_>>(),
+            [vec![3, 1, 1532, 1], vec![1536; 4], vec![511, 808]].concat()
+        );
+        assert_eq!(plan.windows.len(), 2);
+        assert!(plan
+            .windows
+            .iter()
+            .all(|w| w.cuts.len() <= S1_MAX_BOUNDARY_SNAPSHOTS));
+        assert_eq!(plan.windows[0].end_position(), 8192);
+        assert_eq!(plan.windows[0].cuts, vec![3, 4, 1536, 1537]);
+        let (first, second) = (&plan.windows[0], &plan.windows[1]);
+        assert_eq!((first.k1_rows, first.tail_rows), (2, 3 + 511));
+        assert_eq!((second.k1_rows, second.tail_rows), (0, 0));
+        let exits = plan.launch_cuts();
+        for cut in cuts {
+            assert_eq!(exits.iter().filter(|&&exit| exit == cut).count(), 1);
+        }
+        let tiles = plan.window_tiles(first);
+        let sweep = sweep_tiles(dsp::WindowRoute::Aggregate, tiles, 8);
+        assert_eq!(sweep.anchor, Some(2), "the first WMMA tile anchors");
+        assert_eq!(sweep.cohort, [0, 1, 3, 8]);
+        assert_eq!(
+            sweep.registered(tiles, dsp::WindowRoute::Aggregate, 8),
+            [0, 1, 3, 8]
+        );
+        assert_eq!(
+            tiles.iter().filter(|t| t.routing.route_rows == 1).count(),
+            2,
+            "decode tiles exist only for real one-row tiles"
+        );
+        let tail_tiles: Vec<usize> = tiles
+            .iter()
+            .enumerate()
+            .filter(|(_, tile)| !tile.routing.bf16_streams && tile.routing.route_rows > 1)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(tail_tiles, [0, 8], "the F32 tails carry F32 HC tags");
+        let tiles = plan.window_tiles(second);
+        let sweep = sweep_tiles(dsp::WindowRoute::Aggregate, tiles, 8);
+        assert_eq!((sweep.anchor, sweep.cohort.len()), (Some(0), 0));
+        let profile = profile_on(dsp::WindowRoute::Aggregate, 0, 0);
+        validate_window_layouts(&profile, &plan).unwrap();
+    }
+
     /// A request whose last window holds only 3 rows (16384 rows, then the
     /// 3-row tail the fifth cut separates): the production per-window layout
-    /// is valid for it on both route kinds, the K1 bound is 3 there, and the
-    /// plan's tile manifest is the same before and after the layouts are built.
+    /// is valid for it on both route kinds from its ACTUAL cohort rows (K1 on
+    /// the slab route, a pure F32 tail on the aggregate route, no WMMA work
+    /// and the tail anchors and registers itself once), and the plan's tile
+    /// manifest is the same before and after the layouts are built.
     #[test]
     fn slowlink_prompt_three_row_last_window_builds_a_valid_layout_on_both_routes() {
         let cuts = [1536, 3072, 4608, 6144, 16384];
-        let plan = plan(0, 16387, &cuts);
-        assert_chronology(&plan);
-        assert_eq!(plan.windows.len(), 2);
-        assert_eq!(plan.windows[0].rows, 16384);
-        let last = &plan.windows[1];
-        assert_eq!(last.rows, 3);
-        assert_eq!(last.position, 16384);
-        assert_eq!(last.end_position(), 16387);
-        assert_eq!(last.tiles.len(), 1);
-        assert_eq!(plan.tiles[last.tiles.start].rows, 3);
-        assert_eq!(plan.k1_rows_max, 3, "the 3-row remainder is the K1 tile");
-        let manifest = plan.tiles.clone();
-        let windows = plan.windows.clone();
-        for route in [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::AggregateWmma] {
+        let slab_plan = plan(0, 16387, &cuts);
+        let aggregate_plan = plan_aggregate(0, 16387, &cuts);
+        for (route, plan, k1, tail) in [
+            (dsp::WindowRoute::SlabIu4, &slab_plan, 3usize, 0usize),
+            (dsp::WindowRoute::Aggregate, &aggregate_plan, 0, 3),
+        ] {
+            assert_chronology(plan);
+            assert_eq!(plan.windows.len(), 2);
+            assert_eq!(plan.windows[0].rows, 16384);
+            assert_eq!(
+                (plan.windows[0].k1_rows, plan.windows[0].tail_rows),
+                (0, 0),
+                "{route:?}: the first window is all K2 tiles"
+            );
+            let last = &plan.windows[1];
+            assert_eq!(last.rows, 3);
+            assert_eq!(last.position, 16384);
+            assert_eq!(last.end_position(), 16387);
+            assert_eq!(last.tiles.len(), 1);
+            assert_eq!(plan.tiles[last.tiles.start].rows, 3);
+            assert_eq!((plan.k1_rows_max, plan.tail_rows_max), (k1, tail), "{route:?}");
+            assert_eq!((last.k1_rows, last.tail_rows), (k1, tail), "{route:?}");
+            let manifest = plan.tiles.clone();
+            let windows = plan.windows.clone();
             let profile = profile_on(route, 0, 0);
             let dims_before = profile.route_dims();
             for window in &plan.windows {
-                let layout = window_route_layout(&profile, window.rows)
-                    .unwrap_or_else(|error| panic!("{route:?} window {}: {error:?}", window.index));
+                let layout =
+                    window_route_layout(&profile, window.rows, window.k1_rows, window.tail_rows)
+                        .unwrap_or_else(|error| {
+                            panic!("{route:?} window {}: {error:?}", window.index)
+                        });
                 assert_eq!(layout.dims().rows, window.rows);
-                assert_eq!(layout.dims().k1_rows, S1_K1_TAIL_ROWS.min(window.rows));
+                assert_eq!(
+                    (layout.dims().k1_rows, layout.dims().tail_rows),
+                    (window.k1_rows, window.tail_rows)
+                );
                 assert!(layout.total_bytes() as u64 <= profile.census.route_storage);
             }
+            validate_window_layouts(&profile, plan).unwrap();
+            let layout =
+                window_route_layout(&profile, last.rows, last.k1_rows, last.tail_rows).unwrap();
             assert_eq!(
-                window_route_layout(&profile, last.rows)
-                    .unwrap()
-                    .dims()
-                    .k1_rows,
-                3
+                (layout.dims().k1_rows, layout.dims().tail_rows),
+                (k1, tail),
+                "{route:?}"
             );
             assert_eq!(profile.route_dims(), dims_before, "{route:?}");
+            assert_eq!(plan.tiles, manifest, "the tile manifest is untouched");
+            assert_eq!(plan.windows, windows);
+            let tiles = plan.window_tiles(last);
+            let sweep = sweep_tiles(route, tiles, 8);
+            assert_eq!(sweep.anchor, Some(0), "{route:?}: the 3-row tile anchors");
+            assert!(sweep.cohort.is_empty(), "{route:?}: no extra sweep tile");
+            assert_eq!(
+                sweep.registered(tiles, route, 8),
+                if route == dsp::WindowRoute::Aggregate {
+                    vec![0]
+                } else {
+                    Vec::new()
+                },
+                "{route:?}: the aggregate tail registers once through the anchor"
+            );
         }
-        assert_eq!(plan.tiles, manifest, "the tile manifest is untouched");
-        assert_eq!(plan.windows, windows);
+    }
+
+    /// A plan whose actual F32-tail or decode rows exceed the immutable
+    /// admitted capacities is the incumbent's, decided before any mutation.
+    #[test]
+    fn slowlink_prompt_aggregate_cohort_rows_above_admitted_capacity_bypass_before_mutation() {
+        let all_tails = |_: usize| TileRouting {
+            route_rows: 100,
+            bf16_streams: false,
+        };
+        let verdict =
+            plan_on(dsp::WindowRoute::Aggregate, 0, 16384, &[], &all_tails, 8).unwrap();
+        assert!(matches!(
+            verdict,
+            Err(PlanBypass::F32TailRows { window: 0, rows, bound })
+                if bound == S1_AGGREGATE_TAIL_ROWS && rows > bound
+        ));
+        let all_decode = |_: usize| TileRouting {
+            route_rows: 1,
+            bf16_streams: false,
+        };
+        let verdict =
+            plan_on(dsp::WindowRoute::Aggregate, 0, 16384, &[], &all_decode, 8).unwrap();
+        assert!(matches!(
+            verdict,
+            Err(PlanBypass::K1TailRows { window: 0, rows, bound })
+                if bound == S1_K1_TAIL_ROWS && rows > bound
+        ));
+        // The structural worst case of a window (five segments between four
+        // interior cuts, each ending in a 511-row tail) plans and stays
+        // inside the admitted bound.
+        let worst = plan_aggregate(0, 5 * 511, &[511, 1022, 1533, 2044]);
+        assert_eq!(worst.tail_rows_max, 5 * 511);
+        assert!(worst.tail_rows_max <= S1_AGGREGATE_TAIL_ROWS);
+        // A zero-row routing is malformed input, not a verdict.
+        let zero = |_: usize| TileRouting {
+            route_rows: 0,
+            bf16_streams: false,
+        };
+        assert!(plan_on(dsp::WindowRoute::Aggregate, 0, 100, &[], &zero, 8).is_err());
     }
 
     /// The physical prompt census is the allocation layouts' total whatever
