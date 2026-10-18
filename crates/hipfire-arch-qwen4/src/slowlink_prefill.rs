@@ -1360,13 +1360,19 @@ fn validate_head(
 
 /// The pre-mutation dry run of the dispatch admission: seal the first host
 /// layer's MoE call for every distinct tile signature of the plan and ask the
-/// dispatch crate to admit it.
+/// dispatch crate to admit it. The real sealed call's route must also equal
+/// the admitted profile's route: the census (route storage, tile-F32 and
+/// scratch charges) was admitted for `profile.geometry.route` alone, so a call
+/// sealed for another route is refused here, after the tile scope is restored
+/// and before `ensure_runtime` or any other mutation, instead of running
+/// against the other route's census.
 fn preflight_tiles(
     forward: &Qwen4GpuForward,
     bundle: &Qwen4Bundle,
     gpu: &mut Gpu,
     geo: &RunGeo,
     plan: &Qwen4PromptPlan,
+    profile: &SlowlinkProfile,
 ) -> Result<(), String> {
     let layer = geo
         .band
@@ -1427,17 +1433,24 @@ fn preflight_tiles(
                 };
                 let sealed = frame.env.seal_moe(frame.ctx, *moe, frame.scratch_desc)?;
                 dsp::PreparedChunkCall::new(&*gpu, &sealed, 0, stub.position)
-                    .map(|call| (call.arm_signature(), call.is_k2()))
+                    .map(|call| (call.arm_signature(), call.is_k2(), call.window_route()))
                     .map_err(dsp_err("admission"))
             },
         );
         Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-        let (arm, is_k2) = result.map_err(|error| {
+        let (arm, is_k2, route) = result.map_err(|error| {
             format!(
                 "tile of {rows} rows (route rows {}): {error}",
                 routing.route_rows
             )
         })?;
+        if route != profile.geometry.route {
+            return Err(format!(
+                "tile of {rows} rows (route rows {}): the sealed call's window route is \
+                 {route:?} but the admitted profile's census is for {:?}",
+                routing.route_rows, profile.geometry.route
+            ));
+        }
         arms.push((arm, is_k2));
     }
     // Every tile shares the layer geometry (the first five signature values);
@@ -1565,7 +1578,7 @@ fn select(
             }
         }
     }
-    preflight_tiles(forward, bundle, gpu, &geo, &plan)?;
+    preflight_tiles(forward, bundle, gpu, &geo, &plan, &profile)?;
     ensure_runtime(forward, bundle, gpu, &profile)?;
     Ok(Selection { plan, profile, geo })
 }
