@@ -79,7 +79,9 @@
 //! arms, so the pair differs only in who multiplies the host-mapped experts. `d2` needs
 //! `HIPFIRE_QWEN4_D2_DEFAULT=1` with `HIPFIRE_OFFLOAD_EXEC` UNSET (an
 //! explicit `memory.offload_exec` always beats the force) and must arm every host-placed
-//! trunk layer as a whole-layer owner, identity `cpu-whole-split-v1/<bitmap>`. `pcie` needs
+//! trunk layer as an un-tiered owner: a whole-layer host aggregate, identity
+//! `cpu-whole-split-v1/<bitmap>`, or a host-mapped expert-slab arena, identity
+//! `cpu-slab-split-v1/<bitmap>` (both parts joined by `+` when a model has both). `pcie` needs
 //! `HIPFIRE_OFFLOAD_EXEC=pcie` (explicit pcie forces the baseline) with the force unset and
 //! must arm nothing. Each run writes `OUTPUT.d2.json` recording the force, the explicit
 //! exec, the placement and the armed identity; a measurement without that receipt is not
@@ -346,11 +348,36 @@ fn layer_bitmap_hex(labels: &[usize]) -> String {
     bytes.iter().rev().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The un-tiered D2 owner kinds (`split_owner_kinds` labels) and their host-exec identity
+/// prefixes, in the order the core joins them.
+const UNTIERED_OWNERS: [(&str, &str); 2] = [
+    ("whole-layer", "cpu-whole-split-v1"),
+    ("slab", "cpu-slab-split-v1"),
+];
+
+/// The host-exec identity the core renders for these un-tiered owners: one
+/// `<prefix>/<bitmap>` part per kind that armed any layer, joined by `+`.
+fn untiered_identity(owner_kinds: &[(usize, &str)]) -> String {
+    UNTIERED_OWNERS
+        .iter()
+        .filter_map(|(kind, prefix)| {
+            let layers: Vec<usize> = owner_kinds
+                .iter()
+                .filter(|(_, k)| k == kind)
+                .map(|(l, _)| *l)
+                .collect();
+            (!layers.is_empty()).then(|| format!("{prefix}/{}", layer_bitmap_hex(&layers)))
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// What the loaded bundle must look like for one un-tiered arm, given the resolved
 /// host-placed trunk layers `host` (non-empty in both arms: with no host-mapped layer
-/// there is nothing to compare). `d2`: exactly those layers armed, all as whole-layer
-/// owners, identity `cpu-whole-split-v1/<bitmap of those layers>` (no D1 or tier part), and
-/// the split digest equal to it. `pcie`: nothing armed and no host arithmetic identity.
+/// there is nothing to compare). `d2`: exactly those layers armed, each as an un-tiered
+/// owner (whole-layer host aggregate or host-mapped expert slab), the identity the core
+/// renders for those owners ([`untiered_identity`]; no D1 or tier part), and the split
+/// digest equal to it. `pcie`: nothing armed and no host arithmetic identity.
 fn check_untiered_split(
     arm: UntieredArm,
     host: &[usize],
@@ -370,17 +397,19 @@ fn check_untiered_split(
         UntieredArm::D2 => {
             if armed != host {
                 return Err(format!(
-                    "whole-layer D2 armed layers {armed:?}, expected every resolved host-placed trunk layer {host:?}"
+                    "un-tiered D2 armed layers {armed:?}, expected every resolved host-placed trunk layer {host:?}"
                 ));
             }
             if owner_kinds.iter().map(|(l, _)| *l).collect::<Vec<_>>() != armed
-                || owner_kinds.iter().any(|(_, kind)| *kind != "whole-layer")
+                || owner_kinds
+                    .iter()
+                    .any(|(_, kind)| !UNTIERED_OWNERS.iter().any(|(owner, _)| owner == kind))
             {
                 return Err(format!(
-                    "armed split owners must all be whole-layer, got {owner_kinds:?}"
+                    "armed split owners must all be whole-layer or slab, got {owner_kinds:?}"
                 ));
             }
-            let want = format!("cpu-whole-split-v1/{}", layer_bitmap_hex(armed));
+            let want = untiered_identity(owner_kinds);
             if identity != want || split_digest != Some(want.as_str()) {
                 return Err(format!(
                     "host exec identity '{identity}' / split digest {split_digest:?}, expected '{want}'"
@@ -2667,5 +2696,35 @@ kl = [kld_from_block(r['ids'][i],r['logprobs'][i],r['residual'][i],candidate) fo
         assert!(pcie(&[], "", true).is_err());
         // A load that resolved fully resident has nothing to compare in either arm.
         assert!(check_untiered_split(UntieredArm::Pcie, &[], &[], &[], "", None, false).is_err());
+    }
+
+    /// Host-mapped expert-slab owners arm the un-tiered D2 arm under the slab
+    /// identity; a model with both un-tiered kinds carries both parts (whole, then
+    /// slab, as the core joins them), and a mismatched identity fails.
+    #[test]
+    fn untiered_split_checks_accept_slab_owners() {
+        let host = [3usize, 4, 5];
+        let d2 = |kinds: &[(usize, &str)], identity: &str| {
+            check_untiered_split(
+                UntieredArm::D2,
+                &host,
+                &host,
+                kinds,
+                identity,
+                Some(identity),
+                true,
+            )
+        };
+        let slab = [(3usize, "slab"), (4, "slab"), (5, "slab")];
+        let slab_id = "cpu-slab-split-v1/38";
+        assert_eq!(untiered_identity(&slab), slab_id);
+        assert!(d2(&slab, slab_id).is_ok());
+        assert!(d2(&slab, "cpu-whole-split-v1/38").is_err());
+        let mixed = [(3usize, "slab"), (4, "whole-layer"), (5, "slab")];
+        let mixed_id = "cpu-whole-split-v1/10+cpu-slab-split-v1/28";
+        assert_eq!(untiered_identity(&mixed), mixed_id);
+        assert!(d2(&mixed, mixed_id).is_ok());
+        assert!(d2(&mixed, slab_id).is_err());
+        assert!(d2(&[(3, "slab"), (4, "tier"), (5, "slab")], slab_id).is_err());
     }
 }
