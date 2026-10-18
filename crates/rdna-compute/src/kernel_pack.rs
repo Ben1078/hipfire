@@ -99,7 +99,7 @@ pub(crate) fn verify_exports(entries: &[KernelEntry], arch: &str, dir: &Path) ->
         let object = dir.join(format!("{}.hsaco", entry.module));
         let bytes = std::fs::read(&object).map_err(|e| format!("{}: {e}", object.display()))?;
         let exports =
-            code_object_exports(&bytes).map_err(|e| format!("{}: {e}", object.display()))?;
+            code_object_exports(&bytes, arch).map_err(|e| format!("{}: {e}", object.display()))?;
         for symbol in KernelCompiler::indexed_symbols(dir, entry.module)? {
             if !exports.contains(&symbol) {
                 unexported.push(format!("{}:{symbol}", entry.module));
@@ -312,8 +312,11 @@ pub fn default_rocm_range(version: &str) -> Option<(String, String)> {
 }
 
 /// The amdgcn ELF of a `--genco` object: an uncompressed clang offload bundle
-/// holding one amdgcn ELF, or that ELF itself.
-fn device_elf(object: &[u8]) -> Result<&[u8], String> {
+/// or that ELF itself. With `arch`, a bundle must carry an image for exactly
+/// that target (`hipv4-amdgcn-amd-amdhsa--<arch>[:features]`; the host entry
+/// and other targets are skipped); without it, the last amdgcn image. A bare
+/// ELF carries no target triple and is taken as is.
+fn device_elf<'a>(object: &'a [u8], arch: Option<&str>) -> Result<&'a [u8], String> {
     const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
     let read_u64 = |at: usize| -> Result<usize, String> {
         let bytes = object
@@ -338,7 +341,23 @@ fn device_elf(object: &[u8]) -> Result<&[u8], String> {
                 .ok_or("offload bundle offset overflow")?;
             let triple = object.get(start..end).ok_or("truncated offload bundle")?;
             cursor = end;
-            if size > 0 && triple.windows(6).any(|window| window == b"amdgcn") {
+            let target = std::str::from_utf8(triple)
+                .ok()
+                .and_then(|t| t.rsplit("--").next())
+                .map(|t| t.split(':').next().unwrap_or(t));
+            let amdgcn = triple.windows(6).any(|window| window == b"amdgcn");
+            let wanted = amdgcn
+                && match arch {
+                    None => size > 0,
+                    Some(arch) => target == Some(arch),
+                };
+            if wanted && size == 0 {
+                return Err(format!(
+                    "offload bundle entry `{}` is empty",
+                    String::from_utf8_lossy(triple)
+                ));
+            }
+            if wanted {
                 let stop = offset
                     .checked_add(size)
                     .ok_or("offload bundle offset overflow")?;
@@ -349,10 +368,16 @@ fn device_elf(object: &[u8]) -> Result<&[u8], String> {
                 );
             }
         }
-        device.ok_or("offload bundle has no amdgcn object")?
+        device.ok_or_else(|| match arch {
+            Some(arch) => format!("offload bundle has no amdgcn image for {arch}"),
+            None => "offload bundle has no amdgcn object".to_owned(),
+        })?
     } else {
         object
     };
+    if object.starts_with(b"CCOB") {
+        return Err("compressed offload bundle (the recipe uses --no-offload-compress)".to_owned());
+    }
     if elf.get(..4) != Some(b"\x7fELF".as_slice()) || elf.len() < 16 {
         return Err("not an ELF code object".to_owned());
     }
@@ -363,7 +388,7 @@ fn device_elf(object: &[u8]) -> Result<&[u8], String> {
 /// offload bundle holding one amdgcn ELF, or that ELF itself.
 pub fn code_object_version(object: &[u8]) -> Result<u32, String> {
     const ELFOSABI_AMDGPU_HSA: u8 = 64;
-    let elf = device_elf(object)?;
+    let elf = device_elf(object, None)?;
     if elf[7] != ELFOSABI_AMDGPU_HSA {
         return Err(format!("ELF OS/ABI {} is not AMDGPU HSA", elf[7]));
     }
@@ -375,7 +400,7 @@ pub fn code_object_version(object: &[u8]) -> Result<u32, String> {
 /// `.dynsym`, the names `hipModuleGetFunction` resolves. (`<kernel>.kd`
 /// descriptors are data objects, not kernels.) The object is the same
 /// uncompressed bundle or bare ELF [`code_object_version`] accepts.
-pub fn code_object_exports(object: &[u8]) -> Result<BTreeSet<String>, String> {
+pub fn code_object_exports(object: &[u8], arch: &str) -> Result<BTreeSet<String>, String> {
     const ELFCLASS64: u8 = 2;
     const ELFDATA2LSB: u8 = 1;
     const SHT_DYNSYM: u64 = 11;
@@ -383,7 +408,7 @@ pub fn code_object_exports(object: &[u8]) -> Result<BTreeSet<String>, String> {
     const STB_GLOBAL: u8 = 1;
     const SYM_SIZE: usize = 24;
     const SECTION_SIZE: usize = 64;
-    let elf = device_elf(object)?;
+    let elf = device_elf(object, Some(arch))?;
     if elf[4] != ELFCLASS64 || elf[5] != ELFDATA2LSB {
         return Err("not a little-endian ELF64 code object".to_owned());
     }
@@ -606,30 +631,104 @@ mod tests {
             ("helper", FUNC, LOCAL),
         ]);
         let expected: BTreeSet<String> = ["kernel_a", "kernel_b"].map(str::to_owned).into();
-        assert_eq!(code_object_exports(&elf).unwrap(), expected);
+        assert_eq!(code_object_exports(&elf, "gfx1100").unwrap(), expected);
         assert_eq!(code_object_version(&elf).unwrap(), 6);
 
         // The same ELF inside an uncompressed offload bundle next to a host entry.
-        let triples: [&[u8]; 2] = [b"host-x86_64-unknown-linux-gnu-", b"hipv4-amdgcn-amd-amdhsa--gfx1100"];
-        let payload_at = 32 + triples.iter().map(|t| 24 + t.len()).sum::<usize>();
-        let mut bundle = b"__CLANG_OFFLOAD_BUNDLE__".to_vec();
-        bundle.extend_from_slice(&2u64.to_le_bytes());
-        for (index, triple) in triples.iter().enumerate() {
-            let (offset, size) = if index == 0 { (payload_at, 0) } else { (payload_at, elf.len()) };
-            for value in [offset, size, triple.len()] {
-                bundle.extend_from_slice(&(value as u64).to_le_bytes());
-            }
-            bundle.extend_from_slice(triple);
-        }
-        bundle.extend_from_slice(&elf);
-        assert_eq!(code_object_exports(&bundle).unwrap(), expected);
+        let bundle = offload_bundle(&[
+            (b"host-x86_64-unknown-linux-gnu-", &[]),
+            (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &elf),
+        ]);
+        assert_eq!(code_object_exports(&bundle, "gfx1100").unwrap(), expected);
 
-        assert!(code_object_exports(b"not an elf at all, sixteen+ bytes").is_err());
+        assert!(code_object_exports(b"not an elf at all, sixteen+ bytes", "gfx1100").is_err());
         let mut no_symbols = elf.clone();
         // Retype the dynsym section header (section 1) so no `.dynsym` remains.
         let sections_at = u64::from_le_bytes(no_symbols[0x28..0x30].try_into().unwrap()) as usize;
         no_symbols[sections_at + 64 + 4] = 1;
-        assert!(code_object_exports(&no_symbols).unwrap_err().contains(".dynsym"));
+        assert!(code_object_exports(&no_symbols, "gfx1100").unwrap_err().contains(".dynsym"));
+    }
+
+    /// An uncompressed clang offload bundle of `(triple, payload)` entries.
+    fn offload_bundle(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut at = 32 + entries.iter().map(|(t, _)| 24 + t.len()).sum::<usize>();
+        let mut bundle = b"__CLANG_OFFLOAD_BUNDLE__".to_vec();
+        bundle.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (triple, payload) in entries {
+            for value in [at, payload.len(), triple.len()] {
+                bundle.extend_from_slice(&(value as u64).to_le_bytes());
+            }
+            bundle.extend_from_slice(triple);
+            at += payload.len();
+        }
+        for (_, payload) in entries {
+            bundle.extend_from_slice(payload);
+        }
+        bundle
+    }
+
+    #[test]
+    fn bundle_exports_come_from_the_target_arch_image_only() {
+        let g1100 = elf_with_dynsym(&[("only_1100", FUNC, GLOBAL)]);
+        let g1151 = elf_with_dynsym(&[("only_1151", FUNC, GLOBAL)]);
+        let host: (&[u8], &[u8]) = (b"host-x86_64-unknown-linux-gnu-", &[]);
+        let bundle = offload_bundle(&[
+            host,
+            (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &g1100),
+            (b"hipv4-amdgcn-amd-amdhsa--gfx1151:xnack-", &g1151),
+        ]);
+        let names = |arch: &str| {
+            code_object_exports(&bundle, arch).map(|set| set.into_iter().collect::<Vec<_>>())
+        };
+        assert_eq!(names("gfx1100").unwrap(), ["only_1100"]);
+        // A target feature suffix does not change the selected arch.
+        assert_eq!(names("gfx1151").unwrap(), ["only_1151"]);
+        let error = names("gfx1201").unwrap_err();
+        assert!(error.contains("no amdgcn image for gfx1201"), "{error}");
+        // `gfx11` is not a prefix match for gfx1100.
+        assert!(names("gfx11").is_err());
+
+        // A target entry whose payload runs past the file is truncated, not skipped.
+        let truncated = &bundle[..bundle.len() - g1151.len() / 2];
+        assert_eq!(code_object_exports(truncated, "gfx1100").unwrap().len(), 1);
+        let error = code_object_exports(truncated, "gfx1151").unwrap_err();
+        assert!(error.contains("truncated offload bundle entry"), "{error}");
+        // An empty target image is an error for that arch; other arches are unaffected.
+        let empty = offload_bundle(&[host, (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &[])]);
+        assert!(code_object_exports(&empty, "gfx1100").unwrap_err().contains("is empty"));
+        // Compressed bundles are refused by name, never read as ELF.
+        let error = code_object_exports(b"CCOB\x03\x00\x00\x00 compressed", "gfx1100").unwrap_err();
+        assert!(error.contains("compressed offload bundle"), "{error}");
+    }
+
+    /// The actual sealed j1778 gfx1100 `tensor_ops.hsaco` (a clang offload bundle:
+    /// host entry + gfx1100 image, not an ELF at offset 0), as staged and copied
+    /// byte for byte: the reader unwraps its target image and returns the 83
+    /// measured kernels; the bare ELF inside gives the same; other targets and a
+    /// truncated file are refused.
+    #[test]
+    fn real_sealed_tensor_ops_bundle_exports_the_measured_kernels() {
+        use sha2::{Digest, Sha256};
+        let bundle: &[u8] =
+            include_bytes!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.hsaco");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bundle)),
+            "bda5593608b016e8adf70a412b114a4799bf7500af9c3d4173be79549de84a3b"
+        );
+        assert!(bundle.starts_with(b"__CLANG_OFFLOAD_BUNDLE__"));
+        assert_eq!(code_object_version(bundle).unwrap(), 6);
+        let measured: BTreeSet<String> =
+            include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt")
+                .lines()
+                .filter_map(|line| line.strip_prefix("export "))
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(measured.len(), 83);
+        assert_eq!(code_object_exports(bundle, "gfx1100").unwrap(), measured);
+        // The gfx1100 ELF at its bundle offset (4096) is the same image.
+        assert_eq!(code_object_exports(&bundle[4096..], "gfx1100").unwrap(), measured);
+        assert!(code_object_exports(bundle, "gfx1151").unwrap_err().contains("no amdgcn image"));
+        assert!(code_object_exports(&bundle[..bundle.len() - 4096], "gfx1100").is_err());
     }
 
     #[test]
