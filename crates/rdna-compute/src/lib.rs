@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod byte_arena;
 pub mod cdna;
 pub mod code_object;
 pub mod compile_jobs;

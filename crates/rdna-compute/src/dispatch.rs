@@ -1431,6 +1431,12 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// S1 F16-shadow arena: the installed shared plan, the planned source-pointer
+    /// bindings and the lazily exact-allocated roots that back the borrowed views
+    /// stored in `fp16_shadow_cache`. Inactive (and allocation-free) off S1; the
+    /// views are always cleared from the cache before their roots are released.
+    f16_shadow_arena: crate::byte_arena::ShadowRootSet<DeviceBuffer>,
+
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms resolve their weight buffer pointer
     /// to a tensor name via `capture_names` and invoke `capture()` with the
@@ -2321,6 +2327,7 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            f16_shadow_arena: crate::byte_arena::ShadowRootSet::new(),
             active_capture: None,
             capture_names: HashMap::new(),
             hessian_capture: None,
@@ -5033,7 +5040,30 @@ impl Gpu {
             return Ok(shadow.buf.as_ptr());
         }
         let n = m * k;
-        let fp16 = self.alloc_tensor(&[n], DType::F16)?;
+        // A source registered with the S1 arena is served ONLY from its planned span
+        // (an allocation failure is the caller's error, never an individual fallback);
+        // every other source keeps the legacy pooled allocation.
+        let fp16 = if let Some(member) = self.f16_shadow_arena.lookup(key) {
+            self.bind_thread()?;
+            let bytes = n
+                .checked_mul(2)
+                .ok_or_else(|| HipError::new(0, "BF16 shadow too large"))?;
+            let view = {
+                let mut device = DirectHipRuntime { hip: &self.hip };
+                let (root, offset) = self
+                    .f16_shadow_arena
+                    .ensure_member(&mut device, member, bytes)
+                    .map_err(|e| exact_alloc_hip_error("ensure_bf16_f16_shadow", e))?;
+                root.byte_view(offset, bytes)
+            };
+            GpuTensor {
+                buf: view,
+                shape: vec![n],
+                dtype: DType::F16,
+            }
+        } else {
+            self.alloc_tensor(&[n], DType::F16)?
+        };
         self.ensure_kernel(
             "gemm_bf16_xf32_multirow",
             kernels::GEMM_BF16_XF32_MULTIROW_SRC,
@@ -5264,6 +5294,90 @@ impl Gpu {
             shape: shape.to_vec(),
             dtype,
         })
+    }
+
+    /// Allocate a tensor with a direct, EXACT-size `hipMalloc` (owning, non-VMM),
+    /// bypassing the pool so a larger reusable buffer can never be handed back.
+    /// The request is `max(bytes, 256)` (the pool's existing minimum); the shape and
+    /// byte size are overflow-checked and the allocator's actual capacity must equal
+    /// the request, else the buffer is released and an error returned.
+    pub fn alloc_tensor_exact(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "alloc_tensor_exact: element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "alloc_tensor_exact: byte size overflowed"))?;
+        let mut device = DirectHipRuntime { hip: &self.hip };
+        let buf = crate::byte_arena::exact_alloc(&mut device, byte_size)
+            .map_err(|e| exact_alloc_hip_error("alloc_tensor_exact", e))?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// Install the S1 F16-shadow arena: metadata only, no GPU allocation. `plan` is
+    /// the model's shared plan and `source_ptrs[i]` is the device pointer of the BF16
+    /// source weight of `plan.f16_shadows.members[i]` (sorted order). Rejects a bad
+    /// plan or bindings, an existing arena, held quarantined roots, and any bound
+    /// source that already has a cached shadow (a stale entry is never accepted).
+    /// After this, [`Self::ensure_bf16_f16_shadow`] serves registered sources from
+    /// lazily exact-allocated roots and leaves unknown sources on the legacy path.
+    pub fn install_f16_shadow_arena(
+        &mut self,
+        plan: Arc<crate::byte_arena::ModelWeightArenaPlan>,
+        source_ptrs: &[usize],
+    ) -> HipResult<()> {
+        let err = |msg: String| HipError::new(0, &format!("install_f16_shadow_arena: {msg}"));
+        for &ptr in source_ptrs {
+            if self.fp16_shadow_cache.contains_key(&ptr) {
+                return Err(err(format!(
+                    "source 0x{ptr:x} already has a cached F16 shadow"
+                )));
+            }
+        }
+        self.f16_shadow_arena.bind(plan, source_ptrs).map_err(err)
+    }
+
+    /// Clear the S1 F16-shadow arena: drop every borrowed shadow view and binding
+    /// FIRST, then quiesce the device and release the real roots exactly once. A
+    /// failed quiesce quarantines the roots (they are never freed behind it) and
+    /// returns the error; a later call retries. With no arena this is a no-op.
+    pub fn clear_f16_shadow_arena(&mut self) -> HipResult<()> {
+        if !self.f16_shadow_arena.is_active()
+            && self.f16_shadow_arena.live_roots() == 0
+            && self.f16_shadow_arena.quarantined_roots() == 0
+        {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let mut device = DirectHipRuntime { hip: &self.hip };
+        crate::byte_arena::clear_shadow_arena(
+            &mut self.fp16_shadow_cache,
+            |t| t.buf.is_borrowed(),
+            &mut self.f16_shadow_arena,
+            &mut device,
+        )
+        .map(|_| ())
+        .map_err(|msg| HipError::new(0, &format!("clear_f16_shadow_arena: {msg}")))
+    }
+
+    /// The installed F16-shadow arena plan, if any.
+    pub fn f16_shadow_arena_plan(&self) -> Option<&Arc<crate::byte_arena::ModelWeightArenaPlan>> {
+        // bind_thread: skip — pure host metadata read.
+        self.f16_shadow_arena.plan()
+    }
+
+    /// Per planned F16-shadow root, in plan order: `None` for a lazy root not yet
+    /// allocated, `Some(actual allocator capacity)` for an allocated one. Empty
+    /// without an arena.
+    pub fn f16_shadow_arena_root_capacities(&self) -> Vec<Option<usize>> {
+        // bind_thread: skip — pure host metadata read.
+        self.f16_shadow_arena.root_capacities(DeviceBuffer::size)
     }
 
     /// Reserve a dense virtual tensor and optionally map its initial prefix.
@@ -7568,6 +7682,12 @@ impl Gpu {
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
+        // S1 arena (no-op without one): borrowed shadow views are dropped from the
+        // cache BEFORE their roots are quiesced and released, so the loop below only
+        // ever sees owning entries and `free_tensor` never gets a borrowed view.
+        if let Err(err) = self.clear_f16_shadow_arena() {
+            eprintln!("[rdna-compute] invalidate_weight_caches: {err}");
+        }
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {
             let _ = self.free_tensor(t);
@@ -8484,6 +8604,60 @@ impl Drop for Gpu {
                 }
             }
         }
+        if self.f16_shadow_arena.is_active()
+            || self.f16_shadow_arena.live_roots() > 0
+            || self.f16_shadow_arena.quarantined_roots() > 0
+        {
+            // Borrowed shadow views first, then a quiesced release of the roots; a
+            // failed quiesce quarantines (leaks) them rather than freeing live memory.
+            if let Err(err) = self.clear_f16_shadow_arena() {
+                eprintln!("[rdna-compute] failed to release the F16 shadow arena during Gpu drop: {err}");
+            }
+        }
+    }
+}
+
+/// The direct HIP allocator used for exact-capacity roots: `hipMalloc` straight
+/// from the runtime (never the pool's possibly oversized reuse), owning
+/// `HipMalloc` buffers, quiesced with a whole-device synchronize.
+struct DirectHipRuntime<'a> {
+    hip: &'a HipRuntime,
+}
+
+impl crate::byte_arena::ExactRootDevice for DirectHipRuntime<'_> {
+    type Root = DeviceBuffer;
+    type Error = HipError;
+
+    fn alloc_exact(&mut self, bytes: usize) -> HipResult<DeviceBuffer> {
+        self.hip.malloc(bytes)
+    }
+
+    fn is_owning(root: &DeviceBuffer) -> bool {
+        root.is_hip_allocation()
+    }
+
+    fn capacity(root: &DeviceBuffer) -> usize {
+        root.size()
+    }
+
+    fn quiesce(&mut self) -> HipResult<()> {
+        self.hip.device_synchronize()
+    }
+
+    fn release(&mut self, root: DeviceBuffer) -> HipResult<()> {
+        self.hip.free(root)
+    }
+}
+
+/// Map an exact-allocation failure to a `HipError`, preserving the HIP code of a
+/// real allocator failure (out-of-memory stays out-of-memory).
+fn exact_alloc_hip_error(
+    context: &str,
+    err: crate::byte_arena::ExactAllocError<HipError>,
+) -> HipError {
+    match err {
+        crate::byte_arena::ExactAllocError::Alloc(hip) => hip,
+        other => HipError::new(0, &format!("{context}: {other}")),
     }
 }
 
