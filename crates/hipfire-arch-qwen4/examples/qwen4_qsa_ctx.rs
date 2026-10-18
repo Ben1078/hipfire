@@ -58,6 +58,45 @@
 //! snapshot fails. The instrumented repeat (state byte identity) validates
 //! exactly the admitted events.
 //!
+//! Q8 capture-only (lab; one process = one native prefill route):
+//!
+//! * `QSA_CAPTURE_ONLY=1` + `QSA_DUMP_DIR`: run ONLY the tapped prefill of each
+//!   context (no decode rows, instrumented repeat, all-prefill pass, greedy
+//!   continuation, CPU parity or logits files; `DECODE` must be 0) and write one
+//!   real `qsa-source-v1` attention snapshot per admitted QSA slot and chunk for
+//!   the Q8 state: full-capacity raw Q8_0 K/V bytes (row = `kv_heads * dim/32`
+//!   blocks of 34 bytes: f16 scale + 32 i8 codes; never read as F32),
+//!   `qgate.f32`, the ordered `selected.i32` (+ mirror), the eager head output
+//!   `eager.f32`, index projection / raw / pooled arenas, and a header with
+//!   `format:"q8"`, `kv_row_bytes`, `kv_head_bytes`, `kv_block_bytes`,
+//!   `qgate_row_stride_f32`, `eager_row_stride_f32`, `selected_row_stride_i32`,
+//!   rows / position_start / capacity / full_capacity / budget_blocks / compress
+//!   and source (`QSA_SOURCE_SHA` + binary sha256), model (`QSA_ARTIFACT_ID`
+//!   md5 + container metadata / manifest / sidecar identity) and prompt (token
+//!   id sha256, text sha256) identity. Both `QSA_ARTIFACT_ID` and
+//!   `QSA_SOURCE_SHA` are required. The state format must be Q8.
+//! * `QSA_CAPTURE_PLAN=first,last_full,tail,all,<pos>,...`: which prefill tiles
+//!   to capture (default `first,last_full,tail`). Tiles are `chunk` rows from 0,
+//!   `chunk` = the first tile's rows (follows `HIPFIRE_PREFILL_CHUNK_ROWS` and
+//!   load-time admission); `first` = start 0, `last_full` = last full tile,
+//!   `tail` = the partial final tile, `<pos>` = an explicit tile start. A token
+//!   that names no tile (e.g. `tail` when the prefill is a whole number of
+//!   tiles) fails the run, as does any admitted tile/slot not captured.
+//!   `QSA_DUMP_LAYERS` still selects slots (default every QSA slot).
+//!   Mutually exclusive with `QSA_DUMP_POSITIONS`, `QSA_DUMP_LAST_FULL_DECODE`
+//!   and `QSA_DUMP_SELECTOR_ONLY`.
+//!
+//! Native route rows come from the process chunk ceiling (scratch and tiling
+//! are sized at load, so one fresh process per route; `CTX=8192 STRIDE=256
+//! DECODE=0`): `HIPFIRE_PREFILL_CHUNK_ROWS=768` (tiles 0..6912 + 512-row tail
+//! at 7680; default plan `first,last_full,tail`), `=1536` (tiles .. 6144 +
+//! 512-row tail at 7680; same plan), `=8192` (one tile; `QSA_CAPTURE_PLAN=first`,
+//! `tail` would fail; for a deep-context 512-row tail run `CTX=8704` with
+//! `QSA_CAPTURE_PLAN=first,tail`).
+//!
+//! Q8 capture-only usage: QSA_CAPTURE_ONLY=1 QSA_DUMP_DIR=DIR QSA_ARTIFACT_ID=MD5
+//! QSA_SOURCE_SHA=SHA qwen4_qsa_ctx MODEL TEXT OUT.jsonl 8192 256 0
+//!
 //! usage: qwen4_qsa_ctx MODEL TEXT OUT.jsonl [CTX=2048,4096,8192,16384,32768]
 //!        [STRIDE=256] [DECODE=4]
 
@@ -80,6 +119,7 @@ mod evidence;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -342,6 +382,45 @@ fn env_layers() -> Result<Option<Vec<usize>>> {
     Ok(Some(slots))
 }
 
+/// One `QSA_CAPTURE_PLAN` token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanItem {
+    First,
+    LastFull,
+    Tail,
+    All,
+    At(usize),
+}
+
+/// `QSA_CAPTURE_PLAN` text and tokens; `first,last_full,tail` when unset.
+fn env_capture_plan() -> Result<(String, Vec<PlanItem>)> {
+    let text = match std::env::var("QSA_CAPTURE_PLAN") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => "first,last_full,tail".to_string(),
+    };
+    let items = text
+        .split(',')
+        .map(|token| match token.trim() {
+            "first" => Ok(PlanItem::First),
+            "last_full" => Ok(PlanItem::LastFull),
+            "tail" => Ok(PlanItem::Tail),
+            "all" => Ok(PlanItem::All),
+            other => other
+                .parse::<usize>()
+                .map(PlanItem::At)
+                .map_err(|_| format!("QSA_CAPTURE_PLAN: bad token '{other}'")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((text, items))
+}
+
+fn nonfinite_f32(bytes: &[u8]) -> usize {
+    bytes
+        .chunks_exact(4)
+        .filter(|b| !f32::from_le_bytes([b[0], b[1], b[2], b[3]]).is_finite())
+        .count()
+}
+
 struct Probe {
     phase: &'static str,
     ctx: usize,
@@ -378,6 +457,23 @@ struct Probe {
     artifact_id: String,
     expected_state: Vec<(String, String)>,
     validation_cursor: Option<usize>,
+    /// `QSA_CAPTURE_ONLY`: tapped-prefill Q8 snapshots only (see the header).
+    capture_only: bool,
+    plan_text: String,
+    plan: Vec<PlanItem>,
+    /// The plan resolved against this context's tiling (set on the position-0 call).
+    plan_resolved: bool,
+    /// Admitted tile start -> its expected row count.
+    plan_rows: BTreeMap<usize, usize>,
+    /// Every (slot, tile start) tap call of the capture-only prefill.
+    calls: BTreeSet<(usize, usize)>,
+    captured: BTreeSet<(usize, usize)>,
+    /// Tile start -> rows, as observed.
+    tile_trace: BTreeMap<usize, usize>,
+    capture_bytes: u64,
+    capture_s: f64,
+    run_identity: Value,
+    prompt_identity: Value,
 }
 
 impl Probe {
@@ -413,6 +509,9 @@ impl Probe {
     /// Whether QSA_DUMP_LAYERS / QSA_DUMP_POSITIONS / QSA_DUMP_LAST_FULL_DECODE
     /// admit a capture of `slot` at this call (phase, position, rows).
     fn admits(&mut self, slot: usize, op: &IndexedAttentionOp<'_>) -> bool {
+        if self.capture_only {
+            return self.capture_admits(slot, op);
+        }
         if let Some(layers) = self.dump_layers.as_ref() {
             if !layers.contains(&slot) {
                 return false;
@@ -703,11 +802,15 @@ impl Probe {
             return Err("qsa evidence dumps cover the f32 and RDNA fp8 states only (gfx942 fp8 has no exact oracle; QSA_DUMP_SELECTOR_ONLY=1 for the selector snapshot)".into());
         }
         if op.state.format == QsaKvFormat::Q8 {
+            if self.capture_only {
+                return self.q8_evidence(gpu, slot, op, root);
+            }
             // Lab (BF16-index select route G0): with QSA_DUMP_POSITIONS or
             // QSA_DUMP_LAST_FULL_DECODE, the q8 state dumps the selector
-            // inputs/outputs only (the exact attention oracle covers f32/fp8 only).
+            // inputs/outputs only (QSA_CAPTURE_ONLY=1 is the full Q8 attention
+            // snapshot; the exact attention oracle covers f32/fp8 only).
             if self.dump_positions.is_none() && !self.last_full_decode {
-                return Err("qsa evidence dumps cover the f32 and fp8 states only (q8: selector-only with QSA_DUMP_POSITIONS, QSA_DUMP_LAST_FULL_DECODE or QSA_DUMP_SELECTOR_ONLY)".into());
+                return Err("qsa evidence dumps cover the f32 and fp8 states only (q8: QSA_CAPTURE_ONLY=1, or selector-only with QSA_DUMP_POSITIONS, QSA_DUMP_LAST_FULL_DECODE or QSA_DUMP_SELECTOR_ONLY)".into());
             }
             let root = root.clone();
             return self.selector_evidence(gpu, slot, op, root);
@@ -1127,6 +1230,304 @@ impl Probe {
         }
         Ok(())
     }
+
+    /// Capture-only admission: prefill phase, requested slot, planned tile.
+    fn capture_admits(&self, slot: usize, op: &IndexedAttentionOp<'_>) -> bool {
+        self.phase == "prefill"
+            && self.dump_layers.as_ref().map_or(true, |l| l.contains(&slot))
+            && self.plan_rows.contains_key(&op.state.position)
+    }
+
+    /// Reset the per-context capture state.
+    fn begin_capture(&mut self, ctx: usize, prompt_identity: Value) {
+        self.phase = "prefill";
+        self.ctx = ctx;
+        self.chunk_rows = 0;
+        self.plan_resolved = false;
+        self.plan_rows.clear();
+        self.calls.clear();
+        self.captured.clear();
+        self.tile_trace.clear();
+        self.capture_bytes = 0;
+        self.capture_s = 0.0;
+        self.prompt_identity = prompt_identity;
+    }
+
+    /// Resolve the plan against the prefill's tiling from the position-0 call.
+    fn resolve_plan(&mut self, op: &IndexedAttentionOp<'_>) -> Result<()> {
+        let prefill = self.ctx - self.decode;
+        let chunk = if op.rows < prefill {
+            op.rows
+        } else {
+            self.requested_chunk.max(prefill)
+        };
+        let (full, rem) = (prefill / chunk, prefill % chunk);
+        let mut positions = BTreeSet::new();
+        for item in &self.plan {
+            match *item {
+                PlanItem::First => {
+                    positions.insert(0);
+                }
+                PlanItem::LastFull => {
+                    if full == 0 {
+                        return Err(format!("plan last_full: prefill {prefill} holds no full {chunk}-row tile"));
+                    }
+                    positions.insert((full - 1) * chunk);
+                }
+                PlanItem::Tail => {
+                    if rem == 0 {
+                        return Err(format!("plan tail: prefill {prefill} is a whole number of {chunk}-row tiles (no partial tail)"));
+                    }
+                    positions.insert(full * chunk);
+                }
+                PlanItem::All => {
+                    positions.extend((0..prefill).step_by(chunk));
+                }
+                PlanItem::At(p) => {
+                    if p >= prefill || p % chunk != 0 {
+                        return Err(format!("plan position {p}: not a tile start of {chunk}-row tiles over {prefill} rows"));
+                    }
+                    positions.insert(p);
+                }
+            }
+        }
+        self.chunk_rows = chunk;
+        self.plan_rows = positions
+            .into_iter()
+            .map(|p| (p, chunk.min(prefill - p)))
+            .collect();
+        self.plan_resolved = true;
+        Ok(())
+    }
+
+    /// Capture-only tap: no CPU parity, no instrumented repeat.
+    fn capture_tap(
+        &mut self,
+        gpu: &mut Gpu,
+        slot: usize,
+        op: &IndexedAttentionOp<'_>,
+    ) -> Result<()> {
+        if op.state.format != QsaKvFormat::Q8 {
+            return Err(format!(
+                "QSA_CAPTURE_ONLY captures the q8 state only (state is {})",
+                op.state.format.name()
+            ));
+        }
+        let position = op.state.position;
+        self.calls.insert((slot, position));
+        self.tile_trace.entry(position).or_insert(op.rows);
+        if position == 0 && !self.plan_resolved {
+            self.resolve_plan(op)?;
+        }
+        if !self.capture_admits(slot, op) {
+            return Ok(());
+        }
+        let expected = self.plan_rows[&position];
+        if op.rows != expected {
+            return Err(format!(
+                "tile at {position}: {} rows observed, {expected} planned",
+                op.rows
+            ));
+        }
+        let started = Instant::now();
+        gpu.hip.device_synchronize().map_err(err)?;
+        self.full_evidence(gpu, slot, op)?;
+        self.captured.insert((slot, position));
+        self.capture_s += started.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// Verify every planned tile was executed and captured for every slot and
+    /// return the per-context capture summary.
+    fn finish_capture(&mut self) -> Result<Value> {
+        if !self.plan_resolved {
+            return Err("capture-only: the prefill made no tap call at position 0".into());
+        }
+        let slots: BTreeSet<usize> = self
+            .calls
+            .iter()
+            .map(|&(s, _)| s)
+            .filter(|s| self.dump_layers.as_ref().map_or(true, |l| l.contains(s)))
+            .collect();
+        if let Some(layers) = &self.dump_layers {
+            if let Some(missing) = layers.iter().find(|s| !self.calls.iter().any(|c| c.0 == **s)) {
+                return Err(format!("QSA_DUMP_LAYERS slot {missing} never reached the tap"));
+            }
+        }
+        for (&position, &rows) in &self.plan_rows {
+            if self.tile_trace.get(&position) != Some(&rows) {
+                return Err(format!("planned tile {position}/{rows} was not executed"));
+            }
+            for &slot in &slots {
+                if !self.captured.contains(&(slot, position)) {
+                    return Err(format!("slot {slot} tile {position} not captured"));
+                }
+            }
+        }
+        Ok(json!({
+            "kind": "capture_only", "ctx": self.ctx, "decode_rows": self.decode,
+            "plan": self.plan_text, "chunk_rows": self.chunk_rows,
+            "prefill_rows": self.ctx - self.decode,
+            "captured_tiles": self.plan_rows.iter().map(|(&p, &r)| json!({"position_start": p, "rows": r})).collect::<Vec<_>>(),
+            "tile_trace": self.tile_trace.iter().map(|(&p, &r)| json!({"position_start": p, "rows": r})).collect::<Vec<_>>(),
+            "qsa_slots": slots, "snapshots": self.captured.len(),
+            "snapshot_bytes": self.capture_bytes, "capture_io_s": self.capture_s,
+            "identity": self.run_identity, "prompt": self.prompt_identity,
+        }))
+    }
+
+    /// Real Q8 `qsa-source-v1` attention snapshot of one (slot, tile): explicit
+    /// Q8_0 strides, full-capacity raw K/V bytes, the ordered selection, the
+    /// Q/gate rows and the eager output. The cache is never decoded here.
+    fn q8_evidence(
+        &mut self,
+        gpu: &mut Gpu,
+        slot: usize,
+        op: &IndexedAttentionOp<'_>,
+        root: std::path::PathBuf,
+    ) -> Result<()> {
+        let g = evidence::Geometry {
+            rows: op.rows,
+            position_start: op.state.position,
+            heads: op.heads,
+            kv_heads: op.kv_heads,
+            dim: op.head_dim,
+            budget_blocks: op.budget / op.compress,
+            compress: op.compress,
+            capacity: op.state.selected_capacity,
+            full_capacity: op.state.full_capacity,
+            fp8: false,
+        };
+        if g.dim % 32 != 0 {
+            return Err(format!("q8 snapshot: head_dim {} is not a whole Q8_0 block count", g.dim));
+        }
+        let (blocks_per_head, block_bytes) = (g.dim / 32, 34usize);
+        let head_bytes = blocks_per_head * block_bytes;
+        let row_bytes = op.state.format.kv_row_bytes(g.kv_heads, g.dim);
+        if row_bytes != g.kv_heads * head_bytes {
+            return Err(format!("q8 snapshot: row bytes {row_bytes} != {} heads x {head_bytes}", g.kv_heads));
+        }
+        let end = g.position_start + g.rows;
+        if end > g.full_capacity {
+            return Err(format!("q8 snapshot: rows end {end} past capacity {}", g.full_capacity));
+        }
+        for (name, tensor) in [
+            ("qgate", op.qgate_scratch),
+            ("eager", op.qsa_output),
+            ("index-projection", op.index_scratch),
+        ] {
+            if tensor.dtype != DType::F32 {
+                return Err(format!("q8 snapshot: {name} scratch is {:?}, expected F32", tensor.dtype));
+            }
+        }
+        let key = format!("ctx-{}-{}-layer-{slot}-chunk-{}", self.ctx, self.phase, g.position_start);
+        let qgate = read_raw(gpu, op.qgate_scratch, 0, g.rows * g.heads * g.dim * 2)?;
+        let eager = read_raw(gpu, op.qsa_output, 0, g.rows * g.heads * g.dim)?;
+        let cache_bytes = g.full_capacity * row_bytes;
+        let keys = read_bytes(gpu, op.state.full_keys, 0, cache_bytes)?;
+        let values = read_bytes(gpu, op.state.full_values, 0, cache_bytes)?;
+        let selected = read_bytes(gpu, op.selected_scratch, 0, g.rows * g.capacity * 4)?;
+        let mirror = read_bytes(gpu, op.state.selected_indices, 0, g.capacity * 4)?;
+        let raw = read_raw(gpu, op.state.raw_index_keys, 0, g.full_capacity * op.index_dim)?;
+        let pooled = read_raw(gpu, op.state.pooled_keys, 0, op.state.pooled_capacity * op.index_dim)?;
+        let index_stride = (op.index_heads + op.index_kv_heads) * op.index_dim;
+        let index_projection = read_raw(gpu, op.index_scratch, 0, g.rows * index_stride)?;
+        let index_norm = read_raw(gpu, op.indexer_k_norm, 0, op.index_dim)?;
+
+        // Selected rows: ordered ranked blocks then the causal tail, `-1` fill.
+        // An out-of-range token is a corrupt capture; a length that differs
+        // from the documented contract is recorded, not hidden.
+        let (mut len_match, mut max_len, mut duplicate_rows) = (0usize, 0usize, 0usize);
+        for (row, entries) in selected.chunks_exact(g.capacity * 4).enumerate() {
+            let visible = g.position_start + row + 1;
+            let tokens: Vec<i32> = entries
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let live = tokens.iter().filter(|&&t| t >= 0).count();
+            if tokens.iter().any(|&t| t < -1 || t as i64 >= visible as i64) {
+                return Err(format!("q8 snapshot {key}: row {row} selects a token outside [-1, {visible})"));
+            }
+            if tokens[..live].iter().any(|&t| t < 0) {
+                return Err(format!("q8 snapshot {key}: row {row} has -1 inside its selected prefix"));
+            }
+            let unique: BTreeSet<i32> = tokens[..live].iter().copied().collect();
+            duplicate_rows += usize::from(unique.len() != live);
+            len_match += usize::from(live == g.selected_len(row));
+            max_len = max_len.max(live);
+        }
+        let (qgate_nonfinite, eager_nonfinite) = (nonfinite_f32(&qgate), nonfinite_f32(&eager));
+        let blobs = [
+            ("qgate.f32", qgate.as_slice()),
+            ("keys.source", keys.as_slice()),
+            ("values.source", values.as_slice()),
+            ("selected.i32", selected.as_slice()),
+            ("selected-mirror.i32", mirror.as_slice()),
+            ("raw-index.source", raw.as_slice()),
+            ("pooled.source", pooled.as_slice()),
+            ("eager.f32", eager.as_slice()),
+            ("index-projection.f32", index_projection.as_slice()),
+            ("indexer-k-norm.source", index_norm.as_slice()),
+        ];
+        let dir = root.join(&key);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let mut files = serde_json::Map::new();
+        let mut total = 0u64;
+        for (name, bytes) in blobs {
+            std::fs::write(dir.join(name), bytes).map_err(err)?;
+            total += bytes.len() as u64;
+            files.insert(
+                name.into(),
+                json!({"bytes":bytes.len(),"sha256":evidence::sha256(bytes)}),
+            );
+        }
+        let mut geometry = g.json();
+        geometry["format"] = json!("q8");
+        geometry["kv_row_bytes"] = json!(row_bytes);
+        geometry["kv_head_bytes"] = json!(head_bytes);
+        geometry["kv_block_elems"] = json!(32);
+        geometry["kv_block_bytes"] = json!(block_bytes);
+        geometry["kv_blocks_per_head"] = json!(blocks_per_head);
+        geometry["kv_block_layout"] = json!("f16le scale then 32 i8 codes; head-major blocks");
+        geometry["qgate_row_stride_f32"] = json!(g.heads * g.dim * 2);
+        geometry["eager_row_stride_f32"] = json!(g.heads * g.dim);
+        geometry["selected_row_stride_i32"] = json!(g.capacity);
+        geometry["valid_cache_rows"] = json!(end);
+        let identity = json!({"artifact": self.artifact_id, "layer": slot, "chunk": g.position_start,
+            "phase": self.phase, "ctx": self.ctx, "arch": gpu.arch,
+            "source_format": op.state.format.name(), "capture_only": true,
+            "run": self.run_identity, "prompt": self.prompt_identity,
+            "selector":{"heads":op.index_heads,"kv_heads":op.index_kv_heads,"dim":op.index_dim,
+                "projection_stride":index_stride,"projection_dtype":format!("{:?}",op.index_scratch.dtype),
+                "raw_dtype":format!("{:?}",op.state.raw_index_keys.dtype),
+                "pooled_dtype":format!("{:?}",op.state.pooled_keys.dtype),
+                "norm_dtype":format!("{:?}",op.indexer_k_norm.dtype),"pooled_capacity":op.state.pooled_capacity},
+            "eager_source":"production QSA attention output of this tapped prefill step (qsa_output, post-gate)",
+            "validity":{"selected_rows_len_match_contract":len_match,"rows":g.rows,"max_selected_len":max_len,
+                "rows_with_duplicate_tokens":duplicate_rows,
+                "qgate_nonfinite":qgate_nonfinite,"eager_nonfinite":eager_nonfinite}});
+        let path = dir.join("snapshot.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({"schema":"qsa-source-v1","identity":identity,
+            "geometry":geometry,"files":files}))
+            .map_err(err)?,
+        )
+        .map_err(err)?;
+        self.capture_bytes += total;
+        eprintln!(
+            "[capture] ctx {} slot {slot} position {} rows {} {:.1} MiB",
+            self.ctx,
+            g.position_start,
+            g.rows,
+            total as f64 / 1048576.0
+        );
+        self.rows.push(
+            json!({"kind":"full_evidence","format":"q8","slot":slot,"chunk":g.position_start,
+            "phase":self.phase,"ctx":self.ctx,"snapshot":path.display().to_string(),"bytes":total}),
+        );
+        Ok(())
+    }
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -1177,6 +1578,24 @@ fn main() -> Result<()> {
         return Err(
             "QSA_DUMP_LAST_FULL_DECODE and QSA_DUMP_POSITIONS are mutually exclusive".into(),
         );
+    }
+    let capture_only = env_flag("QSA_CAPTURE_ONLY")?;
+    let (capture_plan_text, capture_plan) = env_capture_plan()?;
+    if capture_only {
+        if dump_dir.is_none() {
+            return Err("QSA_CAPTURE_ONLY needs QSA_DUMP_DIR".into());
+        }
+        if dump_positions.is_some() || last_full_decode || selector_only {
+            return Err("QSA_CAPTURE_ONLY is exclusive with QSA_DUMP_POSITIONS / QSA_DUMP_LAST_FULL_DECODE / QSA_DUMP_SELECTOR_ONLY".into());
+        }
+        if decode != 0 {
+            return Err("QSA_CAPTURE_ONLY captures the tapped prefill only: DECODE must be 0".into());
+        }
+        for name in ["QSA_ARTIFACT_ID", "QSA_SOURCE_SHA"] {
+            if std::env::var(name).map_or(true, |v| v.trim().is_empty()) {
+                return Err(format!("QSA_CAPTURE_ONLY needs {name} (model md5 / source commit) for the snapshot identity"));
+            }
+        }
     }
     let dump_enabled = dump_dir.is_some();
     let capture_filtered = dump_layers.is_some() || last_full_decode;
@@ -1230,6 +1649,30 @@ fn main() -> Result<()> {
     let trunk_overlay =
         hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
             .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+    // Snapshot identity (capture-only): container metadata + manifest digests
+    // and file stat identity of the base and the PLE sidecar, taken while the
+    // admitted source is still whole.
+    let model_identity = if capture_only {
+        let id = &receipt.source_identity;
+        let manifest: String = id
+            .manifest
+            .iter()
+            .map(|r| format!("{}|{}|{}|{}|{}|{:?}\n", r.name, r.file_index, r.offset, r.length, r.dtype, r.logical_shape))
+            .collect();
+        let sidecar = match &choice.origin {
+            PleRowsOrigin::Embedded => Value::Null,
+            PleRowsOrigin::Sidecar(p) => json!({"path": p.display().to_string(),
+                "bytes": std::fs::metadata(p).map(|m| m.len()).ok()}),
+        };
+        json!({"path": id.canonical_path.display().to_string(),
+            "files": id.files.iter().map(|f| json!({"path": f.canonical_path.display().to_string(),
+                "len": f.len, "mtime_secs": f.mtime_secs, "mtime_nanos": f.mtime_nanos})).collect::<Vec<_>>(),
+            "metadata_sha256": evidence::sha256(id.metadata_json.as_bytes()),
+            "manifest_entries": id.manifest.len(), "manifest_sha256": evidence::sha256(manifest.as_bytes()),
+            "ple_rows": {"format": choice.format.name(), "sidecar": sidecar}})
+    } else {
+        Value::Null
+    };
     // The loader's forward scratch plan: decided from the actual routed-expert
     // payload (while the mapping is readable) and charged to the auto
     // placement and attached below alike.
@@ -1400,6 +1843,35 @@ fn main() -> Result<()> {
 
     let requested_chunk =
         hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, n_ctx);
+    let text_bytes = text.as_bytes();
+    let run_identity = if capture_only {
+        let env_keys = [
+            "HIPFIRE_PREFILL_CHUNK_ROWS",
+            "HIPFIRE_KV_MODE",
+            "HIPFIRE_STATE_QUANT",
+            "HIPFIRE_QWEN4_QSA_WMMA_GATHER",
+            "HIPFIRE_QWEN4_QSA_PM",
+            "HIPFIRE_QWEN4_F16_WMMA",
+            "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS",
+            "HIPFIRE_QWEN4_QSA_DECODE_SPLITK",
+        ];
+        let env_map: serde_json::Map<String, Value> = env_keys
+            .iter()
+            .map(|k| (k.to_string(), json!(std::env::var(k).ok())))
+            .collect();
+        let exe = std::env::current_exe().map_err(err)?;
+        let exe_bytes = std::fs::read(&exe).map_err(err)?;
+        json!({"source_sha": std::env::var("QSA_SOURCE_SHA").ok(),
+            "binary": exe.display().to_string(), "binary_sha256": evidence::sha256(&exe_bytes),
+            "model_md5": std::env::var("QSA_ARTIFACT_ID").ok(), "model": model_identity,
+            "text_path": args[2], "text_sha256": evidence::sha256(text_bytes),
+            "arch": gpu.arch, "qsa_format": qsa_format.name(), "gdn_format": state_format.gdn.name(),
+            "backend": backend.name(), "n_ctx": n_ctx, "stride": stride,
+            "requested_chunk": requested_chunk,
+            "env": env_map, "plan": capture_plan_text})
+    } else {
+        Value::Null
+    };
     let probe = Arc::new(Mutex::new(Probe {
         phase: "prefill",
         ctx: 0,
@@ -1418,6 +1890,18 @@ fn main() -> Result<()> {
         artifact_id: std::env::var("QSA_ARTIFACT_ID").unwrap_or_else(|_| args[1].clone()),
         expected_state: Vec::new(),
         validation_cursor: None,
+        capture_only,
+        plan_text: capture_plan_text,
+        plan: capture_plan,
+        plan_resolved: false,
+        plan_rows: BTreeMap::new(),
+        calls: BTreeSet::new(),
+        captured: BTreeSet::new(),
+        tile_trace: BTreeMap::new(),
+        capture_bytes: 0,
+        capture_s: 0.0,
+        run_identity,
+        prompt_identity: Value::Null,
         wmma_dense: gpu.arch_caps.has_wmma_w32()
             && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
         wmma_gather: rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format),
@@ -1439,6 +1923,40 @@ fn main() -> Result<()> {
             p.expected_state.clear();
             p.validation_cursor = None;
             p.pooled_checked.iter_mut().for_each(|c| *c = 0);
+        }
+        if capture_only {
+            let ids_le: Vec<u8> = prompt.iter().flat_map(|t| t.to_le_bytes()).collect();
+            probe.lock().map_err(err)?.begin_capture(
+                ctx,
+                json!({"ctx": ctx, "tokens": prompt.len(), "token_ids_sha256": evidence::sha256(&ids_le),
+                    "first_token": prompt[0], "last_token": prompt[ctx - 1], "text_sha256": evidence::sha256(text.as_bytes())}),
+            );
+            let capture_probe = Arc::clone(&probe);
+            bundle
+                .set_qsa_tap(Some(Box::new(move |gpu, slot, op| {
+                    capture_probe.lock().map_err(err)?.capture_tap(gpu, slot, op)
+                })))
+                .map_err(err)?;
+            eprintln!(
+                "[phase] ctx {ctx} capture-only prefill at {:.1}s",
+                run_start.elapsed().as_secs_f64()
+            );
+            let t = Instant::now();
+            bundle
+                .forward_chunk_final(&mut gpu, prompt, &logits, None)
+                .map_err(err)?;
+            gpu.hip.device_synchronize().map_err(err)?;
+            let wall_s = t.elapsed().as_secs_f64();
+            bundle.set_qsa_tap(None).map_err(err)?;
+            let mut summary = probe.lock().map_err(err)?.finish_capture()?;
+            summary["capture_prefill_wall_s"] = json!(wall_s);
+            eprintln!("{summary}");
+            let rows = std::mem::take(&mut probe.lock().map_err(err)?.rows);
+            for row in rows.iter().chain(std::iter::once(&summary)) {
+                writeln!(out, "{row}").map_err(err)?;
+            }
+            out.flush().map_err(err)?;
+            continue;
         }
         let tap_probe = Arc::clone(&probe);
         let tap: Qwen4QsaTap =

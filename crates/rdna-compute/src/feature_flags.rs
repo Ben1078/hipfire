@@ -17,6 +17,10 @@ pub enum Mb4Mode {
     Pack4,
 }
 
+/// Default of the gfx1100 Q8 gathered QSA attention (`HIPFIRE_FN_QSA_GATHER_GFX1100`).
+/// Opt-in during XTX qualification; the promotion commit flips this one constant.
+pub const FN_QSA_GATHER_GFX1100_DEFAULT: bool = false;
+
 #[derive(Debug, Clone)]
 pub struct FeatureFlags {
     // ── Arch identity ──────────────────────────────────────────────
@@ -657,6 +661,10 @@ pub struct FeatureFlags {
     /// incumbent while sharing activation loads across weight rows. Default on
     /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
     pub fn_lane_pm_rows: bool,
+    /// gfx1100 Flash-Next Q8 gathered QSA attention (`HIPFIRE_FN_QSA_GATHER_GFX1100`):
+    /// `None` follows [`FN_QSA_GATHER_GFX1100_DEFAULT`]; `=0` always disables, `=1` enables.
+    /// The architecture capability is gated separately by the runtime.
+    pub fn_qsa_gather_gfx1100: Option<bool>,
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
     /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
     /// exactly `0` (kill switch for both). KLD-gated, not bit-exact against
@@ -1168,6 +1176,7 @@ impl FeatureFlags {
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
+            fn_qsa_gather_gfx1100: parse_bool("HIPFIRE_FN_QSA_GATHER_GFX1100"),
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref() != Some("0"),
             qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
             qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
@@ -1242,6 +1251,14 @@ impl FeatureFlags {
     /// ([`crate::Gpu::lane_rows_pm_enabled`]).
     pub fn fn_lane_pm_rows_enabled(&self) -> bool {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
+    }
+
+    /// Resolved gfx1100 Q8 gathered QSA attention opt-in
+    /// (`HIPFIRE_FN_QSA_GATHER_GFX1100`): env override, else
+    /// [`FN_QSA_GATHER_GFX1100_DEFAULT`]. The architecture capability
+    /// ([`crate::arch_caps::ArchCaps::has_qsa_gather_q8_attend_pm`]) is checked separately.
+    pub fn fn_qsa_gather_gfx1100_enabled(&self) -> bool {
+        self.fn_qsa_gather_gfx1100.unwrap_or(FN_QSA_GATHER_GFX1100_DEFAULT)
     }
 
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
@@ -1631,6 +1648,7 @@ impl FeatureFlags {
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
+            fn_qsa_gather_gfx1100: None,
             qwen4_qsa_decode_splitk: false,
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
@@ -1867,6 +1885,24 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    /// The gfx1100 Q8 gathered QSA attention is opt-in while it is qualified:
+    /// unset follows [`FN_QSA_GATHER_GFX1100_DEFAULT`], `=1` enables, `=0` always
+    /// disables; `for_test` leaves it unset.
+    #[test]
+    fn fn_qsa_gather_gfx1100_is_opt_in_and_zero_always_disables() {
+        let flags = |raw: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1100", |name| match raw {
+                Some(v) if name == "HIPFIRE_FN_QSA_GATHER_GFX1100" => Ok(v.into()),
+                _ => Err(()),
+            })
+        };
+        assert_eq!(flags(None).fn_qsa_gather_gfx1100, None);
+        assert_eq!(flags(None).fn_qsa_gather_gfx1100_enabled(), FN_QSA_GATHER_GFX1100_DEFAULT);
+        assert!(!flags(Some("0")).fn_qsa_gather_gfx1100_enabled());
+        assert!(flags(Some("1")).fn_qsa_gather_gfx1100_enabled());
+        assert_eq!(FeatureFlags::for_test("gfx1100").fn_qsa_gather_gfx1100, None);
     }
 
     /// The lane-rows PM kernels default on for exact gfx1151 only: `0` is the

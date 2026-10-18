@@ -2,19 +2,19 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! QSA gathered F16 WMMA builder family (gfx1151 + gfx1201).
+//! QSA gathered F16 WMMA builder family (gfx1151 + gfx1201 modules, the gfx1100 attention-only module).
 use peacemaker_isa::Arch;
 use peacemaker_isa::kernels::qsa_gather::{self, Kind, Spec};
 #[macro_use]
 #[path = "support/rocm.rs"]
 mod rocm;
 
-const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
+const ARCHES: [Arch; 3] = [Arch::Gfx1151, Arch::Gfx1201, Arch::Gfx1100];
 
 #[test]
 fn entries_are_deterministic_and_target_only_their_arches() {
     for arch in ARCHES {
-        for kind in Kind::ALL {
+        for &kind in Kind::for_arch(arch) {
             let spec = Spec { arch, kind };
             let (a, b) = (qsa_gather::emit(spec).unwrap(), qsa_gather::emit(spec).unwrap());
             assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
@@ -22,7 +22,16 @@ fn entries_are_deterministic_and_target_only_their_arches() {
             assert_eq!(a.shape.barriers, if kind == Kind::Attend { 4 } else { 0 }, "{spec:?}");
         }
     }
-    assert!(qsa_gather::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Attend }).is_err());
+    // gfx1100 carries the attention only: its Q8 converter is the hipcc kernel.
+    assert_eq!(Kind::for_arch(Arch::Gfx1100), [Kind::Attend]);
+    let err = qsa_gather::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Convert }).unwrap_err();
+    assert!(err.contains("gfx1100 builds the attention only"), "{err}");
+    let (emitted, text, _) = qsa_gather::emit_module(Arch::Gfx1100).unwrap();
+    assert_eq!(emitted.len(), 1);
+    assert!(text.contains("indexed_attention_gathered_wmma_f16_pm_gfx1100") && !text.contains("indexed_attention_kv_f16vb"));
+    for kind in Kind::ALL {
+        assert!(qsa_gather::emit(Spec { arch: Arch::Gfx942, kind }).is_err());
+    }
 }
 
 /// The runtime embeds one certified module per arch: it must be exactly
@@ -95,7 +104,7 @@ mod toolchain {
             std::fs::write(&s, &text).unwrap();
             let toolchain = Toolchain::oracle();
             let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
-            for kind in Kind::ALL {
+            for &kind in Kind::for_arch(arch) {
                 let symbol = Spec { arch, kind }.symbol();
                 let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
                 assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
