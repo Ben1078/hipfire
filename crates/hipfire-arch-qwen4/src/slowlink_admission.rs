@@ -2494,6 +2494,16 @@ mod tests {
         // Route storage includes D's `k1_shared` (245,760 B): 386,070,784 B,
         // charged with A4 and the grouped-scatter scratch at 471,924,992 B.
         assert_eq!(s1_total, 2_543_092_544, "S1 layout, no MTP");
+        // The ledger's sums agree before anything is emitted: the owned terms
+        // sum to the owned total, and owned + budgets is the placement reserve.
+        let owned_sum: u64 = census.owned_terms().iter().map(|(_, bytes)| bytes).sum();
+        let budget_sum: u64 = census.budget_terms().iter().map(|(_, bytes)| bytes).sum();
+        assert_eq!(owned_sum, s1_total);
+        assert_eq!(owned_sum + budget_sum, census.total().unwrap());
+        assert_eq!(
+            census.total().unwrap(),
+            s1_total + census.runtime_overhead + census.diagnostic
+        );
         // Native MTP adds exactly the entry pending copy (hc * hidden * 4 B).
         let mtp_pending = (config.hc_count * config.hidden_size * 4) as u64;
         assert_eq!(mtp_pending, 40_960);
@@ -2601,12 +2611,22 @@ mod tests {
             "contexts": contexts,
             "safety_margin_bytes": safety,
             "s1": {
+                // Physical allocations: `total_bytes` is exactly the sum of
+                // `terms` (the seven owned terms); the two budget terms are
+                // reported beside them and `reserve_bytes` is all nine, the
+                // number placement charges.
                 "total_bytes": s1_total,
                 "terms": census
-                    .terms()
+                    .owned_terms()
                     .iter()
                     .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
                     .collect::<Vec<_>>(),
+                "budget_terms": census
+                    .budget_terms()
+                    .iter()
+                    .map(|(name, bytes)| serde_json::json!({ "name": name, "bytes": bytes }))
+                    .collect::<Vec<_>>(),
+                "reserve_bytes": census.total().unwrap(),
                 "boundary_stage_bytes": stage,
                 "boundary_stages": S1_MAX_BOUNDARY_SNAPSHOTS,
                 "hc_arena_bytes": arena.total_bytes,
