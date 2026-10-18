@@ -3129,12 +3129,21 @@ mod slowlink_receipt_tests {
         // The overrun cannot change the verdict or add a check row.
         assert_eq!(checks.status(), "pass");
         assert!(checks.missing().is_empty());
-        assert!(!checks.json().to_string().contains("memory.unowned_residual"));
+        assert!(!checks
+            .json()
+            .to_string()
+            .contains("memory.unowned_residual"));
         // The census and residual stay serialized as a labelled non-gating diagnostic.
         assert_eq!(diag["required"], json!(false));
         assert_eq!(diag["gating"], json!(false));
-        assert!(diag["note"].as_str().unwrap().contains("not live allocations"));
-        assert!(diag["note"].as_str().unwrap().contains("not an actual driver"));
+        assert!(diag["note"]
+            .as_str()
+            .unwrap()
+            .contains("not live allocations"));
+        assert!(diag["note"]
+            .as_str()
+            .unwrap()
+            .contains("not an actual driver"));
         assert!(diag["observed"].is_object());
         assert!(diag["residual"].is_object());
         assert!(diag["allowances"].is_object());
@@ -3157,7 +3166,10 @@ mod slowlink_receipt_tests {
         // The census is missing from the manifest: an info_error with the samples kept.
         let samples = good_memory();
         let diag = memory_diagnostic(&samples, memory_ledger(&manifest()));
-        assert!(diag["info_error"].as_str().unwrap().contains("manifest key"));
+        assert!(diag["info_error"]
+            .as_str()
+            .unwrap()
+            .contains("manifest key"));
         assert_eq!(diag["samples"].as_array().unwrap().len(), samples.len());
         assert_eq!(diag["required"], json!(false));
         assert_eq!(diag["gating"], json!(false));
