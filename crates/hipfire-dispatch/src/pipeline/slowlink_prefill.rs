@@ -1879,6 +1879,49 @@ pub mod selftest {
         }
     }
 
+    /// The device operations [`diag_scope`] needs: tests substitute a fake that models the
+    /// pool, so the lifecycle is exercised on the CPU.
+    pub trait DiagDevice {
+        /// Wait for every stream the diagnostic used; `Err` means quiescence is NOT proven.
+        fn quiesce(&mut self) -> Result<(), DispatchError>;
+        /// Return the buffers parked in the allocator's pool to the runtime (`hipFree`).
+        fn release_parked(&mut self);
+    }
+
+    impl DiagDevice for Gpu {
+        fn quiesce(&mut self) -> Result<(), DispatchError> {
+            sync(self)
+        }
+
+        fn release_parked(&mut self) {
+            // Only after `quiesce` succeeded: `free_tensor` parks buffers (a `DeviceBuffer`
+            // has no `Drop`), so this is what returns a diagnostic's allocations to HIP.
+            self.drain_pool();
+        }
+    }
+
+    /// Run one diagnostic and leave nothing of it parked: the body's result is kept, then the
+    /// stream is waited on and ONLY if that succeeded the parked buffers are returned.  A
+    /// failed wait returns an error and frees nothing (work may still read the buffers).
+    pub fn diag_scope<D: DiagDevice, T>(
+        dev: &mut D,
+        body: impl FnOnce(&mut D) -> Result<T, DispatchError>,
+    ) -> Result<T, DispatchError> {
+        let result = body(dev);
+        match dev.quiesce() {
+            Ok(()) => {
+                dev.release_parked();
+                result
+            }
+            Err(wait) => Err(match result {
+                Ok(_) => wait,
+                Err(error) => bail(format!(
+                    "{error}; the stream wait after it also failed ({wait}), nothing was freed"
+                )),
+            }),
+        }
+    }
+
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
@@ -2245,6 +2288,42 @@ pub mod selftest {
         DecodeTailCohort,
     }
 
+    impl DiagCase {
+        /// The primitive name of the case (the gate's and the receipt's name).
+        pub fn name(self) -> &'static str {
+            match self {
+                DiagCase::CanonicalCombine => "canonical_combine_exact",
+                DiagCase::WithinExpertCanary => "within_expert_panel_canary",
+                DiagCase::K1TailCohort => "k1_tail_cohort",
+                DiagCase::ZeroRowPanel => "zero_row_panel",
+                DiagCase::DecodeTailCohort => "decode_tail_cohort",
+            }
+        }
+
+        /// The case of a primitive name, if it is a dispatch diagnostic.
+        pub fn from_name(name: &str) -> Option<DiagCase> {
+            DEFAULT_SUITE.into_iter().find(|c| c.name() == name)
+        }
+    }
+
+    /// The dispatch half (D4) of the gate's seven named primitives, in the gate's order.
+    pub const GATE_PRIMITIVES: [DiagCase; 4] = [
+        DiagCase::WithinExpertCanary,
+        DiagCase::CanonicalCombine,
+        DiagCase::K1TailCohort,
+        DiagCase::ZeroRowPanel,
+    ];
+
+    /// Every dispatch diagnostic the hold runs: the four gate primitives plus the one-row
+    /// decode tail beside a K2 tile.  Callers take the case list from here, never copy it.
+    pub const DEFAULT_SUITE: [DiagCase; 5] = [
+        DiagCase::WithinExpertCanary,
+        DiagCase::CanonicalCombine,
+        DiagCase::K1TailCohort,
+        DiagCase::ZeroRowPanel,
+        DiagCase::DecodeTailCohort,
+    ];
+
     /// Geometry of the call and binding the diagnostics run over.
     #[derive(Clone, Copy, Debug)]
     pub struct DiagGeometry {
@@ -2268,9 +2347,107 @@ pub mod selftest {
     #[derive(Clone, Debug, Default)]
     pub struct DiagBytes {
         pub device_peak: usize,
+        /// Case-local device bytes: `device_peak` without the grow-only Gpu scratch parts.
+        pub case_local_device: usize,
+        /// The grow-only Gpu scratch slots the case touches (its largest window per slot).
+        pub scratch: ScratchSlots,
         pub host_peak: usize,
         pub device_parts: Vec<(&'static str, usize)>,
         pub host_parts: Vec<(&'static str, usize)>,
+    }
+
+    /// The Gpu's three grow-only scratch slots the windows touch: the gate/up A4 sidecar
+    /// (`int4_mmq_x_scratch`), the down A4 sidecar (`qwen4_moe_down_i4_scratch`) and the
+    /// grouped-scatter scratch.  Each slot grows to the largest need (free old, malloc new),
+    /// so peak growth holds old + new.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ScratchSlots {
+        pub a4_gate_up: usize,
+        pub a4_down: usize,
+        pub group_scatter: usize,
+    }
+
+    impl ScratchSlots {
+        pub fn total(&self) -> usize {
+            self.a4_gate_up + self.a4_down + self.group_scatter
+        }
+
+        fn fields(&self) -> [usize; 3] {
+            [self.a4_gate_up, self.a4_down, self.group_scatter]
+        }
+
+        fn from_fields(f: [usize; 3]) -> Self {
+            Self {
+                a4_gate_up: f[0],
+                a4_down: f[1],
+                group_scatter: f[2],
+            }
+        }
+
+        /// Per-slot maximum.
+        pub fn max_with(&self, other: &ScratchSlots) -> ScratchSlots {
+            let (a, b) = (self.fields(), other.fields());
+            Self::from_fields([a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])])
+        }
+
+        /// The largest OLD slot size a growth step can free while allocating the new one:
+        /// per slot, the largest need strictly below that slot's final size across `needs`;
+        /// growth steps of different slots do not overlap, so the worst single one counts.
+        fn second_largest_transient(&self, needs: &[ScratchSlots]) -> usize {
+            let finals = self.fields();
+            (0..3)
+                .map(|i| {
+                    needs
+                        .iter()
+                        .map(|n| n.fields()[i])
+                        .filter(|&v| v < finals[i])
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    /// Suite-level device and host bytes of the diagnostics (see [`suite_diagnostic_bytes`]).
+    #[derive(Clone, Debug, Default)]
+    pub struct SuiteBytes {
+        pub cases: Vec<(DiagCase, DiagBytes)>,
+        /// Largest case-local device total (everything except the grow-only Gpu scratch): the
+        /// buffers of one case, all freed and returned to HIP at its end.
+        pub case_local_device_peak: usize,
+        /// The grow-only slots at their per-slot maximum over the suite.
+        pub persistent: ScratchSlots,
+        /// The old + new overlap while a slot grows (the old size is bounded by the next
+        /// smaller case's need).
+        pub growth_transient: usize,
+        /// Host (`Vec` and transient conversion) peak of the largest case.
+        pub host_peak: usize,
+    }
+
+    impl SuiteBytes {
+        /// Whole-suite device bytes when nothing of the Gpu scratch was reserved before.
+        pub fn device_total(&self) -> usize {
+            self.case_local_device_peak + self.persistent.total() + self.growth_transient
+        }
+
+        /// Device bytes left to budget once the admitted census already reserved `admitted`
+        /// (the S1 full-window A4 and scatter slots, or whatever the product holds): a slot
+        /// the diagnostics need no more than `admitted` never grows (no extra, no transient);
+        /// a larger one costs its excess, and its growth transient is bounded by
+        /// `max(admitted, the previous need)`.
+        pub fn extra_after_admitted(&self, admitted: &ScratchSlots) -> usize {
+            let (need, have) = (self.persistent.fields(), admitted.fields());
+            let mut excess = 0usize;
+            let mut transient = 0usize;
+            for i in 0..3 {
+                if need[i] > have[i] {
+                    excess += need[i] - have[i];
+                    transient = transient.max(have[i].max(self.growth_transient));
+                }
+            }
+            self.case_local_device_peak + excess + transient
+        }
     }
 
     fn sum_parts(parts: &[(&'static str, usize)]) -> usize {
@@ -2487,13 +2664,84 @@ pub mod selftest {
         }
         out.device_peak = sum_parts(&out.device_parts);
         out.host_peak = sum_parts(&out.host_parts);
+        out.case_local_device = out
+            .device_parts
+            .iter()
+            .filter(|p| !p.0.contains(GROW_ONLY))
+            .map(|p| p.1)
+            .sum();
+        out.scratch = case_scratch_slots(case, g, limits)?;
         Ok(out)
+    }
+
+    /// Marker in a ledger part's name for the Gpu's grow-only scratch slots (persist across
+    /// cases at their per-slot maximum instead of being freed with the case).
+    const GROW_ONLY: &str = "grow-only";
+
+    /// The three Gpu grow-only scratch needs of a window of `rows` tokens.
+    fn window_scratch(g: &DiagGeometry, rows: usize) -> ScratchSlots {
+        ScratchSlots {
+            a4_gate_up: (g.hidden / A4_BLOCK_K) * rows * A4_RECORD_BYTES,
+            a4_down: (g.mi / A4_BLOCK_K) * rows * K_TOP * A4_RECORD_BYTES,
+            group_scatter: rdna_compute::scratch::qwen4_moe_group_layout(rows * K_TOP, g.n_exp)
+                .bytes,
+        }
+    }
+
+    /// The grow-only Gpu scratch slots a case touches: per slot, the largest window the case
+    /// runs (`CanonicalCombine` runs no window).
+    fn case_scratch_slots(
+        case: DiagCase,
+        g: &DiagGeometry,
+        limits: PanelLimits,
+    ) -> Result<ScratchSlots, DispatchError> {
+        Ok(match case {
+            DiagCase::CanonicalCombine => ScratchSlots::default(),
+            DiagCase::WithinExpertCanary => window_scratch(g, limits.max_grouped_rows),
+            DiagCase::K1TailCohort => window_scratch(g, 64 + g.k1_rows),
+            DiagCase::ZeroRowPanel => {
+                window_scratch(g, 40).max_with(&window_scratch(g, g.k1_rows.max(1)))
+            }
+            DiagCase::DecodeTailCohort => window_scratch(g, DECODE_TAIL_ANCHOR_ROWS + 1),
+        })
+    }
+
+    /// The byte ledger of a whole diagnostic suite run in sequence on one `Gpu`, where every
+    /// entry ends with [`diag_scope`] (sync, then return the parked pool buffers to HIP): the
+    /// case-local allocations of different cases are never live together (peak = max), while
+    /// the Gpu's grow-only scratch slots persist at their per-slot maximum and their growth
+    /// briefly holds old + new.  `A` already charges the full-window slots; see
+    /// [`SuiteBytes::extra_after_admitted`] for what is left to budget.
+    pub fn suite_diagnostic_bytes(
+        cases: &[DiagCase],
+        g: &DiagGeometry,
+        limits: PanelLimits,
+    ) -> Result<SuiteBytes, DispatchError> {
+        let mut suite = SuiteBytes::default();
+        let mut needs: Vec<ScratchSlots> = Vec::new();
+        for &case in cases {
+            let b = diagnostic_bytes(case, g, limits)?;
+            suite.case_local_device_peak = suite.case_local_device_peak.max(b.case_local_device);
+            suite.host_peak = suite.host_peak.max(b.host_peak);
+            suite.persistent = suite.persistent.max_with(&b.scratch);
+            needs.push(b.scratch);
+            suite.cases.push((case, b));
+        }
+        suite.growth_transient = suite.persistent.second_largest_transient(&needs);
+        Ok(suite)
     }
 
     /// `canonical_combine_exact`: the production panel/pad combine kernels over the
     /// adversarial fixture and many partitions (within-expert splits included) equal the CPU
     /// canonical model and the monolithic GPU combine; reversed panel order differs.
     pub fn canonical_combine_exact(
+        gpu: &mut Gpu,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        diag_scope(gpu, |gpu| canonical_combine_exact_body(gpu, seed))
+    }
+
+    fn canonical_combine_exact_body(
         gpu: &mut Gpu,
         seed: u64,
     ) -> Result<PrimitiveReport, DispatchError> {
@@ -2525,6 +2773,18 @@ pub mod selftest {
     /// scratch spans stay intact, every panel respects the row bound, and the combine equals
     /// the CPU canonical model and the monolithic GPU combine over the actual GEMM rows.
     pub fn within_expert_panel_canary(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        diag_scope(gpu, |gpu| {
+            within_expert_panel_canary_body(gpu, call, binding, limits, seed)
+        })
+    }
+
+    fn within_expert_panel_canary_body(
         gpu: &mut Gpu,
         call: &PreparedChunkCall<'_>,
         binding: ExpertPanelBinding<'_>,
@@ -2797,6 +3057,16 @@ pub mod selftest {
         limits: PanelLimits,
         seed: u64,
     ) -> Result<PrimitiveReport, DispatchError> {
+        diag_scope(gpu, |gpu| k1_tail_cohort_body(gpu, call, binding, limits, seed))
+    }
+
+    fn k1_tail_cohort_body(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
         let mut rep = PrimitiveReport::new("k1_tail_cohort");
         k1_scenario(gpu, call, binding, limits, seed, true, &mut rep)?;
         Ok(rep)
@@ -2817,6 +3087,19 @@ pub mod selftest {
     /// every expert the decode call's router selects (the resident all-expert binding).
     /// `anchor` is any K2 prefill tile call of the layer (its scratch/geometry).
     pub fn decode_tail_cohort(
+        gpu: &mut Gpu,
+        anchor: &PreparedChunkCall<'_>,
+        decode_call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
+        diag_scope(gpu, |gpu| {
+            decode_tail_cohort_body(gpu, anchor, decode_call, binding, limits, seed)
+        })
+    }
+
+    fn decode_tail_cohort_body(
         gpu: &mut Gpu,
         anchor: &PreparedChunkCall<'_>,
         decode_call: &PreparedChunkCall<'_>,
@@ -3051,6 +3334,16 @@ pub mod selftest {
         limits: PanelLimits,
         seed: u64,
     ) -> Result<PrimitiveReport, DispatchError> {
+        diag_scope(gpu, |gpu| zero_row_panel_body(gpu, call, binding, limits, seed))
+    }
+
+    fn zero_row_panel_body(
+        gpu: &mut Gpu,
+        call: &PreparedChunkCall<'_>,
+        binding: ExpertPanelBinding<'_>,
+        limits: PanelLimits,
+        seed: u64,
+    ) -> Result<PrimitiveReport, DispatchError> {
         let mut rep = PrimitiveReport::new("zero_row_panel");
         let mut rng = model::Rng(seed | 1);
         let tile = synth_tile(&mut rng, 40, call.hidden, false, |_, _| -1);
@@ -3207,6 +3500,245 @@ mod slowlink_panel_tests {
             PromptRouteLayout::new(&d).unwrap().k1_bytes(),
             8 * K_TOP * (2560 * 4 + 4)
         );
+    }
+
+    use super::selftest::{
+        diag_scope, suite_diagnostic_bytes, DiagCase, DiagDevice, DiagGeometry, ScratchSlots,
+        DEFAULT_SUITE, GATE_PRIMITIVES,
+    };
+
+    /// A fake device that models the allocator's parked pool: `free_tensor` parks (a
+    /// `DeviceBuffer` has no `Drop`, so a dropped tensor would leak instead), only the drain
+    /// returns bytes to the runtime.
+    #[derive(Default)]
+    struct FakeDev {
+        log: Vec<&'static str>,
+        parked: usize,
+        returned: usize,
+        sync_fails: bool,
+    }
+
+    impl DiagDevice for FakeDev {
+        fn quiesce(&mut self) -> Result<(), DispatchError> {
+            self.log.push("sync");
+            if self.sync_fails {
+                Err(bail("the stream wait failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn release_parked(&mut self) {
+            self.log.push("drain");
+            self.returned += self.parked;
+            self.parked = 0;
+        }
+    }
+
+    fn park(dev: &mut FakeDev, bytes: usize) {
+        dev.log.push("body");
+        dev.parked += bytes;
+    }
+
+    #[test]
+    fn slowlink_panel_diag_scope_syncs_then_drains_after_success_and_after_an_error() {
+        let mut dev = FakeDev::default();
+        let ok = diag_scope(&mut dev, |d| {
+            park(d, 100);
+            Ok(7)
+        });
+        assert_eq!(ok.unwrap(), 7);
+        assert_eq!(dev.log, ["body", "sync", "drain"]);
+        assert_eq!((dev.parked, dev.returned), (0, 100));
+        // A failing body is still drained once the wait proved quiescence; its error is kept.
+        let mut dev = FakeDev::default();
+        let err = diag_scope(&mut dev, |d| -> Result<(), DispatchError> {
+            park(d, 40);
+            Err(bail("check failed"))
+        })
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("check failed"));
+        assert_eq!(dev.log, ["body", "sync", "drain"]);
+        assert_eq!((dev.parked, dev.returned), (0, 40));
+    }
+
+    #[test]
+    fn slowlink_panel_diag_scope_frees_nothing_when_quiescence_is_not_proven() {
+        let mut dev = FakeDev {
+            sync_fails: true,
+            ..FakeDev::default()
+        };
+        let err = diag_scope(&mut dev, |d| {
+            park(d, 64);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("stream wait failed"));
+        assert_eq!(dev.log, ["body", "sync"], "no drain after a failed wait");
+        assert_eq!((dev.parked, dev.returned), (64, 0), "work may still read the buffers");
+        // Both failures are reported; still nothing is freed.
+        let mut dev = FakeDev {
+            sync_fails: true,
+            ..FakeDev::default()
+        };
+        let err = diag_scope(&mut dev, |d| -> Result<(), DispatchError> {
+            park(d, 8);
+            Err(bail("mismatch"))
+        })
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("mismatch") && text.contains("stream wait"));
+        assert_eq!((dev.parked, dev.returned), (8, 0));
+    }
+
+    #[test]
+    fn slowlink_panel_diag_scope_retains_nothing_across_a_suite_of_cases() {
+        // Different buffer classes per case park separately and are never reused (the
+        // `upload_raw` case), so without the drain the parked bytes would SUM.
+        let sizes = [128_696_320usize, 42_394_880, 7_372_800, 2_949_120, 241_200];
+        let mut dev = FakeDev::default();
+        for &s in &sizes {
+            diag_scope(&mut dev, |d| {
+                park(d, s);
+                park(d, s / 2);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(dev.parked, 0, "nothing parked after a case");
+        }
+        assert_eq!(dev.returned, sizes.iter().map(|s| s + s / 2).sum::<usize>());
+        let without_drain: usize = sizes.iter().map(|s| s + s / 2).sum();
+        assert!(without_drain > 2 * sizes[0], "the parked sum is what the drain removes");
+    }
+
+    #[test]
+    fn slowlink_panel_default_suite_is_the_gate_composition_plus_the_decode_tail() {
+        let names: Vec<&str> = DEFAULT_SUITE.iter().map(|c| c.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "within_expert_panel_canary",
+                "canonical_combine_exact",
+                "k1_tail_cohort",
+                "zero_row_panel",
+                "decode_tail_cohort",
+            ]
+        );
+        // The gate's four dispatch primitives are the first four, in the gate's order.
+        assert_eq!(GATE_PRIMITIVES, DEFAULT_SUITE[..4]);
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len());
+        for case in DEFAULT_SUITE {
+            assert_eq!(DiagCase::from_name(case.name()), Some(case));
+        }
+        assert_eq!(DiagCase::from_name("payload_table_identity"), None);
+    }
+
+    fn real_identity() -> DiagGeometry {
+        DiagGeometry {
+            hidden: 2560,
+            n_exp: 512,
+            mi: 640,
+            binding_experts: 32,
+            k1_rows: 3,
+            shared_intermediate: 640,
+        }
+    }
+
+    #[test]
+    fn slowlink_panel_suite_bytes_split_case_local_from_persistent_scratch() {
+        let g = real_identity();
+        let suite = suite_diagnostic_bytes(&DEFAULT_SUITE, &g, PanelLimits::S1).unwrap();
+        assert_eq!(suite.cases.len(), DEFAULT_SUITE.len());
+        // Case-local peak: the canary's route region + the monolithic reference.
+        assert_eq!(suite.case_local_device_peak, 171_091_200);
+        assert_eq!(
+            suite.persistent,
+            ScratchSlots {
+                a4_gate_up: 2_949_120,
+                a4_down: 7_372_800,
+                group_scatter: 411_648,
+            }
+        );
+        assert_eq!(suite.persistent.total(), 10_733_568);
+        // The old buffer a growth step frees while allocating the new one: the next smaller
+        // case's largest slot (the K1 tail's down sidecar).
+        assert_eq!(suite.growth_transient, 241_200);
+        assert_eq!(suite.device_total(), 182_065_968);
+        assert_eq!(suite.host_peak, 351_518_720);
+        // Each case's own ledger separates the same two kinds of bytes.
+        for (case, b) in &suite.cases {
+            assert_eq!(
+                b.device_peak,
+                b.case_local_device + b.scratch.total(),
+                "{case:?}: the grow-only parts are exactly the scratch slots"
+            );
+        }
+        // T's diagnostic buffers (page + 128 MiB) are an independent sequential case: the
+        // dispatch extra stays under T's actual 217,821,184.
+        assert!(suite.device_total() <= 217_821_184);
+    }
+
+    #[test]
+    fn slowlink_panel_suite_extra_after_the_admitted_census_does_not_double_count() {
+        let g = real_identity();
+        let suite = suite_diagnostic_bytes(&DEFAULT_SUITE, &g, PanelLimits::S1).unwrap();
+        // The S1 full-window census already reserves the 16384-row A4 and scatter slots: the
+        // diagnostics never grow them, so only the case-local buffers are left.
+        let window = PromptRouteLayout::new(&PromptRouteDims {
+            rows: 16_384,
+            hidden: 2560,
+            n_exp: 512,
+            mi: 640,
+            shared_intermediate: 640,
+            k1_rows: 48,
+        })
+        .unwrap();
+        let admitted = ScratchSlots {
+            a4_gate_up: (2560 / A4_BLOCK_K) * 16_384 * A4_RECORD_BYTES,
+            a4_down: (640 / A4_BLOCK_K) * 16_384 * K_TOP * A4_RECORD_BYTES,
+            group_scatter: window.group_scatter_bytes(),
+        };
+        assert_eq!(
+            admitted.a4_gate_up + admitted.a4_down,
+            window.a4_sidecar_bytes()
+        );
+        assert_eq!(suite.extra_after_admitted(&admitted), 171_091_200);
+        // Only the 1536-row tile's slots reserved: the excess plus the old-slot overlap.
+        let tile = PromptRouteLayout::new(&PromptRouteDims {
+            rows: 1536,
+            hidden: 2560,
+            n_exp: 512,
+            mi: 640,
+            shared_intermediate: 640,
+            k1_rows: 48,
+        })
+        .unwrap();
+        let tile_slots = ScratchSlots {
+            a4_gate_up: (2560 / A4_BLOCK_K) * 1536 * A4_RECORD_BYTES,
+            a4_down: (640 / A4_BLOCK_K) * 1536 * K_TOP * A4_RECORD_BYTES,
+            group_scatter: tile.group_scatter_bytes(),
+        };
+        assert_eq!(suite.extra_after_admitted(&tile_slots), 179_303_680);
+        // Nothing reserved: the whole suite total.
+        assert_eq!(
+            suite.extra_after_admitted(&ScratchSlots::default()),
+            suite.device_total()
+        );
+    }
+
+    #[test]
+    fn slowlink_panel_suite_bytes_of_one_case_equal_its_own_ledger() {
+        let g = real_identity();
+        let one = suite_diagnostic_bytes(&[DiagCase::CanonicalCombine], &g, PanelLimits::S1)
+            .unwrap();
+        // The canonical-combine fixture runs no window: no Gpu scratch, no growth.
+        assert_eq!(one.persistent, ScratchSlots::default());
+        assert_eq!(one.growth_transient, 0);
+        assert_eq!(one.device_total(), one.case_local_device_peak);
+        assert!(suite_diagnostic_bytes(&[], &g, PanelLimits::S1).unwrap().device_total() == 0);
     }
 
     #[test]
