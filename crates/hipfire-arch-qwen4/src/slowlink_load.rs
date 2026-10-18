@@ -89,14 +89,24 @@ fn payload<'a>(
 /// and declines S1, exactly as in the product. For the S1 gate and the
 /// hardware tests, whose incumbent arm intentionally names the product's
 /// automatic placement; examples that must keep their own baseline placement
-/// use [`slowlink_load_if_selected`].
+/// use [`slowlink_load_if_selected`]. `purpose` is the explicit admission
+/// intent: `Product` for the product runtime, `PrimitiveSelftest` only for the
+/// diagnostic primitives gate, which sizes its own larger transient reserve.
 pub fn slowlink_load_bundle(
     gpu: &mut Gpu,
     path: &Path,
     max_seq: usize,
     session_cache_budget: Option<u64>,
+    purpose: crate::slowlink_admission::AdmissionPurpose,
 ) -> Result<SlowlinkLoaded, String> {
-    load_inner(gpu, path, max_seq, session_cache_budget, true)?
+    load_inner(
+        gpu,
+        path,
+        max_seq,
+        session_cache_budget,
+        true,
+        purpose,
+    )?
         .ok_or_else(|| "slowlink load produced no bundle".to_string())
 }
 
@@ -106,14 +116,24 @@ pub fn slowlink_load_bundle(
 /// unmeasured link, an explicit expert layer count, any other decline), so the
 /// caller's own loader and placement run byte for byte as before. A forced
 /// selector that is eligible but over capacity is an `Err` with its exact
-/// deficit, as in the product.
+/// deficit, as in the product. This is the product selection (greedy/KLD/
+/// parity examples), so it always admits as
+/// [`crate::slowlink_admission::AdmissionPurpose::Product`] and never pays the
+/// diagnostic reserve.
 pub fn slowlink_load_if_selected(
     gpu: &mut Gpu,
     path: &Path,
     max_seq: usize,
     session_cache_budget: Option<u64>,
 ) -> Result<Option<SlowlinkLoaded>, String> {
-    load_inner(gpu, path, max_seq, session_cache_budget, false)
+    load_inner(
+        gpu,
+        path,
+        max_seq,
+        session_cache_budget,
+        false,
+        crate::slowlink_admission::AdmissionPurpose::Product,
+    )
 }
 
 fn load_inner(
@@ -122,6 +142,7 @@ fn load_inner(
     max_seq: usize,
     session_cache_budget: Option<u64>,
     product_fallback: bool,
+    purpose: crate::slowlink_admission::AdmissionPurpose,
 ) -> Result<Option<SlowlinkLoaded>, String> {
     use crate::expert_residency as residency;
     use crate::slowlink_admission as s1;
@@ -246,6 +267,7 @@ fn load_inner(
             max_k: 0,
             state_format,
             scratch_mode,
+            purpose,
         };
         let profile = s1::select_load_profile(
             s1::SlowlinkMode::from_env(),
