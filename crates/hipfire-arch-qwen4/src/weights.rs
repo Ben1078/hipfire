@@ -2852,17 +2852,7 @@ impl Qwen4Weights {
     /// transaction.  The attached transaction census is drained separately,
     /// after readers and these resident handles are gone.
     pub fn free_gpu(self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
-        let mut first = None;
-        for taken in self.taken {
-            if let WeightHandle::Resident(tensor) = taken.handle {
-                if let Err(error) = gpu.free_tensor(tensor) {
-                    if first.is_none() {
-                        first = Some(error);
-                    }
-                }
-            }
-        }
-        first.map_or(Ok(()), Err)
+        free_taken_handles(self.taken, |tensor| gpu.free_tensor(tensor))
     }
 
     /// Load-time precision experiments: `HIPFIRE_QWEN4_REQUANT="pat=fmt;..."`
@@ -2911,7 +2901,7 @@ impl Qwen4Weights {
             let [m, k] = taken.projection.logical_shape[..] else {
                 continue;
             };
-            let copy = if let Some(dir) = dir {
+            let replacement = if let Some(dir) = dir {
                 // A matching tensor without a file keeps its payload (the
                 // MTP attention shares the trunk's names).
                 let path = dir.join(format!("{}.bin", taken.key.name));
@@ -2927,19 +2917,20 @@ impl Qwen4Weights {
                         bytes.len()
                     ));
                 }
-                upload_qt44(gpu, &bytes)?
+                Replacement::Qt44(Cow::Owned(bytes))
             } else {
                 if tensor.dtype == target {
                     continue;
                 }
-                if target == DType::Q8_0 {
+                let produced = if target == DType::Q8_0 {
                     gpu.quantize_bf16_q8_0(tensor, m, k)
                 } else {
                     gpu.requant_g256(tensor, m, k, target)
                 }
-                .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?
+                .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?;
+                Replacement::Tensor(produced)
             };
-            let (old_bytes, new_bytes) = swap_resident(gpu, taken, copy)?;
+            let (old_bytes, new_bytes) = replace_resident(gpu, taken, replacement)?;
             count += 1;
             before += old_bytes;
             after += new_bytes;
@@ -3004,8 +2995,11 @@ impl Qwen4Weights {
         }
         let (mut before, mut after) = (0usize, 0usize);
         for (payload, &slot) in payloads.iter().zip(&slots) {
-            let copy = upload_qt44(gpu, &payload.bytes)?;
-            let (old_bytes, new_bytes) = swap_resident(gpu, &mut self.taken[slot], copy)?;
+            let (old_bytes, new_bytes) = replace_resident(
+                gpu,
+                &mut self.taken[slot],
+                Replacement::Qt44(Cow::Borrowed(&payload.bytes[..])),
+            )?;
             before += old_bytes;
             after += new_bytes;
         }
@@ -3038,26 +3032,155 @@ fn qt44_matrix_bytes(m: usize, k: usize) -> Option<usize> {
     (k % 256 == 0).then(|| m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES)
 }
 
-/// Upload pre-encoded QT44 bytes as a resident tensor (dtype `MQ4G256V2`).
-/// The one upload path of `HIPFIRE_QWEN4_REQUANT`'s `qt44:` rule and of the
-/// trunk overlay.
-fn upload_qt44(gpu: &mut Gpu, bytes: &[u8]) -> Result<GpuTensor, String> {
-    let mut copy = gpu
-        .upload_raw(bytes, &[bytes.len()])
-        .map_err(|error| error.to_string())?;
-    copy.dtype = DType::MQ4G256V2;
-    Ok(copy)
+/// Release every finalized handle through `free`, one owner each. A true
+/// `Borrowed` resident is a view into an arena root that the transaction's
+/// store owns (and releases last, once): it owns no bytes, so it is skipped
+/// and never reaches the owner free path. Owned handles free normally; the
+/// first error is reported after every handle was attempted.
+fn free_taken_handles(
+    taken: Vec<TakenWeight>,
+    mut free: impl FnMut(GpuTensor) -> hip_bridge::HipResult<()>,
+) -> hip_bridge::HipResult<()> {
+    let mut first = None;
+    for taken in taken {
+        if let WeightHandle::Resident(tensor) = taken.handle {
+            if tensor.buf.is_borrowed() {
+                continue;
+            }
+            if let Err(error) = free(tensor) {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
-/// Install `copy` as `taken`'s resident tensor and free the old one; returns
-/// the old and new device bytes.
-fn swap_resident(
+/// What replaces a resident weight in `HIPFIRE_QWEN4_REQUANT` / a trunk
+/// overlay: a kernel-produced tensor, or pre-encoded QT44 bytes (dtype
+/// `MQ4G256V2`, shape `[len]`).
+enum Replacement<'a> {
+    Tensor(GpuTensor),
+    Qt44(Cow<'a, [u8]>),
+}
+
+/// The device/owner operations of a replacement. [`GpuReplace`] is the only
+/// production implementation; CPU tests substitute a recording fake.
+trait ReplaceOps {
+    /// Prepare an arena-registered weight for an in-place rewrite of its span:
+    /// the Gpu quiesces the device exactly once (even with no cached shadow, a
+    /// direct reader may be in flight), drops the source's cached shadow view
+    /// without freeing any root or binding, and clears value-dependent weight
+    /// metadata, so a stable pointer carrying new bytes/dtype cannot stale-hit.
+    /// An error means nothing may be written.
+    fn invalidate_arena_source(&mut self, ptr: usize) -> Result<bool, String>;
+    /// Upload host bytes to the start of `dst`.
+    fn write_host(&mut self, dst: &hip_bridge::DeviceBuffer, bytes: &[u8]) -> Result<(), String>;
+    /// Copy `bytes` device bytes from the start of `src` to the start of `dst`.
+    fn copy_device(
+        &mut self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &hip_bridge::DeviceBuffer,
+        bytes: usize,
+    ) -> Result<(), String>;
+    /// Free an owned tensor.
+    fn free(&mut self, tensor: GpuTensor) -> Result<(), String>;
+    /// Upload pre-encoded QT44 bytes as an owned resident tensor.
+    fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String>;
+}
+
+struct GpuReplace<'g>(&'g mut Gpu);
+
+impl ReplaceOps for GpuReplace<'_> {
+    fn invalidate_arena_source(&mut self, ptr: usize) -> Result<bool, String> {
+        self.0
+            .invalidate_arena_weight_source(ptr)
+            .map_err(|error| error.to_string())
+    }
+
+    fn write_host(&mut self, dst: &hip_bridge::DeviceBuffer, bytes: &[u8]) -> Result<(), String> {
+        self.0
+            .hip
+            .memcpy_htod_offset(dst, 0, bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn copy_device(
+        &mut self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &hip_bridge::DeviceBuffer,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.0
+            .hip
+            .memcpy_dtod_at(dst, 0, src, 0, bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn free(&mut self, tensor: GpuTensor) -> Result<(), String> {
+        self.0.free_tensor(tensor).map_err(|error| error.to_string())
+    }
+
+    fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+        let mut copy = self
+            .0
+            .upload_raw(bytes, &[bytes.len()])
+            .map_err(|error| error.to_string())?;
+        copy.dtype = DType::MQ4G256V2;
+        Ok(copy)
+    }
+}
+
+fn replace_resident(
     gpu: &mut Gpu,
     taken: &mut TakenWeight,
-    copy: GpuTensor,
+    replacement: Replacement<'_>,
 ) -> Result<(usize, usize), String> {
+    replace_resident_with(&mut GpuReplace(gpu), taken, replacement)
+}
+
+/// Install `replacement` as `taken`'s resident weight and return the old and
+/// new device bytes.
+///
+/// An owned resident is swapped for the replacement and the old tensor is
+/// freed (the pre-arena behavior, unchanged). A true `Borrowed` resident is a
+/// planned arena span: the replacement payload is written INTO that span (no
+/// new permanent owner, the pointer the shadow arena bound stays valid), the
+/// handle's dtype/shape are retagged, and any temporary owner is freed. A
+/// replacement larger than the planned span is refused loudly.
+fn replace_resident_with(
+    ops: &mut dyn ReplaceOps,
+    taken: &mut TakenWeight,
+    replacement: Replacement<'_>,
+) -> Result<(usize, usize), String> {
+    let arena_backed = match &taken.handle {
+        WeightHandle::Resident(old) => old.buf.is_borrowed(),
+        WeightHandle::Alias(_) => {
+            if let Replacement::Tensor(copy) = replacement {
+                let _ = ops.free(copy);
+            }
+            return Err(format!("{}: weight is not resident", taken.key.name));
+        }
+    };
+    if arena_backed {
+        replace_in_arena_span(ops, taken, replacement)
+    } else {
+        replace_owned(ops, taken, replacement)
+    }
+}
+
+fn replace_owned(
+    ops: &mut dyn ReplaceOps,
+    taken: &mut TakenWeight,
+    replacement: Replacement<'_>,
+) -> Result<(usize, usize), String> {
+    let copy = match replacement {
+        Replacement::Tensor(copy) => copy,
+        Replacement::Qt44(bytes) => ops.upload_qt44(&bytes)?,
+    };
     let WeightHandle::Resident(old) = &taken.handle else {
-        let _ = gpu.free_tensor(copy);
+        let _ = ops.free(copy);
         return Err(format!("{}: weight is not resident", taken.key.name));
     };
     let sizes = (old.buf.size(), copy.buf.size());
@@ -3066,8 +3189,119 @@ fn swap_resident(
     else {
         unreachable!()
     };
-    gpu.free_tensor(old).map_err(|error| error.to_string())?;
+    ops.free(old)?;
     Ok(sizes)
+}
+
+/// Exact byte extent of an `[m, k]` replacement of `dtype`: the Q8_0 rows or
+/// the `MQ{2..6}G256V2` groups (`8 + 32*bits` bytes per 256 values) the
+/// requant kernels emit; `None` for any other dtype, a `k` that is not whole
+/// groups, or overflow.
+fn replacement_payload_bytes(dtype: DType, m: usize, k: usize) -> Option<usize> {
+    let group_bytes = match dtype {
+        DType::Q8_0 => return dtype.row_bytes(k).and_then(|row| row.checked_mul(m)),
+        DType::MQ2G256V2 => rdna_compute::MQ2G256V2_GROUP_BYTES,
+        DType::MQ3G256V2 => rdna_compute::MQ3G256V2_GROUP_BYTES,
+        DType::MQ4G256V2 => rdna_compute::MQ4V2_GROUP_BYTES,
+        DType::MQ5G256V2 => rdna_compute::MQ5G256V2_GROUP_BYTES,
+        DType::MQ6G256V2 => rdna_compute::MQ6G256V2_GROUP_BYTES,
+        _ => return None,
+    };
+    (k != 0 && k % 256 == 0)
+        .then(|| m.checked_mul(k / 256)?.checked_mul(group_bytes))
+        .flatten()
+}
+
+/// The retagged view of an arena span that now holds a replacement payload:
+/// SAME pointer and span capacity as `old`, new dtype/shape. Refuses a payload
+/// larger than the span.
+fn arena_replacement_view(
+    old: &GpuTensor,
+    payload_bytes: usize,
+    shape: &[usize],
+    dtype: DType,
+) -> Result<GpuTensor, String> {
+    if !old.buf.is_borrowed() {
+        return Err("arena replacement needs a borrowed arena view".to_string());
+    }
+    if payload_bytes > old.buf.size() {
+        return Err(format!(
+            "replacement payload of {payload_bytes} bytes exceeds the planned arena span of {} bytes; \
+             an arena view cannot grow",
+            old.buf.size()
+        ));
+    }
+    Ok(GpuTensor {
+        buf: old.buf.byte_view(0, old.buf.size()),
+        shape: shape.to_vec(),
+        dtype,
+    })
+}
+
+/// Write a kernel-produced `copy` into the span `old` views.
+fn write_tensor_into_span(
+    ops: &mut dyn ReplaceOps,
+    old: &GpuTensor,
+    copy: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> Result<(GpuTensor, usize), String> {
+    let payload = replacement_payload_bytes(copy.dtype, m, k)
+        .filter(|&bytes| bytes <= copy.buf.size())
+        .ok_or_else(|| {
+            format!(
+                "{:?} replacement of [{m}, {k}] has no exact payload extent within its {}-byte buffer",
+                copy.dtype,
+                copy.buf.size()
+            )
+        })?;
+    let view = arena_replacement_view(old, payload, &copy.shape, copy.dtype)?;
+    // One fence: the Gpu quiesces (even with no cached shadow), drops the
+    // cached shadow view and value-dependent metadata, THEN we overwrite. A
+    // failed fence writes nothing.
+    ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+    ops.copy_device(&old.buf, &copy.buf, payload)?;
+    Ok((view, payload))
+}
+
+fn replace_in_arena_span(
+    ops: &mut dyn ReplaceOps,
+    taken: &mut TakenWeight,
+    replacement: Replacement<'_>,
+) -> Result<(usize, usize), String> {
+    let WeightHandle::Resident(old) = &taken.handle else {
+        unreachable!("caller proved the handle is a borrowed resident")
+    };
+    let (view, before, after, temp) = match replacement {
+        Replacement::Qt44(bytes) => {
+            let view =
+                arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::MQ4G256V2)?;
+            ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+            ops.write_host(&old.buf, &bytes)?;
+            (view, old.buf.size(), bytes.len(), None)
+        }
+        Replacement::Tensor(copy) => {
+            let [m, k] = taken.projection.logical_shape[..] else {
+                let _ = ops.free(copy);
+                return Err(format!(
+                    "{}: replacement needs a rank-2 weight, got {:?}",
+                    taken.key.name, taken.projection.logical_shape
+                ));
+            };
+            match write_tensor_into_span(ops, old, &copy, m, k) {
+                Ok((view, payload)) => (view, old.buf.size(), payload, Some(copy)),
+                Err(error) => {
+                    let _ = ops.free(copy);
+                    return Err(error);
+                }
+            }
+        }
+    };
+    taken.handle = WeightHandle::Resident(view);
+    if let Some(copy) = temp {
+        ops.free(copy)?;
+    }
+    Ok((before, after))
 }
 
 fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError> {
@@ -6589,5 +6823,429 @@ mod tests {
             assert!(tx.contains(&placement.name, placement.layer, 0));
             assert!(tx.projection(&placement.name, placement.layer, 0).is_some());
         }
+    }
+}
+
+/// CPU tests of the arena-aware teardown and in-place replacement. Device
+/// buffers are fabricated descriptors that are never dereferenced; the fake
+/// [`ReplaceOps`] records the exact operation order.
+#[cfg(test)]
+mod weight_store_arena_replacement {
+    use super::*;
+    use hip_bridge::DeviceBuffer;
+    use hipfire_runtime::weight_store::{
+        WeightPlacementKey, WeightProjection, WeightProjectionKind,
+    };
+
+    const ROOT_BASE: usize = 0x4000_0000;
+    const TEMP_BASE: usize = 0x9000_0000;
+
+    /// A borrowed arena view.
+    fn view(ptr: usize, size: usize, dtype: DType, shape: &[usize]) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: never dereferenced; tests only read the descriptor.
+            buf: unsafe { DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, size) },
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
+    /// An owned (non-borrowed) tensor descriptor. A VMM-owner tag is the one
+    /// non-borrowed constructor that needs no device.
+    fn owned(ptr: usize, size: usize, dtype: DType, shape: &[usize]) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: never dereferenced or freed; the fake owner only logs.
+            buf: unsafe { DeviceBuffer::from_vmm_owner(ptr as *mut std::ffi::c_void, size) },
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
+    fn taken(handle: WeightHandle, m: usize, k: usize) -> TakenWeight {
+        TakenWeight {
+            key: WeightPlacementKey::new("w", Some(0), 0),
+            handle,
+            projection: WeightProjection {
+                kind: WeightProjectionKind::Static,
+                axis: None,
+                rank: 0,
+                world_size: 1,
+                logical_shape: vec![m, k],
+                dtype: DType::BF16,
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        log: Vec<String>,
+        fail_invalidate: bool,
+        fail_copy: bool,
+    }
+
+    impl ReplaceOps for Fake {
+        fn invalidate_arena_source(&mut self, ptr: usize) -> Result<bool, String> {
+            self.log.push(format!("invalidate:{ptr:#x}"));
+            if self.fail_invalidate {
+                return Err("fake quiesce failure".into());
+            }
+            Ok(true)
+        }
+        fn write_host(&mut self, dst: &DeviceBuffer, bytes: &[u8]) -> Result<(), String> {
+            self.log
+                .push(format!("write:{:#x}:{}", dst.as_ptr() as usize, bytes.len()));
+            Ok(())
+        }
+        fn copy_device(
+            &mut self,
+            dst: &DeviceBuffer,
+            src: &DeviceBuffer,
+            bytes: usize,
+        ) -> Result<(), String> {
+            self.log.push(format!(
+                "copy:{:#x}<-{:#x}:{bytes}",
+                dst.as_ptr() as usize,
+                src.as_ptr() as usize
+            ));
+            if self.fail_copy {
+                return Err("fake copy failure".into());
+            }
+            Ok(())
+        }
+        fn free(&mut self, tensor: GpuTensor) -> Result<(), String> {
+            self.log.push(format!("free:{:#x}", tensor.buf.as_ptr() as usize));
+            Ok(())
+        }
+        fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+            self.log.push(format!("upload_qt44:{}", bytes.len()));
+            Ok(owned(
+                TEMP_BASE,
+                bytes.len(),
+                DType::MQ4G256V2,
+                &[bytes.len()],
+            ))
+        }
+    }
+
+    fn ptr_of(taken: &TakenWeight) -> usize {
+        let WeightHandle::Resident(tensor) = &taken.handle else {
+            panic!("not resident")
+        };
+        tensor.buf.as_ptr() as usize
+    }
+
+    #[test]
+    fn free_gpu_skips_borrowed_views_and_frees_owned_tensors() {
+        let handles = vec![
+            taken(
+                WeightHandle::Resident(view(ROOT_BASE, 4096, DType::BF16, &[4, 512])),
+                4,
+                512,
+            ),
+            taken(
+                WeightHandle::Resident(owned(TEMP_BASE, 64, DType::F32, &[16])),
+                1,
+                16,
+            ),
+            taken(WeightHandle::Alias("w".into()), 1, 1),
+            taken(
+                WeightHandle::Resident(view(ROOT_BASE + 4096, 256, DType::BF16, &[1, 128])),
+                1,
+                128,
+            ),
+        ];
+        let mut freed = Vec::new();
+        free_taken_handles(handles, |tensor| {
+            freed.push(tensor.buf.as_ptr() as usize);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(freed, vec![TEMP_BASE], "only the owned tensor reaches the free path");
+    }
+
+    #[test]
+    fn free_gpu_reports_the_first_owned_free_error_after_attempting_all() {
+        let handles = vec![
+            taken(
+                WeightHandle::Resident(owned(TEMP_BASE, 64, DType::F32, &[16])),
+                1,
+                16,
+            ),
+            taken(
+                WeightHandle::Resident(owned(TEMP_BASE + 64, 64, DType::F32, &[16])),
+                1,
+                16,
+            ),
+        ];
+        let mut attempts = 0;
+        let error = free_taken_handles(handles, |_| {
+            attempts += 1;
+            Err(hip_bridge::HipError::new(7, &format!("fail {attempts}")))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert!(error.message.contains("fail 1"));
+    }
+
+    #[test]
+    fn replaced_owned_weight_still_frees_the_old_tensor() {
+        let mut weight = taken(
+            WeightHandle::Resident(owned(TEMP_BASE, 4096, DType::BF16, &[4, 512])),
+            4,
+            512,
+        );
+        let copy = owned(TEMP_BASE + 0x1000, 544, DType::Q8_0, &[4, 512]);
+        let mut ops = Fake::default();
+        let sizes =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap();
+        assert_eq!(sizes, (4096, 544));
+        assert_eq!(ptr_of(&weight), TEMP_BASE + 0x1000, "the copy is installed");
+        assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
+    }
+
+    #[test]
+    fn every_requant_rule_replaces_in_place_keeping_pointer_and_span_capacity() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        for (target, expected) in [
+            (DType::MQ2G256V2, m * (k / 256) * 72),
+            (DType::MQ3G256V2, m * (k / 256) * 104),
+            (DType::MQ4G256V2, m * (k / 256) * 136),
+            (DType::MQ5G256V2, m * (k / 256) * 168),
+            (DType::MQ6G256V2, m * (k / 256) * 200),
+            (DType::Q8_0, m * (k / 32) * 34),
+        ] {
+            assert_eq!(replacement_payload_bytes(target, m, k), Some(expected));
+            let mut weight = taken(
+                WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+                m,
+                k,
+            );
+            let copy = owned(TEMP_BASE, expected, target, &[m, k]);
+            let mut ops = Fake::default();
+            let (before, after) =
+                replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap();
+            assert_eq!((before, after), (span, expected), "{target:?}");
+            let WeightHandle::Resident(now) = &weight.handle else {
+                panic!("not resident")
+            };
+            assert_eq!(now.buf.as_ptr() as usize, ROOT_BASE, "{target:?}: pointer stable");
+            assert!(now.buf.is_borrowed(), "{target:?}: still a borrowed view");
+            assert_eq!(now.buf.size(), span, "{target:?}: span capacity preserved");
+            assert_eq!(now.dtype, target);
+            assert_eq!(now.shape, vec![m, k]);
+            // One fence+invalidate, then write, then free only the temporary
+            // owner. The planned span is never freed.
+            assert_eq!(
+                ops.log,
+                vec![
+                    format!("invalidate:{ROOT_BASE:#x}"),
+                    format!("copy:{ROOT_BASE:#x}<-{TEMP_BASE:#x}:{expected}"),
+                    format!("free:{TEMP_BASE:#x}"),
+                ],
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qt44_replacement_writes_the_payload_directly_into_the_span() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let payload = vec![7u8; m * (k / 256) * 136];
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&payload[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (span, payload.len()));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.buf.as_ptr() as usize, ROOT_BASE);
+        assert_eq!(now.buf.size(), span);
+        assert_eq!(now.dtype, DType::MQ4G256V2);
+        assert_eq!(now.shape, vec![payload.len()]);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("write:{ROOT_BASE:#x}:{}", payload.len()),
+            ],
+            "no temporary owner exists, so nothing is uploaded or freed"
+        );
+    }
+
+    #[test]
+    fn a_second_replacement_still_fits_the_original_span_capacity() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let small = vec![1u8; m * (k / 256) * 72];
+        let mut ops = Fake::default();
+        replace_resident_with(&mut ops, &mut weight, Replacement::Qt44(Cow::Borrowed(&small)))
+            .unwrap();
+        // A larger payload than the first, still within the planned span.
+        let larger = vec![2u8; m * (k / 256) * 200];
+        let mut ops = Fake::default();
+        let (before, after) = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&larger)),
+        )
+        .unwrap();
+        assert_eq!((before, after), (span, larger.len()));
+        assert_eq!(ptr_of(&weight), ROOT_BASE);
+    }
+
+    #[test]
+    fn an_oversized_replacement_errors_before_any_write() {
+        let span = 1024usize;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[4, 128])),
+            4,
+            256,
+        );
+        let oversized = vec![0u8; span + 1];
+        let mut ops = Fake::default();
+        let error = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&oversized)),
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds the planned arena span"), "{error}");
+        assert!(ops.log.is_empty(), "no invalidate, write or fallback: {:?}", ops.log);
+        assert_eq!(ptr_of(&weight), ROOT_BASE, "the original view is untouched");
+
+        // A kernel-produced tensor too large for the span is refused the same
+        // way, its temporary owner is freed, and nothing is written.
+        let copy = owned(TEMP_BASE, 4 * 4 * 200, DType::MQ6G256V2, &[4, 1024]);
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[4, 128])),
+            4,
+            1024,
+        );
+        let mut ops = Fake::default();
+        let error =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert!(error.contains("exceeds the planned arena span"), "{error}");
+        assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
+        assert_eq!(ptr_of(&weight), ROOT_BASE);
+    }
+
+    #[test]
+    fn a_failed_fence_writes_nothing_and_keeps_the_original_view() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let expected = m * (k / 256) * 136;
+        let copy = owned(TEMP_BASE, expected, DType::MQ4G256V2, &[m, k]);
+        let mut ops = Fake {
+            fail_invalidate: true,
+            ..Fake::default()
+        };
+        let error =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert!(error.contains("fake quiesce failure"));
+        assert_eq!(
+            ops.log,
+            vec![format!("invalidate:{ROOT_BASE:#x}"), format!("free:{TEMP_BASE:#x}")],
+            "no write; only the temporary owner is released"
+        );
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.dtype, DType::BF16, "the weight keeps its original metadata");
+
+        let payload = vec![0u8; expected];
+        let mut ops = Fake {
+            fail_invalidate: true,
+            ..Fake::default()
+        };
+        replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&payload)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            ops.log,
+            vec![format!("invalidate:{ROOT_BASE:#x}")],
+            "no write on a failed fence"
+        );
+    }
+
+    #[test]
+    fn a_failed_copy_still_frees_the_temporary_and_keeps_the_view_metadata() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let expected = m * (k / 256) * 136;
+        let copy = owned(TEMP_BASE, expected, DType::MQ4G256V2, &[m, k]);
+        let mut ops = Fake {
+            fail_copy: true,
+            ..Fake::default()
+        };
+        replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert_eq!(ops.log.last().unwrap(), &format!("free:{TEMP_BASE:#x}"));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.dtype, DType::BF16);
+    }
+
+    #[test]
+    fn replaced_view_does_not_free_the_root_at_teardown() {
+        let (m, k) = (4usize, 512usize);
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, m * k * 2, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Owned(vec![0u8; m * (k / 256) * 136])),
+        )
+        .unwrap();
+        let mut freed = 0;
+        free_taken_handles(vec![weight], |_| {
+            freed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(freed, 0, "the retagged view is still borrowed: the root owner frees it");
+    }
+
+    #[test]
+    fn a_non_resident_weight_is_refused_and_the_temporary_freed() {
+        let mut weight = taken(WeightHandle::Alias("src".into()), 4, 512);
+        let copy = owned(TEMP_BASE, 544, DType::Q8_0, &[4, 512]);
+        let mut ops = Fake::default();
+        let error =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert!(error.contains("not resident"));
+        assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
     }
 }

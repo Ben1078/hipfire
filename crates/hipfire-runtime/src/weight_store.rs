@@ -21,9 +21,11 @@ use crate::mesh_placement::BandPlacement;
 use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
 use crate::tp_shard::ExpertAssign;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
+use rdna_compute::byte_arena::{ModelWeightArenaPlan, NamedByteArenaSpan};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 thread_local! {
     static RESIDENT_ALLOCATIONS: std::cell::Cell<usize> =
@@ -31,6 +33,11 @@ thread_local! {
     static RESIDENT_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_AFTER_UPLOAD: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static ARENA_ROOT_ALLOCATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static ARENA_ROOT_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ARENA_ROOT_QUARANTINES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Test-only allocation accounting and deterministic post-upload fault seam.
@@ -40,11 +47,17 @@ thread_local! {
 /// [`clear_faults`] after it so a failed test cannot poison a later one.
 #[doc(hidden)]
 pub mod test_support {
-    use super::{FAIL_AFTER_UPLOAD, RESIDENT_ALLOCATIONS, RESIDENT_RELEASES};
+    use super::{
+        ARENA_ROOT_ALLOCATIONS, ARENA_ROOT_QUARANTINES, ARENA_ROOT_RELEASES, FAIL_AFTER_UPLOAD,
+        RESIDENT_ALLOCATIONS, RESIDENT_RELEASES,
+    };
 
     pub fn reset() {
         RESIDENT_ALLOCATIONS.with(|count| count.set(0));
         RESIDENT_RELEASES.with(|count| count.set(0));
+        ARENA_ROOT_ALLOCATIONS.with(|count| count.set(0));
+        ARENA_ROOT_RELEASES.with(|count| count.set(0));
+        ARENA_ROOT_QUARANTINES.with(|count| count.set(0));
         clear_faults();
     }
 
@@ -63,6 +76,22 @@ pub mod test_support {
 
     pub fn resident_releases() -> usize {
         RESIDENT_RELEASES.with(std::cell::Cell::get)
+    }
+
+    /// Exact weight-arena roots allocated since [`reset`].
+    pub fn arena_root_allocations() -> usize {
+        ARENA_ROOT_ALLOCATIONS.with(std::cell::Cell::get)
+    }
+
+    /// Weight-arena roots released through the owner release path since [`reset`].
+    pub fn arena_root_releases() -> usize {
+        ARENA_ROOT_RELEASES.with(std::cell::Cell::get)
+    }
+
+    /// Weight-arena roots leaked (never released) because the device could
+    /// not be quiesced since [`reset`].
+    pub fn arena_root_quarantines() -> usize {
+        ARENA_ROOT_QUARANTINES.with(std::cell::Cell::get)
     }
 
     pub(super) fn record_resident_upload() -> bool {
@@ -262,6 +291,118 @@ impl std::fmt::Display for FulfillError {
 
 impl std::error::Error for FulfillError {}
 
+/// Real exact-allocated roots of a bounded weight arena. They are separate
+/// owners, not placements: a placement is a borrowed view into one of these
+/// roots and never owns bytes. The roots stay live through assembly
+/// (`take`/guard/`finalize`) and are released exactly once, after every view
+/// and after the Gpu's pointer-keyed shadow bindings, by
+/// [`WeightStore::release_with`].
+struct WeightArenaRoots {
+    plan: Arc<ModelWeightArenaPlan>,
+    /// Plan root order; each is an owning exact allocation.
+    roots: Vec<GpuTensor>,
+}
+
+impl WeightArenaRoots {
+    fn span(&self, name: &str) -> Option<&NamedByteArenaSpan> {
+        self.plan.weights.member(name)
+    }
+
+    /// Borrowed view of one planned member, with the manifest's logical
+    /// shape and the payload's source dtype.
+    fn view(
+        &self,
+        span: &NamedByteArenaSpan,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<GpuTensor, String> {
+        let root = self.roots.get(span.root).ok_or_else(|| {
+            format!(
+                "arena member '{}' names root {} of {} live roots",
+                span.name,
+                span.root,
+                self.roots.len()
+            )
+        })?;
+        span.offset
+            .checked_add(span.bytes)
+            .filter(|&end| end <= root.buf.size())
+            .ok_or_else(|| {
+                format!(
+                    "arena member '{}' range {}+{} exceeds root {} capacity {}",
+                    span.name,
+                    span.offset,
+                    span.bytes,
+                    span.root,
+                    root.buf.size()
+                )
+            })?;
+        Ok(GpuTensor {
+            buf: root.buf.byte_view(span.offset, span.bytes),
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    /// Whether `tensor` is a borrowed view that lies wholly inside one root.
+    fn contains_view(&self, tensor: &GpuTensor) -> bool {
+        if !tensor.buf.is_borrowed() {
+            return false;
+        }
+        let ptr = tensor.buf.as_ptr() as usize;
+        self.roots.iter().any(|root| {
+            let base = root.buf.as_ptr() as usize;
+            ptr.checked_sub(base)
+                .and_then(|offset| offset.checked_add(tensor.buf.size()))
+                .is_some_and(|end| end <= root.buf.size())
+        })
+    }
+}
+
+/// The device operations the store's release path needs. [`GpuRelease`] is
+/// the only production implementation; CPU tests substitute a recording fake
+/// so the ordering contract (shadow bindings, views, quiesce, roots) is
+/// checkable without a GPU.
+trait WeightRelease {
+    /// Return an individually allocated resident to its owner.
+    fn free_resident(&mut self, tensor: GpuTensor) -> hip_bridge::HipResult<()>;
+    /// Clear every pointer-keyed weight cache and arena shadow binding. Runs
+    /// before any arena root can be released or its address reused.
+    fn clear_arena_caches(&mut self);
+    /// Drain the device so no queued kernel can still read a root.
+    fn quiesce(&mut self) -> hip_bridge::HipResult<()>;
+    /// Release one real arena root.
+    fn release_root(&mut self, tensor: GpuTensor) -> hip_bridge::HipResult<()>;
+}
+
+struct GpuRelease<'g>(&'g mut Gpu);
+
+impl WeightRelease for GpuRelease<'_> {
+    fn free_resident(&mut self, tensor: GpuTensor) -> hip_bridge::HipResult<()> {
+        // Pool return, not a raw HIP free: residents were uploaded through
+        // the pool (`upload_pooled_bytes`), and the steady-state teardown
+        // (`WeightTensor::free_all` -> `Gpu::free_tensor`) releases to the
+        // same pool. A raw `hip.free` here would orphan pool bookkeeping.
+        self.0.free_tensor(tensor)
+    }
+
+    fn clear_arena_caches(&mut self) {
+        self.0.invalidate_weight_caches();
+    }
+
+    fn quiesce(&mut self) -> hip_bridge::HipResult<()> {
+        self.0.bind_thread()?;
+        self.0.hip.device_synchronize()
+    }
+
+    fn release_root(&mut self, tensor: GpuTensor) -> hip_bridge::HipResult<()> {
+        // Exact hipMalloc owner: freed immediately, never parked in the pool
+        // (a parked root-sized buffer would be handed to the next load as an
+        // oversized candidate).
+        self.0.release_tensor_immediate(tensor)
+    }
+}
+
 /// Load-side placement container. It records one immutable projection per
 /// `(name, layer, device)` and captures the target origin once. The container
 /// itself has no consuming teardown API; lifecycle transitions are represented
@@ -292,6 +433,10 @@ pub struct WeightStore {
     /// separately materialized endpoints. Retained after assembly takes handles.
     aliases: HashMap<WeightPlacementKey, String>,
     origin: Option<WeightOrigin>,
+    /// Real exact-allocated weight arena roots; `None` outside an S1 arena
+    /// fulfillment. Deliberately not part of `placements`/`journal`: roots
+    /// outlive every taken view and are released exactly once, last.
+    arena: Option<WeightArenaRoots>,
 }
 
 /// The only owner that may roll back resident allocations before publication.
@@ -325,6 +470,9 @@ impl WeightLoadTransaction {
         self.store.as_ref().map_or(0, WeightStore::len)
     }
 
+    /// `true` only when the store owns nothing: no placement handles AND no
+    /// live arena root (a fully assembled arena store has empty placements
+    /// but still owns its roots).
     pub fn is_empty(&self) -> bool {
         self.store.as_ref().is_none_or(WeightStore::is_empty)
     }
@@ -360,6 +508,27 @@ impl WeightLoadTransaction {
     }
     pub fn inventory_len(&self) -> usize {
         self.store.as_ref().map_or(0, WeightStore::inventory_len)
+    }
+
+    /// The weight/shadow arena plan this load was fulfilled from, if any.
+    pub fn weight_arena_plan(&self) -> Option<&Arc<ModelWeightArenaPlan>> {
+        self.store.as_ref().and_then(WeightStore::weight_arena_plan)
+    }
+
+    /// ACTUAL live capacities (`buf.size`) of the exact-allocated weight
+    /// roots, in plan root order; empty without live roots.
+    pub fn weight_arena_root_capacities(&self) -> Vec<usize> {
+        self.store
+            .as_ref()
+            .map_or_else(Vec::new, WeightStore::arena_root_capacities)
+    }
+
+    /// Planned root requests, in plan root order (what was asked of the
+    /// exact allocator); empty without an arena.
+    pub fn weight_arena_root_requests(&self) -> Vec<usize> {
+        self.store
+            .as_ref()
+            .map_or_else(Vec::new, WeightStore::arena_root_requests)
     }
 
     pub fn projection(
@@ -411,10 +580,13 @@ impl WeightLoadTransaction {
     /// lifecycle API. Successful frees are reflected in the resident-release
     /// accounting; any failed pool return is returned to the caller.
     pub fn rollback(mut self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
-        if let Some(store) = self.store.take() {
-            store.rollback(gpu)
-        } else {
-            Ok(())
+        self.rollback_via(&mut GpuRelease(gpu))
+    }
+
+    fn rollback_via(&mut self, ops: &mut dyn WeightRelease) -> hip_bridge::HipResult<()> {
+        match self.store.take() {
+            Some(store) => store.release_with(ops),
+            None => Ok(()),
         }
     }
 }
@@ -431,6 +603,7 @@ impl WeightStore {
             external_rows: HashMap::new(),
             journal: Vec::new(),
             aliases: HashMap::new(),
+            arena: None,
             origin: Some(origin),
         }
     }
@@ -443,8 +616,35 @@ impl WeightStore {
         self.placements.len()
     }
 
+    /// `true` only when no placement handle AND no live arena root remains.
     pub fn is_empty(&self) -> bool {
-        self.placements.is_empty()
+        self.placements.is_empty() && !self.has_live_weight_roots()
+    }
+
+    /// Whether real arena roots are live (they outlive taken views).
+    pub fn has_live_weight_roots(&self) -> bool {
+        self.arena
+            .as_ref()
+            .is_some_and(|arena| !arena.roots.is_empty())
+    }
+
+    pub fn weight_arena_plan(&self) -> Option<&Arc<ModelWeightArenaPlan>> {
+        self.arena.as_ref().map(|arena| &arena.plan)
+    }
+
+    /// ACTUAL live capacity (`buf.size`) of every exact weight root, in plan
+    /// root order; empty when no arena roots are live.
+    pub fn arena_root_capacities(&self) -> Vec<usize> {
+        self.arena.as_ref().map_or_else(Vec::new, |arena| {
+            arena.roots.iter().map(|root| root.buf.size()).collect()
+        })
+    }
+
+    /// Planned root requests of the arena plan, in plan root order.
+    pub fn arena_root_requests(&self) -> Vec<usize> {
+        self.arena
+            .as_ref()
+            .map_or_else(Vec::new, |arena| arena.plan.weights.roots.clone())
     }
 
     pub fn contains(&self, name: &str, layer: Option<usize>, device: usize) -> bool {
@@ -629,21 +829,40 @@ impl WeightStore {
     /// by assembly (or restored then re-taken) resolve to no placement and
     /// are skipped, so each resident is freed at most once; aliases own no
     /// buffer and are removed without GPU work.
-    fn release_unchecked(mut self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
-        let mut first_error = None;
+    fn release_unchecked(self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
+        self.release_with(&mut GpuRelease(gpu))
+    }
+
+    /// Release order (arena mode adds steps 1, 3 and 4):
+    /// 1. clear the Gpu's pointer-keyed weight caches and arena shadow
+    ///    bindings, so no address can be served stale once a root is gone;
+    /// 2. free individually owned residents in exact reverse allocation
+    ///    order; borrowed views inside a live root own nothing and are
+    ///    skipped (any other borrowed handle still reaches the owner's
+    ///    refusal);
+    /// 3. quiesce the device;
+    /// 4. release every real root exactly once, last. If the device cannot be
+    ///    quiesced the roots are quarantined (leaked, never released while a
+    ///    kernel may still read them) and the error is reported.
+    fn release_with(mut self, ops: &mut dyn WeightRelease) -> hip_bridge::HipResult<()> {
+        let mut first_error: Option<hip_bridge::HipError> = None;
+        let arena = self.arena.take();
+        if arena.is_some() {
+            ops.clear_arena_caches();
+        }
         for key in self.journal.drain(..).rev() {
             let handle = match self.placements.remove(&key) {
                 Some(handle) => handle,
                 None => continue,
             };
             if let WeightHandle::Resident(tensor) = handle {
-                // Pool return, not a raw HIP free: residents were uploaded
-                // through the pool (`upload_pooled_bytes`), and the
-                // steady-state teardown (`WeightTensor::free_all` →
-                // `Gpu::free_tensor`) releases to the same pool. A raw
-                // `hip.free` here would orphan pool bookkeeping; a pool
-                // return keeps the next fulfillment reusing these buffers.
-                match gpu.free_tensor(tensor) {
+                if arena
+                    .as_ref()
+                    .is_some_and(|arena| arena.contains_view(&tensor))
+                {
+                    continue;
+                }
+                match ops.free_resident(tensor) {
                     Ok(()) => {
                         RESIDENT_RELEASES.with(|count| count.set(count.get() + 1));
                     }
@@ -651,6 +870,43 @@ impl WeightStore {
                         if first_error.is_none() {
                             first_error = Some(error);
                         }
+                    }
+                }
+            }
+        }
+        if let Some(arena) = arena {
+            let roots = arena.roots;
+            if !roots.is_empty() {
+                match ops.quiesce() {
+                    Ok(()) => {
+                        for root in roots.into_iter().rev() {
+                            match ops.release_root(root) {
+                                Ok(()) => {
+                                    ARENA_ROOT_RELEASES.with(|count| count.set(count.get() + 1));
+                                }
+                                Err(error) => {
+                                    if first_error.is_none() {
+                                        first_error = Some(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        ARENA_ROOT_QUARANTINES
+                            .with(|count| count.set(count.get() + roots.len()));
+                        if first_error.is_none() {
+                            first_error = Some(hip_bridge::HipError::new(
+                                error.code,
+                                &format!(
+                                    "{error}; {} weight arena roots quarantined (leaked, not released)",
+                                    roots.len()
+                                ),
+                            ));
+                        }
+                        // `DeviceBuffer` has no destructor: dropping the
+                        // handles leaks the allocations on purpose.
+                        drop(roots);
                     }
                 }
             }
@@ -1029,13 +1285,9 @@ fn validate_payload_extent(shape: &[usize], dtype: DType, actual: usize) -> Resu
     Ok(())
 }
 
-fn upload_range_pooled(
-    gpu: &mut Gpu,
-    descriptor: &SourceRangeDescriptor,
-    dtype: DType,
-    logical_shape: &[usize],
-    tail_pad: usize,
-) -> Result<GpuTensor, String> {
+/// Checked byte length of a range payload: non-empty and a whole number of
+/// `dtype` quant blocks.
+fn range_payload_len(descriptor: &SourceRangeDescriptor, dtype: DType) -> Result<usize, String> {
     let payload_len = usize::try_from(descriptor.length)
         .map_err(|_| "source range length does not fit usize".to_string())?;
     if payload_len == 0 {
@@ -1047,6 +1299,53 @@ fn upload_range_pooled(
             "source range length {payload_len} is not aligned to {alignment}-byte blocks for {dtype:?}"
         ));
     }
+    Ok(payload_len)
+}
+
+/// Stream `payload_len` bytes of `descriptor` into `dst` starting at
+/// `dst_offset`, through one bounded quant-block-aligned staging buffer. The
+/// destination is the final tensor (a pooled allocation or an arena span);
+/// no model-sized host buffer exists.
+fn copy_range_chunks(
+    gpu: &mut Gpu,
+    descriptor: &SourceRangeDescriptor,
+    dtype: DType,
+    payload_len: usize,
+    dst: &hip_bridge::DeviceBuffer,
+    dst_offset: usize,
+) -> Result<(), String> {
+    let alignment = quant_block_bytes(dtype);
+    let mut offset = 0usize;
+    let mut staging = vec![0u8; next_range_chunk(0, payload_len, alignment)];
+    while offset < payload_len {
+        let chunk_len = next_range_chunk(offset, payload_len, alignment);
+        let chunk = &mut staging[..chunk_len];
+        let absolute_offset = descriptor
+            .offset
+            .checked_add(offset as u64)
+            .ok_or_else(|| "source range offset overflow".to_string())?;
+        descriptor
+            .read_exact_at(absolute_offset, chunk)
+            .map_err(|error| format!("source range read failed: {error}"))?;
+        gpu.hip
+            .memcpy_htod_offset(dst, dst_offset + offset, chunk)
+            .map_err(|error| format!("pooled chunk upload failed: {error}"))?;
+        // Read once per load: on unified memory the cached copy only
+        // pushes other pages (the PLE table's) out of the page cache.
+        descriptor.release_uploaded(absolute_offset, chunk_len as u64);
+        offset += chunk_len;
+    }
+    Ok(())
+}
+
+fn upload_range_pooled(
+    gpu: &mut Gpu,
+    descriptor: &SourceRangeDescriptor,
+    dtype: DType,
+    logical_shape: &[usize],
+    tail_pad: usize,
+) -> Result<GpuTensor, String> {
+    let payload_len = range_payload_len(descriptor, dtype)?;
     let mut tensor = gpu
         .alloc_tensor(&[payload_len + tail_pad], DType::Raw)
         .map_err(|error| format!("pooled allocation failed: {error}"))?;
@@ -1057,27 +1356,7 @@ fn upload_range_pooled(
                 .memcpy_htod_offset(&tensor.buf, payload_len, &vec![0u8; tail_pad])
                 .map_err(|error| format!("pooled tail pad upload failed: {error}"))?;
         }
-        let mut offset = 0usize;
-        let mut staging = vec![0u8; next_range_chunk(0, payload_len, alignment)];
-        while offset < payload_len {
-            let chunk_len = next_range_chunk(offset, payload_len, alignment);
-            let chunk = &mut staging[..chunk_len];
-            let absolute_offset = descriptor
-                .offset
-                .checked_add(offset as u64)
-                .ok_or_else(|| "source range offset overflow".to_string())?;
-            descriptor
-                .read_exact_at(absolute_offset, chunk)
-                .map_err(|error| format!("source range read failed: {error}"))?;
-            gpu.hip
-                .memcpy_htod_offset(&tensor.buf, offset, chunk)
-                .map_err(|error| format!("pooled chunk upload failed: {error}"))?;
-            // Read once per load: on unified memory the cached copy only
-            // pushes other pages (the PLE table's) out of the page cache.
-            descriptor.release_uploaded(absolute_offset, chunk_len as u64);
-            offset += chunk_len;
-        }
-        Ok::<(), String>(())
+        copy_range_chunks(gpu, descriptor, dtype, payload_len, &tensor.buf, 0)
     })();
     if let Err(error) = result {
         let _ = gpu.free_tensor(tensor);
@@ -1575,6 +1854,267 @@ fn upload_expert_compact(
     Ok((tensor, dtype))
 }
 
+fn arena_error(reason: impl Into<String>) -> FulfillError {
+    FulfillError {
+        name: "<arena>".to_string(),
+        layer: None,
+        device: 0,
+        reason: reason.into(),
+    }
+}
+
+/// Structural reason `entry` cannot be a view of the weight arena, if any.
+/// The plan (not this predicate) names the members; this only refuses an
+/// entry whose upload semantics an arena view cannot honor.
+fn arena_entry_refusal(entry: &WeightEntry) -> Option<&'static str> {
+    if entry.residency != WeightResidency::Resident {
+        return Some("is not device-resident (host-mapped or external rows)");
+    }
+    if matches!(entry.policy, ShardPolicy::Tied { .. }) {
+        return Some("is a tied alias");
+    }
+    if matches!(
+        entry.policy,
+        ShardPolicy::ExpertSharded { .. } | ShardPolicy::ExpertTensorSharded { .. }
+    ) {
+        return Some("is an expert-sharded tensor");
+    }
+    if range_tail_pad(entry) != 0 {
+        return Some("carries a zeroed tail pad past its payload");
+    }
+    None
+}
+
+/// Input-plan validation against the manifest, run before any allocation.
+/// The layout itself is the plan's ([`ModelWeightArenaPlan::validate`]); this
+/// only binds its names to real, eligible, unambiguous manifest entries.
+fn validate_weight_arena_manifest(
+    plan: &ModelWeightArenaPlan,
+    weights: &[WeightEntry],
+) -> Result<(), String> {
+    plan.validate()?;
+    let mut by_name: HashMap<&str, (usize, &WeightEntry)> = HashMap::new();
+    for entry in weights {
+        by_name
+            .entry(entry.name.as_str())
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert((1, entry));
+    }
+    for member in &plan.weights.members {
+        let Some(&(count, entry)) = by_name.get(member.name.as_str()) else {
+            return Err(format!(
+                "arena member '{}' has no manifest entry",
+                member.name
+            ));
+        };
+        if count != 1 {
+            return Err(format!(
+                "arena member '{}' names {count} manifest entries; names must be unique",
+                member.name
+            ));
+        }
+        if let Some(reason) = arena_entry_refusal(entry) {
+            return Err(format!(
+                "arena member '{}' {reason}; it cannot be an arena view",
+                member.name
+            ));
+        }
+    }
+    for member in &plan.f16_shadows.members {
+        if plan.weights.member(&member.name).is_none() {
+            return Err(format!(
+                "shadow owner '{}' is not a weight arena member",
+                member.name
+            ));
+        }
+        let entry = by_name
+            .get(member.name.as_str())
+            .map(|&(_, entry)| entry)
+            .ok_or_else(|| format!("shadow owner '{}' has no manifest entry", member.name))?;
+        let expected = match entry.logical_shape.as_slice() {
+            [rows, cols] if entry.dtype == DType::BF16 => rows
+                .checked_mul(*cols)
+                .and_then(|elements| elements.checked_mul(2)),
+            _ => None,
+        };
+        if expected != Some(member.bytes) {
+            return Err(format!(
+                "shadow owner '{}' is not a 2-D BF16 weight whose F16 shadow is {} bytes",
+                member.name, member.bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Exact-allocate every weight root of `plan` into `store`, keeping partial
+/// progress in the store so a failure rolls back through the one release
+/// path (roots last), then prove each ACTUAL capacity equals its request.
+fn acquire_weight_roots(
+    store: &mut WeightStore,
+    plan: Arc<ModelWeightArenaPlan>,
+    mut allocate: impl FnMut(usize) -> hip_bridge::HipResult<GpuTensor>,
+) -> Result<(), String> {
+    let requests = plan.weights.roots.clone();
+    store.arena = Some(WeightArenaRoots {
+        plan: Arc::clone(&plan),
+        roots: Vec::with_capacity(requests.len()),
+    });
+    for (index, request) in requests.iter().enumerate() {
+        let root = allocate(*request).map_err(|error| {
+            format!("weight root {index} ({request} bytes) exact allocation failed: {error}")
+        })?;
+        ARENA_ROOT_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+        store
+            .arena
+            .as_mut()
+            .expect("arena installed above")
+            .roots
+            .push(root);
+    }
+    plan.weights
+        .validate_capacities(&store.arena_root_capacities(), plan.granule_bytes)
+        .map_err(|error| format!("weight root capacity validation failed: {error}"))?;
+    Ok(())
+}
+
+/// Real resident source pointers of the F16-shadow owners, in the plan's
+/// sorted member order. Each must be its planned arena view (borrowed,
+/// exactly at root base + planned offset, BF16 2-D), so a binding can never
+/// name a pointer that is not the weight the plan sized the shadow for.
+fn shadow_source_ptrs(store: &WeightStore, weights: &[WeightEntry]) -> Result<Vec<usize>, String> {
+    let Some(arena) = store.arena.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let layers: HashMap<&str, Option<usize>> = weights
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.layer))
+        .collect();
+    let mut ptrs = Vec::with_capacity(arena.plan.f16_shadows.members.len());
+    for member in &arena.plan.f16_shadows.members {
+        let layer = layers
+            .get(member.name.as_str())
+            .copied()
+            .ok_or_else(|| format!("shadow owner '{}' has no manifest entry", member.name))?;
+        let Some(WeightHandle::Resident(tensor)) = store.get(&member.name, layer, 0) else {
+            return Err(format!(
+                "shadow owner '{}' has no resident handle",
+                member.name
+            ));
+        };
+        let span = arena
+            .span(&member.name)
+            .ok_or_else(|| format!("shadow owner '{}' has no weight arena span", member.name))?;
+        let root = arena
+            .roots
+            .get(span.root)
+            .ok_or_else(|| format!("shadow owner '{}' root is not live", member.name))?;
+        let expected = (root.buf.as_ptr() as usize).checked_add(span.offset);
+        let ptr = tensor.buf.as_ptr() as usize;
+        if !tensor.buf.is_borrowed()
+            || Some(ptr) != expected
+            || tensor.dtype != DType::BF16
+            || tensor.shape.len() != 2
+        {
+            return Err(format!(
+                "shadow owner '{}' resident is not its planned BF16 arena view",
+                member.name
+            ));
+        }
+        ptrs.push(ptr);
+    }
+    Ok(ptrs)
+}
+
+/// Upload one Borrowed/Owned payload: into the entry's planned arena span
+/// (direct copy to the final view, no host concatenation) when the store has
+/// an arena naming it, otherwise through the existing per-tensor path.
+fn upload_payload_bytes(
+    gpu: &mut Gpu,
+    store: &WeightStore,
+    entry: &WeightEntry,
+    dtype: DType,
+    bytes: &[u8],
+) -> Result<GpuTensor, String> {
+    let planned = store
+        .arena
+        .as_ref()
+        .and_then(|arena| arena.span(&entry.name).map(|span| (arena, span)));
+    let Some((arena, span)) = planned else {
+        return upload_resident_bytes(gpu, entry.residency, bytes, &entry.logical_shape)
+            .map(|mut tensor| {
+                tensor.dtype = dtype;
+                tensor
+            })
+            .map_err(|error| format!("pooled upload failed: {error}"));
+    };
+    if bytes.len() != span.bytes {
+        return Err(format!(
+            "source payload has {} bytes, arena span of '{}' is {} bytes",
+            bytes.len(),
+            span.name,
+            span.bytes
+        ));
+    }
+    let view = arena.view(span, &entry.logical_shape, dtype)?;
+    if !bytes.is_empty() {
+        gpu.bind_thread()
+            .map_err(|error| format!("arena upload failed: {error}"))?;
+        gpu.hip
+            .memcpy_htod_offset(&arena.roots[span.root].buf, span.offset, bytes)
+            .map_err(|error| format!("arena upload failed: {error}"))?;
+    }
+    Ok(view)
+}
+
+/// [`upload_payload_bytes`] for a checked source range: bounded staging
+/// straight into the arena span, or the existing pooled range upload.
+fn upload_payload_range(
+    gpu: &mut Gpu,
+    store: &WeightStore,
+    entry: &WeightEntry,
+    descriptor: &SourceRangeDescriptor,
+    dtype: DType,
+    range_len: usize,
+) -> Result<GpuTensor, String> {
+    let planned = store
+        .arena
+        .as_ref()
+        .and_then(|arena| arena.span(&entry.name).map(|span| (arena, span)));
+    let Some((arena, span)) = planned else {
+        return upload_range_pooled(
+            gpu,
+            descriptor,
+            dtype,
+            &entry.logical_shape,
+            range_tail_pad(entry),
+        )
+        .map(|mut tensor| {
+            tensor.dtype = dtype;
+            tensor
+        });
+    };
+    if range_len != span.bytes {
+        return Err(format!(
+            "source range has {range_len} bytes, arena span of '{}' is {} bytes",
+            span.name, span.bytes
+        ));
+    }
+    let payload_len = range_payload_len(descriptor, dtype)?;
+    let view = arena.view(span, &entry.logical_shape, dtype)?;
+    gpu.bind_thread()
+        .map_err(|error| format!("arena upload failed: {error}"))?;
+    copy_range_chunks(
+        gpu,
+        descriptor,
+        dtype,
+        payload_len,
+        &arena.roots[span.root].buf,
+        span.offset,
+    )?;
+    Ok(view)
+}
+
 /// Fulfill a Single manifest from the canonical source payload seam.
 ///
 /// Small tensors may be borrowed from a source mmap or owned by the callback.
@@ -1613,6 +2153,60 @@ pub fn fulfill_manifest_from_payloads_ep<'a, F>(
 where
     F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
 {
+    fulfill_payloads_impl(weights, mesh, n_layers, gpu, expected, ep, None, source)
+}
+
+/// [`fulfill_manifest_from_payloads`] for the bounded two-family arena: the
+/// non-expert weights named by `arenas.weights` are uploaded directly into a
+/// few exact-allocated roots and published as borrowed views carrying the
+/// same shape/dtype/projection metadata a per-tensor upload would. The roots
+/// live in the returned transaction's store (not its placements) and are
+/// released last by [`WeightLoadTransaction::rollback`]. The F16-shadow
+/// source bindings of `arenas.f16_shadows` are installed on `gpu` before the
+/// transaction is returned, so no constructor or priming math can run
+/// against an unbound plan. Single-device only: an expert-parallel request
+/// is refused before any allocation. One `Arc` plan drives the root request,
+/// the capacity proof and every view.
+pub fn fulfill_manifest_from_payloads_with_arenas<'a, F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    arenas: Arc<ModelWeightArenaPlan>,
+    source: F,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
+    fulfill_payloads_impl(
+        weights,
+        mesh,
+        n_layers,
+        gpu,
+        expected,
+        None,
+        Some(arenas),
+        source,
+    )
+}
+
+/// The one payload fulfillment implementation. `arenas == None` is the
+/// pre-existing per-tensor behavior, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn fulfill_payloads_impl<'a, F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    ep: Option<EpFulfill>,
+    arenas: Option<Arc<ModelWeightArenaPlan>>,
+    source: F,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
     if let Some(error) = target_error(mesh) {
         return Err(error);
     }
@@ -1643,7 +2237,24 @@ where
         device: 0,
         reason,
     })?;
+    if let Some(plan) = &arenas {
+        if ep.is_some() {
+            return Err(arena_error(
+                "weight arenas are single-device only; expert-parallel fulfillment is refused",
+            ));
+        }
+        if let Err(reason) = validate_weight_arena_manifest(plan, weights) {
+            return Err(arena_error(reason));
+        }
+    }
     let mut store = WeightStore::with_origin(origin);
+    if let Some(plan) = arenas.clone() {
+        if let Err(reason) = acquire_weight_roots(&mut store, plan, |bytes| {
+            gpu.alloc_tensor_exact(&[bytes], DType::Raw)
+        }) {
+            return Err(rollback_fulfill_error(store, gpu, arena_error(reason)));
+        }
+    }
     for entry in weights {
         let devices = placement_devices(entry, mesh, &placement);
         if devices.as_slice() != [0] {
@@ -1829,21 +2440,13 @@ where
                         fulfill_entry_error(entry, reason),
                     ));
                 }
-                let tensor = match upload_resident_bytes(
-                    gpu,
-                    entry.residency,
-                    bytes,
-                    &entry.logical_shape,
-                ) {
-                    Ok(mut tensor) => {
-                        tensor.dtype = dtype;
-                        tensor
-                    }
-                    Err(error) => {
+                let tensor = match upload_payload_bytes(gpu, &store, entry, dtype, bytes) {
+                    Ok(tensor) => tensor,
+                    Err(reason) => {
                         return Err(rollback_fulfill_error(
                             store,
                             gpu,
-                            fulfill_entry_error(entry, format!("pooled upload failed: {error}")),
+                            fulfill_entry_error(entry, reason),
                         ));
                     }
                 };
@@ -1911,21 +2514,13 @@ where
                         fulfill_entry_error(entry, reason),
                     ));
                 }
-                let tensor = match upload_resident_bytes(
-                    gpu,
-                    entry.residency,
-                    &bytes,
-                    &entry.logical_shape,
-                ) {
-                    Ok(mut tensor) => {
-                        tensor.dtype = dtype;
-                        tensor
-                    }
-                    Err(error) => {
+                let tensor = match upload_payload_bytes(gpu, &store, entry, dtype, &bytes) {
+                    Ok(tensor) => tensor,
+                    Err(reason) => {
                         return Err(rollback_fulfill_error(
                             store,
                             gpu,
-                            fulfill_entry_error(entry, format!("pooled upload failed: {error}")),
+                            fulfill_entry_error(entry, reason),
                         ));
                     }
                 };
@@ -2036,17 +2631,8 @@ where
                     ));
                 }
                 let tensor =
-                    match upload_range_pooled(
-                        gpu,
-                        &descriptor,
-                        dtype,
-                        &entry.logical_shape,
-                        range_tail_pad(entry),
-                    ) {
-                        Ok(mut tensor) => {
-                            tensor.dtype = dtype;
-                            tensor
-                        }
+                    match upload_payload_range(gpu, &store, entry, &descriptor, dtype, range_len) {
+                        Ok(tensor) => tensor,
                         Err(reason) => {
                             return Err(rollback_fulfill_error(
                                 store,
@@ -2077,6 +2663,25 @@ where
                 WeightPlacementKey::new(&entry.name, entry.layer, 0),
                 source.clone(),
             );
+        }
+    }
+    if let Some(plan) = &arenas {
+        // Bind the shadow sources to their real resident pointers now, after
+        // every upload and before the constructors / priming math can run. A
+        // failure rolls back through the same release path, which clears the
+        // Gpu's bindings before any root pointer can be reused.
+        let ptrs = match shadow_source_ptrs(&store, weights) {
+            Ok(ptrs) => ptrs,
+            Err(reason) => {
+                return Err(rollback_fulfill_error(store, gpu, arena_error(reason)));
+            }
+        };
+        if let Err(error) = gpu.install_f16_shadow_arena(Arc::clone(plan), &ptrs) {
+            return Err(rollback_fulfill_error(
+                store,
+                gpu,
+                arena_error(format!("F16 shadow binding install failed: {error}")),
+            ));
         }
     }
     Ok(WeightLoadTransaction::new(store))
@@ -2997,5 +3602,647 @@ mod tests {
         assert_eq!(source_dtype("BF16").unwrap(), DType::BF16);
         assert_eq!(source_dtype("mq4g128v2").unwrap(), DType::MQ4G128V2);
         assert!(source_dtype("I64").is_err());
+    }
+}
+
+/// CPU tests of the bounded weight arena's ownership: exact roots, borrowed
+/// views, and the one release path. Device buffers are fabricated descriptors
+/// that are never dereferenced; [`FakeRelease`] records the exact operation
+/// order that [`GpuRelease`] performs against a real device.
+#[cfg(test)]
+mod weight_store_arena {
+    use super::*;
+    use crate::tp_shard::ExpertAssign;
+    use rdna_compute::byte_arena::NamedByteArenaPlan;
+
+    const GRANULE: usize = 512;
+
+    fn fake_buf(ptr: usize, size: usize) -> hip_bridge::DeviceBuffer {
+        // SAFETY: never dereferenced; tests only read the descriptor.
+        unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, size) }
+    }
+
+    /// A fabricated owner-tagged (non-borrowed) buffer, standing in for an
+    /// individually allocated resident that must reach the owner free path.
+    fn fake_owned(ptr: usize, size: usize) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: never dereferenced or freed; the fake owner only logs.
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_vmm_owner(ptr as *mut std::ffi::c_void, size)
+            },
+            shape: vec![size],
+            dtype: DType::Raw,
+        }
+    }
+
+    fn root_tensor(ptr: usize, size: usize) -> GpuTensor {
+        GpuTensor {
+            buf: fake_buf(ptr, size),
+            shape: vec![size],
+            dtype: DType::Raw,
+        }
+    }
+
+    /// Exact (or deliberately oversized / failing) root allocator.
+    struct Bump {
+        next: usize,
+        oversize: usize,
+        fail_at: Option<usize>,
+        count: usize,
+        bases: Vec<usize>,
+    }
+
+    impl Bump {
+        fn new() -> Self {
+            Self {
+                next: 0x1000_0000,
+                oversize: 0,
+                fail_at: None,
+                count: 0,
+                bases: Vec::new(),
+            }
+        }
+
+        fn alloc(&mut self, bytes: usize) -> hip_bridge::HipResult<GpuTensor> {
+            let index = self.count;
+            self.count += 1;
+            if self.fail_at == Some(index) {
+                return Err(hip_bridge::HipError::new(2, "fake out of memory"));
+            }
+            let base = self.next;
+            self.next += bytes + self.oversize + 0x10000;
+            self.bases.push(base);
+            Ok(root_tensor(base, bytes + self.oversize))
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRelease {
+        log: Vec<String>,
+        fail_quiesce: bool,
+        /// Root release call numbers (0-based) that report an error.
+        fail_root_calls: Vec<usize>,
+        root_calls: usize,
+    }
+
+    impl WeightRelease for FakeRelease {
+        fn free_resident(&mut self, tensor: GpuTensor) -> hip_bridge::HipResult<()> {
+            self.log
+                .push(format!("free_resident:{:#x}", tensor.buf.as_ptr() as usize));
+            Ok(())
+        }
+        fn clear_arena_caches(&mut self) {
+            self.log.push("clear".into());
+        }
+        fn quiesce(&mut self) -> hip_bridge::HipResult<()> {
+            self.log.push("quiesce".into());
+            if self.fail_quiesce {
+                return Err(hip_bridge::HipError::new(9, "fake quiesce failure"));
+            }
+            Ok(())
+        }
+        fn release_root(&mut self, tensor: GpuTensor) -> hip_bridge::HipResult<()> {
+            let call = self.root_calls;
+            self.root_calls += 1;
+            self.log.push(format!(
+                "root:{:#x}:{}",
+                tensor.buf.as_ptr() as usize,
+                tensor.buf.size()
+            ));
+            if self.fail_root_calls.contains(&call) {
+                return Err(hip_bridge::HipError::new(3, "fake root release failure"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Weights a(1000) b(1500) c(0) d(600), alignment 256, cap 2048:
+    /// root0 = [a]; root1 = [b, c@1536]; root2 = [d]. Shadows: a, b.
+    fn plan() -> Arc<ModelWeightArenaPlan> {
+        let weights = NamedByteArenaPlan::new(
+            vec![
+                ("d".to_string(), 600),
+                ("a".to_string(), 1000),
+                ("c".to_string(), 0),
+                ("b".to_string(), 1500),
+            ],
+            256,
+            2048,
+        )
+        .unwrap();
+        let f16_shadows = NamedByteArenaPlan::new(
+            vec![("b".to_string(), 1500), ("a".to_string(), 1000)],
+            256,
+            2048,
+        )
+        .unwrap();
+        let plan = ModelWeightArenaPlan {
+            weights,
+            f16_shadows,
+            granule_bytes: GRANULE,
+        };
+        plan.validate().unwrap();
+        Arc::new(plan)
+    }
+
+    fn manifest() -> Vec<WeightEntry> {
+        let entry = |name: &str, shape: Vec<usize>, dtype| {
+            WeightEntry::model(name, shape, dtype, ShardPolicy::Replicate)
+        };
+        vec![
+            entry("a", vec![25, 20], DType::BF16),
+            entry("b", vec![25, 30], DType::BF16),
+            entry("c", vec![0], DType::F16),
+            entry("d", vec![300], DType::F16),
+            // Not planned: individually allocated.
+            entry("expert", vec![8], DType::F32),
+        ]
+    }
+
+    fn projection(dtype: DType) -> WeightProjection {
+        WeightProjection {
+            kind: WeightProjectionKind::Static,
+            axis: None,
+            rank: 0,
+            world_size: 1,
+            logical_shape: vec![1],
+            dtype,
+        }
+    }
+
+    fn empty_store() -> WeightStore {
+        let mesh = DeviceMesh::single().expect("single-device mesh construction cannot overflow");
+        WeightStore::with_origin(WeightOrigin::from_parts(mesh.epoch(), 0, 0))
+    }
+
+    /// A store holding the planned roots and a borrowed view of every planned
+    /// member, exactly as a successful arena fulfillment leaves it.
+    fn arena_store(bump: &mut Bump) -> WeightStore {
+        let mut store = empty_store();
+        acquire_weight_roots(&mut store, plan(), |bytes| bump.alloc(bytes)).unwrap();
+        let entries = manifest();
+        for entry in entries.iter().take(4) {
+            let arena = store.arena.as_ref().unwrap();
+            let span = arena.span(&entry.name).unwrap().clone();
+            let view = arena
+                .view(&span, &entry.logical_shape, entry.dtype)
+                .unwrap();
+            store
+                .insert(
+                    WeightPlacementKey::new(&entry.name, entry.layer, 0),
+                    WeightHandle::Resident(view),
+                    projection(entry.dtype),
+                )
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn root_request_capacity_per_root_equality() {
+        test_support::reset();
+        let plan = plan();
+        assert_eq!(plan.weights.roots, vec![1000, 1536, 600]);
+        let mut bump = Bump::new();
+        let mut store = empty_store();
+        acquire_weight_roots(&mut store, Arc::clone(&plan), |bytes| bump.alloc(bytes)).unwrap();
+        assert_eq!(store.arena_root_requests(), plan.weights.roots);
+        assert_eq!(store.arena_root_capacities(), plan.weights.roots);
+        assert_eq!(test_support::arena_root_allocations(), 3);
+        assert!(store.has_live_weight_roots());
+        assert!(Arc::ptr_eq(store.weight_arena_plan().unwrap(), &plan));
+        plan.weights
+            .validate_capacities(&store.arena_root_capacities(), GRANULE)
+            .unwrap();
+
+        // An oversized (pool-reused style) buffer is rejected, not trusted,
+        // and every root that was allocated is released through the one path.
+        test_support::reset();
+        let mut oversized = Bump::new();
+        oversized.oversize = 256;
+        let mut store = empty_store();
+        let error = acquire_weight_roots(&mut store, Arc::clone(&plan), |bytes| {
+            oversized.alloc(bytes)
+        })
+        .unwrap_err();
+        assert!(error.contains("capacity validation"), "{error}");
+        assert_eq!(store.arena_root_capacities(), vec![1256, 1792, 856]);
+        let mut ops = FakeRelease::default();
+        store.release_with(&mut ops).unwrap();
+        assert_eq!(test_support::arena_root_releases(), 3);
+    }
+
+    #[test]
+    fn partial_root_allocation_failure_releases_only_the_roots_made() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        bump.fail_at = Some(1);
+        let mut store = empty_store();
+        let error = acquire_weight_roots(&mut store, plan(), |bytes| bump.alloc(bytes))
+            .unwrap_err();
+        assert!(error.contains("root 1"), "{error}");
+        assert!(error.contains("exact allocation failed"), "{error}");
+        assert_eq!(test_support::arena_root_allocations(), 1);
+        let mut ops = FakeRelease::default();
+        store.release_with(&mut ops).unwrap();
+        assert_eq!(
+            ops.log,
+            vec![
+                "clear".to_string(),
+                "quiesce".to_string(),
+                format!("root:{:#x}:1000", bump.bases[0]),
+            ]
+        );
+        assert_eq!(test_support::arena_root_releases(), 1);
+    }
+
+    #[test]
+    fn views_carry_metadata_order_zero_size_and_tail_bounds() {
+        let mut bump = Bump::new();
+        let store = arena_store(&mut bump);
+        let arena = store.arena.as_ref().unwrap();
+        let [r0, r1, r2] = [bump.bases[0], bump.bases[1], bump.bases[2]];
+        // Sorted-name order, 256-byte member alignment, next-fit roots.
+        let spans: Vec<_> = arena
+            .plan
+            .weights
+            .members
+            .iter()
+            .map(|span| (span.name.as_str(), span.root, span.offset, span.bytes))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![("a", 0, 0, 1000), ("b", 1, 0, 1500), ("c", 1, 1536, 0), ("d", 2, 0, 600)]
+        );
+        let expected = [("a", r0, 1000), ("b", r1, 1500), ("c", r1 + 1536, 0), ("d", r2, 600)];
+        for (name, ptr, bytes) in expected {
+            let Some(WeightHandle::Resident(view)) = store.get(name, None, 0) else {
+                panic!("{name} has no resident view")
+            };
+            assert!(view.buf.is_borrowed(), "{name} must be a borrowed view");
+            assert_eq!(view.buf.as_ptr() as usize, ptr, "{name} pointer");
+            assert_eq!(view.buf.size(), bytes, "{name} bytes");
+            assert!(arena.contains_view(view), "{name} lies inside a live root");
+        }
+        // Shape, dtype and projection survive exactly as a per-tensor upload.
+        let Some(WeightHandle::Resident(a)) = store.get("a", None, 0) else {
+            panic!()
+        };
+        assert_eq!((a.shape.clone(), a.dtype), (vec![25, 20], DType::BF16));
+        assert_eq!(store.projection("a", None, 0).unwrap().dtype, DType::BF16);
+        // The zero-sized member is a real view at its aligned offset, never a
+        // fabricated pointer, and the tail of every root stays unviewed.
+        let Some(WeightHandle::Resident(c)) = store.get("c", None, 0) else {
+            panic!()
+        };
+        assert_eq!(c.buf.size(), 0);
+
+        // A span past its root, or naming a root that does not exist, is an
+        // error and never a view.
+        let a_span = arena.span("a").unwrap().clone();
+        let past_end = NamedByteArenaSpan {
+            bytes: 1001,
+            ..a_span.clone()
+        };
+        assert!(arena
+            .view(&past_end, &[1], DType::Raw)
+            .unwrap_err()
+            .contains("exceeds root"));
+        let bad_root = NamedByteArenaSpan {
+            root: 9,
+            ..a_span
+        };
+        assert!(arena
+            .view(&bad_root, &[1], DType::Raw)
+            .unwrap_err()
+            .contains("names root"));
+    }
+
+    #[test]
+    fn manifest_validation_refuses_ineligible_or_unknown_members_before_allocation() {
+        let plan = plan();
+        validate_weight_arena_manifest(&plan, &manifest()).unwrap();
+
+        let mut missing = manifest();
+        missing.retain(|entry| entry.name != "d");
+        assert!(validate_weight_arena_manifest(&plan, &missing)
+            .unwrap_err()
+            .contains("no manifest entry"));
+
+        let mut duplicated = manifest();
+        duplicated.push(WeightEntry::model(
+            "a",
+            vec![25, 20],
+            DType::BF16,
+            ShardPolicy::Replicate,
+        ));
+        assert!(validate_weight_arena_manifest(&plan, &duplicated)
+            .unwrap_err()
+            .contains("must be unique"));
+
+        let mut tied = manifest();
+        tied[3].policy = ShardPolicy::Tied { source: "a".into() };
+        assert!(validate_weight_arena_manifest(&plan, &tied)
+            .unwrap_err()
+            .contains("tied alias"));
+
+        let mut host_mapped = manifest();
+        host_mapped[3].residency = WeightResidency::HostMapped;
+        assert!(validate_weight_arena_manifest(&plan, &host_mapped)
+            .unwrap_err()
+            .contains("device-resident"));
+
+        let mut expert = manifest();
+        expert[3].policy = ShardPolicy::ExpertSharded {
+            n_experts: 4,
+            assign: ExpertAssign::Stride,
+        };
+        assert!(validate_weight_arena_manifest(&plan, &expert)
+            .unwrap_err()
+            .contains("expert-sharded"));
+
+        // A shadow owner must be the 2-D BF16 weight its shadow was sized for.
+        let mut wrong_dtype = manifest();
+        wrong_dtype[0].dtype = DType::F16;
+        assert!(validate_weight_arena_manifest(&plan, &wrong_dtype)
+            .unwrap_err()
+            .contains("2-D BF16"));
+    }
+
+    #[test]
+    fn partial_upload_rollback_clears_caches_first_and_releases_roots_last() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        let mut store = arena_store(&mut bump);
+        // An individually allocated resident that reached the store before the
+        // failure (the unplanned `expert`).
+        store
+            .insert(
+                WeightPlacementKey::new("expert", None, 0),
+                WeightHandle::Resident(fake_owned(0x7000_0000, 32)),
+                projection(DType::F32),
+            )
+            .unwrap();
+        let mut ops = FakeRelease::default();
+        store.release_with(&mut ops).unwrap();
+        let [r0, r1, r2] = [bump.bases[0], bump.bases[1], bump.bases[2]];
+        assert_eq!(
+            ops.log,
+            vec![
+                "clear".to_string(),
+                // Only the owned resident reaches the free path; the four
+                // borrowed views own nothing.
+                "free_resident:0x70000000".to_string(),
+                "quiesce".to_string(),
+                // Roots last, once each, reverse allocation order.
+                format!("root:{r2:#x}:600"),
+                format!("root:{r1:#x}:1536"),
+                format!("root:{r0:#x}:1000"),
+            ]
+        );
+        assert_eq!(test_support::arena_root_releases(), 3);
+        assert_eq!(test_support::resident_releases(), 1);
+    }
+
+    #[test]
+    fn constructor_guard_rollback_restores_views_while_roots_stay_live() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        let mut store = arena_store(&mut bump);
+        {
+            let mut assembly = store.begin_assembly();
+            for name in ["a", "b", "c", "d"] {
+                assert!(assembly.take(name, None, 0).is_some());
+            }
+            let guard = assembly.commit();
+            assert!(guard.get(0).is_some());
+            // Constructor failure: the guard drops without `finalize`.
+        }
+        assert_eq!(store.len(), 4, "every taken view returned to the store");
+        assert!(store.has_live_weight_roots());
+        assert_eq!(test_support::arena_root_releases(), 0);
+        let mut ops = FakeRelease::default();
+        store.release_with(&mut ops).unwrap();
+        assert_eq!(
+            ops.log.iter().filter(|line| line.starts_with("root:")).count(),
+            3
+        );
+        assert!(
+            ops.log.iter().all(|line| !line.starts_with("free_resident")),
+            "restored views are still borrowed and are never freed: {:?}",
+            ops.log
+        );
+    }
+
+    #[test]
+    fn taken_view_lifetime_roots_survive_finalize_and_outlive_the_views() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        let mut store = arena_store(&mut bump);
+        let taken = {
+            let mut assembly = store.begin_assembly();
+            for name in ["a", "b", "c", "d"] {
+                assembly.take(name, None, 0).unwrap();
+            }
+            assembly.commit().finalize()
+        };
+        assert_eq!(taken.len(), 4);
+        // Empty placements with live roots are NOT an empty store.
+        assert_eq!(store.len(), 0);
+        assert!(!store.is_empty());
+        assert!(store.has_live_weight_roots());
+        assert_eq!(store.arena_root_capacities(), vec![1000, 1536, 600]);
+        assert_eq!(test_support::arena_root_releases(), 0);
+        // The typed weights are torn down first (borrowed views skipped)...
+        let mut freed = 0;
+        for weight in taken {
+            if let WeightHandle::Resident(tensor) = weight.handle {
+                if !tensor.buf.is_borrowed() {
+                    freed += 1;
+                }
+            }
+        }
+        assert_eq!(freed, 0);
+        assert_eq!(test_support::arena_root_releases(), 0);
+        // ...and only then does the store release its roots.
+        let mut ops = FakeRelease::default();
+        store.release_with(&mut ops).unwrap();
+        assert_eq!(test_support::arena_root_releases(), 3);
+        assert!(WeightLoadTransaction::new(empty_store()).is_empty());
+    }
+
+    #[test]
+    fn rollback_twice_releases_each_root_exactly_once() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        let mut transaction = WeightLoadTransaction::new(arena_store(&mut bump));
+        assert!(!transaction.is_empty());
+        assert_eq!(transaction.weight_arena_root_capacities(), vec![1000, 1536, 600]);
+        assert_eq!(transaction.weight_arena_root_requests(), vec![1000, 1536, 600]);
+        let mut ops = FakeRelease::default();
+        transaction.rollback_via(&mut ops).unwrap();
+        let first = ops.log.clone();
+        transaction.rollback_via(&mut ops).unwrap();
+        assert_eq!(ops.log, first, "the second rollback performs no device work");
+        assert_eq!(test_support::arena_root_releases(), 3);
+        assert!(transaction.weight_arena_plan().is_none());
+        assert!(transaction.weight_arena_root_capacities().is_empty());
+    }
+
+    #[test]
+    fn repeated_loads_clear_bindings_before_each_root_pointer_reuse() {
+        test_support::reset();
+        let mut ops = FakeRelease::default();
+        let mut base_seen = Vec::new();
+        for _ in 0..3 {
+            // Every load's exact roots reuse the same device addresses.
+            let mut bump = Bump::new();
+            let store = arena_store(&mut bump);
+            base_seen.push(bump.bases[0]);
+            let start = ops.log.len();
+            store.release_with(&mut ops).unwrap();
+            let round = &ops.log[start..];
+            let clear = round.iter().position(|line| line == "clear").unwrap();
+            let quiesce = round.iter().position(|line| line == "quiesce").unwrap();
+            let first_root = round
+                .iter()
+                .position(|line| line.starts_with("root:"))
+                .unwrap();
+            assert!(clear < quiesce && quiesce < first_root, "{round:?}");
+        }
+        assert_eq!(base_seen[0], base_seen[2], "the address was genuinely reused");
+        assert_eq!(
+            ops.log.iter().filter(|line| *line == "clear").count(),
+            3,
+            "one cache clear per teardown"
+        );
+        assert_eq!(test_support::arena_root_releases(), 9);
+    }
+
+    #[test]
+    fn failed_quiesce_quarantines_roots_and_never_releases_them() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        let store = arena_store(&mut bump);
+        let mut ops = FakeRelease {
+            fail_quiesce: true,
+            ..FakeRelease::default()
+        };
+        let error = store.release_with(&mut ops).unwrap_err();
+        assert!(error.message.contains("quarantined"), "{}", error.message);
+        assert!(error.message.contains("fake quiesce failure"));
+        assert!(
+            ops.log.iter().all(|line| !line.starts_with("root:")),
+            "an unquiesced root must never be released: {:?}",
+            ops.log
+        );
+        assert_eq!(test_support::arena_root_releases(), 0);
+        assert_eq!(test_support::arena_root_quarantines(), 3);
+    }
+
+    #[test]
+    fn a_failed_root_release_is_reported_after_the_remaining_roots_are_released() {
+        test_support::reset();
+        let mut bump = Bump::new();
+        let store = arena_store(&mut bump);
+        let mut ops = FakeRelease {
+            fail_root_calls: vec![0],
+            ..FakeRelease::default()
+        };
+        let error = store.release_with(&mut ops).unwrap_err();
+        assert!(error.message.contains("fake root release failure"));
+        assert_eq!(
+            ops.log.iter().filter(|line| line.starts_with("root:")).count(),
+            3,
+            "every root is attempted exactly once"
+        );
+        assert_eq!(test_support::arena_root_releases(), 2, "only successes are counted");
+    }
+
+    #[test]
+    fn shadow_source_pointers_follow_plan_order_and_must_be_planned_views() {
+        let mut bump = Bump::new();
+        let store = arena_store(&mut bump);
+        let entries = manifest();
+        let ptrs = shadow_source_ptrs(&store, &entries).unwrap();
+        // Plan shadow members are sorted: a then b.
+        assert_eq!(ptrs, vec![bump.bases[0], bump.bases[1]]);
+
+        // A shadow owner that is no longer BF16 is refused.
+        let mut retagged = arena_store(&mut Bump::new());
+        let key = WeightPlacementKey::new("a", None, 0);
+        let Some(WeightHandle::Resident(a)) = retagged.placements.get_mut(&key) else {
+            panic!()
+        };
+        a.dtype = DType::F16;
+        assert!(shadow_source_ptrs(&retagged, &entries)
+            .unwrap_err()
+            .contains("not its planned BF16 arena view"));
+
+        // A resident that is not the planned view (an owned copy) is refused.
+        let mut copied = arena_store(&mut Bump::new());
+        let Some(WeightHandle::Resident(b)) = copied.placements.get_mut(&WeightPlacementKey::new("b", None, 0))
+        else {
+            panic!()
+        };
+        *b = GpuTensor {
+            buf: fake_buf(0x7777_0000, 1500),
+            shape: vec![25, 30],
+            dtype: DType::BF16,
+        };
+        assert!(shadow_source_ptrs(&copied, &entries)
+            .unwrap_err()
+            .contains("not its planned BF16 arena view"));
+
+        // A missing resident is refused too.
+        let mut absent = arena_store(&mut Bump::new());
+        absent.take("a", None, 0).unwrap();
+        assert!(shadow_source_ptrs(&absent, &entries)
+            .unwrap_err()
+            .contains("no resident handle"));
+    }
+
+    #[test]
+    fn non_arena_store_behaves_exactly_as_before() {
+        test_support::reset();
+        let mut store = empty_store();
+        assert!(store.is_empty());
+        assert!(!store.has_live_weight_roots());
+        assert!(store.weight_arena_plan().is_none());
+        assert!(store.arena_root_capacities().is_empty());
+        assert!(store.arena_root_requests().is_empty());
+        assert_eq!(shadow_source_ptrs(&store, &manifest()).unwrap(), Vec::<usize>::new());
+        store
+            .stage_alias("alias", None, 0, "source", projection(DType::F16))
+            .unwrap();
+        // A borrowed handle with no arena is NOT silently skipped: it still
+        // reaches the owner free path and its refusal.
+        store
+            .insert(
+                WeightPlacementKey::new("borrowed", None, 0),
+                WeightHandle::Resident(root_tensor(0x5000_0000, 64)),
+                projection(DType::F32),
+            )
+            .unwrap();
+        store
+            .insert(
+                WeightPlacementKey::new("owned", None, 0),
+                WeightHandle::Resident(fake_owned(0x6000_0000, 64)),
+                projection(DType::F32),
+            )
+            .unwrap();
+        assert!(!store.is_empty());
+        let mut ops = FakeRelease::default();
+        store.release_with(&mut ops).unwrap();
+        assert_eq!(
+            ops.log,
+            vec![
+                "free_resident:0x60000000".to_string(),
+                "free_resident:0x50000000".to_string(),
+            ],
+            "reverse allocation order, no cache clear, quiesce or root release"
+        );
+        assert_eq!(test_support::arena_root_releases(), 0);
+        assert_eq!(test_support::resident_releases(), 2);
     }
 }
