@@ -5357,18 +5357,16 @@ impl Gpu {
         if self.f16_shadow_arena.lookup(source_ptr).is_none() {
             return Ok(false);
         }
-        if !self
-            .fp16_shadow_cache
-            .get(&source_ptr)
-            .is_some_and(|t| t.buf.is_borrowed())
-        {
-            return Ok(false);
-        }
         self.bind_thread()?;
-        // Quiesce BEFORE forgetting the view: on a failed sync the entry stays.
-        self.hip.device_synchronize()?;
-        self.fp16_shadow_cache.remove(&source_ptr);
-        Ok(true)
+        let mut device = DirectHipRuntime { hip: &self.hip };
+        crate::byte_arena::invalidate_shadow_source(
+            &mut self.fp16_shadow_cache,
+            |t| t.buf.is_borrowed(),
+            &self.f16_shadow_arena,
+            &mut device,
+            source_ptr,
+        )
+        .map_err(|msg| HipError::new(0, &format!("invalidate_f16_shadow_source: {msg}")))
     }
 
     /// Destination of a model-lifetime F16 shadow of `n` elements for the source at

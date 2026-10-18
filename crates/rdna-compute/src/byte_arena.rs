@@ -608,6 +608,33 @@ pub fn clear_shadow_arena<R, V, D: ExactRootDevice<Root = R>>(
     set.release(dev)
 }
 
+/// Drop the cached shadow VIEW of one registered source so it can be recomputed
+/// after the source was rewritten in place. Only a registered source whose cache
+/// entry is a view (`is_view`) is touched: the device is quiesced FIRST and the view
+/// removed only on success (a failed quiesce returns the error with view, binding
+/// and root all kept). The planned root and binding are never changed, so the next
+/// conversion for the same source re-fills the same span with no allocation.
+/// Returns `Ok(false)` (no device traffic) for an unknown, uncached or owning entry.
+pub fn invalidate_shadow_source<R, V, D: ExactRootDevice<Root = R>>(
+    cache: &mut HashMap<usize, V>,
+    is_view: impl Fn(&V) -> bool,
+    set: &ShadowRootSet<R>,
+    dev: &mut D,
+    source_ptr: usize,
+) -> Result<bool, String> {
+    if set.lookup(source_ptr).is_none() || !cache.get(&source_ptr).is_some_and(&is_view) {
+        return Ok(false);
+    }
+    dev.quiesce().map_err(|e| {
+        format!(
+            "quiesce before dropping the F16 shadow view of source 0x{source_ptr:x} failed \
+             ({e}); view, binding and root kept"
+        )
+    })?;
+    cache.remove(&source_ptr);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1343,5 +1370,161 @@ mod tests {
         );
         assert_eq!(set.release(&mut dev).unwrap(), caps.len());
         assert!(dev.live.is_empty());
+    }
+
+    fn cache_view(
+        cache: &mut HashMap<usize, LoggedView>,
+        ptr: usize,
+        name: &'static str,
+        log: &Rc<RefCell<Vec<String>>>,
+    ) {
+        cache.insert(
+            ptr,
+            LoggedView {
+                borrowed: true,
+                name,
+                log: log.clone(),
+            },
+        );
+    }
+
+    #[test]
+    fn invalidate_quiesces_before_dropping_the_view_and_keeps_root_and_binding() {
+        let model = model_plan();
+        let mut set = ShadowRootSet::<MockRoot>::new();
+        let mut dev = MockDevice::new();
+        let log = dev.log.clone();
+        set.bind(model, &[0x1000, 0x2000, 0x3000]).unwrap();
+        let c = set.lookup(0x2000).unwrap();
+        let (root, offset) = set.ensure_member(&mut dev, c, 2048).unwrap();
+        let (addr, off) = (root.addr, offset);
+        let mut cache: HashMap<usize, LoggedView> = HashMap::new();
+        cache_view(&mut cache, 0x2000, "view_c", &log);
+
+        let dropped =
+            invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap();
+        assert!(dropped);
+        let events = log.borrow().clone();
+        let quiesce = events.iter().position(|e| e == "quiesce").unwrap();
+        let drop_view = events.iter().position(|e| e == "drop view_c").unwrap();
+        assert!(quiesce < drop_view, "quiesce before the view drop: {events:?}");
+        assert!(cache.is_empty());
+        // Root, binding and pointer survive; nothing was allocated or freed.
+        assert_eq!(set.lookup(0x2000), Some(c));
+        assert_eq!(set.live_roots(), 1);
+        assert_eq!((dev.mallocs, dev.frees), (1, 0));
+        let (root, offset) = set.ensure_member(&mut dev, c, 2048).unwrap();
+        assert_eq!((root.addr, offset), (addr, off));
+        assert_eq!(dev.mallocs, 1);
+
+        // The arena clear afterwards still releases that one root exactly once.
+        assert_eq!(set.release(&mut dev).unwrap(), 1);
+        assert_eq!(dev.frees, 1);
+    }
+
+    #[test]
+    fn refill_by_a_different_conversion_arm_reuses_the_same_span_without_allocating() {
+        let model = model_plan();
+        let mut set = ShadowRootSet::<MockRoot>::new();
+        let mut dev = MockDevice::new();
+        let log = dev.log.clone();
+        set.bind(model, &[0x1000, 0x2000, 0x3000]).unwrap();
+        let c = set.lookup(0x2000).unwrap();
+        let mut cache: HashMap<usize, LoggedView> = HashMap::new();
+
+        // First conversion arm fills the full reserved span, a later arm (changed
+        // source format, smaller prefix) refills inside it: same root, same offset.
+        let mut seen = Vec::new();
+        for need in [2048usize, 1024, 2048, 256] {
+            let (root, offset) = set.ensure_member(&mut dev, c, need).unwrap();
+            seen.push((root.addr, offset));
+            cache_view(&mut cache, 0x2000, "view_c", &log);
+            assert!(
+                invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000)
+                    .unwrap()
+            );
+            assert!(cache.is_empty());
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "pointer stable: {seen:?}");
+        assert_eq!((dev.mallocs, dev.frees), (1, 0), "refills never allocate");
+        // A refill that would overrun the reserved span is still refused.
+        assert!(set.ensure_member(&mut dev, c, 2049).is_err());
+        assert_eq!(dev.mallocs, 1);
+        assert_eq!(dev.quiesces, 4);
+    }
+
+    #[test]
+    fn failed_quiesce_keeps_view_binding_and_root_and_returns_err() {
+        let model = model_plan();
+        let mut set = ShadowRootSet::<MockRoot>::new();
+        let mut dev = MockDevice::new();
+        let log = dev.log.clone();
+        set.bind(model, &[0x1000, 0x2000, 0x3000]).unwrap();
+        let c = set.lookup(0x2000).unwrap();
+        set.ensure_member(&mut dev, c, 2048).unwrap();
+        let mut cache: HashMap<usize, LoggedView> = HashMap::new();
+        cache_view(&mut cache, 0x2000, "view_c", &log);
+
+        dev.fail_quiesce = true;
+        let err = invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000)
+            .unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+        assert!(cache.contains_key(&0x2000), "view kept");
+        assert!(!log.borrow().iter().any(|e| e.starts_with("drop")));
+        assert_eq!(set.lookup(0x2000), Some(c), "binding kept");
+        assert_eq!(set.live_roots(), 1, "root kept");
+        assert_eq!((dev.mallocs, dev.frees), (1, 0));
+
+        // Recoverable: once the device quiesces the same view drops.
+        dev.fail_quiesce = false;
+        assert!(
+            invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap()
+        );
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn unknown_uncached_owned_or_inactive_sources_are_untouched() {
+        let model = model_plan();
+        let mut set = ShadowRootSet::<MockRoot>::new();
+        let mut dev = MockDevice::new();
+        let log = dev.log.clone();
+        let mut cache: HashMap<usize, LoggedView> = HashMap::new();
+
+        // Inactive set (non-S1): never quiesces, never touches the cache.
+        cache_view(&mut cache, 0x2000, "view_c", &log);
+        assert!(
+            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap()
+        );
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        log.borrow_mut().clear();
+
+        set.bind(model, &[0x1000, 0x2000, 0x3000]).unwrap();
+        // Unknown source: even with a borrowed entry under that key.
+        cache_view(&mut cache, 0x9999, "view_unknown", &log);
+        assert!(
+            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x9999).unwrap()
+        );
+        // Registered but no cached view yet.
+        assert!(
+            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x2000).unwrap()
+        );
+        // Registered with an owning (legacy) entry: never dropped here.
+        cache.insert(
+            0x1000,
+            LoggedView {
+                borrowed: false,
+                name: "owned",
+                log: log.clone(),
+            },
+        );
+        assert!(
+            !invalidate_shadow_source(&mut cache, |v| v.borrowed, &set, &mut dev, 0x1000).unwrap()
+        );
+        assert_eq!(cache.len(), 2);
+        assert_eq!((dev.quiesces, dev.mallocs, dev.frees), (0, 0, 0));
+        assert!(log.borrow().is_empty());
+        assert!(set.lookup(0x2000).is_some() && set.live_roots() == 0);
     }
 }
