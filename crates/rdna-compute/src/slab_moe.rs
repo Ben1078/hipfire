@@ -1962,14 +1962,22 @@ impl Gpu {
                 "slowlink_sync_download_i32: the S1 count barrier needs the active compute stream",
             ));
         };
-        let mut host = vec![0i32; words];
-        // SAFETY: `host` owns `words * 4` initialized bytes, i32 has no padding, and the slice
-        // is used only for this copy, which completes at the stream wait below.
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, words * 4) };
-        self.hip
-            .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
-        self.hip.stream_synchronize(stream)?;
+        let hip = &self.hip;
+        let host = guarded_async_download(
+            vec![0i32; words],
+            |host, enqueued| {
+                // SAFETY: `host` owns `words * 4` initialized bytes, i32 has no padding, and
+                // the slice is used only for this copy, which the guard joins before `host`
+                // can be dropped (or leaks `host` when the join is unconfirmed).
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, words * 4)
+                };
+                hip.memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
+                *enqueued = true;
+                Ok(())
+            },
+            || hip.stream_synchronize(stream),
+        )?;
         self.take_device_wait_error()?;
         Ok(host)
     }
@@ -1997,21 +2005,178 @@ impl Gpu {
                 "slowlink_sync_download_i32_pair: the S1 count barrier needs the active compute stream",
             ));
         };
-        let mut a = vec![0i32; words];
-        let mut b = vec![0i32; words];
-        // SAFETY: each `Vec` owns `words * 4` initialized bytes, i32 has no padding, and the
-        // slices are used only for these copies, which complete at the stream wait below.
-        let (ab, bb) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(a.as_mut_ptr() as *mut u8, words * 4),
-                std::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut u8, words * 4),
-            )
-        };
-        self.hip.memcpy_dtoh_async(ab, &first.buf, Some(stream))?;
-        self.hip.memcpy_dtoh_async(bb, &second.buf, Some(stream))?;
-        self.hip.stream_synchronize(stream)?;
+        let hip = &self.hip;
+        let (a, b) = guarded_async_download(
+            (vec![0i32; words], vec![0i32; words]),
+            |host, enqueued| {
+                // SAFETY: each `Vec` owns `words * 4` initialized bytes, i32 has no padding,
+                // and each slice is used only for its own copy; the guard joins the stream
+                // (both copies, or the one that was accepted) before either `Vec` can be
+                // dropped, and leaks both when the join is unconfirmed.
+                let (ab, bb) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(host.0.as_mut_ptr() as *mut u8, words * 4),
+                        std::slice::from_raw_parts_mut(host.1.as_mut_ptr() as *mut u8, words * 4),
+                    )
+                };
+                hip.memcpy_dtoh_async(ab, &first.buf, Some(stream))?;
+                *enqueued = true;
+                hip.memcpy_dtoh_async(bb, &second.buf, Some(stream))?;
+                Ok(())
+            },
+            || hip.stream_synchronize(stream),
+        )?;
         self.take_device_wait_error()?;
         Ok((a, b))
+    }
+}
+
+/// Host-buffer lifetime guard of a stream-ordered D2H sequence (`hipMemcpyAsync` writes the host
+/// buffer after the call returns; the caller owns that lifetime).  `enqueue` queues the copies
+/// into `host` and sets `enqueued` as soon as the FIRST copy was accepted; `join` is the
+/// confirmed join of the stream.  Rules:
+///
+/// * nothing accepted: no copy can write `host`; it is dropped and the enqueue error returned;
+/// * an enqueue fails after one was accepted: the stream is still joined (the accepted copy
+///   may be writing `host`) and the enqueue error stays the primary error; `host` is dropped
+///   only if the join confirmed;
+/// * the join fails: the copies may still be in flight, so `host` is QUARANTINED (leaked, never
+///   freed while a device write may target it) and the error returned (the enqueue error when
+///   there is one, else the join error).
+///
+/// No retry and no suppression: a failure is reported as it occurred.
+fn guarded_async_download<B>(
+    mut host: B,
+    enqueue: impl FnOnce(&mut B, &mut bool) -> HipResult<()>,
+    join: impl FnOnce() -> HipResult<()>,
+) -> HipResult<B> {
+    let mut enqueued = false;
+    let queued = enqueue(&mut host, &mut enqueued);
+    if !enqueued {
+        return queued.map(|()| host);
+    }
+    let joined = join();
+    match (queued, joined) {
+        (Ok(()), Ok(())) => Ok(host),
+        // Joined: every accepted copy finished, `host` is safe to drop.
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(join_error)) => {
+            std::mem::forget(host);
+            Err(join_error)
+        }
+        (Err(primary), Err(_)) => {
+            std::mem::forget(host);
+            Err(primary)
+        }
+    }
+}
+
+#[cfg(test)]
+mod guarded_download_tests {
+    use super::guarded_async_download;
+    use hip_bridge::{HipError, HipResult};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    /// A host buffer that logs when it is freed.
+    struct Probe(Log);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("drop");
+        }
+    }
+
+    fn err(what: &str) -> HipError {
+        HipError::new(7, what)
+    }
+
+    fn run(
+        log: &Log,
+        first: HipResult<()>,
+        second: Option<HipResult<()>>,
+        join: HipResult<()>,
+    ) -> HipResult<Probe> {
+        guarded_async_download(
+            Probe(log.clone()),
+            |_host, enqueued| {
+                log.borrow_mut().push("enqueue-1");
+                first?;
+                *enqueued = true;
+                if let Some(second) = second {
+                    log.borrow_mut().push("enqueue-2");
+                    second?;
+                }
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("join");
+                join
+            },
+        )
+    }
+
+    #[test]
+    fn slowlink_guarded_download_success_joins_then_hands_the_buffer_over() {
+        let log: Log = Rc::default();
+        let got = run(&log, Ok(()), Some(Ok(())), Ok(()));
+        assert!(got.is_ok());
+        assert_eq!(*log.borrow(), ["enqueue-1", "enqueue-2", "join"]);
+        drop(got);
+        assert_eq!(log.borrow().last(), Some(&"drop"));
+    }
+
+    #[test]
+    fn slowlink_guarded_download_second_enqueue_failure_joins_before_the_buffer_drops() {
+        let log: Log = Rc::default();
+        let got = run(&log, Ok(()), Some(Err(err("second enqueue"))), Ok(()));
+        let e = got.err().expect("the enqueue error is the primary error");
+        assert!(e.to_string().contains("second enqueue"), "{e}");
+        // The accepted first copy is joined BEFORE the host buffer is freed.
+        assert_eq!(
+            *log.borrow(),
+            ["enqueue-1", "enqueue-2", "join", "drop"],
+            "join must precede drop"
+        );
+    }
+
+    #[test]
+    fn slowlink_guarded_download_unconfirmed_join_quarantines_the_buffer() {
+        // Enqueue failure AND join failure: the primary (enqueue) error is returned and the
+        // buffer is leaked, never dropped while a copy may still target it.
+        let log: Log = Rc::default();
+        let got = run(&log, Ok(()), Some(Err(err("second enqueue"))), Err(err("wait")));
+        let e = got.err().unwrap();
+        assert!(e.to_string().contains("second enqueue"), "{e}");
+        assert_eq!(*log.borrow(), ["enqueue-1", "enqueue-2", "join"]);
+        // Join failure alone after both copies were accepted: the join error, still leaked.
+        let log: Log = Rc::default();
+        let got = run(&log, Ok(()), Some(Ok(())), Err(err("wait")));
+        let e = got.err().unwrap();
+        assert!(e.to_string().contains("wait"), "{e}");
+        assert_eq!(*log.borrow(), ["enqueue-1", "enqueue-2", "join"]);
+    }
+
+    #[test]
+    fn slowlink_guarded_download_first_enqueue_failure_needs_no_join() {
+        let log: Log = Rc::default();
+        let got = run(&log, Err(err("first enqueue")), Some(Ok(())), Ok(()));
+        let e = got.err().unwrap();
+        assert!(e.to_string().contains("first enqueue"), "{e}");
+        // Nothing was accepted: no join, and the buffer is freed (no device write targets it).
+        assert_eq!(*log.borrow(), ["enqueue-1", "drop"]);
+    }
+
+    #[test]
+    fn slowlink_guarded_download_single_copy_join_failure_quarantines() {
+        let log: Log = Rc::default();
+        let got = run(&log, Ok(()), None, Err(err("wait")));
+        assert!(got.is_err());
+        assert_eq!(*log.borrow(), ["enqueue-1", "join"]);
+        let log: Log = Rc::default();
+        assert!(run(&log, Ok(()), None, Ok(())).is_ok());
+        assert_eq!(*log.borrow(), ["enqueue-1", "join"]);
     }
 }
 
