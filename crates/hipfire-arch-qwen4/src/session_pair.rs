@@ -2855,10 +2855,7 @@ mod slowlink_txn_tests {
         json!({"name": name, "status": "pass", "mismatches": 0u64, "detail": {"rows": 1}})
     }
 
-    fn collect(
-        fail_at: &[usize],
-        malformed_at: &[usize],
-    ) -> (Vec<String>, Vec<Value>) {
+    fn collect(fail_at: &[usize], malformed_at: &[usize]) -> (Vec<String>, Vec<Value>) {
         let mut invoked = Vec::new();
         let report = collect_primitive_reports(&SLOWLINK_PRIMITIVES, |name| {
             let index = invoked.len();
@@ -2886,9 +2883,15 @@ mod slowlink_txn_tests {
         assert_eq!(case["status"], "error");
         assert!(case["mismatches"].is_null(), "no fabricated count: {case}");
         let error = case["detail"]["error"].as_str().expect("error string");
-        assert!(error.contains(&format!("{name:?}")), "error names its case: {error}");
+        assert!(
+            error.contains(&format!("{name:?}")),
+            "error names its case: {error}"
+        );
         for other in SLOWLINK_PRIMITIVES.iter().filter(|other| **other != name) {
-            assert!(!error.contains(other), "error carries {other}'s context: {error}");
+            assert!(
+                !error.contains(other),
+                "error carries {other}'s context: {error}"
+            );
         }
     }
 
@@ -2907,7 +2910,10 @@ mod slowlink_txn_tests {
     fn primitive_collector_first_and_middle_errors_do_not_stop_or_infect_others() {
         for failing in [0usize, 3, 6] {
             let (invoked, cases) = collect(&[failing], &[]);
-            assert_eq!(invoked, SLOWLINK_PRIMITIVES, "all 7 invoked, failing {failing}");
+            assert_eq!(
+                invoked, SLOWLINK_PRIMITIVES,
+                "all 7 invoked, failing {failing}"
+            );
             assert_ordered_names(&cases);
             for (index, case) in cases.iter().enumerate() {
                 if index == failing {
@@ -2916,7 +2922,10 @@ mod slowlink_txn_tests {
                     assert_eq!(*case, passing(SLOWLINK_PRIMITIVES[index]), "retained pass");
                 }
             }
-            let errors = cases.iter().filter(|case| case["status"] == "error").count();
+            let errors = cases
+                .iter()
+                .filter(|case| case["status"] == "error")
+                .count();
             assert_eq!(errors, 1, "one error, not seven");
         }
     }

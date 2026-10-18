@@ -12159,7 +12159,11 @@ mod tests {
             .expect("armed")
             .note_row(1, armed.target.entries(), false);
         assert_eq!(armed.host_bonus(), 5);
-        assert_eq!(rng_word(&armed.rng), rng_word(&reference), "observing moved no draw");
+        assert_eq!(
+            rng_word(&armed.rng),
+            rng_word(&reference),
+            "observing moved no draw"
+        );
         let window = armed.lab.take().expect("armed");
         let tape = crate::lab_window::peek_uniforms(&start, 2);
         assert_eq!(window.proposals.len(), 1);
@@ -12167,7 +12171,10 @@ mod tests {
         assert_eq!(
             window.proposals[0].verdict,
             Some(LabVerdict::Accept {
-                draw: crate::lab_window::LabDraw { index: 0, u: tape[0] }
+                draw: crate::lab_window::LabDraw {
+                    index: 0,
+                    u: tape[0]
+                }
             })
         );
         let bonus = window.bonus.expect("bonus noted");

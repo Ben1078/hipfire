@@ -280,7 +280,10 @@ fn load_inner(
                 // shared incumbent resolver; `None`: fully resident).
                 let dedicated_stage = residency::dedicated_slab_stage(
                     residency::expert_stage_placement_enabled(&gpu.arch),
-                    matches!(recipe, crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }),
+                    matches!(
+                        recipe,
+                        crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+                    ),
                     false,
                 );
                 residency::incumbent_auto_resident_layers(

@@ -321,7 +321,11 @@ fn gdn_session_tag(scope: u64, format: GdnStateFormat) -> u64 {
     }
 }
 
-fn validate_gdn_session_tag(scope: u64, format: GdnStateFormat, tag: u64) -> Result<(), StateError> {
+fn validate_gdn_session_tag(
+    scope: u64,
+    format: GdnStateFormat,
+    tag: u64,
+) -> Result<(), StateError> {
     if tag == gdn_session_tag(scope, format) {
         Ok(())
     } else {
@@ -2208,7 +2212,11 @@ impl Qwen4State {
                     let recurrent = next_tensor();
                     let ef_residual = format.gdn.has_residual().then(|| next_tensor());
                     let conv = next_tensor();
-                    gdn.push(GdnGpuState { recurrent, ef_residual, conv });
+                    gdn.push(GdnGpuState {
+                        recurrent,
+                        ef_residual,
+                        conv,
+                    });
                 }
                 LayerType::FullAttention => {
                     let full_keys = next_tensor();
@@ -2504,7 +2512,10 @@ impl Qwen4State {
             return Ok(());
         }
         for layer in &self.gdn {
-            let residual = layer.ef_residual.as_ref().ok_or(StateError::AllocationBookkeeping)?;
+            let residual = layer
+                .ef_residual
+                .as_ref()
+                .ok_or(StateError::AllocationBookkeeping)?;
             gdn_q8ef_residual_zero(gpu, residual).map_err(StateError::Hip)?;
         }
         self.gdn_residual_resets = self.gdn_residual_resets.saturating_add(1);
@@ -2908,8 +2919,12 @@ impl Qwen4State {
                     device(&self.gdn.get(slot).ok_or_else(missing)?.recurrent)?
                 }
                 DigestRow::GdnResidual(slot) => device(
-                    self.gdn.get(slot).ok_or_else(missing)?
-                        .ef_residual.as_ref().ok_or_else(missing)?,
+                    self.gdn
+                        .get(slot)
+                        .ok_or_else(missing)?
+                        .ef_residual
+                        .as_ref()
+                        .ok_or_else(missing)?,
                 )?,
                 DigestRow::GdnConv(slot) => device(&self.gdn.get(slot).ok_or_else(missing)?.conv)?,
                 DigestRow::Qsa(slot, field) => {
@@ -3025,7 +3040,10 @@ impl Qwen4State {
         history: PleHistory,
         commits: Option<&[(usize, usize, usize, usize, usize)]>,
     ) -> Result<(Vec<u8>, StateLayout<'_>), StateError> {
-        let mut words = vec![gdn_session_tag(self.map.session_tag(), self.gdn_format), position as u64];
+        let mut words = vec![
+            gdn_session_tag(self.map.session_tag(), self.gdn_format),
+            position as u64,
+        ];
         if self.ple_conv.is_some() {
             let [ple0, ple1] = history.previous();
             words.extend([u64::from(ple0), u64::from(ple1)]);
@@ -3473,7 +3491,8 @@ impl Qwen4State {
             self.row_capture_rows = rows;
             self.gdn_live = 0;
             #[cfg(feature = "lab")]
-            self.lab.ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
+            self.lab
+                .ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
             return Ok(());
         }
         let mut next = Vec::with_capacity(self.gdn.len());
@@ -3537,7 +3556,8 @@ impl Qwen4State {
         self.row_capture_rows = rows;
         self.gdn_live = 0;
         #[cfg(feature = "lab")]
-        self.lab.ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
+        self.lab
+            .ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
         Ok(())
     }
 
@@ -4044,7 +4064,10 @@ mod tests {
         let config = crate::config::compact_test_config();
         let scope = Qwen4BandScope::single(&config);
         let map = Qwen4StateMap::new(&config, &scope).unwrap();
-        let format = |gdn| Qwen4StateFormat { gdn, ..Qwen4StateFormat::F32 };
+        let format = |gdn| Qwen4StateFormat {
+            gdn,
+            ..Qwen4StateFormat::F32
+        };
         let plan = |gdn| {
             let format = format(gdn);
             let geometry = StateGeometry::new(&config, &format, 1024).unwrap();
@@ -4052,46 +4075,88 @@ mod tests {
         };
         let q8 = plan(GdnStateFormat::Q8);
         let ef = plan(GdnStateFormat::Q8Ef);
-        let residuals: Vec<_> = ef.iter()
-            .filter(|part| part.key.ends_with(".ef_residual")).collect();
+        let residuals: Vec<_> = ef
+            .iter()
+            .filter(|part| part.key.ends_with(".ef_residual"))
+            .collect();
         assert_eq!(residuals.len(), 36);
         assert!(residuals.iter().all(|part| part.dtype == DType::F16
-            && part.elements == 48 * 128 * 128 && !part.context_arena));
+            && part.elements == 48 * 128 * 128
+            && !part.context_arena));
         for plain in [GdnStateFormat::F32, GdnStateFormat::Q8] {
             assert!(!plain.has_residual());
-            assert!(plan(plain).iter().all(|part| !part.key.ends_with(".ef_residual")));
+            assert!(plan(plain)
+                .iter()
+                .all(|part| !part.key.ends_with(".ef_residual")));
         }
         // Removing only the live companions leaves exactly the old allocation
         // plan, so mirror and serialized recurrent extents cannot grow with EF.
-        let stored: Vec<_> = ef.iter()
-            .filter(|part| !part.key.ends_with(".ef_residual")).cloned().collect();
+        let stored: Vec<_> = ef
+            .iter()
+            .filter(|part| !part.key.ends_with(".ef_residual"))
+            .cloned()
+            .collect();
         assert_eq!(stored, q8);
-        assert_eq!(residuals.iter().map(|part| part.elements * part.dtype.size()).sum::<usize>(),
-            54 * 1024 * 1024);
+        assert_eq!(
+            residuals
+                .iter()
+                .map(|part| part.elements * part.dtype.size())
+                .sum::<usize>(),
+            54 * 1024 * 1024
+        );
         let context = Qwen4ContextCommit::legacy(1024);
         let live = |gdn| Qwen4State::device_bytes(&config, format(gdn), &context).unwrap();
-        assert_eq!(live(GdnStateFormat::Q8Ef) - live(GdnStateFormat::Q8), 54 * 1024 * 1024);
+        assert_eq!(
+            live(GdnStateFormat::Q8Ef) - live(GdnStateFormat::Q8),
+            54 * 1024 * 1024
+        );
         for rows in [4, 8, 32] {
             let ring = |gdn| Qwen4State::row_capture_bytes(&config, gdn, rows).unwrap();
             assert_eq!(ring(GdnStateFormat::Q8Ef), ring(GdnStateFormat::Q8));
             assert_eq!(
                 live(GdnStateFormat::Q8Ef) + ring(GdnStateFormat::Q8Ef)
-                    - live(GdnStateFormat::Q8) - ring(GdnStateFormat::Q8),
+                    - live(GdnStateFormat::Q8)
+                    - ring(GdnStateFormat::Q8),
                 54 * 1024 * 1024,
             );
             for native_mtp in [false, true] {
                 assert_eq!(
-                    crate::bundle::session_snapshot_bytes(&config, format(GdnStateFormat::Q8Ef), native_mtp, rows),
-                    crate::bundle::session_snapshot_bytes(&config, format(GdnStateFormat::Q8), native_mtp, rows),
+                    crate::bundle::session_snapshot_bytes(
+                        &config,
+                        format(GdnStateFormat::Q8Ef),
+                        native_mtp,
+                        rows
+                    ),
+                    crate::bundle::session_snapshot_bytes(
+                        &config,
+                        format(GdnStateFormat::Q8),
+                        native_mtp,
+                        rows
+                    ),
                 );
             }
         }
         // Every PP/lane owner charges only its own live residual, not another
         // owner's history; together PP bands equal the whole-model owner.
-        let pp_residual: usize = pp_scopes(&[24, 24]).iter().map(|band| {
-            Qwen4State::device_bytes_scoped(&config, format(GdnStateFormat::Q8Ef), &context, band).unwrap()
-                - Qwen4State::device_bytes_scoped(&config, format(GdnStateFormat::Q8), &context, band).unwrap()
-        }).sum();
+        let pp_residual: usize = pp_scopes(&[24, 24])
+            .iter()
+            .map(|band| {
+                Qwen4State::device_bytes_scoped(
+                    &config,
+                    format(GdnStateFormat::Q8Ef),
+                    &context,
+                    band,
+                )
+                .unwrap()
+                    - Qwen4State::device_bytes_scoped(
+                        &config,
+                        format(GdnStateFormat::Q8),
+                        &context,
+                        band,
+                    )
+                    .unwrap()
+            })
+            .sum();
         assert_eq!(pp_residual, 54 * 1024 * 1024);
     }
 
@@ -4119,7 +4184,11 @@ mod tests {
             if gdn_residual_reset_required(GdnStateFormat::Q8Ef, event) {
                 residual.fill(0);
             }
-            assert_eq!(residual, if clears { [0, 0] } else { [0x3800, 0xb800] }, "{label}");
+            assert_eq!(
+                residual,
+                if clears { [0, 0] } else { [0x3800, 0xb800] },
+                "{label}"
+            );
             assert_eq!(other, [0x3400, 0xb400], "{label}");
             for plain in [GdnStateFormat::F32, GdnStateFormat::Q8] {
                 assert!(!gdn_residual_reset_required(plain, event), "{label}");
@@ -4132,8 +4201,12 @@ mod tests {
         use hipfire_runtime::session_cache::SessionRoute;
         let config = crate::config::compact_test_config();
         let map = Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).unwrap();
-        let format = |gdn| Qwen4StateFormat { gdn, ..Qwen4StateFormat::F32 };
-        let scope = |gdn| crate::bundle::session_scope(SessionRoute::Ar, 256, format(gdn), false, None);
+        let format = |gdn| Qwen4StateFormat {
+            gdn,
+            ..Qwen4StateFormat::F32
+        };
+        let scope =
+            |gdn| crate::bundle::session_scope(SessionRoute::Ar, 256, format(gdn), false, None);
         let ef_scope = scope(GdnStateFormat::Q8Ef);
         assert!(ef_scope.contains("q8_ef-reset"), "{ef_scope}");
         let ef_tag = gdn_session_tag(map.session_tag(), GdnStateFormat::Q8Ef);
@@ -4160,11 +4233,20 @@ mod tests {
     fn gdn_q8ef_reset_lifecycle_overflow() {
         let mut config = crate::config::compact_test_config();
         config.linear_num_value_heads = usize::MAX;
-        let format = Qwen4StateFormat { gdn: GdnStateFormat::Q8Ef, ..Qwen4StateFormat::F32 };
-        assert!(matches!(StateGeometry::new(&config, &format, 1024), Err(StateError::DimensionOverflow)));
+        let format = Qwen4StateFormat {
+            gdn: GdnStateFormat::Q8Ef,
+            ..Qwen4StateFormat::F32
+        };
+        assert!(matches!(
+            StateGeometry::new(&config, &format, 1024),
+            Err(StateError::DimensionOverflow)
+        ));
         // The plain Q8 slot fits, but its separate F16 companion does not.
         config.linear_num_value_heads = usize::MAX / (128 * 128 * 2) + 1;
-        assert!(matches!(StateGeometry::new(&config, &format, 1024), Err(StateError::DimensionOverflow)));
+        assert!(matches!(
+            StateGeometry::new(&config, &format, 1024),
+            Err(StateError::DimensionOverflow)
+        ));
     }
 
     #[test]

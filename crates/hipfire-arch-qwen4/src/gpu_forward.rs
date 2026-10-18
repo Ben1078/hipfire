@@ -3912,10 +3912,10 @@ pub(crate) struct Qwen4ExpertStage {
     slab: Option<slab_stage::SlabStageMeta>,
 }
 
-pub(crate) mod slab_stage;
 /// S1 slow-link layer-major prefill transport: the bounded expert page ring
 /// and the layer-ahead weight schedule ([`crate::slowlink_prefill`]).
 pub(crate) mod panel_stage;
+pub(crate) mod slab_stage;
 mod slab_stage;
 
 impl Qwen4ExpertStage {

@@ -269,11 +269,7 @@ pub(crate) fn sweep_tiles(
     } else {
         None
     };
-    let anchor = preferred.or_else(|| {
-        tiles
-            .iter()
-            .position(|tile| tile.routing.route_rows != 1)
-    });
+    let anchor = preferred.or_else(|| tiles.iter().position(|tile| tile.routing.route_rows != 1));
     let cohort = (0..tiles.len())
         .filter(|&ti| Some(ti) != anchor)
         .filter(|&ti| registers_operands(route, tiles[ti].routing.route_rows, few_row_limit))
@@ -3433,24 +3429,22 @@ pub(crate) fn primitive_selftest(
         // same decode call beside an actual WMMA anchor.
         "k1_tail_cohort" => match profile.geometry.route {
             dsp::WindowRoute::SlabIu4 => {
-                dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name).and_then(
-                    |prefill| {
-                        decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
-                            json!({
-                                "name": name,
-                                "status": "pass",
-                                "mismatches": 0u64,
-                                "detail": {
-                                    "prefill_k1": prefill["detail"],
-                                    "decode_tail": decode["detail"],
-                                },
-                            })
+                dispatch_case(forward, &*bundle, gpu, &mut rt, &profile, name).and_then(|prefill| {
+                    decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
+                        json!({
+                            "name": name,
+                            "status": "pass",
+                            "mismatches": 0u64,
+                            "detail": {
+                                "prefill_k1": prefill["detail"],
+                                "decode_tail": decode["detail"],
+                            },
                         })
-                    },
-                )
+                    })
+                })
             }
-            dsp::WindowRoute::Aggregate => {
-                f32_tail_case(forward, &*bundle, gpu, &rt, &profile).and_then(|f32_tail| {
+            dsp::WindowRoute::Aggregate => f32_tail_case(forward, &*bundle, gpu, &rt, &profile)
+                .and_then(|f32_tail| {
                     decode_tail_case(forward, &*bundle, gpu, &rt, &profile).map(|decode| {
                         json!({
                             "name": name,
@@ -3462,8 +3456,7 @@ pub(crate) fn primitive_selftest(
                             },
                         })
                     })
-                })
-            }
+                }),
         },
         other => Err(invalid(format!("unknown slow-link primitive {other:?}"))),
     };
@@ -4108,9 +4101,10 @@ mod slowlink_prompt {
                     }
                 }
                 for (k1, tail) in shapes {
-                    let layout = window_route_layout(&profile, rows, k1, tail).unwrap_or_else(
-                        |error| panic!("{route:?} rows {rows} k1 {k1} tail {tail}: {error:?}"),
-                    );
+                    let layout =
+                        window_route_layout(&profile, rows, k1, tail).unwrap_or_else(|error| {
+                            panic!("{route:?} rows {rows} k1 {k1} tail {tail}: {error:?}")
+                        });
                     let dims = layout.dims();
                     assert_eq!(dims.rows, rows, "{route:?}");
                     assert_eq!(layout.route(), route, "{route:?} rows {rows}");
@@ -4156,13 +4150,7 @@ mod slowlink_prompt {
             "F32 tail rows above the admitted capacity are refused"
         );
         assert!(
-            window_route_layout(
-                &profile_on(dsp::WindowRoute::SlabIu4, 0, 0),
-                16384,
-                0,
-                1
-            )
-            .is_err(),
+            window_route_layout(&profile_on(dsp::WindowRoute::SlabIu4, 0, 0), 16384, 0, 1).is_err(),
             "the slab route has no F32 tail rows"
         );
     }
@@ -4275,10 +4263,7 @@ mod slowlink_prompt {
         assert_eq!((window.k1_rows, window.tail_rows), (1, 3));
         assert_eq!((aggregate.k1_rows_max, aggregate.tail_rows_max), (1, 3));
         let slab = plan(0, 516, &cuts);
-        assert_eq!(
-            (slab.windows[0].k1_rows, slab.windows[0].tail_rows),
-            (4, 0)
-        );
+        assert_eq!((slab.windows[0].k1_rows, slab.windows[0].tail_rows), (4, 0));
         assert_eq!((slab.k1_rows_max, slab.tail_rows_max), (4, 0));
         let canonical = plan_on(
             dsp::WindowRoute::Aggregate,
@@ -4334,7 +4319,11 @@ mod slowlink_prompt {
             window_route_layout(&profile, window.rows, window.k1_rows, window.tail_rows).unwrap();
         assert_eq!(layout.route(), dsp::WindowRoute::Aggregate);
         assert_eq!(
-            (layout.dims().rows, layout.dims().k1_rows, layout.dims().tail_rows),
+            (
+                layout.dims().rows,
+                layout.dims().k1_rows,
+                layout.dims().tail_rows
+            ),
             (3, 0, 3)
         );
         assert!(layout.total_bytes() as u64 <= profile.census.route_storage);
@@ -4345,7 +4334,11 @@ mod slowlink_prompt {
         let layout =
             window_route_layout(&profile, window.rows, window.k1_rows, window.tail_rows).unwrap();
         assert_eq!(
-            (layout.dims().rows, layout.dims().k1_rows, layout.dims().tail_rows),
+            (
+                layout.dims().rows,
+                layout.dims().k1_rows,
+                layout.dims().tail_rows
+            ),
             (1, 1, 0)
         );
         assert!(layout.total_bytes() as u64 <= profile.census.route_storage);
@@ -4515,7 +4508,11 @@ mod slowlink_prompt {
             assert_eq!(last.end_position(), 16387);
             assert_eq!(last.tiles.len(), 1);
             assert_eq!(plan.tiles[last.tiles.start].rows, 3);
-            assert_eq!((plan.k1_rows_max, plan.tail_rows_max), (k1, tail), "{route:?}");
+            assert_eq!(
+                (plan.k1_rows_max, plan.tail_rows_max),
+                (k1, tail),
+                "{route:?}"
+            );
             assert_eq!((last.k1_rows, last.tail_rows), (k1, tail), "{route:?}");
             let manifest = plan.tiles.clone();
             let windows = plan.windows.clone();
@@ -4569,8 +4566,7 @@ mod slowlink_prompt {
             route_rows: 100,
             bf16_streams: false,
         };
-        let verdict =
-            plan_on(dsp::WindowRoute::Aggregate, 0, 16384, &[], &all_tails, 8).unwrap();
+        let verdict = plan_on(dsp::WindowRoute::Aggregate, 0, 16384, &[], &all_tails, 8).unwrap();
         assert!(matches!(
             verdict,
             Err(PlanBypass::F32TailRows { window: 0, rows, bound })
@@ -4580,8 +4576,7 @@ mod slowlink_prompt {
             route_rows: 1,
             bf16_streams: false,
         };
-        let verdict =
-            plan_on(dsp::WindowRoute::Aggregate, 0, 16384, &[], &all_decode, 8).unwrap();
+        let verdict = plan_on(dsp::WindowRoute::Aggregate, 0, 16384, &[], &all_decode, 8).unwrap();
         assert!(matches!(
             verdict,
             Err(PlanBypass::K1TailRows { window: 0, rows, bound })
