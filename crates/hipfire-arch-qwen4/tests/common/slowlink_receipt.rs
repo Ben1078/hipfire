@@ -2793,31 +2793,337 @@ pub fn manifest_problems(manifest: &Value, observed: &Observed) -> Vec<String> {
 
 // ── KLD receipts and the paired verdict ────────────────────────────────
 
-pub const KLD_ROWS: u64 = 6120;
-pub const KLD_SEQUENCES: u64 = 24;
 pub const KLD_HI_LIMIT: f64 = 0.010;
 
-/// A full-gate S11 decode receipt: not a partition, every row, every
-/// corpus sequence, the decode route.
+/// Rows a prefill sequence must have in its one forward: the aggregate
+/// symmetric IU4 MoE route floor (`QWEN4_MOE_SYM_IU4_MIN_ROWS`).
+pub const KLD_PREFILL_MIN_ROWS: u64 = 512;
+
+/// The env var that selects the aggregate symmetric IU4 MoE route.
+pub const MOE_IU4_ENV: &str = "HIPFIRE_QWEN4_MOE_SYM_IU4";
+
+/// Pinned identity of one quality-gate corpus: its corpus and teacher
+/// reference digests and the exact sequence/row counts a full-gate receipt
+/// must carry. A receipt is matched to its identity by `corpus_sha256`; the
+/// name is only reported.
+#[derive(Clone, Copy, Debug)]
+pub struct KldCorpus<'a> {
+    pub name: &'a str,
+    pub corpus_sha256: &'a str,
+    pub corpus_md5: &'a str,
+    pub ref_sha256: &'a str,
+    pub ref_md5: &'a str,
+    pub sequences: u64,
+    pub rows: u64,
+}
+
+/// code24: 24 sequences x 255 scored rows (positions 256..510 of 512 tokens);
+/// WT2: 32 sequences x 255. The md5s are the pinned values of the fp8 S11
+/// teacher references and corpora; the sha256s are those files' digests.
+pub const KLD_CORPORA: [KldCorpus<'static>; 2] = [
+    KldCorpus {
+        name: "code24",
+        corpus_sha256: "b48ad8632cfd0135f9888e8efb21f2f2d0d31f4a05d98e2a3e342c71179aafa3",
+        corpus_md5: "6145e25c0858e31e08527c1e5278c074",
+        ref_sha256: "8df7d428bfd76804ab7aaa854cf72a3e5beb0623f9ece42ebb4258d2ad6b2269",
+        ref_md5: "56d93a4931631e306244e95ea64aecfc",
+        sequences: 24,
+        rows: 6120,
+    },
+    KldCorpus {
+        name: "wt2",
+        corpus_sha256: "11c07f841812e3fbd61041977474fe363a8140e8d27b14967b1555efcbc1f884",
+        corpus_md5: "bc68e288ce5ae0ac6aa4bccb7f610213",
+        ref_sha256: "816573d99d4e3d7974b4e8c3573bdc86ba9519f0c1965a0404efa2dd0dfdd2b9",
+        ref_md5: "6684a1a5c5b8b61be62b0e5012d48a95",
+        sequences: 32,
+        rows: 8160,
+    },
+];
+
+/// The identity in `table` whose corpus digest is `corpus_sha256`.
+pub fn kld_corpus<'t, 'a>(
+    table: &'t [KldCorpus<'a>],
+    corpus_sha256: &str,
+) -> Option<&'t KldCorpus<'a>> {
+    table.iter().find(|c| c.corpus_sha256 == corpus_sha256)
+}
+
+/// Streaming MD5 (RFC 1321) for the identity digests the teacher references,
+/// corpora and binaries are pinned by. Identity only, never a security claim.
+pub struct Md5 {
+    state: [u32; 4],
+    block: [u8; 64],
+    fill: usize,
+    bytes: u64,
+}
+
+impl Default for Md5 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Md5 {
+    const SHIFT: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+
+    pub fn new() -> Self {
+        Self {
+            state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476],
+            block: [0; 64],
+            fill: 0,
+            bytes: 0,
+        }
+    }
+
+    fn compress(state: &mut [u32; 4], block: &[u8; 64]) {
+        let mut words = [0u32; 16];
+        for (word, chunk) in words.iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        let [mut a, mut b, mut c, mut d] = *state;
+        for i in 0..64usize {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let k = (((i + 1) as f64).sin().abs() * 4_294_967_296.0) as u32;
+            let sum = f
+                .wrapping_add(a)
+                .wrapping_add(k)
+                .wrapping_add(words[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(sum.rotate_left(Self::SHIFT[i]));
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.bytes = self.bytes.wrapping_add(data.len() as u64);
+        if self.fill > 0 {
+            let take = (64 - self.fill).min(data.len());
+            self.block[self.fill..self.fill + take].copy_from_slice(&data[..take]);
+            self.fill += take;
+            data = &data[take..];
+            if self.fill < 64 {
+                return;
+            }
+            let block = self.block;
+            Self::compress(&mut self.state, &block);
+            self.fill = 0;
+        }
+        let mut chunks = data.chunks_exact(64);
+        for chunk in &mut chunks {
+            let mut block = [0u8; 64];
+            block.copy_from_slice(chunk);
+            Self::compress(&mut self.state, &block);
+        }
+        let rest = chunks.remainder();
+        self.block[..rest.len()].copy_from_slice(rest);
+        self.fill = rest.len();
+    }
+
+    /// Lowercase hex digest.
+    pub fn finish(mut self) -> String {
+        let bits = self.bytes.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.fill != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bits.to_le_bytes());
+        self.state
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+/// Lowercase hex MD5 of `data`.
+pub fn md5_hex(data: &[u8]) -> String {
+    let mut md5 = Md5::new();
+    md5.update(data);
+    md5.finish()
+}
+
+/// The per-sequence launch census of the aggregate MoE route launchers
+/// (`rdna_compute::gemm::MoeRouteLaunchCensus` delta of one sequence's
+/// forward).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteCensus {
+    pub sym_iu4_gate_up: u64,
+    pub sym_iu4_down: u64,
+    pub a4_gate_producer: u64,
+    pub a4_down_producer: u64,
+    pub f16_wmma_gate_up: u64,
+    pub f16_wmma_down: u64,
+}
+
+impl RouteCensus {
+    pub fn to_value(self) -> Value {
+        json!({
+            "sym_iu4_gate_up": self.sym_iu4_gate_up,
+            "sym_iu4_down": self.sym_iu4_down,
+            "a4_gate_producer": self.a4_gate_producer,
+            "a4_down_producer": self.a4_down_producer,
+            "f16_wmma_gate_up": self.f16_wmma_gate_up,
+            "f16_wmma_down": self.f16_wmma_down,
+        })
+    }
+
+    /// Every counter is required, an unsigned integer.
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let field = |key: &str| value.get(key).and_then(Value::as_u64);
+        Some(Self {
+            sym_iu4_gate_up: field("sym_iu4_gate_up")?,
+            sym_iu4_down: field("sym_iu4_down")?,
+            a4_gate_producer: field("a4_gate_producer")?,
+            a4_down_producer: field("a4_down_producer")?,
+            f16_wmma_gate_up: field("f16_wmma_gate_up")?,
+            f16_wmma_down: field("f16_wmma_down")?,
+        })
+    }
+
+    /// Both IU4 GEMMs ran and neither F16 WMMA GEMM did.
+    pub fn is_iu4(self) -> bool {
+        self.sym_iu4_gate_up > 0
+            && self.sym_iu4_down > 0
+            && self.f16_wmma_gate_up == 0
+            && self.f16_wmma_down == 0
+    }
+
+    /// Both F16 WMMA GEMMs ran and neither IU4 GEMM did.
+    pub fn is_f16(self) -> bool {
+        self.sym_iu4_gate_up == 0
+            && self.sym_iu4_down == 0
+            && self.f16_wmma_gate_up > 0
+            && self.f16_wmma_down > 0
+    }
+}
+
+/// The receipt-level `moe_route` verdict of the scored sequences: `iu4` iff
+/// every sequence is IU4, `f16` iff every sequence is F16, else `mixed` (an
+/// empty list is `mixed`; `mixed` always fails a pairing).
+pub fn moe_route_verdict(sequences: &[RouteCensus]) -> &'static str {
+    if sequences.is_empty() {
+        "mixed"
+    } else if sequences.iter().all(|c| c.is_iu4()) {
+        "iu4"
+    } else if sequences.iter().all(|c| c.is_f16()) {
+        "f16"
+    } else {
+        "mixed"
+    }
+}
+
+/// The IU4 descriptor identity a receipt carries when the gfx1100 kernel
+/// family exists: the frozen shape of `moe_iu4.descriptor` (C2).
+pub fn moe_descriptor_problems(descriptor: &Value, what: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    if !descriptor.is_object() {
+        return vec![format!("{what}: descriptor is not an object")];
+    }
+    if descriptor.get("arch").and_then(Value::as_str) != Some("gfx1100") {
+        bad.push(format!("{what}: descriptor arch is not gfx1100"));
+    }
+    for key in ["module", "gate_up", "down", "down_producer", "checker"] {
+        if !descriptor
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        {
+            bad.push(format!("{what}: descriptor {key} missing or empty"));
+        }
+    }
+    if u64_at(descriptor, "nt") != Some(1) {
+        bad.push(format!("{what}: descriptor nt is not 1"));
+    }
+    if descriptor.get("threads") != Some(&json!([64, 128])) {
+        bad.push(format!("{what}: descriptor threads are not [64,128]"));
+    }
+    if descriptor.get("gate_producer").and_then(Value::as_str) != Some("mq_rotate_x_i4") {
+        bad.push(format!(
+            "{what}: descriptor gate_producer is not mq_rotate_x_i4"
+        ));
+    }
+    if descriptor.get("c2") != Some(&Value::Bool(true)) {
+        bad.push(format!("{what}: descriptor c2 is not true"));
+    }
+    bad
+}
+
+/// The `route` label of an all-row (non-`--decode`) s11ref receipt. The older
+/// spelling `prefill` is accepted as the same route.
+pub const KLD_PREFILL_ROUTE: &str = "cold-prefill";
+
+pub fn is_prefill_route(route: Option<&str>) -> bool {
+    matches!(route, Some("cold-prefill" | "prefill"))
+}
+
+/// A full-gate S11 receipt of the pinned gate corpora: not a partition, every
+/// row, every corpus sequence, the decode or prefill route.
 pub fn kld_receipt_problems(receipt: &Value) -> Vec<String> {
+    kld_receipt_problems_in(receipt, &KLD_CORPORA)
+}
+
+/// [`kld_receipt_problems`] against an explicit corpus identity table (the
+/// receipt's corpus must be one of `table`).
+pub fn kld_receipt_problems_in(receipt: &Value, table: &[KldCorpus<'_>]) -> Vec<String> {
     let mut bad = Vec::new();
     if receipt.get("schema").and_then(Value::as_str) != Some("hipfire.qwen4.s11ref_klrows.v1") {
         bad.push("not a full-gate s11ref receipt (schema; a partition is never the gate)".into());
     }
-    if u64_at(receipt, "rows") != Some(KLD_ROWS) {
-        bad.push(format!(
-            "rows {:?} != {KLD_ROWS}: partial corpus",
-            receipt.get("rows")
-        ));
+    let corpus = receipt
+        .get("corpus_sha256")
+        .and_then(Value::as_str)
+        .and_then(|sha| kld_corpus(table, sha));
+    match corpus {
+        None => bad.push(format!(
+            "corpus_sha256 {:?} is not a pinned gate corpus ({})",
+            receipt.get("corpus_sha256"),
+            table.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")
+        )),
+        Some(c) => {
+            if u64_at(receipt, "rows") != Some(c.rows) {
+                bad.push(format!(
+                    "rows {:?} != {} ({}): partial corpus",
+                    receipt.get("rows"),
+                    c.rows,
+                    c.name
+                ));
+            }
+            if u64_at(receipt, "sequences") != Some(c.sequences) {
+                bad.push(format!(
+                    "sequences {:?} != {} ({}): partial corpus",
+                    receipt.get("sequences"),
+                    c.sequences,
+                    c.name
+                ));
+            }
+            if receipt.get("ref_sha256").and_then(Value::as_str) != Some(c.ref_sha256) {
+                bad.push(format!(
+                    "ref_sha256 is not the pinned {} teacher reference",
+                    c.name
+                ));
+            }
+        }
     }
-    if u64_at(receipt, "sequences") != Some(KLD_SEQUENCES) {
+    let route = receipt.get("route").and_then(Value::as_str);
+    if !(route == Some("decode") || is_prefill_route(route)) {
         bad.push(format!(
-            "sequences {:?} != {KLD_SEQUENCES}: partial corpus",
-            receipt.get("sequences")
+            "route {route:?} is neither decode nor {KLD_PREFILL_ROUTE}"
         ));
-    }
-    if receipt.get("route").and_then(Value::as_str) != Some("decode") {
-        bad.push("route is not decode".into());
     }
     for key in [
         "model_sha256",
@@ -2830,7 +3136,129 @@ pub fn kld_receipt_problems(receipt: &Value) -> Vec<String> {
             bad.push(format!("receipt {key} is not a 64-hex digest"));
         }
     }
+    if is_prefill_route(route) {
+        bad.extend(kld_prefill_problems(receipt, corpus));
+    }
     bad
+}
+
+/// The `prefill` (all-row s11ref) receipt evidence: one forward of the whole
+/// sequence (so the aggregate MoE route sees >= 512 rows), the per-sequence
+/// launch census, a recomputed (never trusted) `moe_route` verdict, the
+/// resolved IU4 request and the md5 identities. `mixed` always fails.
+fn kld_prefill_problems(receipt: &Value, corpus: Option<&KldCorpus<'_>>) -> Vec<String> {
+    let mut bad = Vec::new();
+    let claimed = receipt.get("moe_route").and_then(Value::as_str);
+    let routes = receipt.get("sequence_routes").and_then(Value::as_array);
+    let mut censuses = Vec::new();
+    match routes {
+        None => bad.push("prefill receipt has no sequence_routes array".into()),
+        Some(routes) => {
+            if Some(routes.len() as u64) != u64_at(receipt, "sequences") {
+                bad.push(format!(
+                    "sequence_routes has {} entries, the receipt {:?} sequences",
+                    routes.len(),
+                    receipt.get("sequences")
+                ));
+            }
+            for (index, entry) in routes.iter().enumerate() {
+                let id = entry.get("id").and_then(Value::as_str).unwrap_or("?");
+                let tokens = u64_at(entry, "tokens").unwrap_or(0);
+                if tokens < KLD_PREFILL_MIN_ROWS {
+                    bad.push(format!(
+                        "sequence {index} ({id}) has {tokens} tokens, below the {KLD_PREFILL_MIN_ROWS}-row IU4 floor"
+                    ));
+                }
+                match entry.get("forwards").and_then(Value::as_array) {
+                    Some(forwards)
+                        if forwards.len() == 1 && u64_at(&forwards[0], "rows") == Some(tokens) => {}
+                    other => bad.push(format!(
+                        "sequence {index} ({id}) did not run as one {tokens}-row forward (forwards {other:?})"
+                    )),
+                }
+                match entry.get("census").and_then(RouteCensus::from_value) {
+                    Some(census) => censuses.push(census),
+                    None => bad.push(format!("sequence {index} ({id}) has no launch census")),
+                }
+            }
+        }
+    }
+    let verdict = moe_route_verdict(&censuses);
+    if censuses.len() != routes.map_or(0, Vec::len) {
+        bad.push("a sequence census is missing: moe_route cannot be derived".into());
+    } else if claimed != Some(verdict) {
+        bad.push(format!(
+            "moe_route {claimed:?} disagrees with the per-sequence census ({verdict})"
+        ));
+    }
+    if verdict == "mixed" || claimed == Some("mixed") {
+        bad.push("moe_route is mixed: a pairing never accepts a mixed route".into());
+    }
+    // The top-level `moe_launch_census` is the sum of the per-sequence deltas.
+    let summed = censuses.iter().fold(RouteCensus::default(), |a, c| RouteCensus {
+        sym_iu4_gate_up: a.sym_iu4_gate_up + c.sym_iu4_gate_up,
+        sym_iu4_down: a.sym_iu4_down + c.sym_iu4_down,
+        a4_gate_producer: a.a4_gate_producer + c.a4_gate_producer,
+        a4_down_producer: a.a4_down_producer + c.a4_down_producer,
+        f16_wmma_gate_up: a.f16_wmma_gate_up + c.f16_wmma_gate_up,
+        f16_wmma_down: a.f16_wmma_down + c.f16_wmma_down,
+    });
+    if receipt.get("moe_launch_census").and_then(RouteCensus::from_value) != Some(summed) {
+        bad.push("moe_launch_census missing or not the sum of the per-sequence census".into());
+    }
+    match receipt.get("moe_iu4") {
+        Some(moe) if moe.is_object() => {
+            if moe.get("requested").and_then(Value::as_bool).is_none() {
+                bad.push("moe_iu4.requested missing or not a bool".into());
+            }
+            match moe.get("descriptor") {
+                Some(Value::Null) => {
+                    if verdict == "iu4" {
+                        bad.push("moe_route is iu4 but the descriptor is null".into());
+                    }
+                }
+                Some(descriptor) => bad.extend(moe_descriptor_problems(descriptor, "moe_iu4")),
+                None => bad.push("moe_iu4.descriptor missing (object or null)".into()),
+            }
+        }
+        _ => bad.push("prefill receipt has no moe_iu4 object".into()),
+    }
+    if !receipt.get("env").is_some_and(Value::is_object) {
+        bad.push("prefill receipt has no env object (the HIPFIRE_* configuration)".into());
+    }
+    for key in ["binary_md5", "ref_md5", "corpus_md5"] {
+        if !is_hex(receipt.get(key).and_then(Value::as_str), 32) {
+            bad.push(format!("receipt {key} is not a 32-hex md5"));
+        }
+    }
+    if receipt.get("binary_path").and_then(Value::as_str).is_none() {
+        bad.push("receipt binary_path missing".into());
+    }
+    if let Some(c) = corpus {
+        if receipt.get("corpus_md5").and_then(Value::as_str) != Some(c.corpus_md5) {
+            bad.push(format!("corpus_md5 is not the pinned {} corpus", c.name));
+        }
+        if receipt.get("ref_md5").and_then(Value::as_str) != Some(c.ref_md5) {
+            bad.push(format!("ref_md5 is not the pinned {} reference", c.name));
+        }
+    }
+    bad
+}
+
+/// The ids a prefill receipt scored, in order, against the corpus' ids.
+pub fn kld_sequence_ids_problems(receipt: &Value, ids: &[&str]) -> Vec<String> {
+    let Some(routes) = receipt.get("sequence_routes").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let seen: Vec<&str> = routes
+        .iter()
+        .map(|r| r.get("id").and_then(Value::as_str).unwrap_or("?"))
+        .collect();
+    if seen == ids {
+        Vec::new()
+    } else {
+        vec!["sequence_routes ids differ from the corpus sequence ids/order".into()]
+    }
 }
 
 /// Same reference, corpus, context and route; different weights/binary are
@@ -2840,6 +3268,8 @@ pub fn kld_receipts_comparable(base: &Value, cand: &Value) -> Vec<String> {
     for key in [
         "ref_sha256",
         "corpus_sha256",
+        "ref_md5",
+        "corpus_md5",
         "n_ctx",
         "route",
         "rows",
@@ -2849,6 +3279,249 @@ pub fn kld_receipts_comparable(base: &Value, cand: &Value) -> Vec<String> {
         if base.get(key) != cand.get(key) {
             bad.push(format!(
                 "receipts differ in {key}: not the same ordering/reference/config"
+            ));
+        }
+    }
+    for (arm, receipt) in [("base", base), ("cand", cand)] {
+        if receipt.get("moe_route").and_then(Value::as_str) == Some("mixed") {
+            bad.push(format!("{arm}: moe_route is mixed"));
+        }
+    }
+    bad
+}
+
+/// Per-sequence forward row counts of a prefill receipt, for geometry
+/// comparison: `(id, tokens, forward rows)`.
+fn forward_geometry(receipt: &Value) -> Vec<(Value, Value, Vec<Value>)> {
+    receipt
+        .get("sequence_routes")
+        .and_then(Value::as_array)
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|r| {
+                    let rows = r
+                        .get("forwards")
+                        .and_then(Value::as_array)
+                        .map(|forwards| {
+                            forwards
+                                .iter()
+                                .map(|f| f.get("rows").cloned().unwrap_or(Value::Null))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (
+                        r.get("id").cloned().unwrap_or(Value::Null),
+                        r.get("tokens").cloned().unwrap_or(Value::Null),
+                        rows,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The IU4 prefill pairing: the same binary and model, the baseline on the
+/// F16 route with the flag off, the candidate observed on the IU4 route with
+/// the flag on (a requested IU4 that fell back is a failure, never a
+/// deterministic incumbent pass), identical forward geometry and an
+/// otherwise identical `HIPFIRE_*` environment.
+pub fn kld_iu4_pair_problems(base: &Value, cand: &Value) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (arm, receipt) in [("base", base), ("cand", cand)] {
+        if !is_prefill_route(receipt.get("route").and_then(Value::as_str)) {
+            bad.push(format!("{arm}: an IU4 pair needs the prefill route"));
+        }
+    }
+    let route_of = |receipt: &Value| {
+        receipt
+            .get("moe_route")
+            .and_then(Value::as_str)
+            .unwrap_or("missing")
+            .to_string()
+    };
+    if route_of(base) != "f16" {
+        bad.push(format!(
+            "baseline moe_route is {}, f16 required",
+            route_of(base)
+        ));
+    }
+    if route_of(cand) != "iu4" {
+        bad.push(format!(
+            "candidate expected IU4 but observed moe_route {}: a fallback is a failure, never an incumbent pass",
+            route_of(cand)
+        ));
+    }
+    let requested = |receipt: &Value| receipt["moe_iu4"].get("requested").and_then(Value::as_bool);
+    if requested(base) != Some(false) {
+        bad.push("baseline moe_iu4.requested is not false".into());
+    }
+    if requested(cand) != Some(true) {
+        bad.push("candidate moe_iu4.requested is not true".into());
+    }
+    for key in ["binary_sha256", "binary_md5", "model_sha256"] {
+        if base.get(key).is_none() || base.get(key) != cand.get(key) {
+            bad.push(format!(
+                "arms differ in {key}: an IU4 pair runs one binary and one model"
+            ));
+        }
+    }
+    if forward_geometry(base) != forward_geometry(cand) {
+        bad.push("arms differ in per-sequence forward geometry".into());
+    }
+    let (Some(be), Some(ce)) = (
+        base.get("env").and_then(Value::as_object),
+        cand.get("env").and_then(Value::as_object),
+    ) else {
+        bad.push("an arm has no env object".into());
+        return bad;
+    };
+    let mut keys: Vec<&String> = be.keys().chain(ce.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        if key == MOE_IU4_ENV {
+            continue;
+        }
+        if be.get(key) != ce.get(key) {
+            bad.push(format!(
+                "arms differ in {key}: only {MOE_IU4_ENV} may differ"
+            ));
+        }
+    }
+    let flag = |env: &serde_json::Map<String, Value>| {
+        env.get(MOE_IU4_ENV)
+            .and_then(Value::as_str)
+            .map(String::from)
+    };
+    if !matches!(flag(be).as_deref(), None | Some("0") | Some("false")) {
+        bad.push(format!("baseline {MOE_IU4_ENV} is {:?}", flag(be)));
+    }
+    if !matches!(flag(ce).as_deref(), Some("1") | Some("true")) {
+        bad.push(format!(
+            "candidate {MOE_IU4_ENV} is {:?}, 1 required",
+            flag(ce)
+        ));
+    }
+    bad
+}
+
+// ── S1 receipt `moe_iu4` (C2) ──────────────────────────────────────────
+
+/// Whether the process requested the aggregate IU4 route:
+/// `HIPFIRE_QWEN4_MOE_SYM_IU4` spelled `1`/`true` requests it; unset, `0`
+/// and `false` do not. Any other spelling is refused.
+pub fn moe_iu4_env_requested(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("0") | Some("false") => Ok(false),
+        Some("1") | Some("true") => Ok(true),
+        Some(other) => Err(format!("{MOE_IU4_ENV}={other:?} is not 0|1|true|false")),
+    }
+}
+
+/// The S1 receipt's `moe_iu4` object (C2) judged against what the process
+/// requested. Fails closed on a missing object. Requested: window route
+/// `aggregate-sym-iu4`, a gfx1100 descriptor, every final header verified,
+/// IU4 tiles and no F16 WMMA tiles, and the 16K request's final F32 tail.
+/// Not requested: window route `aggregate` and no IU4 tiles. A request
+/// shorter than the 512-row IU4 floor has no IU4 tile to require; only its
+/// shape, request flag and absence of F16 WMMA tiles under a request are
+/// checked.
+pub fn moe_iu4_problems(receipt: &Value, requested: bool) -> Vec<String> {
+    let Some(moe) = receipt.get("moe_iu4").filter(|m| m.is_object()) else {
+        return vec!["receipt moe_iu4 object missing (C2)".into()];
+    };
+    let mut bad = Vec::new();
+    let route = moe.get("window_route").and_then(Value::as_str);
+    if !matches!(route, Some("aggregate-sym-iu4" | "aggregate" | "slab-iu4")) {
+        bad.push(format!(
+            "moe_iu4.window_route {route:?} is not a known label"
+        ));
+    }
+    match moe.get("requested").and_then(Value::as_bool) {
+        None => bad.push("moe_iu4.requested missing or not a bool".into()),
+        Some(got) if got != requested => bad.push(format!(
+            "moe_iu4.requested is {got}, the process requested {requested}"
+        )),
+        Some(_) => {}
+    }
+    match moe.get("source_headers_symmetric") {
+        Some(Value::Null | Value::Bool(_)) => {}
+        _ => bad.push("moe_iu4.source_headers_symmetric missing (bool or null)".into()),
+    }
+    let verified = moe
+        .get("final_headers_verified")
+        .and_then(Value::as_array)
+        .filter(|a| a.len() == 2)
+        .and_then(|a| Some((a[0].as_u64()?, a[1].as_u64()?)));
+    if verified.is_none() {
+        bad.push("moe_iu4.final_headers_verified is not [verified, total] u64".into());
+    }
+    for key in ["a4_sidecar_bytes", "window_slot_stride"] {
+        if u64_at(moe, key).is_none() {
+            bad.push(format!("moe_iu4.{key} missing or not an unsigned integer"));
+        }
+    }
+    const TILES: [&str; 5] = [
+        "aggregate_iu4",
+        "aggregate_wmma",
+        "aggregate_f32_tail",
+        "slab_k2",
+        "k1_or_decode",
+    ];
+    for key in TILES {
+        if u64_at(moe, &format!("tiles.{key}")).is_none() {
+            bad.push(format!(
+                "moe_iu4.tiles.{key} missing or not an unsigned integer"
+            ));
+        }
+    }
+    let tile = |key: &str| u64_at(moe, &format!("tiles.{key}")).unwrap_or(0);
+    let prompt_rows = u64_at(receipt, "prompt_rows").unwrap_or(0);
+    if requested {
+        if tile("aggregate_wmma") != 0 {
+            bad.push(format!(
+                "moe_iu4.tiles.aggregate_wmma is {}: an IU4 request ran F16 WMMA aggregate tiles",
+                tile("aggregate_wmma")
+            ));
+        }
+        if prompt_rows >= KLD_PREFILL_MIN_ROWS {
+            if route != Some("aggregate-sym-iu4") {
+                bad.push(format!(
+                    "IU4 was requested but the host-layer windows ran {route:?}, aggregate-sym-iu4 required"
+                ));
+            }
+            match moe.get("descriptor") {
+                Some(descriptor) if !descriptor.is_null() => {
+                    bad.extend(moe_descriptor_problems(descriptor, "moe_iu4"))
+                }
+                _ => bad.push("IU4 was requested but moe_iu4.descriptor is null".into()),
+            }
+            match verified {
+                Some((done, total)) if total > 0 && done == total => {}
+                other => bad.push(format!(
+                    "final headers verified {other:?}: every final header must be verified"
+                )),
+            }
+            if tile("aggregate_iu4") == 0 {
+                bad.push("moe_iu4.tiles.aggregate_iu4 is 0: no tile ran the IU4 route".into());
+            }
+            if prompt_rows == TARGET_ROWS && tile("aggregate_f32_tail") == 0 {
+                bad.push(
+                    "16K request: the final F32 tail tile (aggregate_f32_tail) is absent".into(),
+                );
+            }
+        }
+    } else {
+        if route != Some("aggregate") {
+            bad.push(format!(
+                "IU4 was not requested but the windows ran {route:?}, aggregate required"
+            ));
+        }
+        if tile("aggregate_iu4") != 0 {
+            bad.push(format!(
+                "moe_iu4.tiles.aggregate_iu4 is {} without an IU4 request",
+                tile("aggregate_iu4")
             ));
         }
     }

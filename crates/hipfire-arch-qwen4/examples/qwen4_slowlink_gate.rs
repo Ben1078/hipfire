@@ -75,6 +75,22 @@
 //! later ones replay) is the decode body replay, so that is the route proved
 //! after the S1 prefill. A route that does not reach `Ready` or replay every
 //! measured token fails the check.
+//!
+//! IU4 route (`HIPFIRE_QWEN4_MOE_SYM_IU4`, gfx1100, default OFF): the process
+//! request is read from the environment before any GPU work (`1`/`true`
+//! requests, unset/`0`/`false` do not; other spellings are refused). Under
+//! `--route layer-major` every layer-major receipt must carry the C2
+//! `moe_iu4` object and match the request ([`moe_iu4_problems`]): requested
+//! means window route `aggregate-sym-iu4`, a gfx1100 descriptor, every final
+//! header verified, IU4 tiles, no F16 WMMA aggregate tiles and the 16K final
+//! F32 tail; not requested means window route `aggregate` and no IU4 tile.
+//! The same check runs inside every state, session, abort-injection,
+//! product and perf receipt check (`Ctx::validate`), the repeat-digest
+//! comparison covers `moe_iu4`, and the natural-prompt decode check records
+//! the aggregate-route launch census of the prefill and of the captured and
+//! replayed decode: the prefill must have launched the IU4 GEMMs (no F16
+//! WMMA), the decode none of the aggregate-route kernels, the retained body
+//! must be a prepared captured plan and every measured token a replay.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::state_parity::{
@@ -959,6 +975,9 @@ struct Ctx {
     mem: Vec<Value>,
     /// The durable progress sidecar.
     progress: ProgressLog,
+    /// The process requested the aggregate IU4 MoE route
+    /// (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`).
+    moe_iu4_requested: bool,
 }
 
 impl Ctx {
@@ -1000,13 +1019,14 @@ impl Ctx {
         single_window: bool,
         overlap: bool,
     ) -> Vec<String> {
-        call_problems(
+        call_problems_moe(
             self.route,
             self.expected_tile,
             receipt,
             call_rows,
             single_window,
             overlap,
+            self.moe_iu4_requested,
         )
     }
 }
@@ -1038,6 +1058,91 @@ fn call_problems(
         }
         Expect::LayerMajor => validate_forced_short(receipt, &limits),
     }
+}
+
+/// [`call_problems`] plus the C2 `moe_iu4` judgement of a layer-major
+/// receipt against what the process requested. An incumbent receipt (the
+/// named short-request bypass) has no S1 windows and is not subject to it.
+fn call_problems_moe(
+    route: Expect,
+    expected_tile: u64,
+    receipt: Option<&Value>,
+    call_rows: usize,
+    single_window: bool,
+    overlap: bool,
+    moe_iu4_requested: bool,
+) -> Vec<String> {
+    let mut bad = call_problems(
+        route,
+        expected_tile,
+        receipt,
+        call_rows,
+        single_window,
+        overlap,
+    );
+    if route == Expect::LayerMajor {
+        if let Some(r) = receipt.filter(|r| r.get("route").and_then(Value::as_str) == Some("layer-major")) {
+            bad.extend(moe_iu4_problems(r, moe_iu4_requested));
+        }
+    }
+    bad
+}
+
+fn route_census(c: rdna_compute::gemm::MoeRouteLaunchCensus) -> RouteCensus {
+    RouteCensus {
+        sym_iu4_gate_up: c.sym_iu4_gate_up,
+        sym_iu4_down: c.sym_iu4_down,
+        a4_gate_producer: c.a4_gate_producer,
+        a4_down_producer: c.a4_down_producer,
+        f16_wmma_gate_up: c.f16_wmma_gate_up,
+        f16_wmma_down: c.f16_wmma_down,
+    }
+}
+
+/// The IU4 route's launch evidence of one natural-prompt arm: a prefill of at
+/// least the 512-row IU4 floor launched the IU4 GEMMs and no F16 WMMA one,
+/// and the decode that followed launched no aggregate-route kernel at all.
+fn iu4_decode_problems(
+    prefill_rows: usize,
+    prefill: RouteCensus,
+    decode: RouteCensus,
+    arm: &str,
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    if prefill_rows as u64 >= KLD_PREFILL_MIN_ROWS && !prefill.is_iu4() {
+        bad.push(format!(
+            "{arm}: the {prefill_rows}-row natural prefill did not run the IU4 route (census {prefill:?})"
+        ));
+    }
+    if decode != RouteCensus::default() {
+        bad.push(format!(
+            "{arm}: the decode after the prefill launched aggregate-route kernels (census {decode:?})"
+        ));
+    }
+    bad
+}
+
+/// Placement problems of the IU4 request: a forced layer-major run that asks
+/// for IU4 must be on gfx1100 and the runtime must have requested the route
+/// (an unsupported or killed request is refused, never a silent fallback).
+fn moe_iu4_load_problems(
+    env_requested: bool,
+    route: Expect,
+    arch: &str,
+    runtime_requested: bool,
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    if env_requested && route == Expect::LayerMajor {
+        if arch != "gfx1100" {
+            bad.push(format!("{MOE_IU4_ENV}=1 on {arch}: the S1 IU4 route is gfx1100 only"));
+        }
+        if !runtime_requested {
+            bad.push(format!(
+                "{MOE_IU4_ENV}=1 but the runtime did not request the IU4 route (unsupported, killed or C2 unset)"
+            ));
+        }
+    }
+    bad
 }
 
 /// One whole request: either `prefill_final` (no cuts, no entry) or the
@@ -1322,6 +1427,7 @@ fn same_run(a: &Observation, b: &Observation) -> Vec<String> {
             "tile_rows",
             "resident_layers",
             "host_layers",
+            "moe_iu4",
         ] {
             if x.as_ref().and_then(|r| r.get(key)) != y.as_ref().and_then(|r| r.get(key)) {
                 bad.push(format!("receipt {key} differs between repeats"));
@@ -2153,12 +2259,31 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
             json!({"stage": "state.decode", "phase": "natural_prefill_replay_arm",
                    "rows": prompt.prompt_ids.len()}),
         );
+        let census_start = ctx.gpu.moe_route_launch_census();
         let receipts = drive(ctx, &prompt.prompt_ids, 0, &[])?;
+        let census_prefilled = ctx.gpu.moe_route_launch_census();
         ctx.progress.record(
             "phase_end",
             json!({"stage": "state.decode", "phase": "natural_prefill_replay_arm",
                    "windows": window_summary(&receipts), "cache_usage": ctx.cache_usage()}),
         );
+        let moe_checked = ctx.moe_iu4_requested && ctx.route == Expect::LayerMajor;
+        let prompt_rows = prompt.prompt_ids.len();
+        let moe_of = |receipts: &[Option<Value>]| -> Vec<Option<Value>> {
+            receipts
+                .iter()
+                .map(|r| r.as_ref().and_then(|r| r.get("moe_iu4")).cloned())
+                .collect()
+        };
+        let replay_arm_moe = moe_of(&receipts);
+        let mut replay_arm_bad = Vec::new();
+        if moe_checked {
+            for (call, receipt) in receipts.iter().enumerate() {
+                for p in ctx.validate(receipt.as_ref(), prompt_rows, false, false) {
+                    replay_arm_bad.push(format!("natural prefill (replay arm) call {call}: {p}"));
+                }
+            }
+        }
         let row = gpu_error(ctx.gpu.download_f32(&ctx.logits), "download")?;
         let mut pending = Some(hipfire_runtime::llama::argmax(&row));
         ctx.progress.record(
@@ -2190,6 +2315,8 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
             replay_ids.push(t);
         }
         let observation = ctx.gpu.replay.replay_observation();
+        let census_decoded = ctx.gpu.moe_route_launch_census();
+        let prepared = ctx.gpu.replay.prepared_route_identity();
         ctx.progress.record(
             "phase_end",
             json!({"stage": "state.decode", "phase": "replay_warm_and_measured_decode",
@@ -2214,8 +2341,11 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
             json!({"stage": "state.decode", "phase": "natural_prefill_and_eager_decode",
                    "rows": prompt.prompt_ids.len(), "tokens": replay_ids.len()}),
         );
+        let eager_start = ctx.gpu.moe_route_launch_census();
         let receipts = drive(ctx, &prompt.prompt_ids, 0, &[])?;
+        let eager_prefilled = ctx.gpu.moe_route_launch_census();
         let (eager_ids, _) = greedy(ctx, replay_ids.len())?;
+        let eager_decoded = ctx.gpu.moe_route_launch_census();
         ctx.progress.record(
             "phase_end",
             json!({"stage": "state.decode", "phase": "natural_prefill_and_eager_decode",
@@ -2229,12 +2359,63 @@ fn decode_checks(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<S
         if eager_ids != replay_ids {
             replay_bad.push("retained-replay ids differ from the eager ids".to_string());
         }
+        let replay_prefill = route_census(census_prefilled.since(census_start));
+        let replay_decode = route_census(census_decoded.since(census_prefilled));
+        let eager_prefill = route_census(eager_prefilled.since(eager_start));
+        let eager_decode = route_census(eager_decoded.since(eager_prefilled));
+        if moe_checked {
+            replay_bad.extend(replay_arm_bad);
+            replay_bad.extend(iu4_decode_problems(
+                prompt_rows,
+                replay_prefill,
+                replay_decode,
+                "replay arm",
+            ));
+            eager_bad.extend(iu4_decode_problems(
+                prompt_rows,
+                eager_prefill,
+                eager_decode,
+                "eager arm",
+            ));
+            for (call, receipt) in receipts.iter().enumerate() {
+                for p in ctx.validate(receipt.as_ref(), prompt_rows, false, false) {
+                    eager_bad.push(format!("natural prefill (eager arm) call {call}: {p}"));
+                }
+            }
+            if moe_of(&receipts) != replay_arm_moe {
+                eager_bad.push(
+                    "natural prefill moe_iu4 differs between the replay and eager arms".to_string(),
+                );
+            }
+            match (
+                prepared,
+                observation.first_position,
+                observation.last_position,
+            ) {
+                (Some(plan), Some(_), Some(_)) if plan.dispatch_count > 0 => {}
+                (plan, first, last) => replay_bad.push(format!(
+                    "no captured-and-replayed decode body after the IU4 prefill: prepared dispatches {:?}, observed positions {first:?}..{last:?}",
+                    plan.map(|p| p.dispatch_count)
+                )),
+            }
+        }
         let detail = json!({
             "eager_ids": eager_ids, "replay_ids": replay_ids, "warm_tokens": warm,
             "replay_state": state_after_warm,
             "observation": {"count": observation.count, "failed": observation.failed},
             "eager_sha256": sha_u32(&eager_ids), "replay_sha256": sha_u32(&replay_ids),
             "decoded": ctx.tokenizer.decode(&eager_ids),
+            "moe_iu4": {
+                "checked": moe_checked, "prefill_rows": prompt_rows,
+                "replay_arm": {"prefill": replay_prefill.to_value(), "decode": replay_decode.to_value()},
+                "eager_arm": {"prefill": eager_prefill.to_value(), "decode": eager_decode.to_value()},
+                "retained_body": {
+                    "transport": ctx.gpu.replay.transport_name(),
+                    "prepared_dispatches": prepared.map(|p| p.dispatch_count),
+                    "observed_first": observation.first_position,
+                    "observed_last": observation.last_position,
+                },
+            },
         });
         Ok((eager_bad, replay_bad, detail))
     })();
@@ -2592,6 +2773,14 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
     let fixture_json = read_json(&args.fixture)?;
     let fixture = Fixture::parse(&fixture_json)?;
     let manifest = read_json(&args.manifest)?;
+    // The IU4 request is read once, before any GPU work; a bad spelling is
+    // refused rather than ignored.
+    let moe_iu4_value = match std::env::var(MOE_IU4_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("{MOE_IU4_ENV}: {error}")),
+    };
+    let moe_iu4_requested = moe_iu4_env_requested(moe_iu4_value.as_deref())?;
     // The route is forced through the one production switch, before the
     // process config snapshot is first read. A conflicting ambient value is
     // refused rather than overridden.
@@ -2628,6 +2817,10 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             "product_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRODUCT),
             "primitive_tile_rows": manifest_profile_tile(&manifest, PROFILE_PRIMITIVE),
         }}),
+    );
+    progress.record(
+        "moe_iu4_request",
+        json!({"env": moe_iu4_value, "requested": moe_iu4_requested, "route": args.route.name()}),
     );
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     // Baseline sample: after the HIP context exists, before any model allocation.
@@ -2792,6 +2985,17 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             loaded.slowlink_profile,
         ));
         placement_problems.extend(arena_problems);
+        placement_problems.extend(moe_iu4_load_problems(
+            moe_iu4_requested,
+            args.route,
+            &gpu.arch,
+            gpu.qwen4_moe_sym_iu4_requested(),
+        ));
+        out.insert(
+            "moe_iu4".into(),
+            json!({"env": moe_iu4_value, "requested": moe_iu4_requested,
+                   "runtime_requested": gpu.qwen4_moe_sym_iu4_requested(), "arch": gpu.arch}),
+        );
         checks.push(
             "load.placement",
             placement_problems,
@@ -2854,6 +3058,7 @@ fn run(args: &Args, progress: &ProgressLog) -> Result<bool, String> {
             expected_tile,
             mem: mem_samples,
             progress: progress.clone(),
+            moe_iu4_requested,
         };
         progress.record(
             "stage_start",
@@ -3528,7 +3733,7 @@ mod slowlink_receipt_tests {
         json!({
             "schema": "hipfire.qwen4.s11ref_klrows.v1", "rows": 6120, "sequences": 24, "route": "decode",
             "n_ctx": 512, "estimator": "e",
-            "model_sha256": "1".repeat(64), "ref_sha256": "2".repeat(64), "corpus_sha256": "3".repeat(64),
+            "model_sha256": "1".repeat(64), "ref_sha256": KLD_CORPORA[0].ref_sha256, "corpus_sha256": KLD_CORPORA[0].corpus_sha256,
             "binary_sha256": "4".repeat(64), "output_sha256": "5".repeat(64),
         })
     }
@@ -3549,6 +3754,281 @@ mod slowlink_receipt_tests {
         other_ref["ref_sha256"] = json!("9".repeat(64));
         assert!(!kld_receipts_comparable(&kld_receipt(), &other_ref).is_empty());
         assert!(kld_receipts_comparable(&kld_receipt(), &kld_receipt()).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_md5_matches_the_rfc_1321_vectors_and_streams() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5_hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        let mut streamed = Md5::new();
+        for piece in data.chunks(37) {
+            streamed.update(piece);
+        }
+        assert_eq!(streamed.finish(), md5_hex(&data));
+    }
+
+    #[test]
+    fn slowlink_receipt_kld_corpora_pin_code24_and_wt2_by_identity() {
+        assert_eq!(KLD_CORPORA[0].name, "code24");
+        assert_eq!((KLD_CORPORA[0].sequences, KLD_CORPORA[0].rows), (24, 6120));
+        assert_eq!(KLD_CORPORA[0].ref_md5, "56d93a4931631e306244e95ea64aecfc");
+        assert_eq!(KLD_CORPORA[0].corpus_md5, "6145e25c0858e31e08527c1e5278c074");
+        assert_eq!(KLD_CORPORA[1].name, "wt2");
+        assert_eq!((KLD_CORPORA[1].sequences, KLD_CORPORA[1].rows), (32, 8160));
+        assert_eq!(KLD_CORPORA[1].ref_md5, "6684a1a5c5b8b61be62b0e5012d48a95");
+        assert_eq!(KLD_CORPORA[1].corpus_md5, "bc68e288ce5ae0ac6aa4bccb7f610213");
+        // A decode receipt of WT2 shape passes only with the WT2 identity.
+        let mut wt2 = kld_receipt();
+        wt2["corpus_sha256"] = json!(KLD_CORPORA[1].corpus_sha256);
+        wt2["ref_sha256"] = json!(KLD_CORPORA[1].ref_sha256);
+        assert!(!kld_receipt_problems(&wt2).is_empty(), "24/6120 shape under WT2");
+        wt2["rows"] = json!(8160);
+        wt2["sequences"] = json!(32);
+        assert_eq!(kld_receipt_problems(&wt2), Vec::<String>::new());
+        // An unpinned corpus is refused whatever its shape.
+        let mut other = kld_receipt();
+        other["corpus_sha256"] = json!("3".repeat(64));
+        assert!(kld_receipt_problems(&other).iter().any(|p| p.contains("not a pinned")));
+    }
+
+    fn census_value(iu4: u64, f16: u64) -> Value {
+        RouteCensus {
+            sym_iu4_gate_up: iu4,
+            sym_iu4_down: iu4,
+            a4_gate_producer: iu4,
+            a4_down_producer: iu4,
+            f16_wmma_gate_up: f16,
+            f16_wmma_down: f16,
+        }
+        .to_value()
+    }
+
+    /// A full code24 prefill receipt (24 sequences x one 512-row forward).
+    fn prefill_kld_receipt(iu4: bool) -> Value {
+        let (i, f) = if iu4 { (48, 0) } else { (0, 48) };
+        let routes: Vec<Value> = (0..24)
+            .map(|n| {
+                json!({"id": format!("s{n}"), "tokens": 512, "prefill_chunk_rows": 512,
+                       "forwards": [{"rows": 512, "route_rows": 512, "sym_iu4_applies": iu4}],
+                       "census": census_value(i, f)})
+            })
+            .collect();
+        let mut r = kld_receipt();
+        let c = &KLD_CORPORA[0];
+        for (key, value) in [
+            ("route", json!(KLD_PREFILL_ROUTE)),
+            ("moe_route", json!(if iu4 { "iu4" } else { "f16" })),
+            ("moe_launch_census", census_value(24 * i, 24 * f)),
+            ("sequence_routes", Value::Array(routes)),
+            ("env", json!({"HIPFIRE_KV_MODE": "q8"})),
+            ("binary_path", json!("/bin/qwen4_kld")),
+            ("binary_md5", json!("c".repeat(32))),
+            ("ref_md5", json!(c.ref_md5)),
+            ("corpus_md5", json!(c.corpus_md5)),
+            (
+                "moe_iu4",
+                json!({"requested": iu4, "descriptor": descriptor()}),
+            ),
+        ] {
+            r[key] = value;
+        }
+        r
+    }
+
+    fn descriptor() -> Value {
+        json!({"arch": "gfx1100", "module": "qwen4_moe_iu4_sym_pm_gfx1100",
+               "gate_up": "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
+               "down": "qwen4_moe_down_iu4_sym_pm_gfx1100", "nt": 1, "threads": [64, 128],
+               "gate_producer": "mq_rotate_x_i4", "down_producer": "mq_i4_a4_r128_k640_gfx1100",
+               "checker": "qwen4_moe_sym_check_gfx1100", "c2": true})
+    }
+
+    #[test]
+    fn slowlink_receipt_prefill_receipt_is_judged_from_its_census_not_its_claim() {
+        for iu4 in [true, false] {
+            let r = prefill_kld_receipt(iu4);
+            assert_eq!(kld_receipt_problems(&r), Vec::<String>::new(), "iu4 {iu4}");
+        }
+        // The older `prefill` spelling is the same route.
+        let mut old = prefill_kld_receipt(true);
+        old["route"] = json!("prefill");
+        assert!(kld_receipt_problems(&old).is_empty());
+        // A claimed verdict that the census contradicts.
+        let mut lie = prefill_kld_receipt(false);
+        lie["moe_route"] = json!("iu4");
+        assert!(kld_receipt_problems(&lie).iter().any(|p| p.contains("disagrees")));
+        // One sequence on the other route is `mixed`, always a failure.
+        let mut mixed = prefill_kld_receipt(true);
+        mixed["sequence_routes"][5]["census"] = census_value(0, 48);
+        mixed["moe_route"] = json!("mixed");
+        mixed["moe_launch_census"] = census_value(23 * 48, 48);
+        assert!(kld_receipt_problems(&mixed).iter().any(|p| p.contains("mixed")));
+        // The summed census must be the sum.
+        let mut sum = prefill_kld_receipt(true);
+        sum["moe_launch_census"] = census_value(1, 0);
+        assert!(kld_receipt_problems(&sum).iter().any(|p| p.contains("sum")));
+        // A sequence split over two forwards never has the 512-row IU4 floor.
+        let mut split = prefill_kld_receipt(true);
+        split["sequence_routes"][0]["forwards"] = json!([{"rows": 256}, {"rows": 256}]);
+        assert!(kld_receipt_problems(&split).iter().any(|p| p.contains("one 512-row forward")));
+        // F16 route without any launch (no census) is not an F16 pass.
+        let mut idle = prefill_kld_receipt(false);
+        for n in 0..24 {
+            idle["sequence_routes"][n]["census"] = census_value(0, 0);
+        }
+        idle["moe_launch_census"] = census_value(0, 0);
+        assert!(!kld_receipt_problems(&idle).is_empty());
+        // The md5 identities are pinned.
+        let mut md5 = prefill_kld_receipt(true);
+        md5["ref_md5"] = json!("d".repeat(32));
+        assert!(kld_receipt_problems(&md5).iter().any(|p| p.contains("ref_md5")));
+    }
+
+    #[test]
+    fn slowlink_receipt_iu4_pair_wants_f16_base_iu4_candidate_one_binary_one_flag() {
+        let mut base = prefill_kld_receipt(false);
+        base["env"]["HIPFIRE_QWEN4_MOE_SYM_IU4"] = json!("0");
+        let mut cand = prefill_kld_receipt(true);
+        cand["env"]["HIPFIRE_QWEN4_MOE_SYM_IU4"] = json!("1");
+        assert_eq!(kld_iu4_pair_problems(&base, &cand), Vec::<String>::new());
+        // Requested IU4 that fell back to F16 is a failure.
+        let mut fell_back = prefill_kld_receipt(false);
+        fell_back["moe_iu4"]["requested"] = json!(true);
+        fell_back["env"]["HIPFIRE_QWEN4_MOE_SYM_IU4"] = json!("1");
+        assert!(kld_iu4_pair_problems(&base, &fell_back)
+            .iter()
+            .any(|p| p.contains("expected IU4 but observed")));
+        // Reversed arms, another binary, another setting.
+        assert!(!kld_iu4_pair_problems(&cand, &base).is_empty());
+        let mut binary = cand.clone();
+        binary["binary_md5"] = json!("e".repeat(32));
+        assert!(kld_iu4_pair_problems(&base, &binary).iter().any(|p| p.contains("binary_md5")));
+        let mut env = cand.clone();
+        env["env"]["HIPFIRE_KV_MODE"] = json!("bf16");
+        assert!(kld_iu4_pair_problems(&base, &env).iter().any(|p| p.contains("HIPFIRE_KV_MODE")));
+    }
+
+    fn moe_iu4(requested: bool) -> Value {
+        if requested {
+            json!({"window_route": "aggregate-sym-iu4", "requested": true,
+                   "descriptor": descriptor(), "source_headers_symmetric": true,
+                   "final_headers_verified": [48, 48], "a4_sidecar_bytes": 1u64 << 30,
+                   "window_slot_stride": 24576u64,
+                   "tiles": {"aggregate_iu4": 20, "aggregate_wmma": 0, "aggregate_f32_tail": 1,
+                             "slab_k2": 0, "k1_or_decode": 0}})
+        } else {
+            json!({"window_route": "aggregate", "requested": false, "descriptor": null,
+                   "source_headers_symmetric": null, "final_headers_verified": [0, 0],
+                   "a4_sidecar_bytes": 0, "window_slot_stride": 0u64,
+                   "tiles": {"aggregate_iu4": 0, "aggregate_wmma": 20, "aggregate_f32_tail": 1,
+                             "slab_k2": 0, "k1_or_decode": 0}})
+        }
+    }
+
+    fn with_moe(requested: bool) -> Value {
+        let mut r = receipt();
+        r["moe_iu4"] = moe_iu4(requested);
+        r
+    }
+
+    #[test]
+    fn slowlink_receipt_moe_iu4_request_decides_the_window_route_and_tiles() {
+        assert_eq!(moe_iu4_problems(&with_moe(true), true), Vec::<String>::new());
+        assert_eq!(moe_iu4_problems(&with_moe(false), false), Vec::<String>::new());
+        // The receipt must agree with the process request.
+        assert!(!moe_iu4_problems(&with_moe(true), false).is_empty());
+        assert!(!moe_iu4_problems(&with_moe(false), true).is_empty());
+        assert!(moe_iu4_problems(&receipt(), true)
+            .iter()
+            .any(|p| p.contains("moe_iu4 object missing")));
+        let bad = |edit: &dyn Fn(&mut Value)| {
+            let mut r = with_moe(true);
+            edit(&mut r);
+            moe_iu4_problems(&r, true)
+        };
+        assert!(!bad(&|r| r["moe_iu4"]["window_route"] = json!("aggregate")).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["descriptor"] = Value::Null).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["descriptor"]["arch"] = json!("gfx1151")).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["descriptor"]["c2"] = json!(false)).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["final_headers_verified"] = json!([47, 48])).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["tiles"]["aggregate_iu4"] = json!(0)).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["tiles"]["aggregate_wmma"] = json!(1)).is_empty());
+        assert!(!bad(&|r| r["moe_iu4"]["tiles"]["aggregate_f32_tail"] = json!(0)).is_empty());
+        // A request below the 512-row floor has no IU4 tile to require, but
+        // never an F16 WMMA aggregate tile.
+        let short = |edit: &dyn Fn(&mut Value)| {
+            let mut r = with_moe(true);
+            r["prompt_rows"] = json!(256);
+            r["moe_iu4"]["tiles"]["aggregate_iu4"] = json!(0);
+            edit(&mut r);
+            moe_iu4_problems(&r, true)
+        };
+        assert!(short(&|_| {}).is_empty());
+        assert!(!short(&|r| r["moe_iu4"]["tiles"]["aggregate_wmma"] = json!(2)).is_empty());
+        // Not requested: IU4 labels or tiles are a deviation from the byte-for-byte incumbent.
+        let mut off = with_moe(false);
+        off["moe_iu4"]["window_route"] = json!("aggregate-sym-iu4");
+        assert!(!moe_iu4_problems(&off, false).is_empty());
+        let mut off = with_moe(false);
+        off["moe_iu4"]["tiles"]["aggregate_iu4"] = json!(3);
+        assert!(!moe_iu4_problems(&off, false).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_moe_iu4_runs_inside_the_per_call_check_for_layer_major_only() {
+        let tile = 768u64;
+        let mut ok = product_receipt(768);
+        ok["moe_iu4"] = moe_iu4(true);
+        let run = |r: &Value, requested: bool| {
+            call_problems_moe(Expect::LayerMajor, tile, Some(r), 16384, true, true, requested)
+        };
+        assert_eq!(run(&ok, true), Vec::<String>::new());
+        assert!(!run(&ok, false).is_empty());
+        assert!(run(&product_receipt(768), true)
+            .iter()
+            .any(|p| p.contains("moe_iu4")));
+        // The named short-request bypass is an incumbent receipt: not subject.
+        let mut bypass = incumbent();
+        bypass["bypass_reason"] = json!("request at most one tile");
+        bypass["prompt_rows"] = json!(1536);
+        bypass["windows"] = json!([{"start": 0, "rows": 1536}]);
+        bypass["launch_cuts"] = json!([]);
+        assert!(call_problems_moe(Expect::LayerMajor, tile, Some(&bypass), 1536, false, false, true).is_empty());
+        // The incumbent arm never runs it.
+        assert!(call_problems_moe(Expect::Incumbent, tile, Some(&incumbent()), 1536, false, false, true).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_moe_iu4_env_spellings_and_load_problems() {
+        assert_eq!(moe_iu4_env_requested(None), Ok(false));
+        assert_eq!(moe_iu4_env_requested(Some("0")), Ok(false));
+        assert_eq!(moe_iu4_env_requested(Some("false")), Ok(false));
+        assert_eq!(moe_iu4_env_requested(Some("1")), Ok(true));
+        assert_eq!(moe_iu4_env_requested(Some("true")), Ok(true));
+        assert!(moe_iu4_env_requested(Some("")).is_err());
+        assert!(moe_iu4_env_requested(Some("yes")).is_err());
+        assert!(moe_iu4_load_problems(true, Expect::LayerMajor, "gfx1100", true).is_empty());
+        assert!(!moe_iu4_load_problems(true, Expect::LayerMajor, "gfx1100", false).is_empty());
+        assert!(!moe_iu4_load_problems(true, Expect::LayerMajor, "gfx1201", true).is_empty());
+        assert!(moe_iu4_load_problems(false, Expect::LayerMajor, "gfx1100", false).is_empty());
+        assert!(moe_iu4_load_problems(true, Expect::Incumbent, "gfx1100", false).is_empty());
+    }
+
+    #[test]
+    fn slowlink_receipt_iu4_decode_evidence_wants_iu4_prefill_and_a_launch_free_decode() {
+        let iu4 = RouteCensus::from_value(&census_value(48, 0)).unwrap();
+        let f16 = RouteCensus::from_value(&census_value(0, 48)).unwrap();
+        let none = RouteCensus::default();
+        assert!(iu4_decode_problems(2000, iu4, none, "a").is_empty());
+        assert!(!iu4_decode_problems(2000, f16, none, "a").is_empty());
+        assert!(!iu4_decode_problems(2000, iu4, iu4, "a").is_empty());
+        // Below the IU4 floor the prefill has no IU4 requirement.
+        assert!(iu4_decode_problems(300, f16, none, "a").is_empty());
     }
 
     #[test]
