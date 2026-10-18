@@ -767,6 +767,15 @@ impl SlowlinkOwner {
         tensors
     }
 
+    /// Detach every retained boundary stage's device tensors (a failed load's
+    /// unwind); the caller frees them.
+    pub(crate) fn take_stage_tensors(&mut self) -> Vec<GpuTensor> {
+        std::mem::take(&mut self.stages)
+            .into_iter()
+            .flat_map(|stage| stage.fixed)
+            .collect()
+    }
+
     /// Drop every open/armed item after a reset (the tickets died with it).
     pub(crate) fn clear_active(&mut self) {
         self.live = None;
@@ -1182,27 +1191,46 @@ impl Qwen4Bundle {
 
     /// Keep the entry `pending` hidden of an MTP request so a failure can
     /// put it back (the drafter owns `pending`; the copy is stream ordered).
-    /// Called by the orchestrator once, after the request was selected and
-    /// before its first phase.
+    /// Called by the orchestrator once per window, after the request was
+    /// selected and before its first phase. The backup buffer is bound at MTP
+    /// attach ([`Self::slowlink_bind_pending_save`]); a request never
+    /// allocates it.
     pub(crate) fn slowlink_save_pending(
         &mut self,
         gpu: &mut Gpu,
         pending: &GpuTensor,
     ) -> Result<(), BundleError> {
-        if self.slowlink.pending_save.is_none() {
-            self.slowlink.pending_save = Some(
-                gpu.zeros(&pending.shape, pending.dtype)
-                    .map_err(BundleError::Hip)?,
-            );
-        }
-        let saved = self
-            .slowlink
-            .pending_save
-            .as_ref()
-            .expect("allocated above");
+        let saved = self.slowlink.pending_save.as_ref().ok_or_else(|| {
+            BundleError::Forward("the MTP pending backup was not bound at load".into())
+        })?;
         copy_whole(gpu, pending, saved)?;
         self.slowlink.pending_saved = true;
         self.slowlink.pending_for = Some(self.state.position);
+        Ok(())
+    }
+
+    /// The MTP entry `pending` backup buffer exists (bound at MTP attach).
+    pub(crate) fn slowlink_pending_bound(&self) -> bool {
+        self.slowlink.pending_save.is_some()
+    }
+
+    /// Bind the native-MTP entry `pending` backup (one F32 wide row,
+    /// `hc_count * hidden`: the census' `pending_save_bytes`) at MTP attach,
+    /// on a load that admitted a slow-link profile. Idempotent; no profile,
+    /// no allocation.
+    pub(crate) fn slowlink_bind_pending_save(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if self.slowlink.profile.is_none() || self.slowlink.pending_save.is_some() {
+            return Ok(());
+        }
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("MTP pending backup width overflow".into()))?;
+        self.slowlink.pending_save = Some(
+            gpu.zeros(&[width], DType::F32)
+                .map_err(BundleError::Hip)?,
+        );
         Ok(())
     }
 
@@ -1283,7 +1311,35 @@ impl Qwen4Bundle {
             .unwrap_or(0)
     }
 
-    fn ensure_prompt_stages(&mut self, gpu: &mut Gpu, count: usize) -> Result<(), BundleError> {
+    /// Allocate the retained boundary stages ONCE, at the selected load
+    /// ([`PROMPT_TXN_MAX_CUTS`] of them, the census' `boundary_state`): the
+    /// single allocation owner of the stage parts.
+    pub(crate) fn slowlink_bind_boundary_stages(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<(), BundleError> {
+        self.allocate_prompt_stages(gpu, PROMPT_TXN_MAX_CUTS)
+    }
+
+    /// Detach every retained boundary stage's tensors for a failed load's
+    /// unwind; the caller frees them.
+    pub(crate) fn slowlink_take_boundary_stage_tensors(&mut self) -> Vec<GpuTensor> {
+        self.slowlink.take_stage_tensors()
+    }
+
+    /// A window with `count` cuts finds its stages already bound (a
+    /// transaction never allocates them).
+    fn ensure_prompt_stages(&self, count: usize) -> Result<(), BundleError> {
+        if self.slowlink.stages.len() >= count {
+            return Ok(());
+        }
+        Err(BundleError::Forward(format!(
+            "slow-link boundary stage {count} was not bound at load ({} bound)",
+            self.slowlink.stages.len()
+        )))
+    }
+
+    fn allocate_prompt_stages(&mut self, gpu: &mut Gpu, count: usize) -> Result<(), BundleError> {
         if self.slowlink.stages.len() >= count {
             return Ok(());
         }
@@ -1380,7 +1436,7 @@ impl Qwen4Bundle {
             self.config.indexer_compress_ratio,
         )
         .map_err(BundleError::Forward)?;
-        self.ensure_prompt_stages(gpu, book.cuts().len())?;
+        self.ensure_prompt_stages(book.cuts().len())?;
         self.state
             .ensure_mapped_capacity(gpu, end)
             .map_err(BundleError::State)?;

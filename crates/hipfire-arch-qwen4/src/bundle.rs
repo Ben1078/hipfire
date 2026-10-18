@@ -1246,6 +1246,25 @@ impl Qwen4Bundle {
         if let Some(profile) = self.slowlink.profile {
             forward.set_slowlink_profile(profile);
         }
+        // The selected S1 load binds EVERY admitted physical owner here, before
+        // any product request can take the memory the placement charged: the
+        // page ring, route region, HC arena, window scratch and boundary stages
+        // (the native-MTP `pending` backup binds at `attach_mtp`). A mode or
+        // native-kernel capability this load cannot run is a named decline (S1
+        // stays unavailable and requests bypass with that reason, nothing was
+        // allocated); an allocation failure is a named load failure, never a
+        // mid-request fallback. Loads without a profile allocate nothing here.
+        if self.slowlink.profile.is_some() {
+            if let Err(reason) = crate::slowlink_prefill::bind_at_load(&mut forward, self, gpu) {
+                let teardown = match forward.free_gpu(gpu) {
+                    Ok(()) => "released to the device pool".to_string(),
+                    Err(error) => format!("reported {error}"),
+                };
+                return Err(BundleError::Forward(format!(
+                    "{reason}; forward teardown: {teardown}"
+                )));
+            }
+        }
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
@@ -1304,6 +1323,9 @@ impl Qwen4Bundle {
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
+        // The S1 entry `pending` backup is charged by the admission of a
+        // native-MTP load: bind it with the head, never on a request.
+        self.slowlink_bind_pending_save(gpu)?;
         Ok(())
     }
 

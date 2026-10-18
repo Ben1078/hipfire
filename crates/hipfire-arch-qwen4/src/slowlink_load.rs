@@ -351,9 +351,18 @@ fn load_inner(
     if let Some(profile) = profile {
         bundle.attach_slowlink_profile(profile);
     }
-    bundle
-        .attach_forward(gpu, max_seq, scratch_mode)
-        .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
+    // A failed attach (including a named S1 owner-binding failure) leaves no
+    // half-built load behind: the bundle is torn down and the teardown's own
+    // disposition is part of the error, never a silent success.
+    if let Err(error) = bundle.attach_forward(gpu, max_seq, scratch_mode) {
+        let teardown = match bundle.free_gpu(gpu) {
+            Ok(()) => "bundle released to the device pool".to_string(),
+            Err(free) => format!("bundle teardown reported {free}"),
+        };
+        return Err(format!(
+            "qwen4 forward setup failed: {error}; {teardown}"
+        ));
+    }
     if let Some(domain) = cache_domain {
         let cache = hipfire_runtime::session_cache::SessionCache::new(
             domain,

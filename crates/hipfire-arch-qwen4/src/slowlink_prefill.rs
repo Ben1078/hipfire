@@ -1013,13 +1013,15 @@ fn validate_window_layouts(profile: &SlowlinkProfile, plan: &Qwen4PromptPlan) ->
 // ── runtime ──────────────────────────────────────────────────────────
 
 /// What a forward holds of S1: the admitted profile (set before attach, never
-/// mutated by a request) and, once the first qualified request ran, the device
-/// resources the profile's census charged.
+/// mutated by a request) and the device resources the profile's census
+/// charged, bound once at the selected load ([`bind_at_load`]) before any
+/// request.
 #[derive(Default)]
 pub(crate) struct SlowlinkSlot {
     pub(crate) profile: Option<SlowlinkProfile>,
     runtime: Option<SlowlinkRuntime>,
-    /// Sticky: why the resources cannot be built on this load.
+    /// Sticky: why S1 was declined at load (a mode or native-kernel capability
+    /// this forward cannot run); set once by [`bind_at_load`], never by a request.
     unavailable: Option<String>,
 }
 
@@ -1059,33 +1061,183 @@ impl SlowlinkRuntime {
             streams,
             ..
         } = self;
-        let mut first: Option<Qwen4GpuForwardError> = None;
-        // The ring drains both streams before anything it or the route region
-        // feeds is released; a failed drain leaks rather than frees.
-        let drained = ring.free_gpu(gpu);
-        drop(schedule);
-        match drained {
-            Ok(()) => {
-                for tensor in [route_region, streams] {
-                    if let Err(error) = gpu.free_tensor(tensor) {
-                        first.get_or_insert(error.into());
-                    }
-                }
-            }
-            Err(error) => first = Some(error),
-        }
-        first.map_or(Ok(()), Err)
+        free_runtime_parts(
+            gpu,
+            Some(ring),
+            Some(schedule),
+            vec![route_region, streams],
+        )
     }
 }
 
-/// Build the runtime of an admitted profile on this forward. Every failure is
-/// a bypass reason (nothing partial stays allocated).
-fn build_runtime(
+/// Release S1's device owners in the only safe order: the ring drains both
+/// streams before anything it or the route region feeds is released, and a
+/// failed drain QUARANTINES everything (`tensors` are deliberately not freed:
+/// the device may still be reading them, so they stay allocated until process
+/// exit). A successful release only returns the buffers to the device pool
+/// (`Gpu::free_tensor` parks them; they go back to HIP on reuse pressure or a
+/// pool drain), never straight to the driver.
+fn free_runtime_parts(
+    gpu: &mut Gpu,
+    ring: Option<ExpertPanelRing>,
+    schedule: Option<PanelSchedule>,
+    tensors: Vec<GpuTensor>,
+) -> R<()> {
+    let mut first: Option<Qwen4GpuForwardError> = None;
+    let drained = ring.map_or(Ok(()), |ring| ring.free_gpu(gpu));
+    drop(schedule);
+    match drained {
+        Ok(()) => {
+            for tensor in tensors {
+                if let Err(error) = gpu.free_tensor(tensor) {
+                    first.get_or_insert(error.into());
+                }
+            }
+        }
+        Err(error) => first = Some(error),
+    }
+    first.map_or(Ok(()), Err)
+}
+
+// ── load-time binding ────────────────────────────────────────────────
+
+/// One physical S1 owner the selected load binds BEFORE any product request,
+/// in allocation order. Every owned census term has exactly one owner here
+/// (the CPU proof's `load_owner_charge` maps each term); the native-MTP entry `pending` backup is the one
+/// charged byte range bound later, by `Qwen4Bundle::attach_mtp` (the head's
+/// width is only known there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadOwner {
+    /// The expert page ring: payload pages (active + lookahead), their tables,
+    /// timeline events and the copy stream, plus the layer schedule.
+    PagePool,
+    /// The one window-wide route storage region.
+    RouteRegion,
+    /// The window HC-stream arena.
+    HcArena,
+    /// The Gpu grow-only scratch grown to the full window: grouped-scatter
+    /// (and on the slab route the two A4 sidecars).
+    WindowScratch,
+    /// The retained boundary stages (the target's session fixed parts).
+    BoundaryStages,
+}
+
+/// The binding order. The big transport allocation goes first so an
+/// over-committed load fails on it before small owners are built.
+pub(crate) const LOAD_OWNERS: [LoadOwner; 5] = [
+    LoadOwner::PagePool,
+    LoadOwner::RouteRegion,
+    LoadOwner::HcArena,
+    LoadOwner::WindowScratch,
+    LoadOwner::BoundaryStages,
+];
+
+/// Census bytes `owner` holds ([`crate::slowlink_admission::SlowlinkCensus::owned_terms`]).
+/// `BoundaryStages` carries the whole `boundary_state` term (its native-MTP
+/// `pending` share is bound at MTP attach).
+#[cfg(test)]
+pub(crate) fn load_owner_charge(profile: &SlowlinkProfile, owner: LoadOwner) -> u64 {
+    let census = &profile.census;
+    match owner {
+        LoadOwner::PagePool => census.ring + census.lookahead,
+        LoadOwner::RouteRegion => census.route_storage,
+        LoadOwner::HcArena => census.arena,
+        LoadOwner::WindowScratch => census.a4_sidecars + census.group_scatter,
+        LoadOwner::BoundaryStages => census.boundary_state,
+    }
+}
+
+/// What a load binds its owners through: the production binder allocates on
+/// the device, the CPU model of the lifecycle tests records the same steps.
+pub(crate) trait LoadBinder {
+    /// Allocate one owner.
+    fn bind(&mut self, owner: LoadOwner) -> Result<(), String>;
+    /// Release what `bound` (in binding order, the failed owner excluded) and
+    /// the failed owner's partial state hold, last first. Returns the
+    /// DISPOSITION of that cleanup (what was released, what was quarantined),
+    /// never an assumption that parking returned memory to the driver.
+    fn unwind(&mut self, bound: &[LoadOwner]) -> String;
+}
+
+/// Bind every owner or none: the first failure unwinds the owners already
+/// bound and names the owner, the reason and the cleanup disposition.
+pub(crate) fn bind_load_owners(binder: &mut impl LoadBinder) -> Result<(), String> {
+    let mut bound: Vec<LoadOwner> = Vec::with_capacity(LOAD_OWNERS.len());
+    for owner in LOAD_OWNERS {
+        if let Err(reason) = binder.bind(owner) {
+            let cleanup = binder.unwind(&bound);
+            return Err(format!(
+                "slow-link load could not bind the {owner:?} owner: {reason}; cleanup: {cleanup}"
+            ));
+        }
+        bound.push(owner);
+    }
+    Ok(())
+}
+
+/// The arguments of the full-window Gpu scratch growth: what the census'
+/// `group_scatter` and `a4_sidecars` terms are computed from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowScratchArgs {
+    pub(crate) route: dsp::WindowRoute,
+    pub(crate) rows: usize,
+    pub(crate) experts: usize,
+    pub(crate) hidden: usize,
+    pub(crate) intermediate: usize,
+}
+
+pub(crate) fn window_scratch_args(profile: &SlowlinkProfile) -> WindowScratchArgs {
+    let geometry = &profile.geometry;
+    WindowScratchArgs {
+        route: geometry.route,
+        rows: profile.window_rows,
+        experts: geometry.num_experts,
+        hidden: geometry.hidden,
+        intermediate: geometry.moe_intermediate,
+    }
+}
+
+/// Grow the Gpu scratch the window's one count barrier would otherwise grow on
+/// the first long request, through the same reserve entries the forward's
+/// tile-sized reservation uses: the slab route reserves the grouping scratch,
+/// the down sidecar and the gate/up sidecar; the aggregate route (no A4
+/// sidecars) only the grouping scratch.
+fn reserve_window_scratch(gpu: &mut Gpu, args: WindowScratchArgs) -> Result<(), String> {
+    match args.route {
+        dsp::WindowRoute::SlabIu4 => gpu.reserve_qwen4_moe_sym_slab(
+            args.rows,
+            dsp::K_TOP,
+            args.experts,
+            args.hidden,
+            args.intermediate,
+        ),
+        dsp::WindowRoute::Aggregate => {
+            gpu.reserve_qwen4_moe_group_scratch(args.rows, dsp::K_TOP, args.experts)
+        }
+    }
+    .map_err(|error| format!("window scratch growth to {} rows failed: {error}", args.rows))
+}
+
+/// The validated, still-unallocated shape of one forward's runtime: everything
+/// the binder needs before its first device allocation.
+struct RuntimePlan {
+    spec: Option<crate::gpu_forward::panel_stage::PanelPoolSpec>,
+    schedule: Option<PanelSchedule>,
+    host_layer: Vec<bool>,
+    host_layers: usize,
+    resident_layers: usize,
+    route_bytes: usize,
+    stream_elements: usize,
+}
+
+/// Validate the admitted profile against this forward's layers and layouts.
+/// Allocates nothing; an `Err` is a pre-materialization decline.
+fn plan_runtime(
     forward: &Qwen4GpuForward,
     bundle: &Qwen4Bundle,
     gpu: &mut Gpu,
     profile: &SlowlinkProfile,
-) -> Result<SlowlinkRuntime, String> {
+) -> Result<RuntimePlan, String> {
     let config = &bundle.config;
     let mut host_layer = vec![false; config.num_hidden_layers];
     let mut sources = Vec::new();
@@ -1142,34 +1294,260 @@ fn build_runtime(
     if profile.arena.total_bytes % 4 != 0 || stream_bytes > profile.arena.total_bytes {
         return Err("HC-stream arena bytes are not whole F32 elements".to_string());
     }
+    if config.num_experts_per_tok != dsp::K_TOP {
+        return Err(format!(
+            "the model routes {} experts per token, the admitted window layout holds {}",
+            config.num_experts_per_tok,
+            dsp::K_TOP
+        ));
+    }
     let schedule =
         PanelSchedule::new(sources, EXPERTS_PER_PAGE).map_err(|error| error.to_string())?;
-    let ring = ExpertPanelRing::new(gpu, spec).map_err(|error| error.to_string())?;
-    let route_region = match gpu.alloc_tensor(&[layout.total_bytes()], DType::Raw) {
-        Ok(tensor) => tensor,
-        Err(error) => {
-            let _ = ring.free_gpu(gpu);
-            return Err(format!("route region allocation failed: {error}"));
-        }
-    };
-    let streams = match gpu.alloc_tensor(&[(profile.arena.total_bytes / 4) as usize], DType::F32) {
-        Ok(tensor) => tensor,
-        Err(error) => {
-            let _ = ring.free_gpu(gpu);
-            let _ = gpu.free_tensor(route_region);
-            return Err(format!("HC-stream arena allocation failed: {error}"));
-        }
-    };
-    Ok(SlowlinkRuntime {
-        ring,
-        schedule,
-        route_region,
-        streams,
+    Ok(RuntimePlan {
+        spec: Some(spec),
+        schedule: Some(schedule),
         host_layer,
         host_layers,
         resident_layers,
-        tile_scratch_bytes: forward.slowlink_tile_scratch_bytes(),
+        route_bytes: layout.total_bytes(),
+        stream_elements: (profile.arena.total_bytes / 4) as usize,
     })
+}
+
+/// The production binder: allocates every owner through the factories the
+/// request path used to call lazily (the page ring, `alloc_tensor` of the
+/// route region and arena, the Gpu scratch reserves, the bundle's boundary
+/// stage allocator) and holds them in `SlowlinkRuntime` parts.
+struct HipLoadBinder<'a> {
+    forward: &'a Qwen4GpuForward,
+    bundle: &'a mut Qwen4Bundle,
+    gpu: &'a mut Gpu,
+    profile: &'a SlowlinkProfile,
+    plan: RuntimePlan,
+    ring: Option<ExpertPanelRing>,
+    route_region: Option<GpuTensor>,
+    streams: Option<GpuTensor>,
+}
+
+impl LoadBinder for HipLoadBinder<'_> {
+    fn bind(&mut self, owner: LoadOwner) -> Result<(), String> {
+        match owner {
+            LoadOwner::PagePool => {
+                let spec = self
+                    .plan
+                    .spec
+                    .take()
+                    .ok_or_else(|| "the page pool spec was already consumed".to_string())?;
+                self.ring = Some(
+                    ExpertPanelRing::new(&mut *self.gpu, spec)
+                        .map_err(|error| format!("expert page ring allocation failed: {error}"))?,
+                );
+            }
+            LoadOwner::RouteRegion => {
+                self.route_region = Some(
+                    self.gpu
+                        .alloc_tensor(&[self.plan.route_bytes], DType::Raw)
+                        .map_err(|error| format!("route region allocation failed: {error}"))?,
+                );
+            }
+            LoadOwner::HcArena => {
+                self.streams = Some(
+                    self.gpu
+                        .alloc_tensor(&[self.plan.stream_elements], DType::F32)
+                        .map_err(|error| format!("HC-stream arena allocation failed: {error}"))?,
+                );
+            }
+            LoadOwner::WindowScratch => {
+                reserve_window_scratch(&mut *self.gpu, window_scratch_args(self.profile))?;
+            }
+            LoadOwner::BoundaryStages => {
+                self.bundle
+                    .slowlink_bind_boundary_stages(&mut *self.gpu)
+                    .map_err(|error| format!("boundary stage allocation failed: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unwind(&mut self, bound: &[LoadOwner]) -> String {
+        let mut notes: Vec<String> = Vec::new();
+        let stages = self.bundle.slowlink_take_boundary_stage_tensors();
+        if !stages.is_empty() {
+            let count = stages.len();
+            let mut failed = None;
+            for tensor in stages {
+                if let Err(error) = self.gpu.free_tensor(tensor) {
+                    failed.get_or_insert(error);
+                }
+            }
+            notes.push(match failed {
+                None => {
+                    format!("{count} boundary stage buffers returned to the device pool")
+                }
+                Some(error) => format!("boundary stage release failed: {error}"),
+            });
+        }
+        if bound.contains(&LoadOwner::WindowScratch) {
+            notes.push(
+                "the window scratch is Gpu-owned grow-only scratch and stays until Gpu teardown"
+                    .to_string(),
+            );
+        }
+        let tensors: Vec<GpuTensor> = [self.streams.take(), self.route_region.take()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let held = self.ring.is_some() || !tensors.is_empty();
+        let result = free_runtime_parts(
+            &mut *self.gpu,
+            self.ring.take(),
+            self.plan.schedule.take(),
+            tensors,
+        );
+        if held {
+            notes.push(match result {
+                Ok(()) => "the expert ring, route region and HC arena were drained and returned \
+                           to the device pool (parked until reuse or a pool drain, not yet \
+                           returned to HIP)"
+                    .to_string(),
+                Err(error) => format!(
+                    "ring/route/HC cleanup reported {error}; a failed ring drain QUARANTINES the \
+                     ring, route region and HC arena (not freed while the device may still use \
+                     them; leaked until process exit)"
+                ),
+            });
+        }
+        if notes.is_empty() {
+            "nothing had been allocated".to_string()
+        } else {
+            notes.join("; ")
+        }
+    }
+}
+
+impl HipLoadBinder<'_> {
+    fn into_runtime(self) -> Result<SlowlinkRuntime, String> {
+        let Self {
+            forward,
+            plan,
+            ring,
+            route_region,
+            streams,
+            ..
+        } = self;
+        match (ring, plan.schedule, route_region, streams) {
+            (Some(ring), Some(schedule), Some(route_region), Some(streams)) => {
+                Ok(SlowlinkRuntime {
+                    ring,
+                    schedule,
+                    route_region,
+                    streams,
+                    host_layer: plan.host_layer,
+                    host_layers: plan.host_layers,
+                    resident_layers: plan.resident_layers,
+                    tile_scratch_bytes: forward.slowlink_tile_scratch_bytes(),
+                })
+            }
+            _ => Err("a bound slow-link owner is missing".to_string()),
+        }
+    }
+}
+
+/// `few_row_limit` of a `tile_rows`-row tile under the tile's own scope.
+fn few_row_limit_of(forward: &Qwen4GpuForward, gpu: &mut Gpu, tile_rows: usize) -> usize {
+    let (scopes, _) = forward.enter_tile_scopes(gpu, tile_rows);
+    let limit = gpu.few_row_limit();
+    Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
+    limit
+}
+
+/// Why this load must NOT materialize S1 (a mode the forward or bundle does
+/// not own, or a native kernel/route the dispatch capability dry run refuses
+/// for the admitted tile), asked BEFORE any device allocation.
+fn load_decline(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    profile: &SlowlinkProfile,
+) -> Option<String> {
+    if let Err(why) = bundle.slowlink_prompt_eligible() {
+        return Some(why.to_string());
+    }
+    if let Some(why) = forward.slowlink_forward_blocker(&bundle.config) {
+        return Some(why.to_string());
+    }
+    for layer in forward.band_layers() {
+        if let Some(runtime) = forward.moe.get(layer).and_then(Option::as_ref) {
+            if runtime.s1_host_mapped() {
+                if let Err(why) = runtime.s1_layer_check() {
+                    return Some(format!("host layer {layer}: {why}"));
+                }
+            }
+        }
+    }
+    let few_row_limit = few_row_limit_of(forward, gpu, profile.tile_rows);
+    let geo = match RunGeo::new(forward, bundle, few_row_limit, profile.geometry.num_experts) {
+        Ok(geo) => geo,
+        Err(error) => return Some(error.to_string()),
+    };
+    let routing = tile_routing(forward, gpu, profile.tile_rows);
+    preflight_signatures(
+        forward,
+        bundle,
+        gpu,
+        &geo,
+        vec![(profile.tile_rows, routing)],
+        bundle.state.position,
+        profile,
+    )
+    .err()
+}
+
+/// Materialize the whole admitted S1 runtime ONCE, at the selected load, after
+/// the profile is attached and the forward built, before ANY product request
+/// (so no later first-use allocation can take the memory the placement
+/// charged). `Ok(())` with `unavailable` set is a named pre-materialization
+/// decline (a mode or native-kernel capability this load cannot run; nothing
+/// was allocated); `Err` is a named load failure whose partial owners were
+/// unwound with their disposition reported. No profile: nothing happens.
+pub(crate) fn bind_at_load(
+    forward: &mut Qwen4GpuForward,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    let Some(profile) = forward.slowlink_profile().copied() else {
+        return Ok(());
+    };
+    if forward.slowlink.runtime.is_some() || forward.slowlink.unavailable.is_some() {
+        return Ok(());
+    }
+    if let Some(reason) = load_decline(forward, &*bundle, gpu, &profile) {
+        forward.slowlink.unavailable = Some(reason);
+        return Ok(());
+    }
+    let plan = match plan_runtime(forward, &*bundle, gpu, &profile) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            forward.slowlink.unavailable = Some(reason);
+            return Ok(());
+        }
+    };
+    let runtime = {
+        let mut binder = HipLoadBinder {
+            forward: &*forward,
+            bundle: &mut *bundle,
+            gpu: &mut *gpu,
+            profile: &profile,
+            plan,
+            ring: None,
+            route_region: None,
+            streams: None,
+        };
+        bind_load_owners(&mut binder)?;
+        binder.into_runtime()?
+    };
+    forward.slowlink.runtime = Some(runtime);
+    Ok(())
 }
 
 // ── geometry of one request ──────────────────────────────────────────
@@ -1588,7 +1966,7 @@ fn validate_head(
 /// the admitted profile's route: the census (route storage, tile-F32 and
 /// scratch charges) was admitted for `profile.geometry.route` alone, so a call
 /// sealed for another route is refused here, after the tile scope is restored
-/// and before `ensure_runtime` or any other mutation, instead of running
+/// and before the S1 runtime gate or any other mutation, instead of running
 /// against the other route's census.
 fn preflight_tiles(
     forward: &Qwen4GpuForward,
@@ -1598,18 +1976,6 @@ fn preflight_tiles(
     plan: &Qwen4PromptPlan,
     profile: &SlowlinkProfile,
 ) -> Result<(), String> {
-    let layer = geo
-        .band
-        .clone()
-        .find(|&layer| {
-            forward
-                .moe
-                .get(layer)
-                .and_then(Option::as_ref)
-                .is_some_and(|runtime| runtime.s1_host_mapped())
-        })
-        .ok_or_else(|| "no host-resident expert layer".to_string())?;
-    let mut arms: Vec<([usize; 6], bool)> = Vec::new();
     let mut signatures = plan.signatures();
     // A window of one-row decode tiles only has no prefill tile to anchor the
     // panel scratch: the sweep uses a stand-in prefill tile of the admitted tile
@@ -1629,6 +1995,41 @@ fn preflight_tiles(
             signatures.push((rows, routing));
         }
     }
+    preflight_signatures(
+        forward,
+        bundle,
+        gpu,
+        geo,
+        signatures,
+        plan.entry_pos,
+        profile,
+    )
+}
+
+/// [`preflight_tiles`] over explicit launch signatures at `entry_pos`: the
+/// request path's plan signatures, or the load's own admitted-tile signature
+/// (the capability question asked before the runtime is materialized).
+fn preflight_signatures(
+    forward: &Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    gpu: &mut Gpu,
+    geo: &RunGeo,
+    signatures: Vec<(usize, TileRouting)>,
+    entry_pos: usize,
+    profile: &SlowlinkProfile,
+) -> Result<(), String> {
+    let layer = geo
+        .band
+        .clone()
+        .find(|&layer| {
+            forward
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .is_some_and(|runtime| runtime.s1_host_mapped())
+        })
+        .ok_or_else(|| "no host-resident expert layer".to_string())?;
+    let mut arms: Vec<([usize; 6], bool)> = Vec::new();
     for (rows, routing) in signatures {
         let stub = TilePlan {
             index: 0,
@@ -1637,7 +2038,7 @@ fn preflight_tiles(
             window_row: 0,
             stream_offset: 0,
             rows,
-            position: plan.entry_pos,
+            position: entry_pos,
             routing,
             ends_at_cut: None,
             last_in_window: false,
@@ -1774,12 +2175,7 @@ fn select(
     .map_err(|bypass: RequestBypass| format!("{bypass:?}"))?;
 
     let cuts = bundle.prompt_txn_cuts(entry, end);
-    let few_row_limit = {
-        let (scopes, _) = forward.enter_tile_scopes(gpu, profile.tile_rows);
-        let limit = gpu.few_row_limit();
-        Qwen4GpuForward::leave_tile_scopes(gpu, scopes);
-        limit
-    };
+    let few_row_limit = few_row_limit_of(forward, gpu, profile.tile_rows);
     let verdict = {
         let cell = std::cell::RefCell::new(&mut *gpu);
         let routing_forward: &Qwen4GpuForward = &*forward;
@@ -1821,32 +2217,42 @@ fn select(
             }
         }
     }
+    // The MTP entry `pending` backup is bound at MTP attach, never built here.
+    if matches!(
+        output,
+        PromptOutput::Capture {
+            pending: Some(_),
+            ..
+        }
+    ) && !bundle.slowlink_pending_bound()
+    {
+        return Err("the MTP pending backup was not bound at load".into());
+    }
     preflight_tiles(forward, bundle, gpu, &geo, &plan, &profile)?;
-    ensure_runtime(forward, bundle, gpu, &profile)?;
+    runtime_gate(
+        forward.slowlink.runtime.is_some(),
+        forward.slowlink.unavailable.as_deref(),
+    )?;
     Ok(Selection { plan, profile, geo })
 }
 
-/// Allocate the S1 device resources on first use (from the admitted profile,
-/// exactly what its census charged); a failure is sticky for this load.
-fn ensure_runtime(
-    forward: &mut Qwen4GpuForward,
-    bundle: &Qwen4Bundle,
-    gpu: &mut Gpu,
-    profile: &SlowlinkProfile,
-) -> Result<(), String> {
-    if forward.slowlink.runtime.is_some() {
-        return Ok(());
+/// The S1 runtime is bound ONCE at the selected load ([`bind_at_load`]); a
+/// request only consumes it. A load-time decline stays the request's named
+/// bypass; a runtime that was never bound is an error, never a request-time
+/// allocation (a mid-request device allocation could fail after the request
+/// mutated state or fall back to the incumbent with S1's placement already
+/// charged).
+fn runtime_gate(runtime_bound: bool, declined: Option<&str>) -> Result<(), String> {
+    if let Some(reason) = declined {
+        return Err(reason.to_string());
     }
-    match build_runtime(forward, bundle, gpu, profile) {
-        Ok(runtime) => {
-            forward.slowlink.runtime = Some(runtime);
-            Ok(())
-        }
-        Err(reason) => {
-            forward.slowlink.unavailable = Some(reason.clone());
-            Err(reason)
-        }
+    if !runtime_bound {
+        return Err(
+            "the slow-link runtime was not bound at load (requests never construct it)"
+                .to_string(),
+        );
     }
+    Ok(())
 }
 
 // ── tile frame ───────────────────────────────────────────────────────
@@ -3404,7 +3810,11 @@ pub(crate) fn primitive_selftest(
             "slow-link primitive check cannot run: {why}"
         )));
     }
-    ensure_runtime(forward, &*bundle, gpu, &profile).map_err(invalid)?;
+    runtime_gate(
+        forward.slowlink.runtime.is_some(),
+        forward.slowlink.unavailable.as_deref(),
+    )
+    .map_err(invalid)?;
     let mut rt = forward
         .slowlink
         .runtime
@@ -5283,5 +5693,258 @@ mod slowlink_overlap {
         fn model_payload(&self) -> u64 {
             LOG.with(|log| log.borrow().payload_bytes)
         }
+    }
+}
+
+/// CPU proofs of the load-time owner binding: the same [`bind_load_owners`]
+/// walk the production binder runs, against a model device that records the
+/// real allocation steps, their charge and their cleanup disposition.
+#[cfg(test)]
+mod slowlink_eager_load {
+    use super::slowlink_prompt::profile_on;
+    use super::*;
+
+    const ROUTES: [dsp::WindowRoute; 2] = [dsp::WindowRoute::SlabIu4, dsp::WindowRoute::Aggregate];
+
+    /// A device with a byte capacity: owners allocate their census charge,
+    /// cleanup either returns them (in reverse) or quarantines them.
+    struct ModelDevice {
+        profile: SlowlinkProfile,
+        capacity: u64,
+        live: Vec<(LoadOwner, u64)>,
+        quarantined: Vec<LoadOwner>,
+        log: Vec<String>,
+        fail_at: Option<LoadOwner>,
+        drain_fails: bool,
+        /// An S1 request mutation (transaction begin) happened.
+        transaction_begun: bool,
+    }
+
+    impl ModelDevice {
+        fn new(route: dsp::WindowRoute, capacity: u64) -> Self {
+            Self {
+                profile: profile_on(route, 0, 0),
+                capacity,
+                live: Vec::new(),
+                quarantined: Vec::new(),
+                log: Vec::new(),
+                fail_at: None,
+                drain_fails: false,
+                transaction_begun: false,
+            }
+        }
+
+        fn used(&self) -> u64 {
+            self.live.iter().map(|(_, bytes)| bytes).sum()
+        }
+
+        /// The incumbent's own first-use allocation (a short prompt's scratch).
+        fn incumbent_alloc(&mut self, bytes: u64) -> Result<(), String> {
+            if self.used() + bytes > self.capacity {
+                return Err("hipMalloc: out of memory (incumbent first use)".to_string());
+            }
+            self.log.push(format!("incumbent {bytes}"));
+            Ok(())
+        }
+    }
+
+    impl LoadBinder for ModelDevice {
+        fn bind(&mut self, owner: LoadOwner) -> Result<(), String> {
+            let bytes = load_owner_charge(&self.profile, owner);
+            if self.fail_at == Some(owner) || self.used() + bytes > self.capacity {
+                return Err(format!("hipMalloc: out of memory ({bytes} B)"));
+            }
+            self.live.push((owner, bytes));
+            self.log.push(format!("bind {owner:?}"));
+            Ok(())
+        }
+
+        fn unwind(&mut self, bound: &[LoadOwner]) -> String {
+            assert_eq!(
+                bound,
+                self.live.iter().map(|(owner, _)| *owner).collect::<Vec<_>>(),
+                "the unwind covers exactly the owners that were bound"
+            );
+            if self.drain_fails {
+                self.quarantined
+                    .extend(self.live.drain(..).map(|(owner, _)| owner));
+                return "drain failed: owners QUARANTINED, not released".to_string();
+            }
+            while let Some((owner, _)) = self.live.pop() {
+                self.log.push(format!("release {owner:?}"));
+            }
+            "released to the device pool".to_string()
+        }
+    }
+
+    /// What a request's select does about the runtime: only the gate.
+    fn select_model(dev: &ModelDevice, bound: bool, declined: Option<&str>) -> Result<(), String> {
+        let before = dev.log.len();
+        let verdict = runtime_gate(bound, declined);
+        assert_eq!(dev.log.len(), before, "select never allocates");
+        verdict
+    }
+
+    #[test]
+    fn slowlink_eager_load_owners_cover_every_census_term_once() {
+        for route in ROUTES {
+            let profile = profile_on(route, 0, 0);
+            let owned: u64 = profile.census.owned_terms().iter().map(|(_, b)| b).sum();
+            let bound: u64 = LOAD_OWNERS
+                .iter()
+                .map(|owner| load_owner_charge(&profile, *owner))
+                .sum();
+            assert_eq!(bound, owned, "{route:?}: every charged region has one owner");
+            let mut seen = LOAD_OWNERS.to_vec();
+            seen.dedup();
+            assert_eq!(seen.len(), LOAD_OWNERS.len());
+            assert!(
+                load_owner_charge(&profile, LoadOwner::RouteRegion) > 0
+                    && load_owner_charge(&profile, LoadOwner::HcArena) > 0
+                    && load_owner_charge(&profile, LoadOwner::BoundaryStages) > 0,
+                "{route:?}: the owners the first-use path used to allocate are charged"
+            );
+        }
+    }
+
+    #[test]
+    fn slowlink_eager_load_window_scratch_args_are_the_census_bytes() {
+        for route in ROUTES {
+            let profile = profile_on(route, 0, 0);
+            let args = window_scratch_args(&profile);
+            assert_eq!(args.rows, profile.window_rows);
+            let group =
+                rdna_compute::scratch::qwen4_moe_group_layout(args.rows * dsp::K_TOP, args.experts)
+                    .bytes as u64;
+            let sidecars = match args.route {
+                dsp::WindowRoute::SlabIu4 => {
+                    rdna_compute::scratch::qwen4_moe_down_i4_bytes(args.hidden, args.rows).unwrap()
+                        as u64
+                        + rdna_compute::scratch::qwen4_moe_down_i4_bytes(
+                            args.intermediate,
+                            args.rows * dsp::K_TOP,
+                        )
+                        .unwrap() as u64
+                }
+                dsp::WindowRoute::Aggregate => 0,
+            };
+            assert_eq!(group, profile.census.group_scatter, "{route:?}");
+            assert_eq!(sidecars, profile.census.a4_sidecars, "{route:?}");
+        }
+    }
+
+    #[test]
+    fn slowlink_eager_load_owns_every_charged_region_before_the_first_short_incumbent() {
+        for route in ROUTES {
+            let mut dev = ModelDevice::new(route, 0);
+            let owned: u64 = dev.profile.census.owned_terms().iter().map(|(_, b)| b).sum();
+            let incumbent = 3 << 30;
+            dev.capacity = owned + incumbent;
+            bind_load_owners(&mut dev).expect("the charged owners fit the charged capacity");
+            assert_eq!(
+                dev.live.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+                LOAD_OWNERS,
+                "{route:?}: every owner is live at load"
+            );
+            assert_eq!(dev.used(), owned);
+            // The first short incumbent prefill (and any later first-use
+            // owner) can only take what the placement left: it never lands
+            // on S1's bytes, and the S1 owners are untouched when it
+            // over-asks.
+            dev.incumbent_alloc(incumbent).unwrap();
+            assert!(dev.incumbent_alloc(incumbent + 1).is_err());
+            assert_eq!(dev.used(), owned, "S1's owners survive the incumbent's OOM");
+            let first_incumbent = dev
+                .log
+                .iter()
+                .position(|entry| entry.starts_with("incumbent"))
+                .unwrap();
+            assert_eq!(
+                dev.log[..first_incumbent].len(),
+                LOAD_OWNERS.len(),
+                "all {} binds precede the first incumbent allocation",
+                LOAD_OWNERS.len()
+            );
+        }
+    }
+
+    #[test]
+    fn slowlink_eager_load_select_consumes_the_bound_runtime_and_never_allocates() {
+        let mut dev = ModelDevice::new(dsp::WindowRoute::SlabIu4, u64::MAX);
+        bind_load_owners(&mut dev).unwrap();
+        let live = dev.live.clone();
+        let log = dev.log.clone();
+        // Repeated short (bypassed) and long (S1) selects read only the gate.
+        for _ in 0..3 {
+            assert!(select_model(&dev, true, None).is_ok());
+        }
+        assert_eq!((dev.live.clone(), dev.log.clone()), (live, log));
+        // A runtime that is not bound is an error, never an allocation.
+        let unbound = select_model(&dev, false, None).unwrap_err();
+        assert!(unbound.contains("not bound at load"), "{unbound}");
+        // A load-time decline is the request's named bypass.
+        assert_eq!(
+            select_model(&dev, true, Some("lane scope")).unwrap_err(),
+            "lane scope"
+        );
+        assert_eq!(
+            select_model(&dev, false, Some("the NPU trunk")).unwrap_err(),
+            "the NPU trunk"
+        );
+    }
+
+    #[test]
+    fn slowlink_eager_load_failure_unwinds_what_was_bound_and_begins_no_transaction() {
+        for route in ROUTES {
+            for (index, failing) in LOAD_OWNERS.into_iter().enumerate() {
+                let mut dev = ModelDevice::new(route, u64::MAX);
+                dev.fail_at = Some(failing);
+                let error = bind_load_owners(&mut dev).unwrap_err();
+                assert!(error.contains(&format!("{failing:?}")), "{error}");
+                assert!(error.contains("out of memory"), "{error}");
+                assert!(error.contains("cleanup: released to the device pool"), "{error}");
+                assert!(dev.live.is_empty(), "{route:?}/{failing:?}: nothing stays live");
+                assert!(dev.quarantined.is_empty());
+                assert!(!dev.transaction_begun, "no S1 transaction began");
+                let released: Vec<_> = dev
+                    .log
+                    .iter()
+                    .filter(|entry| entry.starts_with("release"))
+                    .cloned()
+                    .collect();
+                let expected: Vec<_> = LOAD_OWNERS[..index]
+                    .iter()
+                    .rev()
+                    .map(|owner| format!("release {owner:?}"))
+                    .collect();
+                assert_eq!(released, expected, "last bound is released first");
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_eager_load_over_capacity_fails_on_the_first_owner_that_does_not_fit() {
+        let mut dev = ModelDevice::new(dsp::WindowRoute::SlabIu4, 0);
+        let ring = load_owner_charge(&dev.profile, LoadOwner::PagePool);
+        let route = load_owner_charge(&dev.profile, LoadOwner::RouteRegion);
+        // Room for the ring and a route region one byte short: the route
+        // region (the allocation that failed in j1778) is the named failure.
+        dev.capacity = ring + route - 1;
+        let error = bind_load_owners(&mut dev).unwrap_err();
+        assert!(error.contains("RouteRegion"), "{error}");
+        assert!(dev.live.is_empty());
+        assert_eq!(dev.log, vec!["bind PagePool", "release PagePool"]);
+    }
+
+    #[test]
+    fn slowlink_eager_load_failed_drain_quarantines_instead_of_releasing() {
+        let mut dev = ModelDevice::new(dsp::WindowRoute::Aggregate, u64::MAX);
+        dev.fail_at = Some(LoadOwner::BoundaryStages);
+        dev.drain_fails = true;
+        let error = bind_load_owners(&mut dev).unwrap_err();
+        assert!(error.contains("QUARANTINED"), "{error}");
+        assert!(!error.contains("released to the device pool"), "{error}");
+        assert_eq!(dev.quarantined, LOAD_OWNERS[..4].to_vec());
+        assert!(dev.log.iter().all(|entry| !entry.starts_with("release")));
     }
 }
