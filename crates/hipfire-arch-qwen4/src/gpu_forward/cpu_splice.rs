@@ -15,12 +15,15 @@
 //! host-mapped, supported layers with no EP / slab / tier / AWQ route that
 //! owns the weights differently.
 //!
-//! [`CpuSplitAdmission`] is the same decision for the D2 hot-set tier split. Both
-//! are architecture-generic: neither has an arch input. D2 arms on any tier plan
-//! the loader admitted (default sibling sidecar on gfx1201 only, an explicit
+//! [`CpuSplitAdmission`] is the same decision for the D2 split, over every
+//! host-span owner kind ([`SplitOwnerKind`]: hot-set tier, whole-layer host
+//! aggregate, host-mapped expert-slab arena). Both are architecture-generic:
+//! neither has an arch input. D2 arms on any tier plan the loader admitted
+//! (default sibling sidecar on gfx1201 only, an explicit
 //! `HIPFIRE_QWEN4_EXPERT_HOTSET` path on any arch; see
-//! `expert_hotset::hotset_arch_admits`) and refuses, with one log line per
-//! reason, every route that has no masked ids or cold-slot installation.
+//! `expert_hotset::hotset_arch_admits`) and on any host span whose experts all
+//! have a CPU decoder, and refuses, with one log line per reason, every route
+//! that has no masked ids or cold-slot installation.
 
 use super::*;
 
@@ -205,7 +208,8 @@ impl CpuExpertOwners {
 /// [`CpuSpliceAdmission`]: the whole-layer D1 splice never arms on a tier
 /// layer, and this mode never sets the layer's `cpu_deferred_experts` flag.
 /// One decision, several span-owner kinds ([`SplitOwnerKind`]): a hot-set tier
-/// layer or an un-tiered host-mapped aggregate layer. Every field is an input;
+/// layer, an un-tiered host-mapped aggregate layer, or a host-mapped
+/// expert-slab arena. Every field is an input;
 /// [`Self::refusal`] is the single decision and [`Self::armed`] its yes/no.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CpuSplitAdmission {
@@ -214,8 +218,8 @@ pub(super) struct CpuSplitAdmission {
     /// ([`crate::d2_default`]) with the setting unset.
     pub enabled: bool,
     /// Which owner kind the layer would read its cold experts from; `None`
-    /// when it has neither a tier plan nor a host-mapped aggregate the D1
-    /// splice has not already taken.
+    /// when it has neither a tier plan, a host-mapped aggregate the D1 splice
+    /// has not already taken, nor a host-mapped slab arena.
     pub kind: Option<SplitOwnerKind>,
     /// The tier plan came from a hot-set sidecar: the loader bound that
     /// sidecar's SHA-256 to the lease before attach. A custom tier plan
@@ -226,8 +230,8 @@ pub(super) struct CpuSplitAdmission {
     pub host_experts: usize,
     /// Flash-Next profile.
     pub flash_next: bool,
-    /// Every expert is a format the CPU executes: the QT44 gate/up + QT53 down
-    /// pair.
+    /// Every host-placed expert's gate/up and down formats have a CPU decoder
+    /// (`hipfire_dispatch::cpu_exec::cpu_quant_for`).
     pub cpu_executed: bool,
     /// The layer is routed through expert parallelism.
     pub ep: bool,
@@ -271,12 +275,13 @@ impl SplitRefusal {
         match self {
             Self::NotRequested => "the CPU split is not requested",
             Self::NoSpanOwner => {
-                "the layer has neither a hot-set tier plan nor a host-mapped aggregate"
+                "the layer has neither a hot-set tier plan, a host-mapped aggregate nor a \
+                 host-mapped expert-slab arena"
             }
             Self::NoColdExperts => "the layer has no host-mapped expert",
             Self::UnboundHotset => "the tier plan is not backed by a bound hot-set sidecar",
             Self::NotFlashNext => "the layer is not a Flash-Next profile layer",
-            Self::NotCpuExecuted => "the layer is not uniform Flash-Next QT44 gate/up + QT53 down",
+            Self::NotCpuExecuted => "a host-placed expert's format has no CPU decoder",
             Self::ExpertParallel => "expert-parallel layers have no masked route",
             Self::Awq => "AWQ layers carry scales the CPU arithmetic would ignore",
             Self::Fp8 => "stock-FP8 layers have no masked route or cold-slot installation",
@@ -499,6 +504,9 @@ pub(super) enum SplitOwnerKind {
     /// An un-tiered aggregate layer whose two expert allocations are
     /// host-mapped: every expert is cold.
     WholeLayer,
+    /// An expert-slab layer whose arena is host-mapped: every present expert
+    /// is cold, each in its own codec.
+    Slab,
 }
 
 impl SplitOwnerKind {
@@ -507,6 +515,7 @@ impl SplitOwnerKind {
         match self {
             Self::Tier => "tier",
             Self::WholeLayer => "whole-layer",
+            Self::Slab => "slab",
         }
     }
 }
@@ -516,6 +525,7 @@ impl SplitOwnerKind {
 pub(super) enum HostSpanOwner {
     Tier(CpuTierOwners),
     WholeLayer(CpuExpertOwners),
+    Slab(super::cpu_slab_owner::CpuSlabOwners),
 }
 
 impl HostSpanOwner {
@@ -523,6 +533,7 @@ impl HostSpanOwner {
         match self {
             Self::Tier(_) => SplitOwnerKind::Tier,
             Self::WholeLayer(_) => SplitOwnerKind::WholeLayer,
+            Self::Slab(_) => SplitOwnerKind::Slab,
         }
     }
 
@@ -536,6 +547,7 @@ impl HostSpanOwner {
         match self {
             Self::Tier(owners) => owners.payload(expert_idx, gate_up_dtype, down_dtype),
             Self::WholeLayer(owners) => owners.payload(expert_idx, gate_up_dtype, down_dtype),
+            Self::Slab(owners) => owners.payload(expert_idx, gate_up_dtype, down_dtype),
         }
     }
 
@@ -544,6 +556,7 @@ impl HostSpanOwner {
         match self {
             Self::Tier(owners) => owners.placement(),
             Self::WholeLayer(owners) => vec![1; owners.experts],
+            Self::Slab(owners) => owners.placement(),
         }
     }
 
@@ -552,37 +565,69 @@ impl HostSpanOwner {
         match self {
             Self::Tier(owners) => owners.cold_experts(),
             Self::WholeLayer(owners) => owners.experts,
+            Self::Slab(owners) => owners.cold_experts(),
         }
     }
+}
+
+/// What names one host layer's cold experts to [`ColdLayerSource`]: the layer's
+/// aggregate expert tensors, or its slab arena.
+#[derive(Clone, Copy)]
+pub(crate) enum ColdLayerRefs<'w> {
+    /// Aggregate gate/up and down expert references (a hot-set tier layer reads
+    /// only the layer index; an un-tiered layer reads both tensors).
+    Aggregate {
+        gate_up: &'w TensorRef,
+        down: &'w TensorRef,
+    },
+    /// The expert-slab layer's one owning arena.
+    Arena(&'w TensorRef),
+}
+
+/// How a source's experts are formatted.
+enum ColdCodecs {
+    /// Every expert holds one `(gate_up, down)` codec pair read in place: the
+    /// GPU reads exactly the CPU payload bytes.
+    Uniform(DType, DType),
+    /// Each slab expert carries its own codec pair and its own GPU read bytes
+    /// ([`cpu_slab_owner::gpu_read_bytes`], one entry per expert, `None` when
+    /// absent).
+    Slab { gpu_read_bytes: Vec<Option<u64>> },
 }
 
 /// The cold-expert byte source of one host layer, resolved from the loaded
 /// weights exactly as the layer build resolves it, for the D2 selector's
 /// real-arm probe ([`crate::d2_default`]). It runs before the layer runtimes
 /// exist, so it builds the same borrowed views ([`CpuTierOwners`] for a hot-set
-/// tier layer, [`CpuExpertOwners`] for an un-tiered host-mapped aggregate) and
+/// tier layer, [`CpuExpertOwners`] for an un-tiered host-mapped aggregate,
+/// [`cpu_slab_owner::CpuSlabOwners`] for a host-mapped expert-slab arena) and
 /// copies nothing.
 pub(crate) struct ColdLayerSource {
     owner: HostSpanOwner,
-    gate_up_dtype: DType,
-    down_dtype: DType,
+    codecs: ColdCodecs,
     experts: usize,
 }
 
 impl ColdLayerSource {
-    /// Resolve trunk layer `layer`'s cold experts. `gate_up` / `down` are the
-    /// layer's aggregate expert references (read only for an un-tiered layer;
-    /// a tier layer's codecs are the fixed QT44 gate/up + QT53 down pair, as in
-    /// the layer build). `Err` names what could not be resolved.
+    /// Resolve trunk layer `layer`'s cold experts. An aggregate layer's codecs
+    /// are the fixed QT44 gate/up + QT53 down pair for a tier layer (as in the
+    /// layer build) and the resident tensors' own for an un-tiered one; a slab
+    /// layer's are per expert, from the arena plan. `Err` names what could not
+    /// be resolved.
     pub(crate) fn new(
         gpu: &Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
         layer: usize,
-        gate_up: &TensorRef,
-        down: &TensorRef,
+        refs: ColdLayerRefs<'_>,
     ) -> Result<Self, String> {
         let experts = config.num_experts;
+        let (gate_up, down) = match refs {
+            ColdLayerRefs::Arena(arena_ref) => {
+                return Self::slab(gpu, weights, config, layer, arena_ref)
+            }
+            ColdLayerRefs::Aggregate { gate_up, down } => (gate_up, down),
+        };
         let extents = |gate_up_dtype: DType, down_dtype: DType| {
             let gate_up = crate::projection::checked_bytes(
                 2 * config.moe_intermediate_size,
@@ -636,15 +681,77 @@ impl ColdLayerSource {
         };
         Ok(Self {
             owner,
-            gate_up_dtype,
-            down_dtype,
+            codecs: ColdCodecs::Uniform(gate_up_dtype, down_dtype),
             experts,
         })
     }
 
-    /// The layer's resident gate/up and down codecs.
-    pub(crate) fn codecs(&self) -> (DType, DType) {
-        (self.gate_up_dtype, self.down_dtype)
+    /// A host-mapped expert-slab layer: the owning arena's pinned bytes and
+    /// each expert's own table entry, from the same plan the layer build reads
+    /// ([`cpu_slab_owner::plan_entries`]).
+    fn slab(
+        gpu: &Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        layer: usize,
+        arena_ref: &TensorRef,
+    ) -> Result<Self, String> {
+        let plan = match &weights.manifest.identity.recipe {
+            crate::weights::Qwen4TierRecipe::FlashNextSlab { arenas, .. } => arenas
+                .layer(layer)
+                .ok_or_else(|| format!("layer {layer}: the expert arena plan has no such layer"))?,
+            _ => {
+                return Err(format!(
+                    "layer {layer}: an expert arena under a non-slab recipe"
+                ))
+            }
+        };
+        let (hidden, mi) = (config.hidden_size, config.moe_intermediate_size);
+        // The plan's per-format extents assume the frozen slab expert geometry,
+        // the same guard the layer build applies.
+        if config.num_experts != plan.experts.len() || [2 * mi, hidden, mi] != [1280, 2560, 640] {
+            return Err(format!(
+                "layer {layer}: the expert slab geometry is 512 experts of [1280,2560] / [2560,640]"
+            ));
+        }
+        let arena = weights
+            .resident(arena_ref)
+            .map_err(|error| format!("layer {layer}: {error}"))?;
+        if arena.buf.size() < plan.bytes {
+            return Err(format!(
+                "layer {layer}: the arena holds {} bytes, its plan needs {}",
+                arena.buf.size(),
+                plan.bytes
+            ));
+        }
+        let entries = cpu_slab_owner::plan_entries(plan, config, layer)
+            .map_err(|error| format!("layer {layer}: {error}"))?;
+        let owners = cpu_slab_owner::CpuSlabOwners::new(gpu, arena, plan.bytes, entries.into_iter())
+            .map_err(|error| format!("layer {layer}: {error}"))?;
+        Ok(Self {
+            owner: HostSpanOwner::Slab(owners),
+            codecs: ColdCodecs::Slab {
+                gpu_read_bytes: cpu_slab_owner::gpu_read_bytes(plan),
+            },
+            experts: config.num_experts,
+        })
+    }
+
+    /// The distinct resident `(gate/up, down)` codec pairs of the layer's cold
+    /// experts, sorted: one pair for an aggregate layer, every pair a present
+    /// slab expert holds for a slab layer.
+    pub(crate) fn codecs(&self) -> Vec<(DType, DType)> {
+        let mut pairs = match (&self.codecs, &self.owner) {
+            (ColdCodecs::Uniform(gate_up, down), _) => vec![(*gate_up, *down)],
+            (ColdCodecs::Slab { .. }, HostSpanOwner::Slab(owners)) => (0..self.experts)
+                .filter_map(|expert| owners.expert_formats(expert))
+                .map(|[(gate_up, _), (down, _)]| (gate_up, down))
+                .collect(),
+            (ColdCodecs::Slab { .. }, _) => Vec::new(),
+        };
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
     }
 
     /// Experts the layer addresses (cold or not).
@@ -652,14 +759,26 @@ impl ColdLayerSource {
         self.experts
     }
 
-    /// Borrowed CPU payload of cold expert `expert`; `None` for a
-    /// device-resident or out-of-range expert or a codec with no CPU executor.
-    pub(crate) fn cold_payload(
+    /// Cold expert `expert` as a probe slot: its borrowed CPU payload in its
+    /// own codecs and the bytes the GPU reads for it over the link. An
+    /// aggregate layer's experts are one codec read in place (the GPU reads the
+    /// CPU payload bytes); a slab slot's GPU read is its own plan format's
+    /// gate/up plus down bytes, resolved independently of its CPU codec and
+    /// span lengths. `None` for a device-resident, absent or out-of-range expert or a
+    /// codec with no CPU executor.
+    pub(crate) fn cold_probe(
         &self,
         expert: usize,
-    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
-        self.owner
-            .payload(expert, self.gate_up_dtype, self.down_dtype)
+    ) -> Option<crate::d2_default::ProbeExpert<'_>> {
+        match (&self.codecs, &self.owner) {
+            (ColdCodecs::Uniform(gate_up, down), owner) => owner
+                .payload(expert, *gate_up, *down)
+                .map(crate::d2_default::ProbeExpert::same_bytes),
+            (ColdCodecs::Slab { gpu_read_bytes }, HostSpanOwner::Slab(owners)) => {
+                owners.probe_expert(expert, (*gpu_read_bytes.get(expert)?)?)
+            }
+            (ColdCodecs::Slab { .. }, _) => None,
+        }
     }
 }
 
@@ -685,13 +804,14 @@ pub(super) fn layer_bitmap_hex(labels: &[usize]) -> String {
 /// `Qwen4GpuForward::host_exec_identity`): empty when nothing is armed,
 /// `cpu-all-v1/<bitmap>` for D1 layers, then one part per D2 owner kind in the
 /// caller's order: `cpu-tier-split-v1/<64-hex tier logical digest>/<bitmap>/
-/// hotset-sha256=<hex | unbound>` for hot-set tier layers and
-/// `cpu-whole-split-v1/<bitmap>` for un-tiered whole-layer host aggregates (no
-/// tier digest or sidecar: every host expert is cold, so there is no plan to
-/// freeze). Parts are joined with `+`. `tier` is the tier-split layers' digest
-/// and bound sidecar SHA; a tier layer set without it is not an identity and
-/// yields `unbound` digest zeros rather than silently collapsing into another
-/// mode.
+/// hotset-sha256=<hex | unbound>` for hot-set tier layers,
+/// `cpu-whole-split-v1/<bitmap>` for un-tiered whole-layer host aggregates and
+/// `cpu-slab-split-v1/<bitmap>` for host-mapped expert-slab arenas (no tier
+/// digest or sidecar: every present host expert is cold and its codec is the
+/// artifact's, so there is no plan to freeze). Parts are joined with `+`.
+/// `tier` is the tier-split layers' digest and bound sidecar SHA; a tier layer
+/// set without it is not an identity and yields `unbound` digest zeros rather
+/// than silently collapsing into another mode.
 pub(super) fn host_exec_identity(
     cpu_all: &[usize],
     splits: &[(SplitOwnerKind, &[usize])],
@@ -722,6 +842,9 @@ pub(super) fn host_exec_identity(
             }
             SplitOwnerKind::WholeLayer => {
                 parts.push(format!("cpu-whole-split-v1/{}", layer_bitmap_hex(layers)));
+            }
+            SplitOwnerKind::Slab => {
+                parts.push(format!("cpu-slab-split-v1/{}", layer_bitmap_hex(layers)));
             }
         }
     }
@@ -1360,6 +1483,20 @@ mod tests {
         );
         assert!(both.starts_with("cpu-tier-split-v1/"), "{both}");
         assert!(both.contains("+cpu-whole-split-v1/"), "{both}");
+        // The slab kind has its own frozen spelling, distinct from both.
+        let slab = host_exec_identity(&[], &[(SplitOwnerKind::Slab, &fewer)], None);
+        assert!(slab.starts_with("cpu-slab-split-v1/"), "{slab}");
+        assert_ne!(slab, host_exec_identity(&[], &[(WholeLayer, &fewer)], None));
+        let all_kinds = host_exec_identity(
+            &[],
+            &[
+                (Tier, &tier_labels),
+                (WholeLayer, &fewer),
+                (SplitOwnerKind::Slab, &fewer),
+            ],
+            Some((&digest, Some(&"c".repeat(64)))),
+        );
+        assert!(all_kinds.ends_with(&format!("+{slab}")), "{all_kinds}");
     }
 
     /// The whole-layer owner resolves the same bytes D1's owners do, and

@@ -2880,10 +2880,12 @@ fn split_shape_conflict(
 /// One predicate for sealing, lowering and execution.
 ///
 /// The mode keeps the router, the shared expert and the canonical combine on
-/// the original grouped QT44/QT53 route unchanged: only the routed GPU tail
-/// reads the executor's masked ids, the cold slots' unweighted F32 rows are
-/// installed into `down_expanded`, and the unchanged BF16 combine folds the
-/// original route once. Anything that changes that bracket refuses.
+/// the original grouped QT44/QT53 or expert-slab route unchanged: only the
+/// routed GPU tail reads the executor's masked ids (the slab K1 planner and
+/// kernels skip an id outside `[0, n_experts)` with no load and no store), the
+/// cold slots' unweighted F32 rows are installed into `down_expanded`, and the
+/// unchanged BF16 combine folds the original route once. Anything that changes
+/// that bracket refuses.
 pub(super) fn cpu_split_decode_conflict(
     params: &MoeParams<'_>,
     route: Option<MoeRouteCapability>,
@@ -2896,8 +2898,8 @@ pub(super) fn cpu_split_decode_conflict(
     if cpu_deferred_experts || params.cpu_deferred_experts {
         return Some("CPU tier split and CPU-deferred routed experts are mutually exclusive");
     }
-    if !route.is_some_and(|route| route.is_qt44_qt53_grouped() && !route.is_slab()) {
-        return Some("requires the original grouped QT44/QT53 route");
+    if !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        return Some("requires the original grouped QT44/QT53 or expert-slab route");
     }
     if !matches!(
         params.recipe,
@@ -2956,8 +2958,8 @@ pub(super) fn cpu_split_prefill_conflict(
     if cpu_deferred_experts || params.cpu_deferred_experts {
         return Some("CPU tier split and CPU-deferred routed experts are mutually exclusive");
     }
-    if !route.is_some_and(|route| route.is_qt44_qt53_grouped() && !route.is_slab()) {
-        return Some("requires the original grouped QT44/QT53 route");
+    if !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        return Some("requires the original grouped QT44/QT53 or expert-slab route");
     }
     if !matches!(
         params.recipe,

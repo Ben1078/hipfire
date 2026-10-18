@@ -8148,9 +8148,10 @@ mod tests {
         assert!(text.contains(needle), "{label}: {text}");
     }
 
-    const SPLIT_ROUTES: [MoeRouteCapability; 2] = [
+    const SPLIT_ROUTES: [MoeRouteCapability; 3] = [
         MoeRouteCapability::Qt44Qt53Grouped,
         MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        MoeRouteCapability::SlabCodecGrouped,
     ];
 
     #[test]
@@ -8311,7 +8312,6 @@ mod tests {
         let grouped = "grouped QT44/QT53";
         for (label, route) in [
             ("no route", None),
-            ("slab", Some(MoeRouteCapability::SlabCodecGrouped)),
             ("fp8", Some(MoeRouteCapability::Fp8B128Grouped)),
         ] {
             split_refused(

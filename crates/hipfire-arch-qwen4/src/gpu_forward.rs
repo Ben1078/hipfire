@@ -1334,7 +1334,8 @@ fn slab_codec_tag_bytes(codecs: &[u8]) -> Vec<u8> {
     bytes
 }
 
-pub(crate) use cpu_splice::ColdLayerSource;
+pub(crate) use cpu_splice::{ColdLayerRefs, ColdLayerSource};
+mod cpu_slab_owner;
 mod cpu_splice;
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -2678,6 +2679,12 @@ impl Qwen4MoeLayerRuntime {
             None => layout,
         };
         if let Some(arena_ref) = moe.expert_arena.as_ref() {
+            // A slab layer never takes the D1 splice, so the explicit `cpu`
+            // mode requests its D2 split exactly as it does a tier layer's.
+            let split_requested = (hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+                && !hipfire_dispatch::cpu_exec::passback_enabled()
+                || d2_default)
+                && allow_tiers;
             return Self::build_slab(
                 gpu,
                 weights,
@@ -2686,6 +2693,7 @@ impl Qwen4MoeLayerRuntime {
                 config,
                 &layout,
                 [router, shared_scalar, shared_gate, shared_up, shared_down],
+                split_requested,
             );
         }
         // Tier loads deliberately have no resident aggregate expert tensors.
@@ -3339,6 +3347,13 @@ impl Qwen4MoeLayerRuntime {
     /// the offsets of the validated span table, with its own dtype, and the
     /// pointer tables name those views. Residency and codec come from the
     /// layer's own arena and per-expert table, never from expert 0.
+    ///
+    /// `split_requested`: the D2 split was asked for this load (explicit
+    /// `memory.offload_exec=cpu` or the per-load default). A host-mapped arena
+    /// whose present experts all have a CPU decoder then serves decode and
+    /// `<=4`-row verify of every routed slot on the CPU, straight from the
+    /// arena's pinned host bytes (the slab span kind of the D2 owner).
+    #[allow(clippy::too_many_arguments)]
     fn build_slab(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -3347,6 +3362,7 @@ impl Qwen4MoeLayerRuntime {
         config: &Qwen4Config,
         layout: &Qwen4ExpertTableLayout<'_>,
         [router, shared_scalar, shared_gate, shared_up, shared_down]: [ProjectionView; 5],
+        split_requested: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         use crate::expert_arena::{ARENA_TAIL_PAD_BYTES, CODEC_MQ4};
         use crate::expert_slabs::ExpertFormat;
@@ -3416,10 +3432,8 @@ impl Qwen4MoeLayerRuntime {
             .map(|expert| expert.effective_format())
             .collect();
         let dtypes_of = |format: ExpertFormat| match format {
-            ExpertFormat::Mq4Xts => Ok((DType::MQ4G256V2, DType::MQ4G128V2)),
-            ExpertFormat::Mq3I4 => Ok((DType::MQ3I4G128R256, DType::MQ3I4G128R128)),
-            ExpertFormat::E8pI4 => Ok((DType::E8PI4G128R256, DType::E8PI4G128R128)),
             ExpertFormat::Mq2I4 => Err(invalid("MQ2-I4 has no expert-slab route")),
+            format => Ok(format.dtypes()),
         };
         let (gate_up_source_name, down_source_name) = match &weights
             .layer(layer_label)
@@ -3527,6 +3541,10 @@ impl Qwen4MoeLayerRuntime {
             down_dtypes.push(down_dtype);
             experts.push(Qwen4ExpertView { gate_up, down });
         }
+        // The D2 slab span entries: the same plan resolution the D2 default's
+        // real-arm probe reads ([`cpu_slab_owner::plan_entries`]).
+        let span_entries = cpu_slab_owner::plan_entries(plan, config, layer_label)
+            .map_err(|error| invalid(format!("layer {layer_label}: {error}")))?;
         let table = ExpertTable::new(metadata)
             .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}")))?;
         let mut cache = table
@@ -3614,7 +3632,60 @@ impl Qwen4MoeLayerRuntime {
         // The K1 planner and entries load before any capture.
         gpu.ensure_qwen4_slab_kernels(cold_codec)?;
         gpu.reserve_qwen4_slab(0)?;
-        Ok(Self {
+        // D2 slab span: the same admission every owner kind takes. A slab
+        // layer has no EP, AWQ or FP8 route (refused above), and a resident
+        // arena has no host-placed expert.
+        let present = span_entries.iter().filter(|entry| !entry.absent);
+        let split_admission = cpu_splice::CpuSplitAdmission {
+            enabled: split_requested && layer_label < config.num_hidden_layers,
+            kind: host_mapped.then_some(cpu_splice::SplitOwnerKind::Slab),
+            bound_hotset: false,
+            host_experts: if host_mapped {
+                present.clone().count()
+            } else {
+                0
+            },
+            flash_next: config.profile.is_flash_next(),
+            cpu_executed: present.clone().all(|entry| {
+                hipfire_dispatch::cpu_exec::cpu_quant_for(entry.gate_up_dtype).is_some()
+                    && hipfire_dispatch::cpu_exec::cpu_quant_for(entry.down_dtype).is_some()
+            }),
+            ep: false,
+            awq: false,
+            fp8: false,
+            narrow_stage: expert_stage_takes_narrow_windows(
+                &gpu.arch,
+                crate::expert_residency::expert_stage_placement_enabled(&gpu.arch),
+                hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+        };
+        if let Some(refusal) = split_admission.refusal() {
+            cpu_splice::log_split_refusal_once(refusal, &gpu.arch);
+        }
+        // Borrowed views of the owning arena's pinned host bytes: no expert is
+        // copied or allocated a second time.
+        let cpu_cold_owners = if split_admission.armed() {
+            match cpu_slab_owner::CpuSlabOwners::new(
+                gpu,
+                arena,
+                plan.bytes,
+                span_entries.iter().copied(),
+            ) {
+                Ok(owners) => Some(cpu_splice::HostSpanOwner::Slab(owners)),
+                Err(why) => {
+                    eprintln!(
+                        "  [moe-cpu-split] qwen4 layer {layer_label}: {why}; this layer \
+                         falls back to the PCIe mapped-expert read"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let runtime = Self {
             table,
             cache,
             router,
@@ -3636,7 +3707,7 @@ impl Qwen4MoeLayerRuntime {
             host_mapped,
             cpu_deferred_experts: false,
             cpu_expert_owners: None,
-            cpu_cold_owners: None,
+            cpu_cold_owners,
             cpu_split: None,
             tier: None,
             tier_identity: None,
@@ -3653,7 +3724,9 @@ impl Qwen4MoeLayerRuntime {
                 arena_bytes: plan.bytes,
             }),
         }
-        .seal_retained_identities()?)
+        .seal_retained_identities()?;
+        // The executor owns device storage, so it is created last.
+        runtime.attach_cpu_split(gpu, config)
     }
 
     /// Check every routed expert header of this layer for the symmetric grid
@@ -6636,13 +6709,14 @@ impl Qwen4GpuForward {
     ///
     /// `cpu-all-v1/<bitmap>` names the D1 layers; `cpu-tier-split-v1/<tier
     /// logical digest>/<bitmap>/hotset-sha256=<sidecar sha | unbound>` the D2
-    /// tier layers and `cpu-whole-split-v1/<bitmap>` the D2 un-tiered
-    /// whole-layer host aggregates; the parts join with `+`. Bitmaps are hex
+    /// tier layers, `cpu-whole-split-v1/<bitmap>` the D2 un-tiered whole-layer
+    /// host aggregates and `cpu-slab-split-v1/<bitmap>` the D2 host-mapped
+    /// expert-slab arenas; the parts join with `+`. Bitmaps are hex
     /// with bit `i` = layer label `i` over the layers that actually armed.
     /// Thread count and scheduling are not part of it: they change timing,
     /// never arithmetic order.
     pub(crate) fn host_exec_identity(&self) -> String {
-        use cpu_splice::SplitOwnerKind::{Tier, WholeLayer};
+        use cpu_splice::SplitOwnerKind::{Slab, Tier, WholeLayer};
         let cpu_all: Vec<usize> = self
             .moe
             .iter()
@@ -6652,6 +6726,7 @@ impl Qwen4GpuForward {
             .collect();
         let tier_split = self.split_layers_of(Tier);
         let whole_split = self.split_layers_of(WholeLayer);
+        let slab_split = self.split_layers_of(Slab);
         let tier = self
             .moe
             .iter()
@@ -6666,7 +6741,11 @@ impl Qwen4GpuForward {
             });
         cpu_splice::host_exec_identity(
             &cpu_all,
-            &[(Tier, &tier_split), (WholeLayer, &whole_split)],
+            &[
+                (Tier, &tier_split),
+                (WholeLayer, &whole_split),
+                (Slab, &slab_split),
+            ],
             tier.as_ref()
                 .map(|(digest, sidecar)| (digest, sidecar.as_deref())),
         )
@@ -6912,26 +6991,70 @@ impl Qwen4GpuForward {
                     hipfire_dispatch::cpu_exec::splice_pool_threads()
                 );
             }
-            let whole_labels: Vec<usize> = moe
-                .iter()
-                .flatten()
-                .filter(|layer| layer.cpu_split.is_some() && layer.tier.is_none())
-                .map(|layer| layer.label)
-                .collect();
-            if !whole_labels.is_empty() {
+            // Un-tiered owner kinds: every host-placed expert of an armed
+            // layer is cold.
+            for (kind, what) in [
+                (
+                    cpu_splice::SplitOwnerKind::WholeLayer,
+                    "whole-layer host aggregate",
+                ),
+                (cpu_splice::SplitOwnerKind::Slab, "host-mapped expert-slab"),
+            ] {
+                let labels: Vec<usize> = moe
+                    .iter()
+                    .flatten()
+                    .filter(|layer| {
+                        layer.cpu_split.is_some()
+                            && layer
+                                .cpu_cold_owners
+                                .as_ref()
+                                .is_some_and(|owners| owners.kind() == kind)
+                    })
+                    .map(|layer| layer.label)
+                    .collect();
+                if labels.is_empty() {
+                    continue;
+                }
                 let cold: usize = moe
                     .iter()
                     .flatten()
                     .filter_map(|layer| layer.cpu_cold_owners.as_ref())
-                    .filter(|owners| owners.kind() == cpu_splice::SplitOwnerKind::WholeLayer)
+                    .filter(|owners| owners.kind() == kind)
                     .map(cpu_splice::HostSpanOwner::cold_experts)
                     .sum();
                 eprintln!(
-                    "  [moe-cpu-split] qwen4: {} whole-layer host aggregate layers armed for the CPU split (cpu-whole-split-v1/{}; every host-placed expert is cold: {cold} expert slots; decode and <=4-row verify of those experts run on the CPU); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe, placement and host allocations are unchanged; layers whose host spans could not be resolved stay on PCIe",
-                    whole_labels.len(),
-                    cpu_splice::layer_bitmap_hex(&whole_labels),
+                    "  [moe-cpu-split] qwen4: {} {what} layers armed for the CPU split ({} layer bitmap {}; every host-placed expert is cold: {cold} expert slots; decode and <=4-row verify of those experts run on the CPU); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe, placement and host allocations are unchanged; layers whose host spans could not be resolved stay on PCIe",
+                    labels.len(),
+                    kind.label(),
+                    cpu_splice::layer_bitmap_hex(&labels),
                     hipfire_dispatch::cpu_exec::splice_pool_threads()
                 );
+                if kind == cpu_splice::SplitOwnerKind::Slab {
+                    // Name the CPU kernel of every format the armed slab
+                    // layers decode, so each run records its E8P/W3/MQ4 path.
+                    let dtypes: std::collections::BTreeSet<DType> = moe
+                        .iter()
+                        .flatten()
+                        .filter(|layer| layer.cpu_split.is_some())
+                        .filter_map(|layer| match layer.cpu_cold_owners.as_ref() {
+                            Some(cpu_splice::HostSpanOwner::Slab(owners)) => Some(owners),
+                            _ => None,
+                        })
+                        .flat_map(|owners| owners.dtypes())
+                        .collect();
+                    let kernels: Vec<String> = dtypes
+                        .into_iter()
+                        .map(|dtype| {
+                            let kernel =
+                                hipfire_dispatch::cpu_exec::cpu_kernel_for(dtype).unwrap_or("none");
+                            format!("{dtype:?}={kernel}")
+                        })
+                        .collect();
+                    eprintln!(
+                        "  [moe-cpu-split] qwen4: host-mapped expert-slab CPU kernels: {}",
+                        kernels.join(" ")
+                    );
+                }
             }
             if hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled() {
                 let slab_layers = moe
@@ -6940,7 +7063,7 @@ impl Qwen4GpuForward {
                     .filter(|layer| layer.slab.is_some())
                     .count();
                 eprintln!(
-                    "  [moe-cpu-expert] qwen4: {cpu_layers}/{} trunk layers armed for CPU routed FFN (armed layers use eager HIP for decode and <=4-row verify; wide prefill keeps PCIe); {slab_layers} expert-slab layers keep the slab GPU route (it has no masked route or cold-slot installation); EP, AWQ, unsupported dtypes and resident layers keep the GPU path; expert-tier/hot-set layers use the separate hot-set tier split (see [moe-cpu-split])",
+                    "  [moe-cpu-expert] qwen4: {cpu_layers}/{} trunk layers armed for CPU routed FFN (armed layers use eager HIP for decode and <=4-row verify; wide prefill keeps PCIe); {slab_layers} expert-slab layers never take this splice (a host-mapped slab arena uses the D2 split, see [moe-cpu-split]); EP, AWQ, unsupported dtypes and resident layers keep the GPU path; expert-tier/hot-set layers use the separate hot-set tier split (see [moe-cpu-split])",
                     moe_count
                 );
             }
@@ -11572,7 +11695,11 @@ mod tests {
         let narrow_stage = super::expert_stage_takes_narrow_windows("gfx1100", true, None);
         assert!(!narrow_stage);
 
-        for kind in [SplitOwnerKind::Tier, SplitOwnerKind::WholeLayer] {
+        for kind in [
+            SplitOwnerKind::Tier,
+            SplitOwnerKind::WholeLayer,
+            SplitOwnerKind::Slab,
+        ] {
             for d2 in [false, true] {
                 let admission = CpuSplitAdmission {
                     enabled: d2,

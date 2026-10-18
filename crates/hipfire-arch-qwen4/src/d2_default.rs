@@ -19,10 +19,12 @@
 //!
 //! Every Flash-Next trunk layer that places routed experts in host memory and
 //! the split can serve: a hot-set tier layer with at least one host-mapped
-//! expert, or an un-tiered aggregate layer whose two expert allocations are
-//! host-mapped QT44/QT53 (the shipped placement; the split reads those pinned
-//! bytes where they are, so nothing is copied or allocated twice and placement
-//! is whatever the loader resolved).
+//! expert, an un-tiered aggregate layer whose two expert allocations are
+//! host-mapped QT44/QT53 (the shipped placement), or an expert-slab layer whose
+//! arena is host-mapped and whose present experts all have a CPU decoder (the
+//! mq2 split's W3/E8P/MQ4 mix). The split reads those pinned bytes where they
+//! are, so nothing is copied or allocated twice and placement is whatever the
+//! loader resolved.
 //!
 //! # Selector
 //!
@@ -89,11 +91,15 @@
 //!   whose experts differ compare as time per GPU byte. GPU traffic is never
 //!   inferred from the CPU span length: where the CPU codec and the GPU read
 //!   format differ (a planar CPU codec against an MQ4 GPU read) the two byte
-//!   counts differ. On this base every host owner is a single codec read in
-//!   place, so the loader sets the GPU bytes to the CPU payload lengths
-//!   ([`ProbeExpert::same_bytes`]). An owner kind that does not exist on this
-//!   base (an expert-slab arena has no CPU span owner here) is not D2
-//!   eligible and stays on PCIe.
+//!   counts can differ. A tier or aggregate owner is one codec read in place,
+//!   so the loader sets the GPU bytes to the CPU payload lengths
+//!   ([`ProbeExpert::same_bytes`], valid only there). A host-mapped expert-slab
+//!   arena holds a codec per expert (MQ4, W3, E8P) and the GPU decode reads each
+//!   routed slot in place in that slot's own codec, so every slab slot carries
+//!   its own GPU read bytes, resolved from the slot's plan format (an E8P slot
+//!   1,305,600 B, an MQ4 slot 2,611,200 B for the mq2 shape) and never from the
+//!   CPU span ranges, the arena size, the manifest recipe or one constant for
+//!   the layer. A batch of mixed slots therefore compares time per GPU byte.
 //! * **`measured_link_rate`** is [`PROBE_SAMPLES`] live zero-copy reads
 //!   (`host_link::zero_copy_read_samples`: a GPU kernel reading
 //!   [`LINK_SAMPLE_BYTES`] of host-mapped memory over the link, the path
@@ -142,8 +148,8 @@ use hipfire_dispatch::cpu_exec::CpuMoeExpert;
 use rdna_compute::{DType, Gpu};
 
 use crate::config::Qwen4Config;
-use crate::gpu_forward::ColdLayerSource;
-use crate::weights::{Qwen4Weights, TensorRef};
+use crate::gpu_forward::{ColdLayerRefs, ColdLayerSource};
+use crate::weights::Qwen4Weights;
 
 /// Timed samples of each engine (and the launch-floor median). Odd, so the
 /// median is a sample.
@@ -533,36 +539,41 @@ pub fn calibration_verdict(unified: bool) -> (&'static str, String) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LayerHostFacts {
     /// `Some(any expert is host-mapped)` for a hot-set tier layer, `None` for
-    /// an un-tiered aggregate layer.
+    /// an un-tiered layer.
     tier_any_host: Option<bool>,
-    /// Un-tiered layer: both aggregate allocations are host-mapped.
+    /// Un-tiered aggregate layer: both aggregate allocations are host-mapped.
     aggregate_host: bool,
-    /// Un-tiered layer: gate/up QT44 and down QT53, the CPU-executed pair.
+    /// Un-tiered aggregate layer: gate/up QT44 and down QT53, the CPU-executed pair.
     aggregate_qt44_qt53: bool,
+    /// `Some((arena host-mapped, every present expert has a CPU decoder))` for
+    /// an expert-slab layer.
+    slab: Option<(bool, bool)>,
     /// `qwen4.expert_keep` payload (compact, original-id owners cannot index it).
     pruned: bool,
 }
 
 impl LayerHostFacts {
     fn qualifies(self) -> bool {
-        !self.pruned
-            && match self.tier_any_host {
-                Some(any_host) => any_host,
-                None => self.aggregate_host && self.aggregate_qt44_qt53,
-            }
+        match (self.tier_any_host, self.slab) {
+            (Some(any_host), _) => !self.pruned && any_host,
+            // A slab arena keeps a pruned expert at its original id (an absent
+            // zero-byte span), so pruning does not disqualify it.
+            (None, Some((host, cpu_executed))) => host && cpu_executed,
+            (None, None) => !self.pruned && self.aggregate_host && self.aggregate_qt44_qt53,
+        }
     }
 }
 
-/// One qualifying host layer: its trunk index and aggregate expert references.
+/// One qualifying host layer: its trunk index and the references that name its
+/// cold experts (aggregate tensors or the slab arena).
 struct HostSplitLayer<'w> {
     layer: usize,
-    gate_up: &'w TensorRef,
-    down: &'w TensorRef,
+    refs: ColdLayerRefs<'w>,
 }
 
 /// Trunk layers the split could serve that place experts in host memory.
-/// Single device, unpruned Flash-Next only: EP, pipeline bands, MTP-head and
-/// expert-slab (arena) layers never arm here.
+/// Single device Flash-Next only: EP, pipeline bands and MTP-head layers never
+/// arm here.
 fn host_split_layers<'w>(
     weights: &'w Qwen4Weights,
     config: &Qwen4Config,
@@ -571,13 +582,46 @@ fn host_split_layers<'w>(
     if !single_scope || weights.ep_placement().is_some() || !config.profile.is_flash_next() {
         return Vec::new();
     }
+    let arenas = match &weights.manifest.identity.recipe {
+        crate::weights::Qwen4TierRecipe::FlashNextSlab { arenas, .. } => Some(arenas),
+        _ => None,
+    };
     let mut layers = Vec::new();
     for layer in &weights.layer_refs {
         let Some(moe) = layer.ffn.moe() else { continue };
-        if layer.layer >= config.num_hidden_layers
-            || moe.expert_arena.is_some()
-            || moe.gate.name.starts_with("mtp.")
-        {
+        if layer.layer >= config.num_hidden_layers || moe.gate.name.starts_with("mtp.") {
+            continue;
+        }
+        if let Some(arena_ref) = moe.expert_arena.as_ref() {
+            let present: Vec<_> = arenas
+                .and_then(|plan| plan.layer(layer.layer))
+                .map(|plan| {
+                    plan.experts
+                        .iter()
+                        .filter(|expert| !expert.is_absent())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let facts = LayerHostFacts {
+                slab: Some((
+                    weights
+                        .resident(arena_ref)
+                        .is_ok_and(|arena| arena.buf.is_host_mapped()),
+                    !present.is_empty()
+                        && present.iter().all(|expert| {
+                            let (gate_up, down) = expert.effective_format().dtypes();
+                            hipfire_dispatch::cpu_exec::cpu_quant_for(gate_up).is_some()
+                                && hipfire_dispatch::cpu_exec::cpu_quant_for(down).is_some()
+                        }),
+                )),
+                ..LayerHostFacts::default()
+            };
+            if facts.qualifies() {
+                layers.push(HostSplitLayer {
+                    layer: layer.layer,
+                    refs: ColdLayerRefs::Arena(arena_ref),
+                });
+            }
             continue;
         }
         let pair = weights
@@ -593,13 +637,16 @@ fn host_split_layers<'w>(
             aggregate_qt44_qt53: pair.is_some_and(|(gu, dn)| {
                 gu.dtype == DType::MQ4G256V2 && dn.dtype == DType::MQ4G128V2
             }),
+            slab: None,
             pruned: config.kept_expert_ids(layer.layer, false).is_some(),
         };
         if facts.qualifies() {
             layers.push(HostSplitLayer {
                 layer: layer.layer,
-                gate_up: &moe.experts_gate_up,
-                down: &moe.experts_down,
+                refs: ColdLayerRefs::Aggregate {
+                    gate_up: &moe.experts_gate_up,
+                    down: &moe.experts_down,
+                },
             });
         }
     }
@@ -773,7 +820,7 @@ fn resolve_sources(
 ) -> Result<(Vec<ColdLayerSource>, Vec<(DType, DType)>), Unusable> {
     let mut sources = Vec::with_capacity(layers.len());
     for layer in layers {
-        match ColdLayerSource::new(gpu, weights, config, layer.layer, layer.gate_up, layer.down) {
+        match ColdLayerSource::new(gpu, weights, config, layer.layer, layer.refs) {
             Ok(source) => sources.push(source),
             Err(why) => {
                 eprintln!("  qwen4 D2 default: real-arm probe: {why}");
@@ -784,7 +831,10 @@ fn resolve_sources(
     if sources.is_empty() {
         return Err(Unusable::Arm);
     }
-    let mut codecs: Vec<(DType, DType)> = sources.iter().map(|source| source.codecs()).collect();
+    let mut codecs: Vec<(DType, DType)> = sources
+        .iter()
+        .flat_map(|source| source.codecs())
+        .collect();
     codecs.sort_unstable();
     codecs.dedup();
     Ok((sources, codecs))
@@ -808,12 +858,10 @@ fn measure_decode(
     let picked = round_robin_pick(
         sources.len(),
         first.experts(),
-        // Beta owners read one codec in place: the GPU reads the CPU payload bytes.
-        |layer, expert| {
-            sources[layer]
-                .cold_payload(expert)
-                .map(ProbeExpert::same_bytes)
-        },
+        // Each source resolves its slot's CPU payload and its GPU read bytes
+        // (the CPU length for a one-codec owner, the slot's own plan format
+        // for a slab).
+        |layer, expert| sources[layer].cold_probe(expert),
         need,
     )
     .map_err(|have| Unusable::ColdExperts { have, need })?;
@@ -1468,7 +1516,9 @@ mod tests {
 
     /// Which layers count as host split layers: a tier layer needs a
     /// host-mapped expert; an un-tiered layer needs both aggregates
-    /// host-mapped and the QT44/QT53 pair; a pruned layer never counts.
+    /// host-mapped and the QT44/QT53 pair; a slab layer needs a host-mapped
+    /// arena whose present experts all have a CPU decoder; a pruned tier or
+    /// aggregate layer never counts (a slab arena keeps pruned ids).
     #[test]
     fn host_split_layer_truth_table() {
         let tier = |any_host| LayerHostFacts {
@@ -1514,6 +1564,27 @@ mod tests {
                 "pruned payloads are compact: the original-id owners cannot index them"
             );
         }
+        let slab = |host, cpu| LayerHostFacts {
+            slab: Some((host, cpu)),
+            ..LayerHostFacts::default()
+        };
+        assert!(slab(true, true).qualifies());
+        assert!(
+            !slab(false, true).qualifies(),
+            "a device-resident arena has no host expert"
+        );
+        assert!(
+            !slab(true, false).qualifies(),
+            "a present expert without a CPU decoder keeps the layer on PCIe"
+        );
+        assert!(
+            LayerHostFacts {
+                pruned: true,
+                ..slab(true, true)
+            }
+            .qualifies(),
+            "a slab arena keeps pruned experts at their original ids"
+        );
     }
 
     /// The default is a per-load `bool`: deciding it, even ON, does not change

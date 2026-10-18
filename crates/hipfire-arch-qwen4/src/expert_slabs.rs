@@ -289,6 +289,19 @@ impl ExpertFormat {
     pub fn slab_bytes(self) -> usize {
         self.gate_up_bytes() + self.down_bytes()
     }
+
+    /// The `(gate_up, down)` dtypes of this format's two tensors (the
+    /// [`pair`](Self::pair) quant types). Which of them a device route serves
+    /// is the route's decision, not this mapping's.
+    pub const fn dtypes(self) -> (rdna_compute::DType, rdna_compute::DType) {
+        use rdna_compute::DType;
+        match self {
+            Self::Mq3I4 => (DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            Self::Mq2I4 => (DType::MQ2I4G128R256, DType::MQ2I4G128R128),
+            Self::E8pI4 => (DType::E8PI4G128R256, DType::E8PI4G128R128),
+            Self::Mq4Xts => (DType::MQ4G256V2, DType::MQ4G128V2),
+        }
+    }
 }
 
 /// `tensor_bytes` for a frozen FN shape, which is legal for the profile by
