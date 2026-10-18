@@ -954,6 +954,13 @@ pub struct AdmissionInputs {
     /// The Hold 1 primitive self-tests' own peak device bytes
     /// ([`diagnostic_budget_bytes`]); 0 for the product purpose.
     pub diagnostic_bytes: u64,
+    /// The HIP runtime overhead the base reserve ([`Self::base_reserve`])
+    /// already includes (`AutoReserve.census.runtime`); 0 where it does not
+    /// model one. The S1 runtime budget only supplements what is missing:
+    /// `S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(base_runtime_reserved_bytes)`,
+    /// so the combined runtime reservation is the exact max of the two, never
+    /// their sum.
+    pub base_runtime_reserved_bytes: u64,
     /// The incumbent's requested prefill chunk resolved at load: the non-S1
     /// checkpoint cadence (8192 on the narrow target). NEVER used for
     /// placement or scratch; those stay on the 1,536-row tile.
@@ -1069,7 +1076,7 @@ pub fn census_of(
             "boundary state",
         )
         .and_then(|stages| checked_add(stages, inputs.pending_save_bytes, "boundary state"))?,
-        runtime_overhead: S1_RUNTIME_OVERHEAD_BYTES,
+        runtime_overhead: S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(inputs.base_runtime_reserved_bytes),
         diagnostic: inputs.diagnostic_bytes,
     };
     Ok((pages, arena, census))
@@ -1160,6 +1167,12 @@ pub struct LoadFacts<'a> {
     /// historical-floor-or-census figure) at the incumbent placement chunk
     /// (sizes the logged baseline layer count only).
     pub incumbent_reserve: u64,
+    /// The HIP runtime overhead the base reserve already charges
+    /// (`AutoReserve.census.runtime`, [`crate::expert_residency::runtime_overhead_bytes`];
+    /// 0 where the census does not model it). A fact of the reserve, never an
+    /// arch or card test: the S1 runtime budget is credited by it
+    /// ([`SlowlinkCensus::runtime_overhead`]).
+    pub base_runtime_reserved_bytes: u64,
     pub state_format: crate::Qwen4StateFormat,
     pub native_mtp: bool,
     pub window_rows: usize,
@@ -1247,6 +1260,7 @@ pub fn load_admission_inputs(
         fixed_state_bytes,
         pending_save_bytes,
         diagnostic_bytes,
+        base_runtime_reserved_bytes: facts.base_runtime_reserved_bytes,
         checkpoint_stride_rows: facts.checkpoint_stride_rows,
         window_rows: facts.window_rows,
         link_gbps,
@@ -1426,6 +1440,9 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
     };
     // Beta's single incumbent helper (probes the host link once, cached).
     let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
+    // The tile reserve once: its census total sizes the placement and its
+    // runtime charge is the credit the S1 runtime budget supplements.
+    let tile_reserve = reserve_at(S1_TILE_ROWS)?;
     Ok(LoadFacts {
         purpose: load.purpose,
         config: load.config,
@@ -1435,7 +1452,8 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
         // S1 sizes its 1,536-row tile from the bottom-up census alone
         // (`AutoReserve::placement_bytes(true)`); the incumbent/log baseline
         // keeps `bytes()`, the larger of the historical floor and the census.
-        tile_reserve: reserve_at(S1_TILE_ROWS)?.placement_bytes(true),
+        tile_reserve: tile_reserve.placement_bytes(true),
+        base_runtime_reserved_bytes: tile_reserve.census.runtime,
         incumbent_reserve: reserve_at(placement_chunk)?.placement_bytes(false),
         state_format: load.state_format,
         native_mtp: load.native_mtp,
@@ -1586,6 +1604,7 @@ mod tests {
             fixed_state_bytes: 64 * MIB,
             pending_save_bytes: 4 * 2560 * 4,
             diagnostic_bytes: 0,
+            base_runtime_reserved_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -1642,7 +1661,7 @@ mod tests {
             + arena.total_bytes
             + S1_MAX_BOUNDARY_SNAPSHOTS as u64 * inputs.fixed_state_bytes
             + inputs.pending_save_bytes
-            + S1_RUNTIME_OVERHEAD_BYTES
+            + S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(inputs.base_runtime_reserved_bytes)
             + inputs.diagnostic_bytes
     }
 
@@ -2071,6 +2090,7 @@ mod tests {
             fixed_state_bytes: stage,
             pending_save_bytes: 0,
             diagnostic_bytes: 0,
+            base_runtime_reserved_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -2188,6 +2208,7 @@ mod tests {
             fixed_state_bytes: stage,
             pending_save_bytes: 0,
             diagnostic_bytes,
+            base_runtime_reserved_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS,
             link_gbps: 7.09,
@@ -2274,6 +2295,75 @@ mod tests {
             .expect("still fits the card");
         assert_eq!(projected_without, 15_432_896);
         assert!(projected_without < MARGIN);
+    }
+
+    /// The generic runtime budget supplements what the base reserve already
+    /// charges and never doubles it: the combined runtime reservation (the
+    /// base census's `runtime` plus the S1 `runtime_overhead` term) is exactly
+    /// `max(base, S1_RUNTIME_OVERHEAD_BYTES)` for a base of 0, below, at and
+    /// above 1 GiB, with the base reserve actually carrying the credited bytes
+    /// (`AutoReserve.census.runtime`), so the same XTX input (base 0) still
+    /// gets the full 1 GiB and a capable path never pays 1 GiB twice. No arch,
+    /// card or host name is consulted.
+    #[test]
+    fn slowlink_residency_runtime_budget_supplements_the_base_runtime_without_double_counting() {
+        use crate::expert_residency::{AutoReserve, ReserveCensus, WORKSPACE_TERM_COUNT};
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        // The measured capable-path HIP runtime charge.
+        const CAPABLE_RUNTIME: u64 = 1_476_395_008;
+        let non_runtime = 2_237_111_724u64;
+        let config = crate::config::compact_test_config();
+        for base_runtime in [0, 512 * MIB, GIB - 1, GIB, GIB + 1, CAPABLE_RUNTIME, 2 * GIB] {
+            // The base reserve really carries the credited runtime bytes.
+            let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+            workspace[0].1 = non_runtime;
+            let reserve = AutoReserve::new(
+                None,
+                ReserveCensus {
+                    qsa_context: 0,
+                    state: 0,
+                    forward: 0,
+                    f16_shadows: 0,
+                    workspace,
+                    qsa_selector: 0,
+                    mtp: 0,
+                    gather: 0,
+                    runtime: base_runtime,
+                },
+            )
+            .unwrap();
+            assert_eq!(reserve.census_total, non_runtime + base_runtime);
+            let inputs = AdmissionInputs {
+                geometry: ModelGeometry::from_config(&config).unwrap(),
+                free: 40 * GIB,
+                non_expert: 5_364_055_296,
+                layer_expert_bytes: GATE_UP_LAYER + DOWN_LAYER,
+                gate_up_layer_bytes: GATE_UP_LAYER,
+                down_layer_bytes: DOWN_LAYER,
+                trunk_layers: config.num_hidden_layers,
+                base_reserve: reserve.placement_bytes(true),
+                baseline_layers: 0,
+                fixed_state_bytes: 34_128_016,
+                pending_save_bytes: 0,
+                diagnostic_bytes: 0,
+                base_runtime_reserved_bytes: reserve.census.runtime,
+                checkpoint_stride_rows: 8192,
+                window_rows: S1_WINDOW_ROWS,
+                link_gbps: 7.09,
+            };
+            let (_, _, census) = census_of(&inputs).unwrap();
+            // The supplement is exactly what the base lacks.
+            assert_eq!(census.runtime_overhead, GIB.saturating_sub(base_runtime));
+            // Base census runtime + supplement == max(base, 1 GiB): no double count.
+            assert_eq!(
+                inputs.base_reserve - non_runtime + census.runtime_overhead,
+                base_runtime.max(S1_RUNTIME_OVERHEAD_BYTES),
+                "base runtime {base_runtime}"
+            );
+            // The census budget terms stay itemised.
+            assert_eq!(census.budget_terms()[0].1, census.runtime_overhead);
+        }
     }
 
     /// Every non-S1 load (the incumbent, fast links, unified memory, every
@@ -2383,6 +2473,7 @@ mod tests {
             fixed_state_bytes: stage,
             pending_save_bytes: 0,
             diagnostic_bytes: 0,
+            base_runtime_reserved_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: S1_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
