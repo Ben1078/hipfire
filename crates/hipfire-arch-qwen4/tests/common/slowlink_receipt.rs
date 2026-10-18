@@ -2061,11 +2061,8 @@ pub fn profile_shape_problems(manifest: &Value) -> Vec<String> {
                 profile_path(profile, "sequential_diag_bytes")
             ));
         }
-        for key in ["s1_tile_census_terms", "s1_extras_terms"] {
-            if matches!(get(manifest, &profile_path(profile, key)), None | Some(Value::Null)) {
-                bad.push(format!("manifest {} missing", profile_path(profile, key)));
-            }
-        }
+        bad.extend(profile_terms_problems(manifest, profile, true));
+        bad.extend(profile_terms_problems(manifest, profile, false));
         if get(manifest, &profile_path(profile, "purpose")).and_then(Value::as_str)
             != Some(profile)
         {
@@ -2142,6 +2139,76 @@ pub fn profile_shape_problems(manifest: &Value) -> Vec<String> {
                 "manifest memory_ledger.device_owned_bytes {:?} != the MAX {peak} of the per-purpose owned bytes",
                 u64_at(manifest, "memory_ledger.device_owned_bytes")
             ));
+        }
+    }
+    bad
+}
+
+/// The name of the one census term that carries the model-lifetime cold
+/// BF16-to-F16 weight shadow bound (the admission emitter's key).
+pub const COLD_F16_TERM: &str = "f16_weight_shadow_bytes";
+
+/// One profile's term array (`[{"name","bytes"}]`, unique names, checked u64
+/// sum equal to its total). The cold F16 shadow term appears exactly once in
+/// the tile census terms and never in the extras, and when the profile also
+/// states `f16_shadow_cold_bound_bytes` it must be that one term, so the cold
+/// bound is charged once and never twice.
+pub fn profile_terms_problems(manifest: &Value, profile: &str, census: bool) -> Vec<String> {
+    let (terms_key, total_key) = if census {
+        ("s1_tile_census_terms", "s1_tile_census_bytes")
+    } else {
+        ("s1_extras_terms", "s1_extras_bytes")
+    };
+    let path = profile_path(profile, terms_key);
+    let Some(array) = get(manifest, &path).and_then(Value::as_array) else {
+        return vec![format!("manifest {path} is not an array of {{name, bytes}} terms")];
+    };
+    let mut bad = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    let mut sum = Some(0u64);
+    let mut cold: Vec<u64> = Vec::new();
+    for (index, term) in array.iter().enumerate() {
+        let name = term.get("name").and_then(Value::as_str).filter(|n| !n.is_empty());
+        let bytes = term.get("bytes").and_then(Value::as_u64);
+        let (Some(name), Some(bytes)) = (name, bytes) else {
+            bad.push(format!(
+                "manifest {path}[{index}] is not {{\"name\": non-empty string, \"bytes\": u64}}"
+            ));
+            continue;
+        };
+        if names.contains(&name) {
+            bad.push(format!("manifest {path} repeats the term name {name:?}"));
+        }
+        names.push(name);
+        sum = sum.and_then(|s| s.checked_add(bytes));
+        if name == COLD_F16_TERM {
+            cold.push(bytes);
+        }
+    }
+    match (sum, u64_at(manifest, &profile_path(profile, total_key))) {
+        (Some(sum), Some(total)) if sum == total => {}
+        (Some(sum), total) => bad.push(format!(
+            "manifest {path} sums to {sum} B, not {} {total:?}",
+            profile_path(profile, total_key)
+        )),
+        (None, _) => bad.push(format!("manifest {path} sum overflows u64")),
+    }
+    let want = usize::from(census);
+    if cold.len() != want {
+        bad.push(format!(
+            "manifest {path} carries {} {COLD_F16_TERM} term(s), expected exactly {want}",
+            cold.len()
+        ));
+    }
+    if census {
+        let stated = get(manifest, &profile_path(profile, "f16_shadow_cold_bound_bytes"));
+        if let Some(stated) = stated.filter(|v| !v.is_null()) {
+            if cold.len() != 1 || stated.as_u64() != Some(cold[0]) {
+                bad.push(format!(
+                    "manifest {} {stated} != the one {COLD_F16_TERM} term {cold:?}",
+                    profile_path(profile, "f16_shadow_cold_bound_bytes")
+                ));
+            }
         }
     }
     bad

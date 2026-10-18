@@ -19,8 +19,13 @@
 //!   slowlink_prefill_hw --ignored --test-threads=1 --exact <test>
 //! ```
 //!
-//! `HIPFIRE_SLOWLINK_HW_ROWS` (default 3400, two full tiles and a tail) sets
-//! the prompt length; the 16384-row one-window proof is the gate's `state`
+//! `HIPFIRE_SLOWLINK_HW_ROWS` (default 3400, four full 768-row product tiles
+//! and a tail; it must exceed the 1,536-row named incumbent-bypass bound) sets
+//! the prompt length. Every product test loads the `Product` purpose and
+//! judges its receipts against that profile's tile (`purpose_tile_rows`, read
+//! back from the bundle), never the generic `Limits::default()`; the
+//! primitives test loads `PrimitiveSelftest` (512 rows) and proves kernel
+//! correctness only. The 16384-row one-window proof is the gate's `state`
 //! mode (`examples/qwen4_slowlink_gate.rs`). The un-ignored tests are
 //! GPU-free and prove the shared receipt validation rejects what the plan
 //! requires it to reject.
@@ -86,9 +91,13 @@ struct Hw {
     vocab: usize,
     eos: u32,
     rows: usize,
+    /// The admitted purpose profile's tile, read from the loaded bundle.
+    tile: u64,
 }
 
-fn load() -> Hw {
+type Purpose = hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose;
+
+fn load(purpose: Purpose) -> Hw {
     require_hold();
     // Before the first config read of this process.
     match std::env::var(ROUTE_ENV) {
@@ -104,9 +113,11 @@ fn load() -> Hw {
     let rows = std::env::var(ROWS_ENV)
         .ok()
         .map_or(3400, |v| v.parse::<usize>().expect("rows"));
+    // The named incumbent bypass covers requests of at most 1,536 rows, so a
+    // forced S1 request must be longer than that (several product tiles).
     assert!(
         rows > MAX_TILE_ROWS as usize,
-        "the prompt must exceed one tile"
+        "the prompt must exceed the named incumbent-bypass bound"
     );
     let mut gpu = Gpu::init().expect("GPU");
     let SlowlinkLoaded {
@@ -122,12 +133,24 @@ fn load() -> Hw {
         &model,
         MAX_SEQ,
         None,
-        hipfire_arch_qwen4::slowlink_admission::AdmissionPurpose::Product,
+        purpose,
     )
     .expect("load");
     assert!(
         slowlink_profile && resident_layers >= MIN_RESIDENT_LAYERS as usize,
         "the forced route was not admitted (placement {placement}, resident layers {resident_layers})"
+    );
+    // The bundle's actual admitted profile must be this purpose's, at exactly
+    // the tile the loader derives for it.
+    let (admitted_purpose, tile) = {
+        let profile = bundle.slowlink_profile().expect("an admitted S1 profile");
+        (profile.purpose, profile.tile_rows as u64)
+    };
+    assert_eq!(admitted_purpose, purpose, "the load admitted another purpose");
+    assert_eq!(
+        tile,
+        hipfire_arch_qwen4::slowlink_admission::purpose_tile_rows(purpose) as u64,
+        "the admitted tile is not the purpose's tile"
     );
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     Hw {
@@ -137,6 +160,7 @@ fn load() -> Hw {
         vocab,
         eos: eos_token,
         rows,
+        tile,
     }
 }
 
@@ -182,9 +206,13 @@ impl Hw {
     }
 }
 
-fn assert_valid(receipt: &Option<Value>, rows: usize) {
+/// A receipt is valid only at the admitted purpose's tile (`tile`, read from
+/// the loaded bundle and checked against `purpose_tile_rows`), never the generic
+/// default upper bound.
+fn assert_valid(receipt: &Option<Value>, rows: usize, tile: u64) {
     let limits = Limits {
         require_single_window: rows as u64 == TARGET_ROWS,
+        expected_tile_rows: Some(tile),
         ..Limits::default()
     };
     let bad = validate(receipt.as_ref(), Expect::LayerMajor, &limits);
@@ -199,7 +227,9 @@ fn assert_valid(receipt: &Option<Value>, rows: usize) {
 #[test]
 #[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
 fn slowlink_primitives_pass_on_the_admitted_profile() {
-    let mut hw = load();
+    // The self-test runs on its own purpose's profile (512 rows, with the
+    // diagnostic reserve): kernel correctness only, not a product-shape claim.
+    let mut hw = load(Purpose::PrimitiveSelftest);
     let report = hw
         .bundle
         .slowlink_primitive_selftest(&mut hw.gpu, &PRIMITIVE_CASES)
@@ -222,14 +252,14 @@ fn slowlink_primitives_pass_on_the_admitted_profile() {
 #[test]
 #[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
 fn slowlink_repeated_epochs_are_deterministic_with_one_sweep_each() {
-    let mut hw = load();
+    let mut hw = load(Purpose::Product);
     let ids = prompt(0x51, hw.rows);
     let first = hw.prefill(&ids);
-    assert_valid(&first.2, hw.rows);
+    assert_valid(&first.2, hw.rows, hw.tile);
     let submitted = u64_at(first.2.as_ref().unwrap(), "submitted_bytes");
     for epoch in 1..4 {
         let again = hw.prefill(&ids);
-        assert_valid(&again.2, hw.rows);
+        assert_valid(&again.2, hw.rows, hw.tile);
         assert_eq!(
             again.0["combined"], first.0["combined"],
             "epoch {epoch}: state digest"
@@ -253,10 +283,10 @@ fn slowlink_repeated_epochs_are_deterministic_with_one_sweep_each() {
 #[test]
 #[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
 fn slowlink_injected_failures_abort_cleanly_and_rerun_matches() {
-    let mut hw = load();
+    let mut hw = load(Purpose::Product);
     let ids = prompt(0x52, hw.rows);
     let clean = hw.prefill(&ids);
-    assert_valid(&clean.2, hw.rows);
+    assert_valid(&clean.2, hw.rows, hw.tile);
     for point in FAILURE_POINTS {
         hw.bundle.reset(&mut hw.gpu).expect("reset");
         hw.bundle.slowlink_inject_failure(Some(point)).expect("arm");
@@ -272,7 +302,7 @@ fn slowlink_injected_failures_abort_cleanly_and_rerun_matches() {
         assert_eq!(consumed, Some(true), "{point}: injection not consumed");
         hw.bundle.slowlink_inject_failure(None).expect("clear");
         let again = hw.prefill(&ids);
-        assert_valid(&again.2, hw.rows);
+        assert_valid(&again.2, hw.rows, hw.tile);
         assert_eq!(
             again.0["combined"], clean.0["combined"],
             "{point}: state after abort + rerun"
@@ -291,7 +321,7 @@ fn slowlink_injected_failures_abort_cleanly_and_rerun_matches() {
 #[test]
 #[ignore = "needs a HIP GPU, a narrow-link host and HIPFIRE_SLOWLINK_HW_MODEL"]
 fn slowlink_decode_after_prefill_replays_the_eager_ids() {
-    let mut hw = load();
+    let mut hw = load(Purpose::Product);
     let ids = prompt(0x53, hw.rows);
     hw.gpu.replay.configure_model_default(true);
     hw.prefill(&ids);
@@ -369,4 +399,43 @@ fn slowlink_receipt_a_short_forced_bypass_must_name_its_reason() {
     let mut named = incumbent;
     named["bypass_reason"] = json!("request shorter than the S1 qualification");
     assert!(validate_forced_short(Some(&named), &Limits::default()).is_empty());
+}
+
+/// The hardware product proof is judged against the admitted purpose's tile,
+/// never the generic `Limits::default()` (shape-agnostic, historical units): a
+/// product receipt at the old 1,536 rows or at the primitive 512 rows fails.
+#[test]
+fn slowlink_receipt_product_hardware_limits_name_the_admitted_purpose_tile() {
+    use hipfire_arch_qwen4::slowlink_admission::{purpose_tile_rows, AdmissionPurpose};
+    let receipt = |tile: u64| {
+        json!({
+            "schema": RECEIPT_SCHEMA, "route": "layer-major", "selected_by": "env1", "bypass_reason": null,
+            "entry_pos": 0, "prompt_rows": 3400, "windows": [{"start": 0, "rows": 3400}], "launch_cuts": [],
+            "tile_rows": tile, "retained_scratch_rows": tile, "sweeps": 1, "resident_layers": 10, "host_layers": 38,
+            "host_expert_bytes_total": 50_803_507_200u64, "submitted_bytes": 50_803_507_200u64,
+            "useful_bytes": 50_000_000_000u64, "unused_prefetched_bytes": 803_507_200u64,
+            "reserve": {"tile": 1u64 << 30, "arena": 1u64 << 29, "ring": 167_772_160u64,
+                        "lookahead": 1_336_000_000u64, "tables": 1u64 << 20, "total": 4_000_000_000u64},
+            "spans_ms": {"wall": 1.0, "copy": 0.5, "compute": 0.5, "route_barrier": 0.0, "nonexpert": 0.1},
+            "overlap": {"cross_layer_intersections": 1, "cross_layer_overlap_ms": 1.0, "copy_idle_ms": 0.0,
+                        "page_full_stalls": 0, "copy_starved_stalls": 0},
+            "peak_vram_bytes": 1,
+        })
+    };
+    let product = purpose_tile_rows(AdmissionPurpose::Product) as u64;
+    let primitive = purpose_tile_rows(AdmissionPurpose::PrimitiveSelftest) as u64;
+    assert_eq!((product, primitive), (768, 512));
+    let bound = |tile: u64| Limits {
+        expected_tile_rows: Some(tile),
+        ..Limits::default()
+    };
+    assert!(validate(Some(&receipt(768)), Expect::LayerMajor, &bound(product)).is_empty());
+    for wrong in [1536u64, 1024, primitive] {
+        assert!(
+            !validate(Some(&receipt(wrong)), Expect::LayerMajor, &bound(product)).is_empty(),
+            "a product receipt at {wrong} rows must fail"
+        );
+    }
+    // The shape-agnostic default stays only for historical units.
+    assert!(validate(Some(&receipt(1536)), Expect::LayerMajor, &Limits::default()).is_empty());
 }

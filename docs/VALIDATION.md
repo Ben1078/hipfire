@@ -464,6 +464,16 @@ bundle's actually admitted purpose, tile, window rows and resident layers equal
 the selected sealed profile. A product receipt at 1,536, 1,024 or 512 rows is
 therefore a failure even though it is under the historical bound. A manifest
 without both profiles describes an older binary and is refused.
+Each profile's `s1_tile_census_terms` and `s1_extras_terms` are arrays of
+`{name, bytes}` with unique names whose checked integer sums equal
+`s1_tile_census_bytes` and `s1_extras_bytes`; the cold BF16-to-F16 shadow bound is
+exactly one `f16_weight_shadow_bytes` term in the tile census terms and none in
+the extras, and a stated `f16_shadow_cold_bound_bytes` must equal that one term,
+so it is never charged twice. The hardware tests (`slowlink_prefill_hw`) load the
+`Product` purpose for state, determinism, injection and replay and judge receipts
+at the bundle's admitted product tile; only the primitives test loads
+`PrimitiveSelftest`. The generic `Limits::default()` remains for GPU-free
+shape-agnostic units only.
 The generic 1,536-row
 limit (`Limits::default`) remains only for historical validators and as the
 bound of the approved named incumbent bypass for requests of at most 1,536 rows,

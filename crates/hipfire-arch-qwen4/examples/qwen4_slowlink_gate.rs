@@ -2865,8 +2865,17 @@ mod slowlink_receipt_tests {
             "purpose": purpose, "tile_rows": tile, "resident_expert_layers": 10,
             "window_rows": 16384, "page_count": 18,
             "device_weights_bytes": weights,
-            "s1_tile_census_bytes": census, "s1_tile_census_terms": {"tile": census},
-            "s1_extras_bytes": extras, "s1_extras_terms": {"extras": extras},
+            "s1_tile_census_bytes": census,
+            "s1_tile_census_terms": [
+                {"name": "f16_weight_shadow_bytes", "bytes": census / 2},
+                {"name": "tile_workspace_bytes", "bytes": census - census / 2},
+            ],
+            "f16_shadow_cold_bound_bytes": census / 2,
+            "s1_extras_bytes": extras,
+            "s1_extras_terms": [
+                {"name": "ring_bytes", "bytes": extras / 2},
+                {"name": "route_storage_bytes", "bytes": extras - extras / 2},
+            ],
             "device_core_bytes": core, "sequential_diag_bytes": diag,
             "device_owned_bytes": core + diag, "runtime_budget_bytes": 24 * GIB,
             "safety_margin_bytes": GIB / 2,
@@ -4658,6 +4667,92 @@ mod slowlink_receipt_tests {
             true,
             "the product profile has no diagnostic bytes to decompose"
         );
+    }
+
+    #[test]
+    fn slowlink_receipt_profile_terms_sum_exactly_and_charge_the_cold_f16_once() {
+        let m = manifest();
+        for profile in [PROFILE_PRODUCT, PROFILE_PRIMITIVE] {
+            assert!(profile_terms_problems(&m, profile, true).is_empty());
+            assert!(profile_terms_problems(&m, profile, false).is_empty());
+        }
+        let terms = |m: &mut Value, profile: &str, key: &str| -> Vec<Value> {
+            m["memory_ledger"]["profiles"][profile][key]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        for profile in [PROFILE_PRODUCT, PROFILE_PRIMITIVE] {
+            // A term sum that is off by one byte, in either array, fails.
+            for (key, census) in [("s1_tile_census_terms", true), ("s1_extras_terms", false)] {
+                let mut m = manifest();
+                let mut array = terms(&mut m, profile, key);
+                let last = array.len() - 1;
+                let bytes = array[last]["bytes"].as_u64().unwrap();
+                array[last]["bytes"] = json!(bytes + 1);
+                m["memory_ledger"]["profiles"][profile][key] = json!(array);
+                let bad = profile_terms_problems(&m, profile, census);
+                assert!(bad.iter().any(|p| p.contains("sums to")), "{profile} {key}: {bad:?}");
+                assert!(!manifest_problems(&m, &observed()).is_empty());
+            }
+            // The cold F16 term must appear exactly once in the census terms.
+            let mut none = manifest();
+            let kept: Vec<Value> = terms(&mut none, profile, "s1_tile_census_terms")
+                .into_iter()
+                .filter(|t| t["name"] != COLD_F16_TERM)
+                .collect();
+            none["memory_ledger"]["profiles"][profile]["s1_tile_census_terms"] = json!(kept);
+            assert!(profile_terms_problems(&none, profile, true)
+                .iter()
+                .any(|p| p.contains("expected exactly 1")));
+            let mut twice = manifest();
+            let mut array = terms(&mut twice, profile, "s1_tile_census_terms");
+            let cold = array.iter().find(|t| t["name"] == COLD_F16_TERM).unwrap().clone();
+            array.push(cold);
+            twice["memory_ledger"]["profiles"][profile]["s1_tile_census_terms"] = json!(array);
+            let bad = profile_terms_problems(&twice, profile, true);
+            assert!(bad.iter().any(|p| p.contains("repeats the term name")), "{bad:?}");
+            assert!(bad.iter().any(|p| p.contains("expected exactly 1")), "{bad:?}");
+            // ...and never in the extras (no duplicate physical charge).
+            let mut extra = manifest();
+            let mut array = terms(&mut extra, profile, "s1_extras_terms");
+            array.push(json!({"name": COLD_F16_TERM, "bytes": 0}));
+            extra["memory_ledger"]["profiles"][profile]["s1_extras_terms"] = json!(array);
+            assert!(profile_terms_problems(&extra, profile, false)
+                .iter()
+                .any(|p| p.contains("expected exactly 0")));
+            // The stated cold bound is that one term, and nothing else.
+            let stated = manifest_profile_u64(&m, profile, "f16_shadow_cold_bound_bytes");
+            assert!(stated.is_some_and(|n| n > 0));
+            let mut wrong = manifest();
+            wrong["memory_ledger"]["profiles"][profile]["f16_shadow_cold_bound_bytes"] =
+                json!(stated.unwrap() + 1);
+            assert!(profile_terms_problems(&wrong, profile, true)
+                .iter()
+                .any(|p| p.contains("f16_shadow_cold_bound_bytes")));
+            // Malformed terms fail: not an array, a missing name or bytes, a
+            // negative or fractional byte count, an empty name.
+            for bad_terms in [
+                json!({"tile": 1}),
+                json!([{"bytes": 1}]),
+                json!([{"name": "a"}]),
+                json!([{"name": "a", "bytes": -1}]),
+                json!([{"name": "a", "bytes": 1.5}]),
+                json!([{"name": "", "bytes": 1}]),
+            ] {
+                let mut m = manifest();
+                m["memory_ledger"]["profiles"][profile]["s1_extras_terms"] = bad_terms;
+                assert!(!profile_terms_problems(&m, profile, false).is_empty());
+            }
+            // A u64 overflow of the term sum refuses rather than wrapping.
+            let mut big = manifest();
+            big["memory_ledger"]["profiles"][profile]["s1_extras_terms"] = json!([
+                {"name": "a", "bytes": u64::MAX}, {"name": "b", "bytes": 1}
+            ]);
+            assert!(profile_terms_problems(&big, profile, false)
+                .iter()
+                .any(|p| p.contains("overflows")));
+        }
     }
 
     #[test]
