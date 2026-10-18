@@ -464,9 +464,44 @@ pub fn qwen4_forward_device_bytes(
     mode: Qwen4ForwardScratchMode,
 ) -> Option<u64> {
     let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows, mode).ok()?;
-    let spec = qwen4_spec_logit_rows(rows)
-        .checked_mul(config.vocab_size.checked_mul(4)?.checked_add(4)?)?;
-    scratch.checked_add(spec as u64)
+    let [logits, argmax] = qwen4_spec_buffer_bytes(config, rows)?;
+    scratch.checked_add(logits)?.checked_add(argmax)
+}
+
+/// Bytes of the two speculative buffers `Qwen4Bundle::attach_forward`
+/// allocates beside the scratch for a `rows`-row forward: the F32 logits
+/// (`spec_rows * vocab * 4`) and the i32 argmax (`spec_rows * 4`), each one
+/// `gpu.zeros` allocation. `None` on arithmetic overflow.
+fn qwen4_spec_buffer_bytes(config: &Qwen4Config, rows: usize) -> Option<[u64; 2]> {
+    let spec_rows = qwen4_spec_logit_rows(rows) as u64;
+    let logits = spec_rows.checked_mul((config.vocab_size as u64).checked_mul(4)?)?;
+    let argmax = spec_rows.checked_mul(std::mem::size_of::<i32>() as u64)?;
+    Some([logits, argmax])
+}
+
+/// Every device allocation [`qwen4_forward_device_bytes`] counts, one entry
+/// per actual allocation: the owning scratch slots of the whole-model plan
+/// (borrowed alias views and zero-byte slots are not allocations), then the
+/// speculative logits and argmax buffers. The entries sum to
+/// [`qwen4_forward_device_bytes`]; `None` on any overflow or a refused plan.
+/// CPU-only: plans, never touches a device.
+pub(crate) fn qwen4_forward_allocation_sizes(
+    config: &Qwen4Config,
+    rows: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Option<Vec<u64>> {
+    let (slots, _) = Qwen4GpuForwardScratch::plan(config, rows, mode).ok()?;
+    let [logits, argmax] = qwen4_spec_buffer_bytes(config, rows)?;
+    let mut sizes = Vec::with_capacity(slots.len() + 2);
+    for bytes in Qwen4GpuForwardScratch::owning_slot_bytes(&slots) {
+        sizes.push(bytes.ok()?);
+    }
+    for bytes in [logits, argmax] {
+        if bytes > 0 {
+            sizes.push(bytes);
+        }
+    }
+    Some(sizes)
 }
 
 /// Free device memory a chunk rung must leave beside its chunk-sized
@@ -5590,14 +5625,24 @@ impl Qwen4GpuForwardScratch {
         scope: &Qwen4BandScope,
     ) -> Result<u64, Qwen4GpuForwardError> {
         let (slots, _) = Self::plan_scoped(config, max_chunk, mode, scope)?;
+        Self::owning_slot_bytes(&slots).try_fold(0u64, |total, bytes| {
+            total
+                .checked_add(bytes?)
+                .ok_or_else(|| invalid("scratch device bytes overflow"))
+        })
+    }
+
+    /// Bytes of each owning slot of a plan, the only slots
+    /// [`Self::allocate`] hands to `gpu.zeros` (borrowed views and absent
+    /// zero-element fields are not allocations).
+    fn owning_slot_bytes(
+        slots: &[ScratchSlot],
+    ) -> impl Iterator<Item = Result<u64, Qwen4GpuForwardError>> + '_ {
         slots
             .iter()
             .filter(|slot| slot.owner.is_none())
-            .try_fold(0u64, |total, slot| {
-                total
-                    .checked_add(slot.bytes()? as u64)
-                    .ok_or_else(|| invalid("scratch device bytes overflow"))
-            })
+            .map(|slot| slot.bytes().map(|bytes| bytes as u64))
+            .filter(|bytes| !matches!(bytes, Ok(0)))
     }
 
     pub fn new(
@@ -11878,6 +11923,74 @@ mod tests {
             qwen4_forward_device_bytes(&config, 8192, Mode::FnSymGfx1201)
                 <= qwen4_forward_device_bytes(&config, 4096, Mode::Full)
         );
+    }
+
+    /// The allocation inventory is the owner's own plan: one entry per owning
+    /// non-empty scratch slot (borrowed alias views omitted) plus the spec
+    /// logits and argmax, and it sums to the byte query admission uses.
+    #[test]
+    fn allocation_sizes_sum_to_the_forward_device_bytes() {
+        let config = fn_config();
+        for mode in [Mode::Full, Mode::FnSymGfx1201] {
+            for rows in [1usize, 4, 512, 768, 1536, 4096, 8192] {
+                let sizes = super::qwen4_forward_allocation_sizes(&config, rows, mode);
+                let bytes = qwen4_forward_device_bytes(&config, rows, mode);
+                assert_eq!(
+                    sizes.as_ref().map(|sizes| sizes.iter().sum::<u64>()),
+                    bytes,
+                    "{mode:?} {rows} rows"
+                );
+                let sizes = sizes.expect("representative plans admit");
+                let slots = Scratch::plan(&config, rows, mode).expect("plan").0;
+                let owned: Vec<u64> = slots
+                    .iter()
+                    .filter(|slot| slot.owner.is_none())
+                    .map(|slot| slot.bytes().expect("slot bytes") as u64)
+                    .filter(|&bytes| bytes > 0)
+                    .collect();
+                let spec_rows = qwen4_spec_logit_rows(rows) as u64;
+                let mut expected = owned.clone();
+                expected.push(spec_rows * config.vocab_size as u64 * 4);
+                expected.push(spec_rows * 4);
+                assert_eq!(sizes, expected, "{mode:?} {rows} rows");
+                assert!(sizes.iter().all(|&bytes| bytes > 0));
+                assert_eq!(
+                    sizes[..owned.len()].iter().sum::<u64>(),
+                    scratch_bytes(rows, mode)
+                );
+                // Aliases are views, never allocations or double charges.
+                let views = slots.iter().filter(|slot| slot.owner.is_some()).count();
+                assert_eq!(
+                    sizes.len() + views,
+                    slots.iter().filter(|slot| slot.elements > 0).count() + 2,
+                    "{mode:?} {rows} rows"
+                );
+                if mode == Mode::Full {
+                    assert_eq!(views, 0);
+                } else {
+                    assert!(views > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_sizes_refuse_zero_rows_and_overflow_like_the_byte_query() {
+        let config = fn_config();
+        for mode in [Mode::Full, Mode::FnSymGfx1201] {
+            assert_eq!(super::qwen4_forward_allocation_sizes(&config, 0, mode), None);
+            assert_eq!(qwen4_forward_device_bytes(&config, 0, mode), None);
+            let mut huge = config.clone();
+            huge.vocab_size = usize::MAX;
+            assert_eq!(super::qwen4_forward_allocation_sizes(&huge, 64, mode), None);
+            assert_eq!(qwen4_forward_device_bytes(&huge, 64, mode), None);
+            let mut wide = config.clone();
+            wide.vocab_size = usize::MAX / 4;
+            assert_eq!(
+                super::qwen4_forward_allocation_sizes(&wide, 64, mode).is_some(),
+                qwen4_forward_device_bytes(&wide, 64, mode).is_some()
+            );
+        }
     }
 
     #[test]

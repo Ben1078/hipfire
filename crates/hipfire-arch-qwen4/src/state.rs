@@ -1779,6 +1779,71 @@ fn state_tensor_plan(
     Ok(plan)
 }
 
+/// Bytes one QSA context arena of `spec` commits under `context`: its whole
+/// allocation under legacy storage, else the growth pages the shared KV chunk
+/// plan maps for the committed tokens (pooled arenas by
+/// `ceil(tokens / compress)` rows, F16 arenas by whole four-token blocks), as
+/// `ensure_mapped_capacity` maps them.
+fn committed_context_arena_bytes(
+    spec: &StateTensorSpec,
+    context: &Qwen4ContextCommit,
+    geometry: &StateGeometry,
+    ratio: usize,
+) -> Option<usize> {
+    let bytes = spec.elements.checked_mul(spec.dtype.size())?;
+    if context.backend == Qwen4KvBackend::Legacy {
+        return Some(bytes);
+    }
+    let (rows, tokens) = if spec.key.ends_with(".pooled_keys") || spec.key.ends_with(".pooled_bf16")
+    {
+        (
+            geometry.pooled_capacity,
+            context.tokens.div_ceil(ratio),
+        )
+    } else if spec.key.ends_with(".f16_keys") || spec.key.ends_with(".f16_values") {
+        (
+            qsa_f16_arena_rows(context.max_seq),
+            qsa_f16_arena_rows(context.tokens),
+        )
+    } else {
+        (context.max_seq, context.tokens)
+    };
+    if rows == 0 || !bytes.is_multiple_of(rows) {
+        return None;
+    }
+    context_arena_plan(bytes / rows, rows, context.granularity)
+        .ok()?
+        .mapped_bytes_for_tokens(tokens)
+        .ok()
+}
+
+/// The snapshot-arena mirror allocation (elements, dtype) of one state
+/// tensor, `None` for state a snapshot does not copy (QSA full/pooled/F16
+/// arenas, the live EF residual). Mirrors [`Qwen4StateSnapshotArena::new`]:
+/// GDN recurrent and conv, QSA partial K/V, the raw-index circular block of
+/// `compress_ratio` rows, selected indices, PLE conv and hyper feedback.
+fn snapshot_mirror(
+    spec: &StateTensorSpec,
+    geometry: &StateGeometry,
+    ratio: usize,
+) -> Option<(usize, DType)> {
+    let key = spec.key.as_str();
+    if key.ends_with(".recurrent")
+        || key.ends_with(".conv")
+        || key.ends_with(".partial_keys")
+        || key.ends_with(".partial_values")
+        || key.ends_with(".selected_indices")
+        || key == "ple_conv"
+        || key == "hyper_feedback"
+    {
+        Some((spec.elements, spec.dtype))
+    } else if key.ends_with(".raw_index_keys") {
+        Some((ratio.checked_mul(geometry.raw_width)?, spec.dtype))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QsaDigestField {
     FullKeys,
@@ -2459,6 +2524,49 @@ impl Qwen4State {
             .checked_mul(gdn_layers)?
             .checked_add(qsa_layer.checked_mul(qsa_layers)?)?
             .checked_add(per_request)
+    }
+
+    /// Every device allocation [`Self::device_bytes`] counts, one entry per
+    /// allocation (aliases never appear: nothing in the state is a borrowed
+    /// view of a counted tensor): each tensor of [`state_tensor_plan`] over
+    /// the whole-model scope, with QSA context arenas sized as `context`
+    /// commits them (the full allocation under legacy storage, each VMM
+    /// arena's mapped growth pages for the committed tokens), then one entry
+    /// per snapshot-arena mirror allocation
+    /// ([`Qwen4StateSnapshotArena::new`]). Zero-byte allocations are
+    /// omitted. The entries sum to [`Self::device_bytes`]; `None` on any
+    /// overflow, geometry or mapping-plan refusal. CPU-only.
+    pub(crate) fn device_allocation_sizes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+    ) -> Option<Vec<u64>> {
+        let ratio = config.indexer_compress_ratio;
+        if ratio == 0 || context.max_seq == 0 {
+            return None;
+        }
+        let map = Qwen4StateMap::new(config, &Qwen4BandScope::single(config)).ok()?;
+        let geometry = StateGeometry::new(config, &format, context.max_seq).ok()?;
+        let plan = state_tensor_plan(config, &format, context.max_seq, &geometry, &map).ok()?;
+        let mut sizes = Vec::with_capacity(2 * plan.len());
+        let mut push = |bytes: usize| -> Option<()> {
+            if bytes > 0 {
+                sizes.push(u64::try_from(bytes).ok()?);
+            }
+            Some(())
+        };
+        for spec in &plan {
+            let live = if spec.context_arena {
+                committed_context_arena_bytes(spec, context, &geometry, ratio)?
+            } else {
+                spec.elements.checked_mul(spec.dtype.size())?
+            };
+            push(live)?;
+            if let Some((elements, dtype)) = snapshot_mirror(spec, &geometry, ratio) {
+                push(elements.checked_mul(dtype.size())?)?;
+            }
+        }
+        Some(sizes)
     }
 
     /// Explicit numerical mode: Raw dtype alone cannot distinguish Q8 and EF.
@@ -4470,6 +4578,207 @@ mod tests {
             );
             assert_eq!(per_layer * config.n_full_layers(), tokens / 4 * 256 * 12);
         }
+    }
+
+    fn allocation_formats() -> Vec<(&'static str, Qwen4StateFormat)> {
+        let base = Qwen4StateFormat::F32;
+        vec![
+            ("f32", base),
+            (
+                "q8",
+                Qwen4StateFormat {
+                    gdn: GdnStateFormat::Q8,
+                    ..base
+                },
+            ),
+            (
+                "q8_ef",
+                Qwen4StateFormat {
+                    gdn: GdnStateFormat::Q8Ef,
+                    ..base
+                },
+            ),
+            (
+                "fp8",
+                Qwen4StateFormat {
+                    qsa: QsaKvFormat::Fp8,
+                    gdn: GdnStateFormat::Q8,
+                    ..base
+                },
+            ),
+            (
+                "f16_arena",
+                Qwen4StateFormat {
+                    qsa_f16_arena: true,
+                    ..base
+                },
+            ),
+            (
+                "pooled_bf16",
+                Qwen4StateFormat {
+                    qsa_pooled_bf16: true,
+                    ..base
+                },
+            ),
+            (
+                "arena_and_mirror_q8_ef",
+                Qwen4StateFormat {
+                    gdn: GdnStateFormat::Q8Ef,
+                    qsa_f16_arena: true,
+                    qsa_pooled_bf16: true,
+                    ..base
+                },
+            ),
+        ]
+    }
+
+    fn allocation_contexts() -> Vec<Qwen4ContextCommit> {
+        let granularity = 2 << 20;
+        vec![
+            Qwen4ContextCommit::legacy(1024),
+            Qwen4ContextCommit::legacy(8193),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 8193, 1025, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 8192, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 100, 8192, granularity),
+            Qwen4ContextCommit {
+                backend: Qwen4KvBackend::Vmm,
+                max_seq: 262_144,
+                tokens: 32_769,
+                granularity,
+            },
+        ]
+    }
+
+    /// The per-allocation inventory sums to the closed-form byte query for
+    /// every state format and legacy/VMM context commit (including the F16
+    /// and pooled BF16 arenas and the live-only EF residual).
+    #[test]
+    fn allocation_sizes_sum_to_device_bytes() {
+        let config = crate::config::compact_test_config();
+        for (name, format) in allocation_formats() {
+            for context in allocation_contexts() {
+                let sizes = Qwen4State::device_allocation_sizes(&config, format, &context)
+                    .unwrap_or_else(|| panic!("{name} {context:?} admits"));
+                let total = sizes
+                    .iter()
+                    .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+                    .expect("inventory sum fits");
+                assert_eq!(
+                    Some(total),
+                    Qwen4State::device_bytes(&config, format, &context).map(|bytes| bytes as u64),
+                    "{name} {context:?}"
+                );
+                assert!(sizes.iter().all(|&bytes| bytes > 0), "{name} {context:?}");
+            }
+        }
+    }
+
+    /// Compared with the owner's own tensor plan: under legacy storage the
+    /// inventory is each planned tensor once plus exactly one snapshot-arena
+    /// mirror per in-place tensor (GDN recurrent/conv, QSA partial K/V,
+    /// selected indices, the raw-index circular block, PLE conv, hyper
+    /// feedback); the EF residual and the append-only/derived context arenas
+    /// have no mirror, and no alias is charged twice.
+    #[test]
+    fn allocation_sizes_are_the_state_plan_plus_one_mirror_per_in_place_tensor() {
+        let config = crate::config::compact_test_config();
+        let map = Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).unwrap();
+        let ratio = config.indexer_compress_ratio;
+        let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
+        for (name, format) in allocation_formats() {
+            for max_seq in [1024usize, 8193] {
+                let geometry = StateGeometry::new(&config, &format, max_seq).unwrap();
+                let plan = state_tensor_plan(&config, &format, max_seq, &geometry, &map).unwrap();
+                let mut expected = Vec::new();
+                for spec in &plan {
+                    let bytes = (spec.elements * spec.dtype.size()) as u64;
+                    expected.push(bytes);
+                    match spec.key.rsplit('.').next().unwrap() {
+                        "recurrent" | "conv" | "partial_keys" | "partial_values"
+                        | "selected_indices" | "ple_conv" | "hyper_feedback" => {
+                            expected.push(bytes)
+                        }
+                        "raw_index_keys" => expected.push(
+                            (ratio * raw_width * format.layout().index_dtype().size()) as u64,
+                        ),
+                        _ => {}
+                    }
+                }
+                expected.retain(|&bytes| bytes > 0);
+                expected.sort_unstable();
+                let mut sizes = Qwen4State::device_allocation_sizes(
+                    &config,
+                    format,
+                    &Qwen4ContextCommit::legacy(max_seq),
+                )
+                .unwrap();
+                sizes.sort_unstable();
+                assert_eq!(sizes, expected, "{name} {max_seq}");
+            }
+        }
+    }
+
+    /// Under VMM each context arena is its own mapped-pages entry: they sum
+    /// to the owner's committed layer bytes per QSA layer, and the fixed
+    /// state is unchanged by the backend.
+    #[test]
+    fn vmm_allocation_sizes_charge_each_context_arena_its_mapped_pages() {
+        let config = crate::config::compact_test_config();
+        let layers = config.n_full_layers() as u64;
+        for (name, format) in allocation_formats() {
+            let legacy = Qwen4ContextCommit::legacy(262_144);
+            let vmm = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, 2 << 20);
+            let total = |context: &Qwen4ContextCommit| {
+                Qwen4State::device_allocation_sizes(&config, format, context)
+                    .unwrap()
+                    .iter()
+                    .sum::<u64>()
+            };
+            let committed = |context: &Qwen4ContextCommit| {
+                context
+                    .committed_layer_bytes(&config, format.layout())
+                    .unwrap() as u64
+            };
+            assert!(committed(&vmm) < committed(&legacy));
+            assert_eq!(
+                total(&legacy) - total(&vmm),
+                (committed(&legacy) - committed(&vmm)) * layers,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_sizes_refuse_zero_capacity_and_overflow_like_the_byte_query() {
+        let config = crate::config::compact_test_config();
+        let format = Qwen4StateFormat::F32;
+        assert_eq!(
+            Qwen4State::device_allocation_sizes(&config, format, &Qwen4ContextCommit::legacy(0)),
+            None
+        );
+        let mut wide = config.clone();
+        wide.indexer_head_dim = usize::MAX;
+        let mut ratio_zero = config.clone();
+        ratio_zero.indexer_compress_ratio = 0;
+        let context = Qwen4ContextCommit::legacy(1024);
+        for (label, config, context) in [
+            ("indexer width", &wide, context),
+            ("ratio zero", &ratio_zero, context),
+            ("context", &config, Qwen4ContextCommit::legacy(usize::MAX)),
+        ] {
+            assert_eq!(
+                Qwen4State::device_allocation_sizes(config, format, &context),
+                None,
+                "{label}"
+            );
+        }
+        // The owner's closed form refuses the genuinely overflowing ones too.
+        assert_eq!(Qwen4State::device_bytes(&wide, format, &context), None);
+        assert_eq!(
+            Qwen4State::device_bytes(&config, format, &Qwen4ContextCommit::legacy(usize::MAX)),
+            None
+        );
     }
 
     /// Scopes of consecutive bands `counts` over the trunk: first is input,
