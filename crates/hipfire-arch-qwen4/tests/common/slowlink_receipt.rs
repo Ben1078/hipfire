@@ -3524,6 +3524,9 @@ pub fn moe_iu4_problems(receipt: &Value, requested: bool) -> Vec<String> {
                 tile("aggregate_iu4")
             ));
         }
+        if !moe.get("descriptor").is_some_and(Value::is_null) {
+            bad.push("moe_iu4.descriptor must be null without an IU4 window route".into());
+        }
     }
     bad
 }
@@ -3553,21 +3556,22 @@ pub fn sequence_means(rows: &[f64], counts: &[usize]) -> Result<Vec<f64>, String
         .collect())
 }
 
-/// Two-sided 95% Student-t critical value for `df` degrees of freedom
-/// (conservative above 30).
+/// Two-sided 95% Student-t critical value for `df` degrees of freedom: the table through
+/// df 40 (WT2's 32 sequences give df 31), then the value of the preceding table point
+/// (df 40, 60, 120), so the interval is never narrower than the exact one (t decreases with df).
 pub fn t_975(df: usize) -> f64 {
-    const TABLE: [f64; 30] = [
+    const TABLE: [f64; 40] = [
         12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
         2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
-        2.052, 2.048, 2.045, 2.042,
+        2.052, 2.048, 2.045, 2.042, 2.040, 2.037, 2.035, 2.032, 2.030, 2.028, 2.026, 2.024, 2.023,
+        2.021,
     ];
     match df {
         0 => f64::INFINITY,
-        1..=30 => TABLE[df - 1],
-        31..=40 => 2.021,
-        41..=60 => 2.000,
-        61..=120 => 1.980,
-        _ => 1.960,
+        1..=40 => TABLE[df - 1],
+        41..=60 => 2.021,
+        61..=120 => 2.000,
+        _ => 1.980,
     }
 }
 

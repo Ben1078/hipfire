@@ -4083,6 +4083,11 @@ mod slowlink_receipt_tests {
         assert!(paired_ci(&b[..1], &noisy[..1]).is_err());
         assert!(paired_ci(&b, &noisy[..5]).is_err());
         assert!((t_975(23) - 2.069).abs() < 1e-9);
+        // WT2 (32 sequences, df 31) uses its own critical value, never df 40's narrower one,
+        // and the table never narrows the interval as df falls.
+        assert!((t_975(31) - 2.040).abs() < 1e-9);
+        assert!((t_975(41) - 2.021).abs() < 1e-9);
+        assert!((2..=200).all(|df| t_975(df) <= t_975(df - 1)));
     }
 
     const CUTS: [usize; 5] = [3, 4, 1536, 1537, 8192];
