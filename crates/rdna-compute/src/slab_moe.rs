@@ -1580,9 +1580,9 @@ impl Gpu {
             &[tokens, hidden, 4],
             "slowlink_combine_panel accumulator",
         )?;
-        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const MODULE: &str = "slowlink_prefill";
         const FUNC: &str = "slowlink_combine_panel";
-        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(MODULE, kernels::SLOWLINK_PREFILL_SRC, FUNC)?;
         let (yp, ip, tp, wp, ap) = (
             y.buf.as_ptr(),
             inverse.buf.as_ptr(),
@@ -1680,9 +1680,9 @@ impl Gpu {
             &[tokens, hidden, 4],
             "slowlink_combine_pad accumulator",
         )?;
-        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const MODULE: &str = "slowlink_prefill";
         const FUNC: &str = "slowlink_combine_pad";
-        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(MODULE, kernels::SLOWLINK_PREFILL_SRC, FUNC)?;
         let (tp, ap) = (topk.buf.as_ptr(), acc.buf.as_ptr());
         let (hv, tv, nx) = (hidden as i32, tokens as i32, n_experts as i32);
         let mut params = [
@@ -1752,9 +1752,9 @@ impl Gpu {
         }
         crate::moe::require_span(ids, &[n, 4], "slowlink_fold_k1_counts ids")?;
         crate::moe::require_span(counts, &[n_experts, 4], "slowlink_fold_k1_counts counts")?;
-        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const MODULE: &str = "slowlink_prefill";
         const FUNC: &str = "slowlink_fold_k1_counts";
-        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(MODULE, kernels::SLOWLINK_PREFILL_SRC, FUNC)?;
         let (ip, cp) = (ids.buf.as_ptr(), counts.buf.as_ptr());
         let (nv, ev) = (n as i32, n_experts as i32);
         let mut params = [
@@ -1799,9 +1799,9 @@ impl Gpu {
         }
         crate::moe::require_span(ids, &[n, 4], "slowlink_mask_ids ids")?;
         crate::moe::require_span(out, &[n, 4], "slowlink_mask_ids output")?;
-        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const MODULE: &str = "slowlink_prefill";
         const FUNC: &str = "slowlink_mask_ids";
-        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(MODULE, kernels::SLOWLINK_PREFILL_SRC, FUNC)?;
         let (ip, op) = (ids.buf.as_ptr(), out.buf.as_ptr());
         let (nv, lv, hv) = (n as i32, lo as i32, hi as i32);
         let mut params = [
@@ -1846,9 +1846,9 @@ impl Gpu {
         }
         crate::moe::require_span(sorted, &[rows, 4], "slowlink_remap_sorted sorted")?;
         crate::moe::require_span(local, &[rows, 4], "slowlink_remap_sorted local")?;
-        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const MODULE: &str = "slowlink_prefill";
         const FUNC: &str = "slowlink_remap_sorted";
-        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(MODULE, kernels::SLOWLINK_PREFILL_SRC, FUNC)?;
         let (sp, lp) = (sorted.buf.as_ptr(), local.buf.as_ptr());
         let rv = rows as i32;
         let mut params = [
@@ -1905,9 +1905,9 @@ impl Gpu {
         crate::moe::require_span(src, &[slots, width, 4], "slowlink_merge_rows src")?;
         crate::moe::require_span(dst, &[slots, width, 4], "slowlink_merge_rows dst")?;
         crate::moe::require_span(ids, &[slots, 4], "slowlink_merge_rows ids")?;
-        const MODULE: &str = "moe_down_combine_grouped_top10";
+        const MODULE: &str = "slowlink_prefill";
         const FUNC: &str = "slowlink_merge_rows";
-        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(MODULE, kernels::SLOWLINK_PREFILL_SRC, FUNC)?;
         let (sp, dp, ip) = (src.buf.as_ptr(), dst.buf.as_ptr(), ids.buf.as_ptr());
         let (sv, wv, lv, hv) = (slots as i32, width as i32, lo as i32, hi as i32);
         let mut params = [

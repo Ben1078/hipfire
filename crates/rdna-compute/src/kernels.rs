@@ -4227,6 +4227,11 @@ pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
 pub const MOE_DOWN_COMBINE_GROUPED_TOP10_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_grouped_top10.hip");
 
+/// S1 slow-link layer-major prefill kernels (panel combine, ownership masks,
+/// cohort counts, sorted-row remap, row merge): a module of their own, so the
+/// legacy top-10 grouped combine source above keeps its recorded identity.
+pub const SLOWLINK_PREFILL_SRC: &str = include_str!("../../../kernels/src/slowlink_prefill.hip");
+
 /// Qwen4 top-10 fused indexed combine.  Route weights are applied once here,
 /// after the unweighted expanded down projection.
 pub const MOE_DOWN_COMBINE_TOP10_BATCHED_SRC: &str =

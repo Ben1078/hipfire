@@ -98,14 +98,10 @@ fn six_header_specific_recipes_match_baseline_factories() {
                         .iter()
                         .find(|e| e.module == module)
                         .unwrap_or_else(|| panic!("{name}: missing source factory for {module}"));
-                    let live = format!("{:x}", Sha256::digest(oracle.source().as_bytes()));
-                    if live != entry["sha256"].as_str().unwrap() {
-                        // The only intentional source change since the measurement: S1 D
-                        // appended kernels to one module. Anything else still fails here.
-                        assert_s1_d_append_only(module, oracle.source(), &entry["sha256"]);
-                    } else {
-                        assert_eq!(live, entry["sha256"]);
-                    }
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(oracle.source().as_bytes())),
+                        entry["sha256"]
+                    );
                     let recipe = KernelCompiler::recipe_for_source(
                         arch,
                         module,
@@ -374,43 +370,4 @@ fn measured_q8_route_symbols_are_in_the_packaged_index() {
     }
     // Recorded Q8 traces: gfx1100 and gfx1201 (gfx1151 recorded none).
     assert_eq!(covered, 2);
-}
-
-/// `moe_down_combine_grouped_top10` as measured by G0 / the walked plans
-/// (sha256 `HISTORICAL`) was the first `PREFIX_LEN` bytes of today's source;
-/// S1 D only appended kernels after it. Bounded old-to-new identity proof,
-/// not a relaxed hash: the prefix must still hash to the historical value, and
-/// everything after it must be the S1 section whose kernels are all `slowlink_*`.
-const S1_D_MODULE: &str = "moe_down_combine_grouped_top10";
-const S1_D_HISTORICAL_SHA: &str = "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334";
-const S1_D_PREFIX_LEN: usize = 9665;
-
-fn assert_s1_d_append_only(module: &str, source: &str, historical: &Value) {
-    assert_eq!(module, S1_D_MODULE, "{module}: source changed since the G0 measurement");
-    assert_eq!(historical, S1_D_HISTORICAL_SHA);
-    let bytes = source.as_bytes();
-    assert!(bytes.len() > S1_D_PREFIX_LEN);
-    assert_eq!(format!("{:x}", Sha256::digest(&bytes[..S1_D_PREFIX_LEN])), S1_D_HISTORICAL_SHA);
-    let appended = &source[S1_D_PREFIX_LEN..];
-    assert!(appended.starts_with("// ----"), "S1 section must follow the measured source");
-    let kernels: Vec<&str> = appended
-        .split("extern \"C\" __global__")
-        .skip(1)
-        .map(|k| k.split("void ").nth(1).unwrap().split('(').next().unwrap().trim())
-        .collect();
-    assert!(!kernels.is_empty() && kernels.iter().all(|k| k.starts_with("slowlink_")), "{kernels:?}");
-}
-
-#[test]
-fn s1_d_append_keeps_the_walked_moe_down_combine_prefix() {
-    let entry = kernel_registry::lookup("gfx1201", S1_D_MODULE, "").unwrap();
-    assert_s1_d_append_only(S1_D_MODULE, entry.source(), &Value::from(S1_D_HISTORICAL_SHA));
-    // The live sha is what the rebound walked-plan rows carry.
-    let live = format!("{:x}", Sha256::digest(entry.source().as_bytes()));
-    for plan in kernel_registry::walked_route_plans().unwrap() {
-        for row in plan.rows.iter().filter(|r| !r.embedded && r.module == S1_D_MODULE) {
-            assert_eq!(row.sha256, live);
-            assert!(row.symbols.iter().all(|s| !s.starts_with("slowlink_")));
-        }
-    }
 }

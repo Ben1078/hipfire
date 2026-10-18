@@ -2175,6 +2175,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "moe_down_combine_grouped_top10",
                 "moe_down_combine_grouped_top10_bf16in",
                 "moe_down_combine_grouped_top10_bf16in_zinit",
+            ]
+        );
+        // S1 slow-link layer-major prefill kernels: their own module and source, so the
+        // legacy `moe_down_combine_grouped_top10` source/identity above is unchanged.
+        add!(
+            "slowlink_prefill",
+            kernels::SLOWLINK_PREFILL_SRC,
+            [
                 "slowlink_combine_pad",
                 "slowlink_combine_panel",
                 "slowlink_fold_k1_counts",
@@ -7020,8 +7028,9 @@ mod tests {
                 directive.push_str(lines[index].trim());
                 index += 1;
             }
-            let (keyword, rest) =
-                directive.split_once(char::is_whitespace).unwrap_or((directive.as_str(), ""));
+            let (keyword, rest) = directive
+                .split_once(char::is_whitespace)
+                .unwrap_or((directive.as_str(), ""));
             let rest = rest.split("//").next().unwrap_or("").trim();
             let live = stack.iter().all(|(live, _)| *live);
             match keyword {
@@ -7084,7 +7093,11 @@ mod tests {
         }
         for line in active_text.lines() {
             let line = line.trim();
-            for prefix in ["QSA_SELECT_SERIAL(", "QSA_SELECT_PARALLEL(", "QSA_DECODE_PROLOGUE("] {
+            for prefix in [
+                "QSA_SELECT_SERIAL(",
+                "QSA_SELECT_PARALLEL(",
+                "QSA_DECODE_PROLOGUE(",
+            ] {
                 if let Some(args) = line.strip_prefix(prefix) {
                     names.insert(identifier(args));
                 }
@@ -7103,33 +7116,61 @@ mod tests {
         source_exports(crate::tensor_ops::TENSOR_OPS_SRC, arch)
     }
 
-    /// S1 slow-link layer-major kernels (the panel/mask/combine wrappers of
-    /// `slab_moe.rs`, all in `moe_down_combine_grouped_top10.hip`) take the
-    /// same registry path as every other module: the module's index is the
-    /// source's export set on every qwen4 arch, and every kernel a
-    /// `slowlink_*` wrapper requests (read from the wrappers' own `FUNC`
-    /// constants, no allowlist here) is in it, so the official pack of each
-    /// arch carries them with no arch-specific gate. (S1 stays default-off;
-    /// the Flash-Next walked plans are open, so these load lazily from the
-    /// same index.)
+    /// The legacy `moe_down_combine_grouped_top10` source is byte-for-byte the
+    /// one the G0 fixtures and the walked gfx1201 plans recorded, and the S1
+    /// slow-link kernels live in a module of their own, `slowlink_prefill`.
+    /// Both modules take the same registry path as every other: each index is
+    /// its source's export set on every qwen4 arch, and every kernel a
+    /// `slowlink_*` wrapper requests (read from `slab_moe.rs` itself, no
+    /// allowlist here) is in the new module's index, so the official pack of
+    /// each arch carries them with no arch-specific gate. (S1 stays default-off;
+    /// the Flash-Next walked plans are open and unedited, so these load lazily
+    /// from the same index.)
     #[test]
-    fn s1_d_kernels_are_in_the_packaged_index_of_every_qwen4_arch() {
+    fn s1_d_kernels_are_in_their_own_packaged_module_on_every_qwen4_arch() {
         use std::collections::BTreeSet;
-        let wrappers: BTreeSet<&str> = include_str!("slab_moe.rs")
+        const OLD: &str = "moe_down_combine_grouped_top10";
+        const NEW: &str = "slowlink_prefill";
+        const OLD_SHA: &str = "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334";
+        let slab = include_str!("slab_moe.rs");
+        let wrappers: BTreeSet<&str> = slab
             .lines()
             .filter_map(|line| {
-                line.trim().strip_prefix("const FUNC: &str = \"slowlink_")?.strip_suffix("\";")
+                line.trim()
+                    .strip_prefix("const FUNC: &str = \"slowlink_")?
+                    .strip_suffix("\";")
             })
             .collect();
         assert!(wrappers.len() >= 6, "{wrappers:?}");
+        // Every slowlink wrapper loads the new module and source; none the legacy one.
+        let loads = |needle: &str| slab.lines().filter(|l| l.contains(needle)).count();
+        assert_eq!(loads("kernels::SLOWLINK_PREFILL_SRC"), wrappers.len());
+        assert_eq!(loads("MOE_DOWN_COMBINE_GROUPED_TOP10_SRC"), 0);
+        assert_eq!(loads(&format!("const MODULE: &str = \"{NEW}\";")), wrappers.len());
+        assert_eq!(loads(&format!("\"{OLD}\"")), 0);
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
-            let entry = lookup(arch, "moe_down_combine_grouped_top10", "").unwrap();
-            let registered: BTreeSet<String> =
-                entry.symbols.iter().map(|s| (*s).to_owned()).collect();
-            assert_eq!(registered, source_exports(entry.source(), arch), "{arch}");
+            let old = lookup(arch, OLD, "").unwrap();
+            assert_eq!(format!("{:x}", Sha256::digest(old.source().as_bytes())), OLD_SHA, "{arch}");
+            let new = lookup(arch, NEW, "").unwrap();
+            let index = |entry: &KernelEntry| -> BTreeSet<String> {
+                entry.symbols.iter().map(|s| (*s).to_owned()).collect()
+            };
+            assert_eq!(index(&old), source_exports(old.source(), arch), "{arch} {OLD}");
+            assert_eq!(index(&new), source_exports(new.source(), arch), "{arch} {NEW}");
+            assert!(index(&old).iter().all(|s| !s.starts_with("slowlink_")), "{arch}");
+            assert!(index(&old).is_disjoint(&index(&new)), "{arch}");
             for name in &wrappers {
                 let symbol = format!("slowlink_{name}");
-                assert!(registered.contains(&symbol), "{arch}: {symbol}");
+                assert!(index(&new).contains(&symbol), "{arch}: {symbol}");
+            }
+            assert_eq!(index(&new).len(), wrappers.len(), "{arch}: unrequested export");
+        }
+        // The walked plans still name the legacy module at its recorded identity.
+        let old = lookup("gfx1201", OLD, "").unwrap();
+        let live = format!("{:x}", Sha256::digest(old.source().as_bytes()));
+        for plan in walked_route_plans().unwrap() {
+            for row in plan.rows.iter().filter(|r| !r.embedded && r.module == OLD) {
+                assert_eq!(row.sha256, live);
             }
         }
     }
@@ -7152,7 +7193,10 @@ mod tests {
         };
         let (index, elf) = (rows("index "), rows("export "));
         assert_eq!((index.len(), elf.len()), (74, 83));
-        assert!(index.is_subset(&elf), "the sealed index named a symbol its object lacks");
+        assert!(
+            index.is_subset(&elf),
+            "the sealed index named a symbol its object lacks"
+        );
         assert_eq!(tensor_ops_source_exports("gfx1100"), elf);
         let omitted: Vec<&str> = elf.difference(&index).map(String::as_str).collect();
         assert_eq!(
@@ -7199,8 +7243,14 @@ mod tests {
                 .collect();
             let omitted: Vec<_> = exported.difference(&registered).collect();
             let phantom: Vec<_> = registered.difference(&exported).collect();
-            assert!(omitted.is_empty(), "{arch}: exports missing from the index: {omitted:?}");
-            assert!(phantom.is_empty(), "{arch}: indexed but not compiled: {phantom:?}");
+            assert!(
+                omitted.is_empty(),
+                "{arch}: exports missing from the index: {omitted:?}"
+            );
+            assert!(
+                phantom.is_empty(),
+                "{arch}: indexed but not compiled: {phantom:?}"
+            );
         }
         let has = |arch: &str, symbol: &str| tensor_ops_source_exports(arch).contains(symbol);
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {

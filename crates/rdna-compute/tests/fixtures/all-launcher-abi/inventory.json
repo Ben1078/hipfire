@@ -155,7 +155,8 @@
     "kernels/src/qwen4_moe_iu4_sym.gfx1151.hip",
     "kernels/src/qwen4_moe_scatter_fused_k8.hip",
     "kernels/src/qwen4_moe_scatter_stable_top10.hip",
-    "kernels/src/qwen4_slab_union_plan.hip"
+    "kernels/src/qwen4_slab_union_plan.hip",
+    "kernels/src/slowlink_prefill.hip"
   ],
   "pm_emitters": [
     "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs",
