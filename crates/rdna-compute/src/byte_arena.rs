@@ -1256,6 +1256,7 @@ mod tests {
     }
 
     /// A view whose drop is recorded, standing in for a borrowed cache GpuTensor.
+    #[derive(Debug)]
     struct LoggedView {
         borrowed: bool,
         name: &'static str,
