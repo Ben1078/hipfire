@@ -1422,12 +1422,15 @@ pub fn f16_shadow_charge(
     }
 }
 
-fn f16_shadow_bytes_owned(
-    weights: &[WeightEntry],
+/// Whether `entry` is a lazily F16-shadowed BF16 owner of the trunk
+/// ([`f16_shadow_bytes`]'s one predicate, shared with the physical-granule
+/// census so the two can never name different owners).
+fn is_f16_shadow_owner(
+    entry: &WeightEntry,
     num_layers: usize,
-    owns_layer: impl Fn(usize) -> bool,
+    owns_layer: &impl Fn(usize) -> bool,
     owns_root: bool,
-) -> Result<u64, String> {
+) -> bool {
     use rdna_compute::DType;
     const LAYER_PREFIX: &str = "model.language_model.layers.";
     let shadowed = |name: &str| {
@@ -1443,24 +1446,223 @@ fn f16_shadow_bytes_owned(
                     && F16_SHADOW_LAYER_SUFFIXES.contains(&suffix)
             })
     };
+    entry.dtype == DType::BF16
+        && entry.logical_shape.len() == 2
+        && !entry.residency.is_external()
+        && !matches!(entry.policy, ShardPolicy::Tied { .. })
+        && shadowed(&entry.name)
+}
+
+/// The F16 shadow allocation of one owner: `2 * rows * cols` bytes.
+fn f16_shadow_entry_bytes(entry: &WeightEntry) -> Result<u64, String> {
+    entry.logical_shape[0]
+        .checked_mul(entry.logical_shape[1])
+        .and_then(|elements| elements.checked_mul(2))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| format!("F16 shadow bytes of '{}' overflow", entry.name))
+}
+
+fn f16_shadow_bytes_owned(
+    weights: &[WeightEntry],
+    num_layers: usize,
+    owns_layer: impl Fn(usize) -> bool,
+    owns_root: bool,
+) -> Result<u64, String> {
     weights
         .iter()
-        .filter(|entry| {
-            entry.dtype == DType::BF16
-                && entry.logical_shape.len() == 2
-                && !entry.residency.is_external()
-                && !matches!(entry.policy, ShardPolicy::Tied { .. })
-                && shadowed(&entry.name)
-        })
+        .filter(|entry| is_f16_shadow_owner(entry, num_layers, &owns_layer, owns_root))
         .try_fold(0u64, |total, entry| {
-            let bytes = entry.logical_shape[0]
-                .checked_mul(entry.logical_shape[1])
-                .and_then(|elements| elements.checked_mul(2))
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .and_then(|bytes| total.checked_add(bytes))
-                .ok_or_else(|| format!("F16 shadow bytes of '{}' overflow", entry.name))?;
-            Ok(bytes)
+            f16_shadow_entry_bytes(entry)?
+                .checked_add(total)
+                .ok_or_else(|| format!("F16 shadow bytes of '{}' overflow", entry.name))
         })
+}
+
+/// Physical VRAM allocation granule model. The granule is NEVER a constant
+/// here: a load takes it from the device's own query
+/// (`Gpu::vmm_recommended_granularity`, `hipMemGetAllocationGranularity` with
+/// the recommended flag for a pinned device allocation) and `0` models no
+/// rounding. This is a MEASURED BACKING MODEL, not a proven API contract: that
+/// query is documented for VMM physical mappings, and it is applied to
+/// ordinary `hipMalloc` allocations because the j1786 Hold 1a run's external
+/// 20 ms sampler saw 227 of 267 device-memory steps of at least 2 MiB land on
+/// an exact multiple of 2 MiB (20 more on a multiple plus one 4 KiB page),
+/// e.g. the 496,640,000 B language head became 497,025,024 B (237 granules),
+/// a 445,644,800 B resident down arena 446,693,376 B (213) and the session
+/// cache's 34,130,944 B and 34,183,168 B snapshots each 35,651,584 B (17).
+/// The query's value on that device is not in the run's artifacts; its
+/// equality with 2 MiB is an inference the placement log line prints for
+/// confirmation. Allocations below one granule were not observed to round
+/// (tiny allocations sub-allocate) and are charged at their payload. The
+/// census otherwise sums payload bytes; [`granule_slack`] is the per-owner
+/// difference, kept apart from the opaque runtime budget it must not double
+/// count.
+///
+/// Bytes one device allocation of `bytes` occupies beyond its payload at
+/// `granule`: the distance to the next granule boundary for an allocation of
+/// at least one granule, else 0. `granule == 0` models no rounding.
+pub fn granule_slack(bytes: u64, granule: u64) -> u64 {
+    if granule == 0 || bytes < granule {
+        0
+    } else {
+        (granule - bytes % granule) % granule
+    }
+}
+
+/// [`granule_slack`] summed over one owner's allocations, checked.
+pub fn granule_slack_total(
+    sizes: impl IntoIterator<Item = u64>,
+    granule: u64,
+) -> Result<u64, String> {
+    sizes.into_iter().try_fold(0u64, |total, bytes| {
+        total
+            .checked_add(granule_slack(bytes, granule))
+            .ok_or_else(|| "device allocation granule slack overflows".to_string())
+    })
+}
+
+/// The granule rounding of the incumbent base reserve, owner by owner. Every
+/// term is the sum, over that owner's real device allocations, of
+/// [`granule_slack`]; none is a measured residual. Owners not enumerated
+/// (native MTP, QSA gather, kernel module code, HIP runtime state) stay in
+/// the runtime budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GranuleSlack {
+    /// Every resident non-routed-expert weight tensor, one allocation each.
+    pub weights: u64,
+    /// The lazy F16 weight shadows ([`f16_shadow_bytes`]), one allocation per
+    /// owner; 0 when the reserve does not charge shadows.
+    pub f16_shadows: u64,
+    /// The forward scratch's owning slots and speculative buffers.
+    pub forward: u64,
+    /// The request state's tensors and snapshot-arena mirror.
+    pub state: u64,
+    /// The kernels' pool workspace terms, one allocation each.
+    pub workspace: u64,
+}
+
+impl GranuleSlack {
+    /// Every term, named, in log order.
+    pub fn terms(&self) -> [(&'static str, u64); 5] {
+        [
+            ("weight tensors", self.weights),
+            ("F16 weight shadows", self.f16_shadows),
+            ("forward scratch", self.forward),
+            ("request state", self.state),
+            ("kernel workspace", self.workspace),
+        ]
+    }
+
+    /// Sum of every term, checked.
+    pub fn total(&self) -> Result<u64, String> {
+        self.terms().iter().try_fold(0u64, |total, (name, bytes)| {
+            total
+                .checked_add(*bytes)
+                .ok_or_else(|| format!("granule slack overflows at '{name}'"))
+        })
+    }
+}
+
+/// Granule slack of the resident non-routed-expert weights of `weights`: the
+/// same entries [`resident_split`] counts as non-expert, one device
+/// allocation per tensor.
+pub fn weight_granule_slack(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    granule: u64,
+) -> Result<u64, String> {
+    let mut sizes = Vec::new();
+    for entry in weights {
+        if entry.residency.is_external()
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+            || is_routed_expert(&entry.name)
+        {
+            continue;
+        }
+        sizes.push(
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?,
+        );
+    }
+    granule_slack_total(sizes, granule)
+}
+
+/// Granule slack of the lazy F16 weight shadows ([`f16_shadow_bytes`]'s
+/// owners), one allocation per shadow.
+pub fn f16_shadow_granule_slack(
+    weights: &[WeightEntry],
+    num_layers: usize,
+    granule: u64,
+) -> Result<u64, String> {
+    let mut sizes = Vec::new();
+    for entry in weights {
+        if is_f16_shadow_owner(entry, num_layers, &|_| true, true) {
+            sizes.push(f16_shadow_entry_bytes(entry)?);
+        }
+    }
+    granule_slack_total(sizes, granule)
+}
+
+/// What [`base_granule_slack`] reads: the same load facts
+/// [`placement_inputs`] read, plus the reserve it returned.
+pub struct GranuleSlackArgs<'a> {
+    pub config: &'a Qwen4Config,
+    pub weights: &'a [WeightEntry],
+    pub bytes_of: &'a dyn Fn(&WeightEntry) -> Option<u64>,
+    pub backend: crate::Qwen4KvBackend,
+    pub max_seq: usize,
+    pub vmm_granularity: usize,
+    pub state_format: crate::Qwen4StateFormat,
+    pub scratch_mode: Qwen4ForwardScratchMode,
+    /// The chunk the reserve was sized from.
+    pub chunk_rows: usize,
+    /// The reserve [`placement_inputs`] returned for these arguments: it
+    /// says whether shadows are charged and carries the workspace terms.
+    pub reserve: AutoReserve,
+    pub granule: u64,
+}
+
+/// The granule slack of one load's base reserve ([`GranuleSlack`]), from the
+/// owners' own allocation lists: the manifest's tensors and shadow owners,
+/// `gpu_forward::qwen4_forward_allocation_sizes`,
+/// `state::Qwen4State::device_allocation_sizes` (the state and QSA
+/// context at the census context [`placement_inputs`] charges) and the
+/// workspace terms of `reserve`.
+pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, String> {
+    let GranuleSlackArgs {
+        config,
+        weights,
+        bytes_of,
+        backend,
+        max_seq,
+        vmm_granularity,
+        state_format,
+        scratch_mode,
+        chunk_rows,
+        reserve,
+        granule,
+    } = args;
+    let census_context =
+        crate::Qwen4ContextCommit::new(*backend, *max_seq, *max_seq, *vmm_granularity);
+    let forward =
+        crate::gpu_forward::qwen4_forward_allocation_sizes(config, *chunk_rows, *scratch_mode)
+            .ok_or_else(|| "forward scratch allocation sizes overflow".to_string())?;
+    let state =
+        crate::state::Qwen4State::device_allocation_sizes(config, *state_format, &census_context)
+            .ok_or_else(|| "request state allocation sizes overflow".to_string())?;
+    Ok(GranuleSlack {
+        weights: weight_granule_slack(weights, bytes_of, *granule)?,
+        f16_shadows: if reserve.census.f16_shadows > 0 {
+            f16_shadow_granule_slack(weights, config.num_hidden_layers, *granule)?
+        } else {
+            0
+        },
+        forward: granule_slack_total(forward, *granule)?,
+        state: granule_slack_total(state, *granule)?,
+        workspace: granule_slack_total(
+            reserve.census.workspace.iter().map(|term| term.1),
+            *granule,
+        )?,
+    })
 }
 
 /// The reserve `auto` keeps free: the larger of the historical measured
@@ -6935,5 +7137,51 @@ mod tests {
         assert!(routed_layer_payload_split(&[], element_bytes).is_err());
         // A missing payload size is an error, never zero.
         assert!(routed_layer_payload_split(&weights, |_| None).is_err());
+    }
+
+    /// The weight slack counts the resident non-routed-expert tensors only:
+    /// routed experts, tied aliases and sub-granule tensors add none, an
+    /// exact granule multiple adds none, and the total is checked.
+    #[test]
+    fn slowlink_granule_weight_slack_counts_the_resident_non_expert_tensors_only() {
+        let granule = 2 << 20;
+        let model = |name: &str, shape: Vec<usize>| {
+            WeightEntry::model(name, shape, DType::BF16, ShardPolicy::Replicate)
+        };
+        let tied = WeightEntry::model(
+            "model.tied",
+            vec![1000, 1500],
+            DType::BF16,
+            ShardPolicy::Tied {
+                source: "model.language_model.embed_tokens.weight".into(),
+            },
+        );
+        let weights = vec![
+            // 3,000,000 B: 1,194,304 B short of the next granule.
+            model("model.language_model.embed_tokens.weight", vec![1000, 1500]),
+            // Exactly one granule.
+            model("lm_head.weight", vec![1024, 1024]),
+            // Below a granule.
+            model("model.norm.weight", vec![512]),
+            // A routed expert tensor and a tied alias are not resident weights.
+            model(
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                vec![1000, 1500],
+            ),
+            tied,
+        ];
+        assert_eq!(
+            weight_granule_slack(&weights, element_bytes, granule),
+            Ok(1_194_304)
+        );
+        assert_eq!(weight_granule_slack(&weights, element_bytes, 0), Ok(0));
+        assert!(weight_granule_slack(&weights, |_| None, granule).is_err());
+        let slack = GranuleSlack {
+            weights: u64::MAX,
+            f16_shadows: 1,
+            ..GranuleSlack::default()
+        };
+        assert!(slack.total().unwrap_err().contains("overflows"));
+        assert_eq!(GranuleSlack::default().total(), Ok(0));
     }
 }
