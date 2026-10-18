@@ -1523,9 +1523,8 @@ pub fn granule_slack_total(
 
 /// The granule rounding of the incumbent base reserve, owner by owner. Every
 /// term is the sum, over that owner's real device allocations, of
-/// [`granule_slack`]; none is a measured residual. Owners not enumerated
-/// (native MTP, QSA gather, kernel module code, HIP runtime state) stay in
-/// the runtime budget.
+/// [`granule_slack`]; none is a measured residual. Not enumerated (and so
+/// left in the runtime budget): kernel module code and HIP runtime state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GranuleSlack {
     /// Every resident non-routed-expert weight tensor, one allocation each.
@@ -1535,21 +1534,31 @@ pub struct GranuleSlack {
     pub f16_shadows: u64,
     /// The forward scratch's owning slots and speculative buffers.
     pub forward: u64,
-    /// The request state's tensors and snapshot-arena mirror.
+    /// The request state's tensors and snapshot-arena mirror (VMM context
+    /// arenas are listed at their mapped, already granule-rounded size).
     pub state: u64,
     /// The kernels' pool workspace terms, one allocation each.
     pub workspace: u64,
+    /// The native MTP head and its first-request allocations (0 without a
+    /// kept head).
+    pub native_mtp: u64,
+    /// The QSA gathered-prefill workspace (one legacy allocation; a VMM
+    /// workspace maps granule-rounded pages, so nothing is added) and the QSA
+    /// split selector's one scratch allocation.
+    pub qsa_workspace: u64,
 }
 
 impl GranuleSlack {
     /// Every term, named, in log order.
-    pub fn terms(&self) -> [(&'static str, u64); 5] {
+    pub fn terms(&self) -> [(&'static str, u64); 7] {
         [
             ("weight tensors", self.weights),
             ("F16 weight shadows", self.f16_shadows),
             ("forward scratch", self.forward),
             ("request state", self.state),
             ("kernel workspace", self.workspace),
+            ("native MTP", self.native_mtp),
+            ("QSA workspace", self.qsa_workspace),
         ]
     }
 
@@ -1605,18 +1614,23 @@ pub fn f16_shadow_granule_slack(
 /// What [`base_granule_slack`] reads: the same load facts
 /// [`placement_inputs`] read, plus the reserve it returned.
 pub struct GranuleSlackArgs<'a> {
+    pub gpu: &'a rdna_compute::Gpu,
     pub config: &'a Qwen4Config,
     pub weights: &'a [WeightEntry],
     pub bytes_of: &'a dyn Fn(&WeightEntry) -> Option<u64>,
     pub backend: crate::Qwen4KvBackend,
     pub max_seq: usize,
     pub vmm_granularity: usize,
+    /// The native MTP head stays attached (as for [`placement_inputs`]).
+    pub mtp_kept: bool,
+    pub max_k: usize,
     pub state_format: crate::Qwen4StateFormat,
     pub scratch_mode: Qwen4ForwardScratchMode,
     /// The chunk the reserve was sized from.
     pub chunk_rows: usize,
     /// The reserve [`placement_inputs`] returned for these arguments: it
-    /// says whether shadows are charged and carries the workspace terms.
+    /// says whether shadows are charged and carries the workspace, gather and
+    /// selector terms.
     pub reserve: AutoReserve,
     pub granule: u64,
 }
@@ -1629,12 +1643,15 @@ pub struct GranuleSlackArgs<'a> {
 /// workspace terms of `reserve`.
 pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, String> {
     let GranuleSlackArgs {
+        gpu,
         config,
         weights,
         bytes_of,
         backend,
         max_seq,
         vmm_granularity,
+        mtp_kept,
+        max_k,
         state_format,
         scratch_mode,
         chunk_rows,
@@ -1649,6 +1666,40 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
     let state =
         crate::state::Qwen4State::device_allocation_sizes(config, *state_format, &census_context)
             .ok_or_else(|| "request state allocation sizes overflow".to_string())?;
+    // The native MTP allocations of the SAME call `placement_inputs` charges
+    // (`mtp_for(&census_context)`): empty without a kept head.
+    let native_mtp = if *mtp_kept {
+        let head = language_head_dtype(weights).ok_or("manifest has no language head")?;
+        let drafts = crate::mtp_spec::native_mtp_proposal_drafts(*max_k, &gpu.arch);
+        let row_capture =
+            crate::mtp_spec::native_mtp_capture(gpu, config, state_format.gdn, drafts);
+        crate::mtp_spec::native_mtp_allocation_sizes(
+            config,
+            &census_context,
+            *chunk_rows,
+            drafts,
+            head,
+            row_capture,
+            crate::mtp_spec::native_mtp_fill_scratch(gpu),
+        )
+        .ok_or_else(|| "native MTP allocation sizes overflow".to_string())?
+    } else {
+        Vec::new()
+    };
+    // The gathered-prefill workspace is one allocation on the legacy backend;
+    // a VMM workspace maps granule-rounded pages (no second rounding). The
+    // split selector reserves one scratch allocation (`qsa_select_scores`).
+    let qsa_workspace = granule_slack_total(
+        [
+            if matches!(backend, crate::Qwen4KvBackend::Legacy) {
+                reserve.census.gather
+            } else {
+                0
+            },
+            reserve.census.qsa_selector,
+        ],
+        *granule,
+    )?;
     Ok(GranuleSlack {
         weights: weight_granule_slack(weights, bytes_of, *granule)?,
         f16_shadows: if reserve.census.f16_shadows > 0 {
@@ -1662,6 +1713,8 @@ pub fn base_granule_slack(args: &GranuleSlackArgs<'_>) -> Result<GranuleSlack, S
             reserve.census.workspace.iter().map(|term| term.1),
             *granule,
         )?,
+        native_mtp: granule_slack_total(native_mtp, *granule)?,
+        qsa_workspace,
     })
 }
 

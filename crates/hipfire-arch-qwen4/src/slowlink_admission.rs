@@ -1026,6 +1026,10 @@ pub struct GranuleInputs {
     /// [`crate::expert_residency::base_granule_slack`] of the base reserve at
     /// the purpose's tile.
     pub base: crate::expert_residency::GranuleSlack,
+    /// Granule slack of ONE boundary stage's part allocations
+    /// (`Qwen4State::session_fixed_part_sizes`, one `zeros` per part); the
+    /// profile charges [`S1_MAX_BOUNDARY_SNAPSHOTS`] stages.
+    pub boundary_stage_slack: u64,
 }
 
 /// Physical-granule slack an admitted profile carries, owner by owner: the
@@ -1044,15 +1048,19 @@ pub struct GranuleCharge {
     pub route_region: u64,
     /// The HC-stream arena, one allocation of [`PromptArenaLayout::total_bytes`].
     pub hc_arena: u64,
-    /// The resident expert layers' gate/up and down tensors, one allocation
-    /// each, charged for the [`S1_MIN_RESIDENT_LAYERS`] floor (a layer beyond
-    /// it adds at most two granules, uncharged).
-    pub resident_layers: u64,
+    /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary stages' part allocations.
+    pub boundary_stages: u64,
+    /// Granule slack of ONE resident expert layer (its gate/up and down
+    /// tensors, one allocation each). NOT a fixed term of [`Self::total`]: it
+    /// is part of every resident layer's cost
+    /// ([`SlowlinkProfile::placement_layer_bytes`]), so it is charged for the
+    /// layers actually admitted, never for the floor.
+    pub layer: u64,
 }
 
 impl GranuleCharge {
-    /// Every term, named, in log order.
-    pub fn terms(&self) -> [(&'static str, u64); 9] {
+    /// Every fixed term, named, in log order (the per-layer slack is not one).
+    pub fn terms(&self) -> [(&'static str, u64); 11] {
         let base = self.base.terms();
         [
             base[0],
@@ -1060,14 +1068,16 @@ impl GranuleCharge {
             base[2],
             base[3],
             base[4],
+            base[5],
+            base[6],
             ("expert pages", self.expert_pages),
             ("route region", self.route_region),
             ("HC arena", self.hc_arena),
-            ("resident layer tensors", self.resident_layers),
+            ("boundary stages", self.boundary_stages),
         ]
     }
 
-    /// Sum of every term, checked.
+    /// Sum of every fixed term, checked.
     pub fn total(&self) -> Result<u64, String> {
         self.terms().iter().try_fold(0u64, |total, (name, bytes)| {
             total
@@ -1076,11 +1086,15 @@ impl GranuleCharge {
         })
     }
 
-    /// `name MiB, ...` for the placement log.
+    /// `name KiB, ...` for the placement log, then the per-layer slack.
     pub fn describe(&self) -> String {
         self.terms()
             .into_iter()
             .map(|(name, bytes)| format!("{name} {} KiB", bytes >> 10))
+            .chain(std::iter::once(format!(
+                "per resident layer {} KiB",
+                self.layer >> 10
+            )))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -1181,7 +1195,18 @@ pub struct SlowlinkProfile {
 }
 
 impl SlowlinkProfile {
-    /// The one number placement charges for this profile.
+    /// Device bytes one resident layer costs the placement: the loader's
+    /// `layer_expert_bytes` plus the layer's own physical-granule slack
+    /// ([`GranuleCharge::layer`]). The loader's resident-layer resolver MUST
+    /// size layers with this, against [`Self::reserve_bytes`], so it keeps
+    /// exactly [`Self::resident_layers`].
+    pub fn placement_layer_bytes(&self, layer_expert_bytes: u64) -> Result<u64, String> {
+        layer_expert_bytes
+            .checked_add(self.granule.layer)
+            .ok_or_else(|| "slow-link prefill resident layer bytes overflow".to_string())
+    }
+
+    /// The one number placement charges for this profile besides its layers.
     pub fn reserve_bytes(&self) -> Result<u64, String> {
         self.census.total().and_then(|census| {
             self.granule
@@ -1301,6 +1326,9 @@ struct JointPlacement {
     granule: GranuleCharge,
     /// `base_reserve + safety margin + S1 census total + granule slack`.
     reserve: u64,
+    /// Device bytes one resident layer costs: its payload plus its own
+    /// granule slack ([`GranuleCharge::layer`]).
+    layer_cost: u64,
     /// Layers that remain resident beside it (not yet judged against the floor).
     layers: usize,
 }
@@ -1332,6 +1360,12 @@ fn joint_placement(
     let reserve = charges
         .reserve(inputs.base_reserve)
         .map_err(SlowlinkDecline::Geometry)?;
+    let layer_cost = inputs
+        .layer_expert_bytes
+        .checked_add(granule.layer)
+        .ok_or_else(|| {
+            SlowlinkDecline::Geometry("slow-link prefill resident layer bytes overflow".into())
+        })?;
     let layers = if inputs
         .non_expert
         .checked_add(reserve)
@@ -1340,7 +1374,7 @@ fn joint_placement(
         crate::expert_residency::auto_vram_layers(
             inputs.free,
             inputs.non_expert,
-            inputs.layer_expert_bytes,
+            layer_cost,
             inputs.trunk_layers,
             reserve,
         )
@@ -1354,13 +1388,15 @@ fn joint_placement(
         granule,
         charges,
         reserve,
+        layer_cost,
         layers,
     })
 }
 
 /// The physical-granule slack of the profile's own owners at `inputs`'
-/// granule: the page pool, route region, HC arena and resident layer tensors,
-/// each from the same layout that allocates it, beside the base reserve's.
+/// granule: the page pool, route region, HC arena and boundary stages (fixed
+/// terms) and one resident layer's tensors (charged per admitted layer), each
+/// from the same layout that allocates it, beside the base reserve's.
 fn granule_charge(
     inputs: &AdmissionInputs,
     pages: &PanelPageLayout,
@@ -1384,11 +1420,12 @@ fn granule_charge(
         )?,
         route_region: slack(census.route_storage),
         hc_arena: slack(arena.total_bytes),
-        resident_layers: checked_mul(
-            S1_MIN_RESIDENT_LAYERS as u64,
-            layer,
-            "resident layer granule slack",
+        boundary_stages: checked_mul(
+            S1_MAX_BOUNDARY_SNAPSHOTS as u64,
+            inputs.granule.boundary_stage_slack,
+            "boundary stage granule slack",
         )?,
+        layer,
     })
 }
 
@@ -1406,7 +1443,7 @@ fn judge_placement(
     }
     if joint.layers < S1_MIN_RESIDENT_LAYERS {
         let required = (S1_MIN_RESIDENT_LAYERS as u64)
-            .checked_mul(inputs.layer_expert_bytes)
+            .checked_mul(joint.layer_cost)
             .and_then(|bytes| bytes.checked_add(inputs.non_expert))
             .and_then(|bytes| bytes.checked_add(joint.reserve))
             .ok_or_else(|| {
@@ -1456,7 +1493,7 @@ pub(crate) fn admit_at_tile(
     // Everything the placement keeps beside the joint reserve (safety margin
     // included): what is left of `free` is discretionary capacity.
     let device_snapshot_budget_bytes = (joint.layers as u64)
-        .checked_mul(inputs.layer_expert_bytes)
+        .checked_mul(joint.layer_cost)
         .and_then(|layers| layers.checked_add(inputs.non_expert))
         .and_then(|bytes| bytes.checked_add(joint.reserve))
         .and_then(|needed| inputs.free.checked_sub(needed))
@@ -1563,7 +1600,8 @@ impl FrontierPoint {
     /// non-expert weights, the layers and the whole charged reserve.
     pub fn needed_bytes_for(&self, layers: usize) -> u128 {
         u128::from(self.non_expert)
-            + layers as u128 * u128::from(self.layer_expert_bytes)
+            + layers as u128
+                * (u128::from(self.layer_expert_bytes) + u128::from(self.granule.layer))
             + u128::from(self.reserve)
     }
 
@@ -1949,6 +1987,13 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
         &tile_reserve,
         granule_bytes,
     )?;
+    // One boundary stage's own part allocations (`allocate_prompt_stages`
+    // makes one `zeros` per session fixed part), from the state's own list.
+    let boundary_stage_slack = crate::expert_residency::granule_slack_total(
+        crate::state::Qwen4State::session_fixed_part_sizes(load.config, load.state_format)
+            .ok_or_else(|| "boundary stage part sizes overflow".to_string())?,
+        granule_bytes,
+    )?;
     Ok(LoadFacts {
         purpose: load.purpose,
         config: load.config,
@@ -1964,6 +2009,7 @@ pub fn single_device_facts<'a>(load: &SingleDeviceLoad<'a>) -> Result<LoadFacts<
         granule: GranuleInputs {
             granule_bytes,
             base: base_slack,
+            boundary_stage_slack,
         },
         incumbent_reserve: single_device_reserve(load, placement_chunk)?.placement_bytes(false),
         state_format: load.state_format,
@@ -2011,12 +2057,15 @@ fn single_device_granule_slack(
     granule_bytes: u64,
 ) -> Result<crate::expert_residency::GranuleSlack, String> {
     crate::expert_residency::base_granule_slack(&crate::expert_residency::GranuleSlackArgs {
+        gpu: load.gpu,
         config: load.config,
         weights: load.weights,
         bytes_of: load.bytes_of,
         backend: load.backend,
         max_seq: load.max_seq,
         vmm_granularity: load.vmm_granularity,
+        mtp_kept: load.mtp_kept,
+        max_k: load.max_k,
         state_format: load.state_format,
         scratch_mode: load.scratch_mode,
         chunk_rows,
@@ -4389,7 +4438,10 @@ mod tests {
                     forward: 3_000_007,
                     state: 4_000_009,
                     workspace: 5_000_011,
+                    native_mtp: 6_000_013,
+                    qsa_workspace: 7_000_017,
                 },
+                boundary_stage_slack: 1_234,
             },
             ..inputs
         }
@@ -4468,10 +4520,10 @@ mod tests {
         assert_eq!(charge.route_region, granule_slack(census.route_storage, g));
         assert_eq!(charge.hc_arena, granule_slack(arena.total_bytes, g));
         assert_eq!(
-            charge.resident_layers,
-            S1_MIN_RESIDENT_LAYERS as u64
-                * (granule_slack(GATE_UP_LAYER, g) + granule_slack(DOWN_LAYER, g))
+            charge.layer,
+            granule_slack(GATE_UP_LAYER, g) + granule_slack(DOWN_LAYER, g)
         );
+        assert_eq!(charge.boundary_stages, 4 * 1_234);
         // The Flash-Next layer: gate/up is a granule multiple, down is not.
         assert_eq!(granule_slack(GATE_UP_LAYER, g), 0);
         assert_eq!(granule_slack(DOWN_LAYER, g), 1_048_576);
@@ -4483,7 +4535,7 @@ mod tests {
         // Free memory that keeps exactly ten layers beside the payload census
         // AND the granule slack.
         let probe = with_granule(inputs(
-            free_for(&inputs(0), 10) + charge.total().unwrap(),
+            free_for(&inputs(0), 10) + charge.total().unwrap() + 10 * charge.layer,
         ));
         let on = admit(&probe).unwrap();
         assert_eq!(on.granule, charge);
@@ -4499,7 +4551,7 @@ mod tests {
         let layers = auto_placement_layers(
             probe.free,
             probe.non_expert,
-            probe.layer_expert_bytes,
+            on.placement_layer_bytes(probe.layer_expert_bytes).unwrap(),
             probe.trunk_layers,
             probe.base_reserve,
             &PlacementCharges::new(probe.layer_expert_bytes, false)
@@ -4540,10 +4592,9 @@ mod tests {
     fn slowlink_granule_budget_never_draws_the_safety_margin() {
         let probe = with_granule(inputs(0));
         let (pages, arena, census) = census_of(&probe).unwrap();
-        let granule = granule_charge(&probe, &pages, &arena, &census)
-            .unwrap()
-            .total()
-            .unwrap();
+        let charge = granule_charge(&probe, &pages, &arena, &census).unwrap();
+        let granule = charge.total().unwrap();
+        let layer_cost = LAYER + charge.layer;
         let fixed = probe.non_expert
             + probe.base_reserve
             + EXPERT_MARGIN
@@ -4551,7 +4602,7 @@ mod tests {
             + granule;
         for layers in 10..=12u64 {
             for extra in [0, 1, 4096, MIB, 100 * MIB, LAYER - 1] {
-                let free = fixed + layers * LAYER + extra;
+                let free = fixed + layers * layer_cost + extra;
                 let profile = admit(&AdmissionInputs { free, ..probe }).unwrap();
                 assert_eq!(profile.resident_layers as u64, layers, "{layers} {extra}");
                 assert_eq!(profile.device_snapshot_budget_bytes, extra);
@@ -4559,7 +4610,7 @@ mod tests {
                 assert_eq!(
                     free,
                     probe.non_expert
-                        + layers * LAYER
+                        + layers * layer_cost
                         + probe.base_reserve
                         + EXPERT_MARGIN
                         + profile.reserve_bytes().unwrap()
@@ -4567,7 +4618,7 @@ mod tests {
                 );
             }
         }
-        let edge = fixed + 10 * LAYER;
+        let edge = fixed + 10 * layer_cost;
         assert!(matches!(
             admit(&AdmissionInputs {
                 free: edge - 1,
@@ -4644,9 +4695,16 @@ mod tests {
         // artifact (536 of them at least one granule), from its model-index.
         const J1778_WEIGHT_GRANULE_SLACK: u64 = 635_740_160;
         let granule = 2 * MIB;
-        let base_slack = |tile: usize| {
+        // The resident non-expert weights packed in ONE 256 B-aligned arena of
+        // the artifact (the model-index's 1,099 tensors; the worst internal
+        // alignment is below the arena's granule tail).
+        const J1778_WEIGHT_PACKED_ROOT: u64 = 5_364_514_816;
+        // The owners' own allocation lists at `tile`: forward scratch (owning
+        // slots + spec buffers), request state (context arenas as the Legacy
+        // backend commits them + snapshot mirror) and the kernel workspace
+        // terms, one entry per allocation.
+        let lists = |tile: usize| {
             let config = crate::config::compact_test_config();
-            let reserve = j1778_reserve_at(tile);
             let context = crate::Qwen4ContextCommit::new(
                 crate::Qwen4KvBackend::Legacy,
                 J1778_MAX_SEQ,
@@ -4665,6 +4723,19 @@ mod tests {
                 &context,
             )
             .unwrap();
+            let workspace: Vec<u64> = j1778_reserve_at(tile)
+                .census
+                .workspace
+                .iter()
+                .map(|term| term.1)
+                .filter(|bytes| *bytes > 0)
+                .collect();
+            (forward, state, workspace)
+        };
+        let base_slack = |tile: usize| {
+            let config = crate::config::compact_test_config();
+            let reserve = j1778_reserve_at(tile);
+            let (forward, state, workspace) = lists(tile);
             residency::GranuleSlack {
                 weights: J1778_WEIGHT_GRANULE_SLACK,
                 f16_shadows: residency::f16_shadow_granule_slack(
@@ -4675,13 +4746,28 @@ mod tests {
                 .unwrap(),
                 forward: residency::granule_slack_total(forward, granule).unwrap(),
                 state: residency::granule_slack_total(state, granule).unwrap(),
-                workspace: residency::granule_slack_total(
-                    reserve.census.workspace.iter().map(|term| term.1),
+                workspace: residency::granule_slack_total(workspace, granule).unwrap(),
+                // Hold 1 runs no native MTP head (the CPU claim for a kept
+                // head is `base_granule_slack`'s `native_mtp` list).
+                native_mtp: 0,
+                // Legacy backend: the gather workspace is one allocation and
+                // the selector scratch another; both are 0 on this fixture.
+                qsa_workspace: residency::granule_slack_total(
+                    [reserve.census.gather, reserve.census.qsa_selector],
                     granule,
                 )
                 .unwrap(),
             }
         };
+        let boundary_stage_slack = residency::granule_slack_total(
+            crate::state::Qwen4State::session_fixed_part_sizes(
+                &crate::config::compact_test_config(),
+                j1778_state_format(),
+            )
+            .unwrap(),
+            granule,
+        )
+        .unwrap();
         let mut rows = Vec::new();
         for (route, purpose, payload_slack) in [
             (
@@ -4700,6 +4786,7 @@ mod tests {
                 granule: GranuleInputs {
                     granule_bytes: granule,
                     base: base_slack(purpose_tile_rows(purpose)),
+                    boundary_stage_slack,
                 },
                 ..payload_only
             };
@@ -4719,7 +4806,9 @@ mod tests {
                 );
                 assert_eq!(
                     point.slack_for(10),
-                    payload_slack[index] - i128::from(total),
+                    payload_slack[index]
+                        - i128::from(total)
+                        - 10 * i128::from(point.granule.layer),
                     "{route:?} {purpose:?} tile {}",
                     point.tile_rows
                 );
@@ -4747,6 +4836,11 @@ mod tests {
             }
             // The product load itself declines with its exact byte deficit.
             let tile = purpose_tile_rows(purpose);
+            let inputs_layer_slack = census_of(&inputs)
+                .map(|(pages, arena, census)| {
+                    granule_charge(&inputs, &pages, &arena, &census).unwrap().layer
+                })
+                .unwrap();
             let reserve = inputs.base_reserve
                 + census_of(&inputs).unwrap().2.total().unwrap()
                 + {
@@ -4762,12 +4856,66 @@ mod tests {
                     assert_eq!(deficit.reserve, reserve, "tile {tile}");
                     assert_eq!(
                         deficit.deficit_bytes,
-                        10 * LAYER + J1778_NON_EXPERT + reserve - J1778_PRELOAD_FREE
+                        10 * (LAYER + inputs_layer_slack) + J1778_NON_EXPERT + reserve
+                            - J1778_PRELOAD_FREE
                     );
                 }
                 other => panic!("tile {tile} must decline on the corrected census: {other:?}"),
             }
         }
+        // The exact CPU backing model at the product tile: each owner group's
+        // payload, its physical size as individual allocations and as ONE
+        // 256 B-aligned arena of that lifetime group (rounded once). The
+        // weights and shadows rows use the artifact's own lists (constants
+        // from the model-index, shadows computed); forward, state and kernel
+        // workspace use the owners' allocation lists above.
+        let product = purpose_tile_rows(AdmissionPurpose::Product);
+        let (forward, state, workspace) = lists(product);
+        let pack = |sizes: &[u64]| -> (u64, u64, u64) {
+            let payload: u64 = sizes.iter().sum();
+            let individual: u64 = sizes
+                .iter()
+                .map(|bytes| bytes + residency::granule_slack(*bytes, granule))
+                .sum();
+            let aligned: u64 = sizes.iter().map(|bytes| bytes.next_multiple_of(256)).sum();
+            (payload, individual, aligned.next_multiple_of(granule))
+        };
+        let mut backing = Vec::new();
+        for (name, (payload, individual, packed)) in [
+            ("forward scratch + spec buffers", pack(&forward)),
+            ("request state + snapshot mirror", pack(&state)),
+            ("kernel workspace terms", pack(&workspace)),
+            (
+                "F16 shadows (291 owners, 256 B multiples)",
+                (
+                    J1778_SHADOWS,
+                    J1778_SHADOWS + 387_186_688,
+                    J1778_SHADOWS.next_multiple_of(granule),
+                ),
+            ),
+            (
+                "resident non-expert weights (model-index)",
+                (
+                    J1778_NON_EXPERT,
+                    J1778_NON_EXPERT + J1778_WEIGHT_GRANULE_SLACK,
+                    J1778_WEIGHT_PACKED_ROOT,
+                ),
+            ),
+        ] {
+            assert!(packed <= individual, "{name}: an arena never costs more");
+            backing.push(serde_json::json!({
+                "owner": name,
+                "payload_bytes": payload,
+                "individual_physical_bytes": individual,
+                "packed_physical_bytes": packed,
+                "recovered_vs_individual_bytes": individual - packed,
+                "recovered_credit_vs_census_bytes": i128::from(individual) - i128::from(packed),
+            }));
+        }
+        println!(
+            "SLOWLINK_GRANULE_BACKING {}",
+            serde_json::to_string(&backing).unwrap()
+        );
         println!(
             "SLOWLINK_GRANULE_FRONTIER {}",
             serde_json::to_string(&rows).unwrap()
