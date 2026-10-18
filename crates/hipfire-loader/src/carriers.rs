@@ -2137,6 +2137,7 @@ fn load_qwen4_rank_scoped(
                     max_k,
                     state_format,
                     scratch_mode,
+                    purpose: s1::AdmissionPurpose::Product,
                 })
             },
         )?
@@ -7550,6 +7551,7 @@ mod qwen4_slowlink_tests {
             baseline_layers: 10,
             fixed_state_bytes: FIXED_STATE,
             pending_save_bytes: PENDING_SAVE,
+            diagnostic_bytes: 0,
             checkpoint_stride_rows: 8192,
             window_rows: s1::S1_WINDOW_ROWS,
             link_gbps,
