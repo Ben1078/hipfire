@@ -9126,47 +9126,6 @@ pub fn native_mtp_device_bytes(
         .checked_add(u64::try_from(scratch).ok()?.max(request))
 }
 
-/// [`native_mtp_device_bytes`] per allocation, one entry per device
-/// allocation, same arguments (`max_k` is `drafts`, `batched_fill` is
-/// `fill_scratch`): the resident head allocations
-/// ([`crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes`]) then the allocations
-/// of whichever of the two coexisting alternatives wins the `max` of
-/// `native_mtp_device_bytes` — the head's build scratch (released at attach)
-/// or the first speculative request's ([`native_mtp_request_allocation_sizes`]),
-/// the request on a tie. The entries sum to `native_mtp_device_bytes`.
-pub(crate) fn native_mtp_allocation_sizes(
-    config: &crate::Qwen4Config,
-    context: &crate::Qwen4ContextCommit,
-    chunk_rows: usize,
-    drafts: usize,
-    head_dtype: rdna_compute::DType,
-    row_capture: Option<(crate::GdnStateFormat, usize)>,
-    fill_scratch: bool,
-) -> Option<Vec<u64>> {
-    let request = native_mtp_request_allocation_sizes(
-        config,
-        context.max_seq,
-        chunk_rows,
-        drafts,
-        row_capture,
-        fill_scratch,
-    )?;
-    let (mut sizes, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(config, context, head_dtype)?;
-    let total = |entries: &[u64]| {
-        entries
-            .iter()
-            .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
-    };
-    sizes.extend(if total(&scratch)? > total(&request)? {
-        scratch
-    } else {
-        request
-    });
-    total(&sizes)?;
-    Some(sizes)
-}
-
 /// Rows a native MTP request sizes for windows of up to `max_k` drafts (pass
 /// [`native_mtp_proposal_drafts`], which counts n-gram takeovers): the seed
 /// row plus `max_k` clamped to the widest verify forward
@@ -9357,24 +9316,48 @@ mod tests {
         }
     }
 
-    /// `native_mtp_allocation_sizes` is the resident head allocations plus
-    /// the allocations of the winning alternative of the byte query's `max`
-    /// (build scratch or first request), summing to `native_mtp_device_bytes`
-    /// for every context commit, chunk, draft count, head dtype and capture.
+    /// The two production inventories compose to the byte query: the resident
+    /// head allocations plus the larger (by sum) of the head's build scratch
+    /// and the first request's allocations, the request on a tie, summing to
+    /// `native_mtp_device_bytes` for every context commit, chunk, draft count,
+    /// head dtype and capture.
     #[test]
     fn native_mtp_allocation_sizes_sum_to_the_device_bytes() {
         use crate::GdnStateFormat as G;
         use rdna_compute::DType;
         let config = crate::config::compact_test_config();
+        let composed = |context: &crate::Qwen4ContextCommit,
+                        chunk_rows: usize,
+                        drafts: usize,
+                        head: DType,
+                        capture: Option<(G, usize)>,
+                        fill: bool|
+         -> Option<Vec<u64>> {
+            let request = native_mtp_request_allocation_sizes(
+                &config,
+                context.max_seq,
+                chunk_rows,
+                drafts,
+                capture,
+                fill,
+            )?;
+            let (mut sizes, scratch) =
+                crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(&config, context, head)?;
+            sizes.extend(if scratch.iter().sum::<u64>() > request.iter().sum::<u64>() {
+                scratch
+            } else {
+                request
+            });
+            Some(sizes)
+        };
         for context in mtp_contexts() {
             for chunk_rows in [1usize, 4, 512, 768, 1536] {
                 for drafts in [1usize, 3, 63] {
                     for head in [DType::BF16, DType::Q8_0, DType::MQ6G256V2, DType::F32] {
                         for capture in [None, Some((G::Q8Ef, 8))] {
                             for fill in [false, true] {
-                                let sizes = native_mtp_allocation_sizes(
-                                    &config, &context, chunk_rows, drafts, head, capture, fill,
-                                );
+                                let sizes =
+                                    composed(&context, chunk_rows, drafts, head, capture, fill);
                                 let bytes = native_mtp_device_bytes(
                                     &config, &context, chunk_rows, drafts, head, capture, fill,
                                 );
@@ -9383,44 +9366,19 @@ mod tests {
                                     bytes,
                                     "{context:?} {chunk_rows} {drafts} {head:?} {capture:?} {fill}"
                                 );
-                                let Some(sizes) = sizes else { continue };
-                                assert!(sizes.iter().all(|&bytes| bytes > 0));
-                                let (resident, scratch) =
-                                    crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(
-                                        &config, &context, head,
-                                    )
-                                    .unwrap();
-                                let request = native_mtp_request_allocation_sizes(
-                                    &config,
-                                    context.max_seq,
-                                    chunk_rows,
-                                    drafts,
-                                    capture,
-                                    fill,
-                                )
-                                .unwrap();
-                                let tail = if sum(&scratch) > sum(&request) {
-                                    scratch
-                                } else {
-                                    request
-                                };
-                                assert_eq!(sizes, [resident, tail].concat());
+                                if let Some(sizes) = sizes {
+                                    assert!(sizes.iter().all(|&bytes| bytes > 0));
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        let huge = crate::Qwen4ContextCommit::legacy(usize::MAX);
+        assert_eq!(composed(&huge, 1536, 3, DType::BF16, None, false), None);
         assert_eq!(
-            native_mtp_allocation_sizes(
-                &config,
-                &crate::Qwen4ContextCommit::legacy(usize::MAX),
-                1536,
-                3,
-                rdna_compute::DType::BF16,
-                None,
-                false
-            ),
+            native_mtp_device_bytes(&config, &huge, 1536, 3, DType::BF16, None, false),
             None
         );
     }
