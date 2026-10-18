@@ -8,19 +8,33 @@ use std::path::Path;
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/jit-g0/");
 const MANIFESTS: &[&str] = &[
-    "27b-xts-gfx1201.routes.json", "27b-xts-gfx1100.routes.json",
-    "27b-xts-gfx1151.routes.json", "flash-next-gfx1201.routes.json",
-    "flash-next-gfx1100.routes.json", "flash-next-gfx1151.routes.json",
+    "27b-xts-gfx1201.routes.json",
+    "27b-xts-gfx1100.routes.json",
+    "27b-xts-gfx1151.routes.json",
+    "flash-next-gfx1201.routes.json",
+    "flash-next-gfx1100.routes.json",
+    "flash-next-gfx1151.routes.json",
 ];
 fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(Path::new(ROOT).join(name)).unwrap()).unwrap()
 }
 fn strings(value: &Value) -> Vec<&str> {
-    value.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect()
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect()
 }
 fn image_identity(entry: &Value) -> String {
-    format!("{}:{}:{}:{}:{}", entry["kind"], entry["sha256"], entry["flags"],
-        entry["scheduler_profile"], entry["cache_abi"])
+    format!(
+        "{}:{}:{}:{}:{}",
+        entry["kind"],
+        entry["sha256"],
+        entry["flags"],
+        entry["scheduler_profile"],
+        entry["cache_abi"]
+    )
 }
 fn validate_public_entries(entries: &[Value]) -> Result<(), String> {
     let mut selected = BTreeMap::new();
@@ -28,7 +42,9 @@ fn validate_public_entries(entries: &[Value]) -> Result<(), String> {
         let identity = image_identity(entry);
         for symbol in strings(&entry["symbols"]) {
             if let Some(previous) = selected.insert(symbol, identity.clone()) {
-                if previous != identity { return Err(format!("conflicting image for {symbol}")); }
+                if previous != identity {
+                    return Err(format!("conflicting image for {symbol}"));
+                }
             }
         }
     }
@@ -41,19 +57,35 @@ fn six_header_specific_recipes_match_baseline_factories() {
         let manifest = fixture(name);
         let arch = manifest["arch"].as_str().unwrap();
         assert_eq!(manifest["baseline"], "83cb363e8a");
-        assert_eq!(manifest["mixed_fixture_role"], "superset only; not default route membership");
+        assert_eq!(
+            manifest["mixed_fixture_role"],
+            "superset only; not default route membership"
+        );
         let corpus = kernel_registry::corpus_entries(arch, "-DIU4_A4_CANDIDATES=2").unwrap();
         let sets = std::iter::once(&manifest["default_entries"]).chain(
-            manifest["alternate_arms"].as_array().unwrap().iter().map(|arm| {
-                if let Some(entries) = arm.get("entries") {
-                    entries
-                } else {
-                    let reference = arm["entries_ref"].as_str().unwrap_or_else(||
-                        panic!("{name}: arm {} has neither entries nor entries_ref", arm["name"]));
-                    manifest.get(reference).unwrap_or_else(||
-                        panic!("{name}: arm {} references missing field {reference}", arm["name"]))
-                }
-            }));
+            manifest["alternate_arms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arm| {
+                    if let Some(entries) = arm.get("entries") {
+                        entries
+                    } else {
+                        let reference = arm["entries_ref"].as_str().unwrap_or_else(|| {
+                            panic!(
+                                "{name}: arm {} has neither entries nor entries_ref",
+                                arm["name"]
+                            )
+                        });
+                        manifest.get(reference).unwrap_or_else(|| {
+                            panic!(
+                                "{name}: arm {} references missing field {reference}",
+                                arm["name"]
+                            )
+                        })
+                    }
+                }),
+        );
         for entries in sets {
             let entries = entries.as_array().unwrap();
             validate_public_entries(entries).unwrap();
@@ -62,37 +94,74 @@ fn six_header_specific_recipes_match_baseline_factories() {
                 assert!(!strings(&entry["symbols"]).is_empty());
                 if entry["kind"] == "hip" {
                     let module = entry["module"].as_str().unwrap();
-                    let oracle = corpus.iter().find(|e| e.module == module).unwrap_or_else(||
-                        panic!("{name}: missing source factory for {module}"));
-                    assert_eq!(format!("{:x}", Sha256::digest(oracle.source().as_bytes())), entry["sha256"]);
-                    let recipe = KernelCompiler::recipe_for_source(arch, module, oracle.source(), "-DIU4_A4_CANDIDATES=2");
+                    let oracle = corpus
+                        .iter()
+                        .find(|e| e.module == module)
+                        .unwrap_or_else(|| panic!("{name}: missing source factory for {module}"));
+                    let live = format!("{:x}", Sha256::digest(oracle.source().as_bytes()));
+                    if live != entry["sha256"].as_str().unwrap() {
+                        // The only intentional source change since the measurement: S1 D
+                        // appended kernels to one module. Anything else still fails here.
+                        assert_s1_d_append_only(module, oracle.source(), &entry["sha256"]);
+                    } else {
+                        assert_eq!(live, entry["sha256"]);
+                    }
+                    let recipe = KernelCompiler::recipe_for_source(
+                        arch,
+                        module,
+                        oracle.source(),
+                        "-DIU4_A4_CANDIDATES=2",
+                    );
                     assert_eq!(serde_json::to_value(&recipe.flags).unwrap(), entry["flags"]);
-                    assert_eq!(recipe.scheduler_profile.as_deref(), entry["scheduler_profile"].as_str());
-                    assert_eq!(recipe.cache_abi as u64, entry["cache_abi"].as_u64().unwrap());
+                    assert_eq!(
+                        recipe.scheduler_profile.as_deref(),
+                        entry["scheduler_profile"].as_str()
+                    );
+                    assert_eq!(
+                        recipe.cache_abi as u64,
+                        entry["cache_abi"].as_u64().unwrap()
+                    );
                     let required = strings(&entry["symbols"]);
-                    let missing: BTreeSet<_> = required.iter().copied()
-                        .filter(|s| !oracle.symbols.contains(s)).collect();
+                    let missing: BTreeSet<_> = required
+                        .iter()
+                        .copied()
+                        .filter(|s| !oracle.symbols.contains(s))
+                        .collect();
                     // `registry_missing_symbols` is the immutable G0 measurement of the
                     // legacy registry (the Q8 gap of HOLD1-R2-REVIEW section 3). It stays
                     // as data; the live registry must now close every measured symbol.
                     assert!(missing.is_empty(),
                         "{name}:{module}: required symbols missing from the live registry: {missing:?}");
-                    let historical: BTreeSet<_> =
-                        strings(&entry["registry_missing_symbols"]).into_iter().collect();
-                    assert!(historical.iter().all(|s| required.contains(s)),
-                        "{name}:{module}: historical gap names a symbol the route never required");
-                    assert_eq!(entry["export_receipt"]["sha256"].as_str().unwrap().len(), 64);
+                    let historical: BTreeSet<_> = strings(&entry["registry_missing_symbols"])
+                        .into_iter()
+                        .collect();
+                    assert!(
+                        historical.iter().all(|s| required.contains(s)),
+                        "{name}:{module}: historical gap names a symbol the route never required"
+                    );
+                    assert_eq!(
+                        entry["export_receipt"]["sha256"].as_str().unwrap().len(),
+                        64
+                    );
                     for symbol in required {
-                        assert!(strings(&entry["exports"]).contains(&symbol), "{name}:{module}:{symbol}");
+                        assert!(
+                            strings(&entry["exports"]).contains(&symbol),
+                            "{name}:{module}:{symbol}"
+                        );
                     }
                 } else {
                     assert_eq!(entry["kind"], "embedded");
-                    let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(entry["repo_image"].as_str().unwrap());
+                    let image = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../..")
+                        .join(entry["repo_image"].as_str().unwrap());
                     let bytes = std::fs::read(image).unwrap();
                     assert_eq!(format!("{:x}", Sha256::digest(&bytes)), entry["sha256"]);
                     assert!(strings(&entry["flags"]).is_empty());
                     for symbol in strings(&entry["symbols"]) {
-                        assert!(strings(&entry["image_exports"]).contains(&symbol), "missing native export {symbol}");
+                        assert!(
+                            strings(&entry["image_exports"]).contains(&symbol),
+                            "missing native export {symbol}"
+                        );
                     }
                 }
             }
@@ -106,8 +175,12 @@ fn all_current_cold_sources_have_selected_symbols() {
     let cold = fixture("cold-24.json");
     assert_eq!(cold.as_array().unwrap().len(), 24);
     for source in cold.as_array().unwrap() {
-        let entry = manifest["default_entries"].as_array().unwrap().iter().find(|e|
-            e["module"] == source["module"] && e["sha256"] == source["sha256"]).unwrap();
+        let entry = manifest["default_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["module"] == source["module"] && e["sha256"] == source["sha256"])
+            .unwrap();
         assert!(!strings(&entry["symbols"]).is_empty());
     }
 }
@@ -117,21 +190,36 @@ fn headers_are_quant_and_shape_specific_not_mixed_trace_defaults() {
     for name in MANIFESTS {
         let m = fixture(name);
         let family = m["family"].as_str().unwrap();
-        let h = fixture(if family == "27b-xts" { "header-27b.json" } else { "header-flash-next.json" });
+        let h = fixture(if family == "27b-xts" {
+            "header-27b.json"
+        } else {
+            "header-flash-next.json"
+        });
         assert_eq!(m["header"]["header_sha256"], h["header_sha256"]);
         assert_eq!(m["header"]["quant_census"], h["quant_census"]);
-        assert!(h["tensors"].as_array().unwrap().iter().all(|t|
-            !t["name"].as_str().unwrap().is_empty() && t["shape"].as_array().unwrap().iter().all(|d| d.as_u64().unwrap() > 0)));
+        assert!(h["tensors"].as_array().unwrap().iter().all(|t| !t["name"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+            && t["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|d| d.as_u64().unwrap() > 0)));
         for e in m["default_entries"].as_array().unwrap() {
             let module = e["module"].as_str().unwrap();
             assert!(!module.starts_with("dflash_") || module == "dflash_state_bulk_copy_gfx1100");
             assert!(!module.contains("ddtree") && !module.contains("dspark"));
-            if family == "27b-xts" { assert!(!module.contains("moe")); }
+            if family == "27b-xts" {
+                assert!(!module.contains("moe"));
+            }
         }
         if family == "flash-next" && m["arch"] == "gfx1100" {
             assert_eq!(m["evidence_status"], "source-predicted");
             assert_eq!(m["effective_policy"]["spec"], "ar");
-            assert!(m["effective_policy"]["host_mapped_experts"].as_bool().unwrap());
+            assert!(m["effective_policy"]["host_mapped_experts"]
+                .as_bool()
+                .unwrap());
         }
     }
 }
@@ -143,22 +231,28 @@ fn same_source_aliases_union_symbols_without_erasing_module_names() {
     let mut groups: BTreeMap<String, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
     for e in entries.iter().filter(|e| e["kind"] == "hip") {
         let (modules, symbols) = groups.entry(image_identity(e)).or_default();
-        modules.insert(e["module"].as_str().unwrap()); symbols.extend(strings(&e["symbols"]));
+        modules.insert(e["module"].as_str().unwrap());
+        symbols.extend(strings(&e["symbols"]));
     }
     assert_eq!(groups.len(), 43);
-    assert!(groups.values().any(|(m,s)| m.contains("qwen35_fa_prep_batched_gfx1201")
-        && m.contains("qwen35_fa_prep_fp8q_nogate_batched_gfx1201")
-        && s.contains("qwen35_fa_prep_batched_gfx1201") && s.contains("qwen35_fa_prep_fp8q_nogate_batched_gfx1201")));
+    assert!(groups
+        .values()
+        .any(|(m, s)| m.contains("qwen35_fa_prep_batched_gfx1201")
+            && m.contains("qwen35_fa_prep_fp8q_nogate_batched_gfx1201")
+            && s.contains("qwen35_fa_prep_batched_gfx1201")
+            && s.contains("qwen35_fa_prep_fp8q_nogate_batched_gfx1201")));
 }
 
 #[test]
 fn conflicting_public_entry_images_refuse_even_if_modules_differ() {
     let m = fixture("27b-xts-gfx1201.routes.json");
     let e = m["default_entries"].as_array().unwrap()[0].clone();
-    let mut conflict = e.clone(); conflict["module"] = Value::from("alternate");
+    let mut conflict = e.clone();
+    conflict["module"] = Value::from("alternate");
     conflict["sha256"] = Value::from("different-image");
     assert!(validate_public_entries(&[e.clone(), conflict]).is_err());
-    let mut alias = e.clone(); alias["module"] = Value::from("same-recipe-alias");
+    let mut alias = e.clone();
+    alias["module"] = Value::from("same-recipe-alias");
     assert!(validate_public_entries(&[e, alias]).is_ok());
 }
 
@@ -166,14 +260,23 @@ fn conflicting_public_entry_images_refuse_even_if_modules_differ() {
 fn architecture_defaults_and_current_shape_ports_are_not_blanket_aliases() {
     assert_eq!(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS, 512);
     assert_eq!(rdna_compute::gemm::QWEN4_MQ6_X4_PM_MIN_M_GFX1151, 2560);
-    for (arch, level) in [("gfx1151",3), ("gfx1201",1), ("gfx1100",0)] {
+    for (arch, level) in [("gfx1151", 3), ("gfx1201", 1), ("gfx1100", 0)] {
         let m = fixture(&format!("flash-next-{arch}.routes.json"));
         assert_eq!(m["effective_policy"]["hc_fuse"], level);
     }
     assert_eq!(rdna_compute::gemm::QWEN4_MQ6_X4_PM_MIN_N_GFX1151, 2048);
-    assert_eq!(Gpu::qwen4_lds_tile_gfx1201(320, 10240).entry(), "qwen4_wmma_lds_64_128_32_64_k64_p_s4");
-    assert_eq!(Gpu::qwen4_lds_tile_gfx1201(640, 2560).entry(), "qwen4_wmma_lds_128_128_32_64_k64");
-    assert_eq!(Gpu::qwen4_lds_tile_gfx1201(2560, 640).entry(), "qwen4_wmma_lds_128_256_32_64_k64");
+    assert_eq!(
+        Gpu::qwen4_lds_tile_gfx1201(320, 10240).entry(),
+        "qwen4_wmma_lds_64_128_32_64_k64_p_s4"
+    );
+    assert_eq!(
+        Gpu::qwen4_lds_tile_gfx1201(640, 2560).entry(),
+        "qwen4_wmma_lds_128_128_32_64_k64"
+    );
+    assert_eq!(
+        Gpu::qwen4_lds_tile_gfx1201(2560, 640).entry(),
+        "qwen4_wmma_lds_128_256_32_64_k64"
+    );
 }
 
 #[test]
@@ -183,25 +286,41 @@ fn g0_pass_is_not_an_a3_ready_plan_or_an_inadmissible_fixture_guarantee() {
         assert_eq!(m["g0_gate"], "PASS");
         assert_eq!(m["is_closed_ready_plan"], false);
         assert!(!strings(&m["a3_coverage_not_proven"]).is_empty());
-        assert!(m["alternate_arms"].as_array().unwrap().iter()
+        assert!(m["alternate_arms"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|arm| arm["name"] == "serial-compiler-kill-arm"
                 && arm["entries_ref"] == "default_entries"));
-        assert!(m["explicit_spec_inventory_role"].as_str().unwrap().contains("superset"));
+        assert!(m["explicit_spec_inventory_role"]
+            .as_str()
+            .unwrap()
+            .contains("superset"));
         if *name == "flash-next-gfx1100.routes.json" {
-            assert!(m["g0_fixture_exclusion"].as_str().unwrap().contains("not admissible"));
+            assert!(m["g0_fixture_exclusion"]
+                .as_str()
+                .unwrap()
+                .contains("not admissible"));
         } else {
             assert!(m["g0_fixture_exclusion"].is_null());
         }
     }
     let m = fixture("flash-next-gfx1201.routes.json");
-    let tensor_ops = m["default_entries"].as_array().unwrap().iter()
-        .find(|e| e["module"] == "tensor_ops").unwrap();
+    let tensor_ops = m["default_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["module"] == "tensor_ops")
+        .unwrap();
     let missing = strings(&tensor_ops["registry_missing_symbols"]);
     assert!(missing.contains(&"indexed_attention_cache_append_q8_batched"));
     assert!(missing.contains(&"indexed_attention_decode_prologue_q8"));
     let live = kernel_registry::lookup("gfx1201", "tensor_ops", "-DIU4_A4_CANDIDATES=2").unwrap();
     for symbol in missing {
-        assert!(live.symbols.contains(&symbol), "live registry still omits {symbol}");
+        assert!(
+            live.symbols.contains(&symbol),
+            "live registry still omits {symbol}"
+        );
     }
 }
 
@@ -210,21 +329,88 @@ fn g0_pass_is_not_an_a3_ready_plan_or_an_inadmissible_fixture_guarantee() {
 /// not only in the JIT corpus: the sealed gfx1100 package omitted nine.
 #[test]
 fn measured_q8_route_symbols_are_in_the_packaged_index() {
+    let mut covered = 0usize;
     for arch in ["gfx1100", "gfx1151", "gfx1201"] {
         let m = fixture(&format!("flash-next-{arch}.routes.json"));
         let packaged = kernel_registry::entries(arch, "-DIU4_A4_CANDIDATES=2").unwrap();
         let tensor_ops = packaged.iter().find(|e| e.module == "tensor_ops").unwrap();
         let arms = std::iter::once(&m["default_entries"]).chain(
-            m["alternate_arms"].as_array().unwrap().iter().filter_map(|arm| arm.get("entries")));
+            m["alternate_arms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|arm| arm.get("entries")),
+        );
         let mut q8 = BTreeSet::new();
         for entries in arms {
-            for entry in entries.as_array().unwrap().iter().filter(|e| e["module"] == "tensor_ops") {
-                q8.extend(strings(&entry["symbols"]).into_iter().filter(|s| s.contains("q8")));
+            for entry in entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["module"] == "tensor_ops")
+            {
+                q8.extend(
+                    strings(&entry["symbols"])
+                        .into_iter()
+                        .filter(|s| s.contains("q8")),
+                );
             }
         }
-        assert!(q8.len() >= 4, "{arch}: no Q8 tensor_ops route symbols in the fixture");
+        if q8.is_empty() {
+            // This arch's recorded trace requested no Q8 tensor_ops symbol (gfx1151's
+            // flash-next fixture). Nothing is asserted from an unrecorded trace; its Q8
+            // capability is the source-export closure in `kernel_registry` tests.
+            assert_eq!(arch, "gfx1151", "{arch}: fixture lost its Q8 route symbols");
+            continue;
+        }
+        covered += 1;
+        assert!(q8.len() >= 4, "{arch}: too few Q8 tensor_ops route symbols");
         for symbol in q8 {
-            assert!(tensor_ops.symbols.contains(&symbol), "{arch}: packaged index omits {symbol}");
+            assert!(
+                tensor_ops.symbols.contains(&symbol),
+                "{arch}: packaged index omits {symbol}"
+            );
+        }
+    }
+    // Recorded Q8 traces: gfx1100 and gfx1201 (gfx1151 recorded none).
+    assert_eq!(covered, 2);
+}
+
+/// `moe_down_combine_grouped_top10` as measured by G0 / the walked plans
+/// (sha256 `HISTORICAL`) was the first `PREFIX_LEN` bytes of today's source;
+/// S1 D only appended kernels after it. Bounded old-to-new identity proof,
+/// not a relaxed hash: the prefix must still hash to the historical value, and
+/// everything after it must be the S1 section whose kernels are all `slowlink_*`.
+const S1_D_MODULE: &str = "moe_down_combine_grouped_top10";
+const S1_D_HISTORICAL_SHA: &str = "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334";
+const S1_D_PREFIX_LEN: usize = 9665;
+
+fn assert_s1_d_append_only(module: &str, source: &str, historical: &Value) {
+    assert_eq!(module, S1_D_MODULE, "{module}: source changed since the G0 measurement");
+    assert_eq!(historical, S1_D_HISTORICAL_SHA);
+    let bytes = source.as_bytes();
+    assert!(bytes.len() > S1_D_PREFIX_LEN);
+    assert_eq!(format!("{:x}", Sha256::digest(&bytes[..S1_D_PREFIX_LEN])), S1_D_HISTORICAL_SHA);
+    let appended = &source[S1_D_PREFIX_LEN..];
+    assert!(appended.starts_with("// ----"), "S1 section must follow the measured source");
+    let kernels: Vec<&str> = appended
+        .split("extern \"C\" __global__")
+        .skip(1)
+        .map(|k| k.split("void ").nth(1).unwrap().split('(').next().unwrap().trim())
+        .collect();
+    assert!(!kernels.is_empty() && kernels.iter().all(|k| k.starts_with("slowlink_")), "{kernels:?}");
+}
+
+#[test]
+fn s1_d_append_keeps_the_walked_moe_down_combine_prefix() {
+    let entry = kernel_registry::lookup("gfx1201", S1_D_MODULE, "").unwrap();
+    assert_s1_d_append_only(S1_D_MODULE, entry.source(), &Value::from(S1_D_HISTORICAL_SHA));
+    // The live sha is what the rebound walked-plan rows carry.
+    let live = format!("{:x}", Sha256::digest(entry.source().as_bytes()));
+    for plan in kernel_registry::walked_route_plans().unwrap() {
+        for row in plan.rows.iter().filter(|r| !r.embedded && r.module == S1_D_MODULE) {
+            assert_eq!(row.sha256, live);
+            assert!(row.symbols.iter().all(|s| !s.starts_with("slowlink_")));
         }
     }
 }
