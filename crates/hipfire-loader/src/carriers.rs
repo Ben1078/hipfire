@@ -2382,6 +2382,10 @@ fn load_qwen4_rank_scoped(
         None
     } else if hotset_plan.is_some() {
         None
+    } else if slowlink_profile.is_some() {
+        // The S1 admission already sized the placement (and found host layers
+        // to stream); no second free-memory query decides fully resident.
+        Some(residency::ExpertVramLayers::Auto)
     } else if let Some(layers) = expert_vram_layers {
         // The split an expert-parallel load agreed on (minimum over
         // ranks): applied as is, never re-derived per rank.
@@ -2541,9 +2545,17 @@ fn load_qwen4_rank_scoped(
                 residency::EXPERT_VRAM_LAYERS_ENV
             ));
         }
-        let vram_layers = match policy {
-            residency::ExpertVramLayers::Layers(layers) => layers,
-            residency::ExpertVramLayers::Auto => {
+        // An admitted S1 profile already carries the maximal-fitting resident
+        // count from the ONE post-initialization quote (`profile.placement`).
+        // The placement never re-queries free memory or re-derives the joint
+        // arithmetic from another epoch: it places exactly that count.
+        let admitted = slowlink_profile
+            .as_ref()
+            .map(|profile| profile.resident_layers);
+        let vram_layers = match (policy, admitted) {
+            (residency::ExpertVramLayers::Layers(layers), _) => layers,
+            (residency::ExpertVramLayers::Auto, Some(layers)) => layers,
+            (residency::ExpertVramLayers::Auto, None) => {
                 let (free, non_expert, layer_experts, auto, mtp_bytes, gather_bytes) =
                     match measured.take() {
                         Some(inputs) => inputs,
@@ -2610,20 +2622,6 @@ fn load_qwen4_rank_scoped(
                 }
             }
         };
-        if let Some(profile) = &slowlink_profile {
-            // The admitted joint plan selected its maximal-fitting resident
-            // count (ten is only preferred, never a floor); the placement just
-            // resolved from the same post-initialization inputs must keep
-            // EXACTLY that count, or the load stops before anything is placed.
-            let kept = vram_layers.min(config.num_hidden_layers);
-            if kept != profile.resident_layers {
-                return Err(format!(
-                    "qwen4: slow-link prefill (S1) was admitted at {} resident layers but the placement kept {kept}; free GPU memory or set {}=0",
-                    profile.resident_layers,
-                    hipfire_arch_qwen4::slowlink_admission::SLOWLINK_PREFILL_ENV
-                ));
-            }
-        }
         let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
         applied_layers = vram_layers.min(config.num_hidden_layers);
         // This rank's pinned bytes; the host check covers every rank that
