@@ -507,7 +507,7 @@ impl ArchCaps {
     /// (`kernels::QSA_GATHER_PM_GFX1100`) carries the attention only; the Q8 cache
     /// converter stays the hipcc `indexed_attention_kv_f16vb_q8`. Hardware/module
     /// capability (exact gfx1100) and independent of any env override; the
-    /// opt-in is `FeatureFlags::fn_qsa_gather_gfx1100_enabled`.
+    /// switch is `FeatureFlags::fn_qsa_gather_gfx1100_enabled` (default on).
     pub fn has_qsa_gather_q8_attend_pm(&self) -> bool {
         self.has_qsa_gather_q8_attend_pm
     }

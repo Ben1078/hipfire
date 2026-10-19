@@ -1201,7 +1201,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-f16-wmma-prefill",
         predicates: &[IsRecording, CaptureMode],
-        condition: "QWEN4_F16_WMMA routes at rows >= QWEN4_F16_WMMA_MIN_TOKENS and `!is_recording() && !capture_mode`: qwen4_f16_wmma_applies, qwen4_bf16_streams (gemm.rs:27873-27902), gated_delta_chunk_route (tensor_ops.rs:559), qsa_dense_wmma_applies (tensor_ops.rs:3685), qsa_gathered_wmma_applies (tensor_ops.rs:3858, on unless HIPFIRE_QWEN4_QSA_WMMA_GATHER=0; on gfx1100 only with the has_qsa_gather_q8_attend_pm capability, the Q8 24/2-head shape and the opt-in HIPFIRE_FN_QSA_GATHER_GFX1100=1, default off); gfx1201 fn_gdn_dense::applies (fn_gdn_dense.rs:46, rows >= 64, on unless HIPFIRE_FN_GDN_DENSE_SCAN=0)",
+        condition: "QWEN4_F16_WMMA routes at rows >= QWEN4_F16_WMMA_MIN_TOKENS and `!is_recording() && !capture_mode`: qwen4_f16_wmma_applies, qwen4_bf16_streams (gemm.rs:27873-27902), gated_delta_chunk_route (tensor_ops.rs:559), qsa_dense_wmma_applies (tensor_ops.rs:3685), qsa_gathered_wmma_applies (tensor_ops.rs:3858, on unless HIPFIRE_QWEN4_QSA_WMMA_GATHER=0; on gfx1100 only with the has_qsa_gather_q8_attend_pm capability, the Q8 24/2-head shape and HIPFIRE_FN_QSA_GATHER_GFX1100 not 0, default on); gfx1201 fn_gdn_dense::applies (fn_gdn_dense.rs:46, rows >= 64, on unless HIPFIRE_FN_GDN_DENSE_SCAN=0)",
         effect: KernelSelection,
         switches: "eager: F16 WMMA BF16 GEMM / chunked GDN / dense C64 GDN chunk scan (gfx1201) / dense or gathered QSA WMMA; recorded: incumbent qwen4 kernels",
         kernels: &[],

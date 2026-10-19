@@ -45,7 +45,8 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 /// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
 /// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
 /// the F32 and q8 states, gfx1201 on the fp8 state, gfx1100 on the q8 state of
-/// 24/2-head layers only and opt-in (`HIPFIRE_FN_QSA_GATHER_GFX1100=1`).  Not
+/// 24/2-head layers only, on by default for exact gfx1100
+/// (`HIPFIRE_FN_QSA_GATHER_GFX1100=0` is its architecture-local kill).  Not
 /// bit-exact against the hg4
 /// kernel; admitted because its error against an f64 reference is no worse
 /// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
@@ -9708,8 +9709,8 @@ const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 
 /// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` (read
 /// first, so with it `0` nothing else is consulted), the Qwen4 F16 route not opted
 /// out, and an arch with a kernel for the state format (gfx1151: F32 and
-/// q8, gfx1201: fp8, gfx1100: q8 only and opt-in via
-/// `HIPFIRE_FN_QSA_GATHER_GFX1100`, see [`qsa_gathered_format_enabled`]).
+/// q8, gfx1201: fp8, gfx1100: q8 only, on by default and killed by
+/// `HIPFIRE_FN_QSA_GATHER_GFX1100=0`, see [`qsa_gathered_format_enabled`]).
 /// Loaders use it to reserve and account the route's scratch.
 pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
     *QWEN4_QSA_WMMA_GATHER
@@ -10613,11 +10614,11 @@ mod tests {
         );
     }
 
-    /// The gfx1100 Q8 gathered attention is opt-in: off by default, on with
-    /// the flag, off with `=0`; F32/Fp8 never. gfx1151/gfx1201 are unchanged
-    /// and ignore the gfx1100 flag.
+    /// The gfx1100 Q8 gathered attention is on by default: on when unset, on
+    /// with the flag, off with `=0`; F32/Fp8 never. gfx1151/gfx1201 are
+    /// unchanged and ignore the gfx1100 flag.
     #[test]
-    fn qsa_gathered_format_gate_gfx1100_is_opt_in_q8_only() {
+    fn qsa_gathered_format_gate_gfx1100_is_default_on_q8_only() {
         let enabled = |arch: &str, flag: Option<bool>, format| {
             let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
             flags.fn_qsa_gather_gfx1100 = flag;
@@ -10630,7 +10631,7 @@ mod tests {
             enabled("gfx1100", None, Q8),
             crate::feature_flags::FN_QSA_GATHER_GFX1100_DEFAULT
         );
-        assert!(!enabled("gfx1100", None, Q8));
+        assert!(enabled("gfx1100", None, Q8));
         assert!(enabled("gfx1100", Some(true), Q8));
         assert!(!enabled("gfx1100", Some(false), Q8));
         for format in [F32, Fp8, Fp8Fnuz] {

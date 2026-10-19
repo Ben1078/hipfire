@@ -17,9 +17,11 @@ pub enum Mb4Mode {
     Pack4,
 }
 
-/// Default of the gfx1100 Q8 gathered QSA attention (`HIPFIRE_FN_QSA_GATHER_GFX1100`).
-/// Opt-in during XTX qualification; the promotion commit flips this one constant.
-pub const FN_QSA_GATHER_GFX1100_DEFAULT: bool = false;
+/// Default of the gfx1100 Q8 gathered QSA attention (`HIPFIRE_FN_QSA_GATHER_GFX1100`):
+/// on for the gated capability (exact gfx1100, Q8 cache, 24/2 heads, eager rows >= 512).
+/// `HIPFIRE_FN_QSA_GATHER_GFX1100=0` is the architecture-local kill;
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` remains the hard kill.
+pub const FN_QSA_GATHER_GFX1100_DEFAULT: bool = true;
 
 #[derive(Debug, Clone)]
 pub struct FeatureFlags {
@@ -1253,7 +1255,7 @@ impl FeatureFlags {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
     }
 
-    /// Resolved gfx1100 Q8 gathered QSA attention opt-in
+    /// Resolved gfx1100 Q8 gathered QSA attention switch
     /// (`HIPFIRE_FN_QSA_GATHER_GFX1100`): env override, else
     /// [`FN_QSA_GATHER_GFX1100_DEFAULT`]. The architecture capability
     /// ([`crate::arch_caps::ArchCaps::has_qsa_gather_q8_attend_pm`]) is checked separately.
@@ -1887,11 +1889,11 @@ mod tests {
         }
     }
 
-    /// The gfx1100 Q8 gathered QSA attention is opt-in while it is qualified:
-    /// unset follows [`FN_QSA_GATHER_GFX1100_DEFAULT`], `=1` enables, `=0` always
+    /// The gfx1100 Q8 gathered QSA attention is on by default: unset follows
+    /// [`FN_QSA_GATHER_GFX1100_DEFAULT`] (true), `=1` enables, `=0` always
     /// disables; `for_test` leaves it unset.
     #[test]
-    fn fn_qsa_gather_gfx1100_is_opt_in_and_zero_always_disables() {
+    fn fn_qsa_gather_gfx1100_is_default_on_and_zero_always_disables() {
         let flags = |raw: Option<&str>| {
             FeatureFlags::from_lookup("gfx1100", |name| match raw {
                 Some(v) if name == "HIPFIRE_FN_QSA_GATHER_GFX1100" => Ok(v.into()),
@@ -1899,7 +1901,8 @@ mod tests {
             })
         };
         assert_eq!(flags(None).fn_qsa_gather_gfx1100, None);
-        assert_eq!(flags(None).fn_qsa_gather_gfx1100_enabled(), FN_QSA_GATHER_GFX1100_DEFAULT);
+        assert!(FN_QSA_GATHER_GFX1100_DEFAULT);
+        assert!(flags(None).fn_qsa_gather_gfx1100_enabled());
         assert!(!flags(Some("0")).fn_qsa_gather_gfx1100_enabled());
         assert!(flags(Some("1")).fn_qsa_gather_gfx1100_enabled());
         assert_eq!(FeatureFlags::for_test("gfx1100").fn_qsa_gather_gfx1100, None);

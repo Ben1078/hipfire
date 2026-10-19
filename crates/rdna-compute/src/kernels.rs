@@ -4335,9 +4335,10 @@ pub const QSA_GATHER_PM_GFX1201: &[u8] =
 /// Certified builder module of the gfx1100 gathered QSA prefill attention
 /// (`peacemaker-isa emit --kernel qsa_gather --arch gfx1100`): the attention only,
 /// symbol `indexed_attention_gathered_wmma_f16_pm_gfx1100`; the Q8 cache converter
-/// stays the hipcc `indexed_attention_kv_f16vb_q8`. Opt-in
-/// (`HIPFIRE_FN_QSA_GATHER_GFX1100=1`, exact gfx1100, Q8, 24/2 heads, rows >= 512);
-/// `HIPFIRE_QWEN4_QSA_PM=0` selects the hipcc gathered attention instead.
+/// stays the hipcc `indexed_attention_kv_f16vb_q8`. Default on
+/// (exact gfx1100, Q8, 24/2 heads, rows >= 512; `HIPFIRE_FN_QSA_GATHER_GFX1100=0`
+/// is the architecture-local kill); `HIPFIRE_QWEN4_QSA_PM=0` selects the hipcc
+/// gathered attention instead.
 /// SHA-256 6faa1aa005cdad6930247976e6e67d4bc4e43d45b25189b97abcbf71aa7c8a28.
 pub const QSA_GATHER_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/qsa_gather_pm_gfx1100.hxaco");
