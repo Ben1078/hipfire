@@ -5880,6 +5880,7 @@ mod slowlink_prompt {
             reports: &[],
             peak_vram_bytes: None,
             status: "ok".to_string(),
+            moe_iu4: no_moe_iu4(),
         });
         assert_eq!(interleaved["resident_layer_set"], json!([1, 3, 4, 20, 47]));
         assert_eq!(interleaved["resident_layers"], 5);
