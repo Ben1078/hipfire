@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""CPU tests of quality_campaign.py: manifest / plan / env / identity / lifecycle-argument invariants,
+route evidence and determinism parsing. No model, no GPU, no native executable is run.
+
+Run: python3 -B -m unittest discover -s scripts/slowlink-gap -p 'quality_test_*.py'
+"""
+import copy
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import quality_campaign as qc  # noqa: E402
+import quality_scorer as qs  # noqa: E402
+
+PLAN_SHA = "74ce7b8291b15bc25254b589844ccd0c2f6b342dfb103e725736c8232b33bcf6"
+LEVER_KEYS = ("HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS", "HIPFIRE_QWEN4_MOE_SYM_IU4", "HIPFIRE_FN_QSA_GATHER_GFX1100")
+
+
+def base_plan():
+    return {
+        "schema": qc.PLAN_SCHEMA, "max_seq": 16897,
+        "artifact": {"path": "/m/model.mq4", "size": 10, "sha256": "8" * 64},
+        "expect": {"resident_layers": 9, "baseline_tile_rows": 4096, "s1_tile_rows": 768,
+                   "s1_layer_major_min_rows": 1537, "ple_format": "q4", "env": dict(qc.PINNED_ENV),
+                   "env_absent": [qc.EXPLICIT_LAYERS_ENV],
+                   "baseline_env": {qc.EXPLICIT_LAYERS_ENV: "9", "HIPFIRE_PREFILL_CHUNK_ROWS": "4096"}},
+        "determinism": {"case_ids": ["p512", "p1536", "p1537", "p8192", "irregular", "resume", "natural"]},
+        "primary": {"contexts": [{"id": "ctx16k"}, {"id": "ctx4k"}]},
+    }
+
+
+def fake_camp(root="/r"):
+    camp = {"schema": qc.CAMPAIGN_SCHEMA, "label": "t", "root": root,
+            "harness": {"quality_campaign_sha256": "1" * 64},
+            "source_pin": {"commit": "a" * 40, "example_sha256": "b" * 64},
+            "exe": {"path": "/x/bin/qwen4_slowlink_quality", "sha256": "c" * 64, "size": 5},
+            "pack": {"digest": "d" * 64}, "config": {"path": "/c.toml", "sha256": "e" * 64},
+            "model": {"path": "/m/model.mq4", "dev": 1, "ino": 2, "size": 10, "mtime_ns": 1790928378750535607,
+                      "sha256": "8" * 64},
+            "plan": {"path": "/p", "sha256": PLAN_SHA}, "arms": {}}
+    for arm in qc.ARMS:
+        runs = {ph: {"run_dir": "%s/runs/%s-%s" % (root, arm, ph), "out_dir": "%s/phases/%s-%s" % (root, arm, ph),
+                     "argv": qc.native_argv("/x/bin/qwen4_slowlink_quality", ph, "/pl/%s.json" % arm,
+                                            "/mf/%s-%s.json" % (arm, ph), "/m/model.mq4",
+                                            "%s/phases/%s-%s" % (root, arm, ph)),
+                     "manifest": {"path": "/mf/%s-%s.json" % (arm, ph), "sha256": None}} for ph in qc.PHASES}
+        camp["arms"][arm] = {"levers_on": list(qc.ARMS[arm]), "lever_env": qc.lever_env(arm),
+                             "plan": {"path": "/pl/%s.json" % arm, "sha256": "f" * 64}, "runs": runs}
+    return camp
+
+
+class LeverEnv(unittest.TestCase):
+    def test_off_and_each_on_value(self):
+        self.assertEqual(qc.lever_env("off"), {LEVER_KEYS[0]: "front", LEVER_KEYS[1]: "0", LEVER_KEYS[2]: "0"})
+        self.assertEqual(qc.lever_env("place")[LEVER_KEYS[0]], "0,3,7,15,19,23,27,39,43")
+        self.assertEqual(qc.lever_env("place")[LEVER_KEYS[1]], "0")
+        self.assertEqual(qc.lever_env("iu4"), {LEVER_KEYS[0]: "front", LEVER_KEYS[1]: "1", LEVER_KEYS[2]: "0"})
+        self.assertEqual(qc.lever_env("qsa"), {LEVER_KEYS[0]: "front", LEVER_KEYS[1]: "0", LEVER_KEYS[2]: "1"})
+        st = qc.lever_env("stack")
+        self.assertEqual(st, {LEVER_KEYS[0]: "0,3,7,15,19,23,27,39,43", LEVER_KEYS[1]: "1", LEVER_KEYS[2]: "1"})
+
+    def test_place_set_is_nine_distinct_ascending(self):
+        self.assertEqual(len(qc.PLACE_LAYERS), 9)
+        self.assertEqual(qc.PLACE_LAYERS, sorted(set(qc.PLACE_LAYERS)))
+
+    def test_unknown_arm_refused(self):
+        with self.assertRaises(qc.Refusal):
+            qc.lever_env("q8w")  # removed lever
+
+    def test_f32_state_is_never_applied(self):
+        for arm in qc.ARMS:
+            self.assertEqual(qc.applied_env(arm, "/rd")["HIPFIRE_STATE_QUANT"], "q8")
+
+
+class ProcessEnv(unittest.TestCase):
+    PARENT = {"PATH": "/usr/bin", "HIPFIRE_QWEN4_MOE_SYM_IU4": "1", "HIPFIRE_FN_QSA_GATHER_GFX1100": "1",
+              "HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS": "spread", "HIPFIRE_STATE_QUANT": "f32",
+              qc.EXPLICIT_LAYERS_ENV: "9", "HIP_VISIBLE_DEVICES": "3", "ROCR_VISIBLE_DEVICES": "x",
+              "HSA_FOO": "1", "GPU_BAR": "1", "AMD_LOG_LEVEL": "9", "HIPFIRE_QWEN4_Q8_TRUNK_WMMA": "1",
+              "FABRIC_JOB": "1:2:xtx", "FABRIC_CARDS": "xtx", "HIPFIRE_FABRIC_ADMISSION": "tok", "HOME": "/h"}
+
+    def test_inherited_lever_flags_are_stripped_then_explicitly_applied(self):
+        env, unset, applied = qc.process_env(self.PARENT, "off", "/rd")
+        self.assertEqual(env[LEVER_KEYS[1]], "0")           # inherited =1 did not leak into OFF
+        self.assertEqual(env[LEVER_KEYS[2]], "0")
+        self.assertEqual(env[LEVER_KEYS[0]], "front")
+        self.assertNotIn(qc.EXPLICIT_LAYERS_ENV, env)
+        self.assertNotIn("HIPFIRE_QWEN4_Q8_TRUNK_WMMA", env)  # q8w removed, inherited value stripped
+        self.assertEqual(env["HIPFIRE_STATE_QUANT"], "q8")
+        for k in ("HSA_FOO", "GPU_BAR", "AMD_LOG_LEVEL"):
+            self.assertNotIn(k, env)
+        self.assertIn(qc.EXPLICIT_LAYERS_ENV, unset)
+        self.assertEqual(env["HIP_VISIBLE_DEVICES"], "0")
+        self.assertEqual(env["ROCR_VISIBLE_DEVICES"], qc.DEVICE["uuid"])
+        self.assertEqual(env["HOME"], "/rd/home")
+        self.assertEqual(env["FABRIC_JOB"], "1:2:xtx")
+        self.assertEqual(env["HIPFIRE_FABRIC_ADMISSION"], "tok")
+        self.assertEqual(env[qc.SELECTOR_ENV], "1")
+
+    def test_stack_applies_all_three_on(self):
+        env, _u, applied = qc.process_env(self.PARENT, "stack", "/rd")
+        self.assertEqual([env[k] for k in LEVER_KEYS], ["0,3,7,15,19,23,27,39,43", "1", "1"])
+        for k, v in qc.PINNED_ENV.items():
+            self.assertEqual(env[k], v)
+        self.assertEqual(applied[qc.SELECTOR_ENV], "1")
+
+    def test_pinned_class_is_the_native_eight(self):
+        self.assertEqual(qc.PINNED_ENV, {
+            "HIPFIRE_STATE_QUANT": "q8", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_GRAPH": "0",
+            "HIPFIRE_NORMALIZE_PROMPT": "0", "HIPFIRE_CHAT_CURRENT_DATE": "2026-10-17",
+            "HIPFIRE_OFFLOAD_EXEC": "pcie", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0"})
+
+    def test_applied_env_is_deterministic_and_run_dir_private(self):
+        a = qc.applied_env("iu4", "/rd")
+        self.assertEqual(a, qc.applied_env("iu4", "/rd"))
+        for k in ("HOME", "HIPFIRE_HOME", "HIPFIRE_LOCK_DIR", "HIPFIRE_KERNEL_CACHE"):
+            self.assertTrue(a[k].startswith("/rd/"))
+
+
+class ArmPlans(unittest.TestCase):
+    def test_plan_differs_only_in_expect_env_and_asserts_all_lever_flags(self):
+        base = base_plan()
+        for arm in qc.ARMS:
+            p = qc.arm_plan(base, arm)
+            self.assertTrue(qc.plan_diff_only_expect_env(base, p))
+            for k, v in qc.lever_env(arm).items():
+                self.assertEqual(p["expect"]["env"][k], v)
+            for k, v in qc.PINNED_ENV.items():
+                self.assertEqual(p["expect"]["env"][k], v)
+            self.assertEqual(p["expect"]["env_absent"], [qc.EXPLICIT_LAYERS_ENV])
+            self.assertEqual(p["expect"]["baseline_env"], base["expect"]["baseline_env"])
+        self.assertNotIn(LEVER_KEYS[0], base["expect"]["env"])  # input untouched (deepcopy)
+
+    def test_native_counts_tiles_are_not_relaxed(self):
+        for field, bad in (("resident_layers", 10), ("s1_tile_rows", 1536), ("baseline_tile_rows", 2048)):
+            b = base_plan()
+            b["expect"][field] = bad
+            with self.assertRaises(qc.Refusal):
+                qc.arm_plan(b, "off")
+
+    def test_missing_n9_absent_assertion_or_pinned_value_refused(self):
+        b = base_plan()
+        b["expect"]["env_absent"] = []
+        with self.assertRaises(qc.Refusal):
+            qc.arm_plan(b, "off")
+        b = base_plan()
+        b["expect"]["env"]["HIPFIRE_STATE_QUANT"] = "f32"
+        with self.assertRaises(qc.Refusal):
+            qc.arm_plan(b, "off")
+
+    def test_base_plan_already_naming_a_lever_is_refused(self):
+        for where in ("env", "env_absent", "baseline_env"):
+            b = base_plan()
+            if where == "env_absent":
+                b["expect"]["env_absent"].append(LEVER_KEYS[1])
+            else:
+                b["expect"][where][LEVER_KEYS[1]] = "0"
+            with self.assertRaises(qc.Refusal):
+                qc.arm_plan(b, "off")
+
+    def test_schema_checked(self):
+        b = base_plan()
+        b["schema"] = "x"
+        with self.assertRaises(qc.Refusal):
+            qc.arm_plan(b, "off")
+
+    def test_corpus_change_is_detected(self):
+        base = base_plan()
+        p = qc.arm_plan(base, "off")
+        p["primary"]["contexts"][0]["id"] = "other"
+        self.assertFalse(qc.plan_diff_only_expect_env(base, p))
+
+
+class Manifests(unittest.TestCase):
+    def test_each_arm_phase_manifest(self):
+        camp = fake_camp()
+        for arm in qc.ARMS:
+            for ph in qc.PHASES:
+                m = qc.native_manifest(camp, arm, ph)
+                self.assertEqual(m["schema"], qc.MANIFEST_SCHEMA)
+                self.assertEqual(m["binary"]["sha256"], camp["exe"]["sha256"])
+                self.assertEqual(m["launch"]["lever_env"], qc.lever_env(arm))
+                for k, v in qc.lever_env(arm).items():
+                    self.assertEqual(m["launch"]["env"]["set"][k], v)
+                self.assertEqual(m["launch"]["command"][:3], [camp["exe"]["path"], "--phase", ph])
+                self.assertNotIn(qc.EXPLICIT_LAYERS_ENV, m["launch"]["env"]["set"])
+                self.assertEqual(m["source"]["arm"], arm)
+                self.assertEqual(m["model"]["mtime_sec"], 1790928378)
+                self.assertEqual(m["model"]["mtime_nsec"], 750535607)
+                self.assertEqual(m["model"]["sha256"], camp["model"]["sha256"])
+                self.assertTrue(m["source"])  # native: non-empty object
+                self.assertEqual(set(m), {"schema", "binary", "source", "launch", "model"})  # native refuses unknown keys
+
+    def test_one_executable_and_distinct_outputs_for_every_run(self):
+        camp = fake_camp()
+        outs = {r["out_dir"] for a in camp["arms"].values() for r in a["runs"].values()}
+        runs = {r["run_dir"] for a in camp["arms"].values() for r in a["runs"].values()}
+        self.assertEqual(len(outs), 10)
+        self.assertEqual(len(runs), 10)
+        self.assertEqual({r["argv"][0] for a in camp["arms"].values() for r in a["runs"].values()},
+                         {camp["exe"]["path"]})
+
+    def test_native_argv_shape(self):
+        argv = qc.native_argv("/e", "s1b", "/p", "/m", "/mod", "/o")
+        self.assertEqual(argv, ["/e", "--phase", "s1b", "--plan", "/p", "--manifest", "/m", "--model", "/mod",
+                                "--out-dir", "/o"])
+
+    def test_only_s1a_and_s1b_gpu_phases(self):
+        self.assertEqual(qc.PHASES, ("s1a", "s1b"))
+        self.assertEqual(list(qc.ARMS), ["off", "place", "iu4", "qsa", "stack"])
+        self.assertEqual(len(qc.SERIAL_ORDER), 10)
+        self.assertEqual(qc.SERIAL_ORDER[:4], [("off", "s1a"), ("off", "s1b"), ("place", "s1a"), ("place", "s1b")])
+
+
+class LaunchArgs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.camp = fake_camp(self.tmp.name)
+        with open(os.path.join(self.tmp.name, "campaign.json"), "w") as f:
+            json.dump(self.camp, f)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_job_cap_and_class(self):
+        cmd = qc.build_launch_command(self.camp, "stack", "s1a", 1800, "P0")
+        self.assertEqual(cmd[0], "bash")
+        i = cmd.index("--max-secs")
+        self.assertEqual(cmd[i + 1], "1800")
+        for flag, val in (("--card", "xtx"), ("--mem-gb", "22.4"), ("--hostmem-gb", "67"), ("--priority", "P0")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], val)
+        self.assertIn("--hostmem-lock", cmd)
+        j = cmd.index("--")
+        inner = cmd[j + 1:]
+        self.assertEqual(inner[:3], ["python3", "-B", os.path.realpath(qc.__file__)])
+        self.assertEqual(inner[3], "run-phase")
+        self.assertEqual(inner[inner.index("--arm") + 1], "stack")
+        self.assertEqual(inner[inner.index("--phase") + 1], "s1a")
+        self.assertEqual(len(inner[inner.index("--expect-campaign-sha256") + 1]), 64)
+
+    def test_exactly_one_phase_per_job(self):
+        cmd = qc.build_launch_command(self.camp, "off", "s1b", 1500, "P1")
+        inner = cmd[cmd.index("--") + 1:]
+        self.assertEqual(inner.count("--phase"), 1)
+        self.assertEqual(inner.count("--arm"), 1)
+
+    def test_refuses_over_1800_and_bad_priority_and_phase(self):
+        for secs in (1801, 0, -5, 1800.0):
+            with self.assertRaises(qc.Refusal):
+                qc.build_launch_command(self.camp, "off", "s1a", secs, "P1")
+        with self.assertRaises(qc.Refusal):
+            qc.build_launch_command(self.camp, "off", "s1a", 1800, "high")
+        with self.assertRaises(qc.Refusal):
+            qc.build_launch_command(self.camp, "off", "baseline", 1800, "P1")
+        with self.assertRaises(qc.Refusal):
+            qc.build_launch_command(self.camp, "carry", "s1a", 1800, "P1")
+
+    def test_child_cap_leaves_100s_for_drain(self):
+        self.assertEqual(qc.CHILD_CAP_SECS + 100, qc.MAX_JOB_SECS)
+
+    def test_detach_script_closes_every_fd_above_2_and_execs(self):
+        self.assertIn("${f##*/}", qc.DETACH_SCRIPT)
+        self.assertIn("-gt 2", qc.DETACH_SCRIPT)
+        self.assertIn("exec env OUT_PREFIX", qc.DETACH_SCRIPT)
+
+
+class Lifecycle(unittest.TestCase):
+    def test_group_members_finds_exactly_own_group_and_terminate_drains_it(self):
+        p = subprocess.Popen(["sleep", "300"], start_new_session=True, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(50):
+                if qc.group_members(p.pid):
+                    break
+                time.sleep(0.02)
+            self.assertEqual([m[0] for m in qc.group_members(p.pid)], [p.pid])
+            self.assertNotIn(os.getpid(), [m[0] for m in qc.group_members(p.pid)])
+            left = qc.terminate_group(p.pid, 5)
+            p.wait(timeout=10)
+            self.assertEqual(left, [])
+            self.assertEqual(qc.group_members(p.pid), [])
+            self.assertEqual(p.returncode, -signal.SIGTERM)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    def test_term_ignoring_child_group_is_killed(self):
+        p = subprocess.Popen(["bash", "-c", "trap '' TERM; while :; do sleep 1; done"], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.3)
+            left = qc.terminate_group(p.pid, 0.5)
+            p.wait(timeout=15)
+            self.assertEqual(left, [])
+            self.assertEqual(p.returncode, -signal.SIGKILL)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    def test_terminate_of_an_empty_group_is_a_noop(self):
+        p = subprocess.Popen(["true"], start_new_session=True)
+        p.wait()
+        self.assertEqual(qc.terminate_group(p.pid, 0.2), [])
+
+
+class FakeHost(qc.Host):
+    def __init__(self, files):
+        super().__init__(environ={})
+        self.files = files
+
+    def read_text(self, path):
+        if path not in self.files:
+            raise OSError(path)
+        return self.files[path]
+
+
+class DeviceChecks(unittest.TestCase):
+    BDF = "/sys/bus/pci/devices/0000:67:00.0/"
+
+    def files(self, **kw):
+        d = {self.BDF + "vendor": "0x1002\n", self.BDF + "device": "0x744c\n", self.BDF + "mem_info_vram_used": "123\n"}
+        d.update({self.BDF + k: v for k, v in kw.items()})
+        return d
+
+    def test_healthy(self):
+        self.assertEqual(qc.device_state(FakeHost(self.files())), (True, []))
+
+    def test_vendor_disappearance_is_not_ok(self):
+        f = self.files()
+        del f[self.BDF + "vendor"]
+        ok, probs = qc.device_state(FakeHost(f))
+        self.assertFalse(ok)
+        self.assertTrue(probs)
+
+    def test_wrong_device_or_uuid(self):
+        self.assertFalse(qc.device_state(FakeHost(self.files(device="0x7551\n")))[0])
+        self.assertFalse(qc.device_state(FakeHost(self.files(unique_id="deadbeefdeadbeef\n")))[0])
+        self.assertTrue(qc.device_state(FakeHost(self.files(unique_id="43390A851E296EE5\n")))[0])
+
+    def test_vram_and_memavailable_parsers(self):
+        f = self.files()
+        f["/proc/meminfo"] = "MemTotal: 1 kB\nMemAvailable:   83886080 kB\n"
+        h = FakeHost(f)
+        self.assertEqual(qc.vram_used(h), 123)
+        self.assertEqual(qc.mem_available_kib(h), 83886080)
+        self.assertGreaterEqual(qc.mem_available_kib(h), qc.MIN_MEM_AVAILABLE_KIB)
+        self.assertEqual(qc.vram_used(FakeHost({})), -1)
+
+    def test_identity_constants(self):
+        self.assertEqual(qc.DEVICE["bdf"], "0000:67:00.0")
+        self.assertEqual(qc.DEVICE["vendor_id"], "0x1002")
+        self.assertEqual(qc.DEVICE["device_id"], "0x744c")
+        self.assertEqual(qc.DEVICE["uuid"], "GPU-43390a851e296ee5")
+
+
+class RunPhaseGuards(unittest.TestCase):
+    def test_refuses_outside_an_xtx_fabric_hold(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            camp = fake_camp(tmp.name)
+            data = json.dumps(camp, indent=2, sort_keys=True).encode()
+            with open(os.path.join(tmp.name, "campaign.json"), "wb") as f:
+                f.write(data)
+            ns = type("A", (), {"root": tmp.name, "expect_campaign_sha256": qc.sha256_bytes(data), "arm": "stack",
+                                "phase": "s1a", "cap_secs": 1700})()
+            with self.assertRaises(qc.Refusal):
+                qc.run_phase(ns, host=FakeHost({}))                         # no FABRIC_JOB
+            h = FakeHost({})
+            h._environ = {"FABRIC_JOB": "1:2:xtx", "FABRIC_CARDS": "r9700"}  # wrong card
+            with self.assertRaises(qc.Refusal):
+                qc.run_phase(ns, host=h)
+            ns.expect_campaign_sha256 = "0" * 64                              # campaign pin mismatch
+            with self.assertRaises(qc.Refusal):
+                qc.run_phase(ns, host=h)
+        finally:
+            tmp.cleanup()
+
+
+# ---------------------------------------------------------------- evidence
+
+def receipt(iu4=False, place=None, status="ok", tiles=None, route="layer-major"):
+    place = list(range(9)) if place is None else place
+    mo = {"window_route": "aggregate-sym-iu4" if iu4 else "aggregate", "requested": iu4,
+          "descriptor": {"arch": "gfx1100"} if iu4 else None, "source_headers_symmetric": True if iu4 else None,
+          "final_headers_verified": [40, 40] if iu4 else [0, 40], "a4_sidecar_bytes": 0,
+          "tiles": tiles or {"aggregate_iu4": 22 if iu4 else 0, "aggregate_wmma": 0 if iu4 else 22,
+                             "aggregate_f32_tail": 1, "slab_k2": 0, "k1_or_decode": 0}}
+    return {"route": route, "status": status, "resident_layers": 9, "tile_rows": 768, "retained_scratch_rows": 768,
+            "resident_layer_set": place, "moe_iu4": mo}
+
+
+def cells(**kw):
+    return [{"cell": "primary-ctx16k-teacher", "prefill": {"receipts": [receipt(**kw)]}},
+            {"cell": "primary-ctx4k-teacher", "prefill": {"receipts": [receipt(**kw)]}},
+            {"cell": "det-p512", "prefill": {"receipts": [{"route": "incumbent", "bypass_reason": "TooShort"}]}}]
+
+
+LOAD_FRONT = "qwen4 slowlink load: placement=slowlink-profile resident layers=9 host-mapped tensors=80 slowlink profile=true\n"
+LOAD_SET = ("qwen4 slowlink load: placement=slowlink-profile resident layers=9 resident_layer_set=[0, 3, 7, 15, 19, 23, "
+            "27, 39, 43] host-mapped tensors=80 slowlink profile=true\n")
+QSA_LINE = "  qwen4 QSA gather workspace: 192 MiB reserved for 16897 context tokens, 192 MiB committed\n"
+
+
+class RouteEvidence(unittest.TestCase):
+    def test_off_arm_clean(self):
+        ev = qc.route_evidence("off", cells(), LOAD_FRONT, [])
+        self.assertTrue(ev["ok"], ev)
+        self.assertEqual(ev["qsa"]["strength"], "none")
+
+    def test_place_requires_actual_set_in_receipts_and_loader_log(self):
+        ok = qc.route_evidence("place", cells(place=qc.PLACE_LAYERS), LOAD_SET, [])
+        self.assertTrue(ok["place"]["ok"], ok["place"])
+        self.assertEqual(ok["place"]["loader_set"], qc.PLACE_LAYERS)
+        bad = qc.route_evidence("place", cells(), LOAD_FRONT, [])   # env requested but front placement actually ran
+        self.assertFalse(bad["place"]["ok"])
+        bad = qc.route_evidence("place", cells(place=qc.PLACE_LAYERS), LOAD_FRONT, [])
+        self.assertFalse(bad["place"]["ok"])
+        leaked = qc.route_evidence("off", cells(place=qc.PLACE_LAYERS), LOAD_SET, [])
+        self.assertFalse(leaked["place"]["ok"])
+
+    def test_iu4_requires_sym_route_tiles_and_headers(self):
+        ok = qc.route_evidence("iu4", cells(iu4=True), LOAD_FRONT, [])
+        self.assertTrue(ok["iu4"]["ok"], ok["iu4"])
+        self.assertGreater(ok["iu4"]["tile_totals"]["aggregate_iu4"], 0)
+        bad = qc.route_evidence("iu4", cells(iu4=False), LOAD_FRONT, [])
+        self.assertFalse(bad["iu4"]["ok"])
+        leaked = qc.route_evidence("off", cells(iu4=True), LOAD_FRONT, [])
+        self.assertFalse(leaked["iu4"]["ok"])
+
+    def test_iu4_incumbent_fallback_tiles_detected(self):
+        c = cells(iu4=True)
+        c[0]["prefill"]["receipts"][0]["moe_iu4"]["tiles"]["aggregate_wmma"] = 3
+        self.assertFalse(qc.route_evidence("iu4", c, LOAD_FRONT, [])["iu4"]["ok"])
+
+    def test_qsa_needs_workspace_line_and_off_arm_must_not_have_it(self):
+        kc = ["kcache/x/indexed_attention_gathered_wmma.hsaco"]
+        ok = qc.route_evidence("qsa", cells(), LOAD_FRONT + QSA_LINE, kc)
+        self.assertTrue(ok["qsa"]["ok"], ok["qsa"])
+        self.assertEqual(ok["qsa"]["strength"], "workspace+module")
+        none = qc.route_evidence("qsa", cells(), LOAD_FRONT, [])
+        self.assertFalse(none["qsa"]["ok"])
+        leaked = qc.route_evidence("off", cells(), LOAD_FRONT + QSA_LINE, kc)
+        self.assertFalse(leaked["qsa"]["ok"])
+
+    def test_common_route_problems(self):
+        ev = qc.route_evidence("off", cells(status="aborted: x"), LOAD_FRONT, [])
+        self.assertFalse(ev["common"]["ok"])
+        ev = qc.route_evidence("off", [c for c in cells() if c["cell"] != "primary-ctx4k-teacher"], LOAD_FRONT, [])
+        self.assertFalse(ev["common"]["ok"])
+        self.assertFalse(qc.route_evidence("off", [], LOAD_FRONT, [])["ok"])
+
+    def test_stack_all_three(self):
+        c = cells(iu4=True, place=qc.PLACE_LAYERS)
+        ev = qc.route_evidence("stack", c, LOAD_SET + QSA_LINE, ["k/indexed_attention_gathered_wmma.hsaco"])
+        self.assertTrue(ev["ok"], ev)
+
+
+class Determinism(unittest.TestCase):
+    CASES = ["p512", "p1536"]
+
+    def det(self, **over):
+        d = {"all_identical": True, "cases": []}
+        for cid in self.CASES:
+            d["cases"].append({"case": cid, "identical": True, "token_ids_equal": True, "finish_equal": True,
+                               "first_differing_row": None, "stream_sha256": [cid + "a", cid + "a"]})
+        for k, v in over.items():
+            d["cases"][0][k] = v
+        return d
+
+    def cells(self, text_b="hello"):
+        mk = lambda t: [{"cell": "det-" + c, "stream_sha256": c + "a", "text": t,  # noqa: E731
+                         "prefill": {"receipts": [receipt()]}} for c in self.CASES]
+        return mk("hello"), mk(text_b)
+
+    def test_ok(self):
+        a, b = self.cells()
+        r = qc.determinism_report(self.det(), self.CASES, a, b)
+        self.assertTrue(r["ok"], r["problems"])
+        self.assertTrue(r["route_signature_equal"])
+
+    def test_token_or_bit_difference_and_text_difference(self):
+        a, b = self.cells()
+        self.assertFalse(qc.determinism_report(self.det(token_ids_equal=False), self.CASES, a, b)["ok"])
+        self.assertFalse(qc.determinism_report(self.det(identical=False), self.CASES, a, b)["ok"])
+        a, b = self.cells("different")
+        self.assertFalse(qc.determinism_report(self.det(), self.CASES, a, b)["ok"])
+
+    def test_missing_case_and_stream_hash_mismatch(self):
+        a, b = self.cells()
+        d = self.det()
+        d["cases"].pop()
+        self.assertFalse(qc.determinism_report(d, self.CASES, a, b)["ok"])
+        a2 = copy.deepcopy(a)
+        a2[0]["stream_sha256"] = "zzz"
+        self.assertFalse(qc.determinism_report(self.det(), self.CASES, a2, b)["ok"])
+
+    def test_route_signature_difference_between_a_and_b(self):
+        a, b = self.cells()
+        b[0]["prefill"]["receipts"] = [receipt(iu4=True)]
+        r = qc.determinism_report(self.det(), self.CASES, a, b)
+        self.assertFalse(r["route_signature_equal"])
+        self.assertFalse(r["ok"])
+
+
+class TextEvidence(unittest.TestCase):
+    def test_flags_and_review_requirement(self):
+        cs = [{"cell": "det-a", "text": "A sentence.", "token_ids": list(range(10)), "finish_reason": "length"},
+              {"cell": "det-b", "text": "", "token_ids": [7] * 12, "finish_reason": "length"},
+              {"cell": "det-c", "text": "x\ufffdy", "token_ids": [1, 2, 3], "finish_reason": "stop"},
+              {"cell": "no-text"}]
+        t = qc.text_evidence(cs, cs)
+        self.assertTrue(t["manual_review_required"])
+        flagged = {c.split("@")[0] for c in t["auto_flag_cells"]}
+        self.assertEqual(flagged, {"det-b", "det-c"})
+        self.assertEqual(len(t["cells"]), 6)
+
+
+class ReferenceAndBounds(unittest.TestCase):
+    def test_bounds_file_pinned_when_present(self):
+        path = qc.DEFAULT_BOUNDS_FILE
+        if not os.path.exists(path):
+            self.skipTest("bounds file not present on this host")
+        got = qc.verify_bounds_file(path)
+        self.assertEqual(got["values"], qs.GATE_BOUNDS_EXACT)
+
+    def test_bounds_file_wrong_hash_refused(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"x": 1}, f)
+        try:
+            with self.assertRaises(qc.Refusal):
+                qc.verify_bounds_file(f.name)
+        finally:
+            os.unlink(f.name)
+
+    def test_beta_cells_include_resume_references(self):
+        self.assertEqual(qc.BETA_CELLS, {"primary-ctx16k-teacher": 512, "primary-ctx4k-teacher": 512,
+                                         "resume-cold": 32, "resume-split": 32})
+
+    def test_parse_arms(self):
+        self.assertEqual(qc.parse_arms("stack,off"), ["off", "stack"])
+        self.assertEqual(qc.parse_arms(None), list(qc.ARMS))
+        for bad in ("off,off", "q8w", "off,carry"):
+            with self.assertRaises(qc.Refusal):
+                qc.parse_arms(bad)
+
+    def test_expected_beta_plan_pin(self):
+        self.assertEqual(qc.EXPECTED_BETA_PLAN_SHA256, PLAN_SHA)
+
+    def test_cached_model_entry_checks_live_stat_without_reading_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "model.bin")
+            with open(fake, "wb") as f:
+                f.write(b"x" * 10)
+            st = os.stat(fake)
+            rc = os.path.join(d, "r.json")
+            rec = {"path": fake, "size_bytes": 10, "device": st.st_dev, "inode": st.st_ino, "mtime_ns": st.st_mtime_ns,
+                   "sha256": "9" * 64}
+            with open(rc, "w") as f:
+                json.dump(rec, f)
+            m = qc.cached_model_entry(rc, fake, plan_artifact={"path": fake, "size": 10, "sha256": "9" * 64})
+            self.assertFalse(m["payload_hashed_here"])
+            self.assertEqual(m["sha256"], "9" * 64)
+            rec["size_bytes"] = 11
+            with open(rc, "w") as f:
+                json.dump(rec, f)
+            with self.assertRaises(qc.Refusal):
+                qc.cached_model_entry(rc, fake)
+
+
+class SerialDriver(unittest.TestCase):
+    def test_serial_stops_when_an_earlier_phase_has_a_failed_record_and_never_launches_next(self):
+        with tempfile.TemporaryDirectory() as d:
+            camp = fake_camp(d)
+            run0 = camp["arms"]["off"]["runs"]["s1a"]["run_dir"]
+            os.makedirs(run0)
+            with open(os.path.join(run0, "run-record.json"), "w") as f:
+                json.dump({"status": "INCOMPLETE"}, f)
+            data = json.dumps(camp, indent=2, sort_keys=True).encode()
+            with open(os.path.join(d, "campaign.json"), "wb") as f:
+                f.write(data)
+            ns = type("A", (), {"root": d, "expect_campaign_sha256": qc.sha256_bytes(data), "priority": "P1",
+                                "max_secs": 1800, "wrapper": "/nonexistent", "fabric": "/nonexistent",
+                                "max_wait_per_phase": 1, "detach": False})()
+            self.assertEqual(qc.serial(ns, host=FakeHost({})), 1)
+            self.assertTrue(os.path.exists(os.path.join(d, "serial", "STOPPED")))
+            self.assertFalse(os.path.exists(os.path.join(d, "launch")))      # nothing was submitted
+            with self.assertRaises(qc.Refusal):                               # STOPPED must be cleared by hand
+                qc.serial(ns, host=FakeHost({}))
+
+    def test_serial_refuses_to_submit_when_the_device_is_unhealthy(self):
+        with tempfile.TemporaryDirectory() as d:
+            camp = fake_camp(d)
+            data = json.dumps(camp, indent=2, sort_keys=True).encode()
+            with open(os.path.join(d, "campaign.json"), "wb") as f:
+                f.write(data)
+            ns = type("A", (), {"root": d, "expect_campaign_sha256": qc.sha256_bytes(data), "priority": "P1",
+                                "max_secs": 1800, "wrapper": "/nonexistent", "fabric": "/nonexistent",
+                                "max_wait_per_phase": 1, "detach": False})()
+            self.assertEqual(qc.serial(ns, host=FakeHost({})), 1)           # sysfs unreadable => not healthy
+            self.assertFalse(os.path.exists(os.path.join(d, "launch")))
+
+
+if __name__ == "__main__":
+    unittest.main()
