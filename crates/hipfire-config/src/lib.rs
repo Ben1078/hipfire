@@ -1891,6 +1891,19 @@ pub static FIELDS: &[ConfigField] = &[
         "Byte budget of the session cache's disk tier: snapshots evicted from memory are written to memory.session_cache_dir and restored on demand, surviving restarts. 0 disables it."
     ),
     process_field!(
+        "memory.session_cache_host_bytes",
+        "session_cache_host_bytes",
+        Memory,
+        DefaultValue::Integer(4294967296),
+        ValueRule::Integer {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_SESSION_CACHE_HOST_BYTES",
+        "Pinned host memory for session-cache snapshots the device evicts (memory guard, context growth): they move to host RAM instead of being dropped, so the prefix hit survives at the cost of a host-to-device copy, and go on to the disk tier when this budget evicts them. Allocated only on demand, never past 1 GiB short of host RAM or the GTT limit; skipped on unified memory. 0 disables it."
+    ),
+    process_field!(
         "memory.session_cache_dir",
         "session_cache_dir",
         Memory,
@@ -9399,6 +9412,15 @@ pub mod memory {
         process_value("HIPFIRE_SESSION_CACHE_DISK_BYTES")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// Pinned-host byte budget of session snapshots the device tier evicts
+    /// (`memory.session_cache_host_bytes`, compat env
+    /// `HIPFIRE_SESSION_CACHE_HOST_BYTES`); 0 disables it.
+    pub fn session_cache_host_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_HOST_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4294967296)
     }
 
     /// Directory of the session cache's disk tier (`memory.session_cache_dir`,
