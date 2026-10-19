@@ -130,6 +130,11 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         self.total_bytes
     }
 
+    /// Every key held, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = &CheckpointKey> {
+        self.entries.keys()
+    }
+
     /// Number of entries currently in the pool.
     pub fn len(&self) -> usize {
         self.entries.len()

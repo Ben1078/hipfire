@@ -665,7 +665,8 @@ pub struct SessionCacheUsage {
     /// Published resident and tail buffers (outside the pool budget).
     pub resident_bytes: u64,
     /// Displaced snapshots and buffers waiting for the next `begin`/`clear`
-    /// to free them.
+    /// to free them, and device buffers quarantined because a copy from
+    /// them could not be drained.
     pub deferred_release_bytes: u64,
     /// The parked conversation's buffer plus its own resident and tail
     /// buffers (distinct from `resident_bytes`).
@@ -789,6 +790,11 @@ pub struct SessionCache {
     /// host pool cannot be iterated, and the context-growth planner must find
     /// the host descendants that pin a device owner.
     host_index: Vec<Key>,
+    /// Device buffers that were the source of a host copy whose drain failed:
+    /// a copy may still read them, so they are never read, written or freed
+    /// until a later device-wide drain succeeds (then freed), and are leaked
+    /// at teardown otherwise.
+    device_quarantine: Vec<DeviceBuffer>,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -1183,6 +1189,21 @@ fn copy_to_host(
     )
 }
 
+/// Wait for every queued GPU operation of this device; `false` when the wait
+/// fails.
+fn drain_device(gpu: &Gpu) -> bool {
+    gpu.bind_thread()
+        .and_then(|()| gpu.hip.device_synchronize())
+        .is_ok()
+}
+
+/// Whether a failed host transfer on `block` may still be using its device
+/// side: the transfer's own fence failed (`block` is flagged undrained) and a
+/// fresh device-wide `drain` cannot prove it complete either.
+fn transfer_in_flight(block: &HostBlock, drain: impl FnOnce() -> bool) -> bool {
+    block.undrained.load(Ordering::Acquire) && !drain()
+}
+
 /// The live-state buffer of copy part `part` (fixed parts first, then row
 /// streams).
 fn live_buf<'a>(live: &StateLayout<'a>, part: usize) -> &'a DeviceBuffer {
@@ -1530,6 +1551,7 @@ impl SessionCache {
             backing_granule: None,
             quarantine: None,
             host_index: Vec::new(),
+            device_quarantine: Vec::new(),
         }
     }
 
@@ -1822,7 +1844,11 @@ impl SessionCache {
     /// Move the published device `snapshot` at `key` (already out of the
     /// pool) to the host pool ([`Self::adopt_demoted`]). Handed back
     /// unchanged when the host tier cannot take it
-    /// ([`Self::reserve_host_block`]) or the copy fails.
+    /// ([`Self::reserve_host_block`]) or the copy failed with nothing left in
+    /// flight. When the failed copy may still read it
+    /// ([`transfer_in_flight`]), it is never handed back for a disk write or
+    /// a free: it is dropped from the cache into the device quarantine
+    /// ([`Self::quarantine_source`]) and `None` is returned.
     fn demote_to_host(
         &mut self,
         gpu: &mut Gpu,
@@ -1847,12 +1873,99 @@ impl SessionCache {
                 "  session cache: demoting a {}-token snapshot to the host failed: {error}",
                 key.1
             );
+            if transfer_in_flight(&block, || drain_device(gpu)) {
+                drop(block);
+                for store in self.quarantine_source(&key, snapshot) {
+                    free_store(gpu, store);
+                }
+                return None;
+            }
             return Some((key, snapshot));
         }
         if let Some(buf) = self.adopt_demoted(key, snapshot, block) {
             free_device(gpu, buf);
         }
         None
+    }
+
+    /// Bookkeeping, no GPU, of a device snapshot (already out of its pool)
+    /// whose demotion copy may still be reading it: it is never read or freed
+    /// again. Its buffer moves to the device quarantine (freed only after a
+    /// later device-wide drain, [`Self::retry_quarantine`]), and it leaves
+    /// the cache unlinked from its parent, with every descendant on every
+    /// tier (their chains cannot restore without it). Returns the
+    /// descendants' memory to free.
+    fn quarantine_source(&mut self, key: &Key, snapshot: StoredSnapshot) -> Vec<Store> {
+        if let Some(parent) = &snapshot.parent {
+            self.unlink(parent);
+        }
+        let (mut stores, descendants) = self.take_descendants(key);
+        match snapshot.location {
+            SnapshotLocation::Device(buf) => self.device_quarantine.push(buf),
+            SnapshotLocation::Host(block) => stores.push(Store::Host(block)),
+            SnapshotLocation::Disk { .. } => {}
+        }
+        self.evictions_total = self.evictions_total.saturating_add(1);
+        eprintln!(
+            "  session cache: dropped the {}-token snapshot and {descendants} descendant(s): a copy from it could not be drained, so its device memory is quarantined",
+            key.1
+        );
+        stores
+    }
+
+    /// Take every pending or published snapshot below `key` out of the cache,
+    /// with the disk descendants of each; no GPU. Returns their memory to
+    /// free and how many left.
+    fn take_descendants(&mut self, key: &Key) -> (Vec<Store>, usize) {
+        let mut stores = Vec::new();
+        let mut taken = 0;
+        let mut parents = vec![key.clone()];
+        while let Some(parent) = parents.pop() {
+            self.children.remove(&parent);
+            if let Some(disk) = &mut self.disk {
+                disk.drop_descendants(&parent);
+            }
+            let below = |snapshot: &StoredSnapshot| snapshot.parent.as_ref() == Some(&parent);
+            let mut i = 0;
+            while i < self.pending.len() {
+                if below(&self.pending[i].1) {
+                    let (child, snapshot) = self.pending.remove(i);
+                    stores.extend(snapshot.into_store());
+                    parents.push(child);
+                    taken += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            let device: Vec<Key> = self
+                .pool
+                .keys()
+                .filter(|k| self.pool.peek(&k.0, k.1, k.2).is_some_and(below))
+                .cloned()
+                .collect();
+            for child in device {
+                if let Some(snapshot) = self.pool.evict(&child.0, child.1, child.2) {
+                    stores.extend(snapshot.into_store());
+                    parents.push(child);
+                    taken += 1;
+                }
+            }
+            let host: Vec<Key> = self
+                .host_index
+                .iter()
+                .filter(|k| self.host_pool.peek(&k.0, k.1, k.2).is_some_and(below))
+                .cloned()
+                .collect();
+            for child in host {
+                if let Some(snapshot) = self.host_pool.evict(&child.0, child.1, child.2) {
+                    self.host_index.retain(|k| *k != child);
+                    stores.extend(snapshot.into_store());
+                    parents.push(child);
+                    taken += 1;
+                }
+            }
+        }
+        (stores, taken)
     }
 
     /// Bookkeeping of a demotion, no GPU: publish `block` (a drained copy of
@@ -1945,6 +2058,17 @@ impl SessionCache {
                     "  session cache: demoting a {}-token snapshot to the host failed: {error}",
                     key.1
                 );
+                if transfer_in_flight(&block, || drain_device(gpu)) {
+                    drop(block);
+                    let snapshot = self
+                        .pool
+                        .evict(&key.0, key.1, key.2)
+                        .expect("peeked in the device pool");
+                    for store in self.quarantine_source(&key, snapshot) {
+                        free_store(gpu, store);
+                    }
+                    return None;
+                }
                 continue;
             }
             let snapshot = self
@@ -2020,22 +2144,24 @@ impl SessionCache {
             .is_some_and(|parent| self.host_pool.contains(&parent.0, parent.1, parent.2))
     }
 
-    /// Free the quarantined host memory once a device-wide drain proves no
-    /// GPU access can still target it; until then it stays counted against
-    /// the host budget. Between requests only (it waits on the device).
-    fn retry_quarantine(&self, gpu: &Gpu) {
-        let Some(quarantine) = &self.quarantine else {
-            return;
-        };
-        if quarantine.bytes() == 0 {
+    /// Free the quarantined host and device memory once a device-wide drain
+    /// proves no GPU access can still target it; until then it stays counted
+    /// (host against the host budget, device as deferred release). Between
+    /// requests only (it waits on the device).
+    fn retry_quarantine(&mut self, gpu: &Gpu) {
+        let host = self.quarantine.as_ref().map_or(0, |q| q.bytes());
+        if host == 0 && self.device_quarantine.is_empty() {
             return;
         }
-        if gpu
-            .bind_thread()
-            .and_then(|()| gpu.hip.device_synchronize())
-            .is_ok()
-        {
-            quarantine.release();
+        if drain_device(gpu) {
+            if let Some(quarantine) = &self.quarantine {
+                quarantine.release();
+            }
+            for buf in self.device_quarantine.drain(..) {
+                if let Err(error) = gpu.hip.free(buf) {
+                    eprintln!("  session cache: freeing a quarantined buffer failed: {error}");
+                }
+            }
         }
     }
 
@@ -2104,6 +2230,11 @@ impl SessionCache {
                 )
                 .chain(self.release.iter().map(|s| round(device_bytes(s))))
                 .chain(self.release_bufs.iter().map(|s| round(s.device_bytes())))
+                .chain(
+                    self.device_quarantine
+                        .iter()
+                        .map(|buf| round(buf.size() as u64)),
+                )
                 .chain([
                     resident(&self.resident),
                     resident(&self.resident_pending),
@@ -3430,7 +3561,8 @@ impl SessionCache {
                 self.release
                     .iter()
                     .map(device_bytes)
-                    .chain(self.release_bufs.iter().map(Store::device_bytes)),
+                    .chain(self.release_bufs.iter().map(Store::device_bytes))
+                    .chain(self.device_quarantine.iter().map(|buf| buf.size() as u64)),
             ),
             parked_bytes: self.parked.as_ref().map_or(0, |parked| {
                 saturating_total([
@@ -8658,6 +8790,83 @@ mod tests {
         assert_eq!(cache.usage().host_budget_bytes, 7000);
         assert!(cache.host_demotable(&key, 1000));
         assert!(!cache.host_demotable(&key, 1001));
+    }
+
+    #[test]
+    fn a_demotion_copy_whose_fence_fails_never_hands_back_or_frees_its_device_source() {
+        let host_drops = counter();
+        let fenced_drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = SessionCache::new(domain(), 1 << 20).with_host_demotion(1 << 20);
+        let quarantine = Arc::clone(cache.quarantine.as_ref().expect("armed"));
+        let root = publish_device(&mut cache, &hist, 2, None);
+        let mid = publish_device(&mut cache, &hist, 3, Some(root.clone()));
+        let leaf = publish_device(&mut cache, &hist, 4, Some(mid.clone()));
+        // A published host child of `mid` and a pending capture under `leaf`.
+        let host_kid = cut_key(&cache, &hist, 5);
+        cache.link(&mid);
+        cache.pending.push((
+            host_kid.clone(),
+            host_snapshot(100, Some(mid.clone()), &host_drops),
+        ));
+        cache.commit();
+        let pending = cut_key(&cache, &hist, 6);
+        cache.link(&leaf);
+        cache.pending.push((
+            pending.clone(),
+            StoredSnapshot {
+                parent: Some(leaf.clone()),
+                ..fake_snapshot(6)
+            },
+        ));
+
+        // The demotion copy of `mid` through the production transfer driver:
+        // queued, then its fence fails.
+        let source = fake_buf(4096);
+        let block = quarantined_block(4096, &fenced_drops, &quarantine);
+        let moves = [HostMove {
+            live: &source,
+            live_offset: 0,
+            host: &block,
+            host_offset: 0,
+            bytes: 4096,
+        }];
+        assert!(run_transfer(&moves, |_| Ok(()), || Err("fence".to_string())).is_err());
+        // A fresh drain that succeeds proves the copy complete, so the source
+        // may be handed back; one that fails leaves the copy in flight.
+        assert!(!transfer_in_flight(&block, || true));
+        assert!(transfer_in_flight(&block, || false));
+        let drained = quarantined_block(4096, &fenced_drops, &quarantine);
+        assert!(!transfer_in_flight(&drained, || false));
+        drop(drained);
+        drop(block);
+        assert_eq!(quarantine.bytes(), 4096, "the undrained host block is held");
+        assert_eq!(released(&fenced_drops), 1);
+
+        // In flight: the source leaves the cache into the device quarantine,
+        // never handed back for a disk write or a free.
+        let snapshot = cache.pool.evict(&mid.0, mid.1, mid.2).unwrap();
+        let stores = cache.quarantine_source(&mid, snapshot);
+        assert_eq!(cache.device_quarantine.len(), 1);
+        assert_eq!(cache.device_quarantine[0].size(), 4096);
+        // Every descendant (device leaf, host child, pending capture) leaves
+        // with it: their chains name the quarantined key.
+        assert_eq!(stores.len(), 3);
+        for key in [&mid, &leaf, &host_kid] {
+            assert!(!cache.present(&key.0, key.1, key.2), "{}", key.1);
+        }
+        assert!(cache.pending.is_empty());
+        assert!(cache.host_index.is_empty());
+        assert!(cache.children.is_empty());
+        // The root lost its only child: unpinned, still a hit.
+        assert!(cache.present(&root.0, root.1, root.2));
+        assert!(!cache.pool.is_pinned(&root.0, root.1, root.2));
+        let usage = cache.usage();
+        assert_eq!(usage.pool_bytes, 4096);
+        assert_eq!(usage.deferred_release_bytes, 4096);
+        assert_eq!(usage.evictions_total, 1);
+        drop(stores);
+        assert_eq!(released(&host_drops), 1, "the host child is freed once");
     }
 
     /// `n` back-to-back moves of `bytes` between `live` and `host`.
