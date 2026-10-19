@@ -223,6 +223,9 @@ fn assert_same_state(name: &str, cold: &[[u8; 32]], warm: &[[u8; 32]]) {
     }
 }
 
+/// State digests, final logits bytes and `DECODE` greedy ids of one run.
+type RunOutput = (Vec<[u8; 32]>, Vec<u8>, Vec<u32>);
+
 /// Prefill `tokens` reusing `reused` cached tokens and commit. Returns the
 /// state digests, the final logits bytes and `DECODE` greedy ids.
 fn run(
@@ -231,7 +234,7 @@ fn run(
     logits: &GpuTensor,
     tokens: &[u32],
     reused: usize,
-) -> (Vec<[u8; 32]>, Vec<u8>, Vec<u32>) {
+) -> RunOutput {
     run_timed(bundle, gpu, logits, tokens, reused).0
 }
 
@@ -243,7 +246,7 @@ fn run_timed(
     logits: &GpuTensor,
     tokens: &[u32],
     reused: usize,
-) -> ((Vec<[u8; 32]>, Vec<u8>, Vec<u32>), Duration) {
+) -> (RunOutput, Duration) {
     gpu.hip.device_synchronize().expect("sync");
     let started = Instant::now();
     bundle

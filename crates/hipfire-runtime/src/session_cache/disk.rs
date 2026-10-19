@@ -500,7 +500,11 @@ impl DiskTier {
 
     /// Write the pinned-host `snapshot` at `key` to disk, straight from its
     /// drained host memory (no GPU, no staging).
-    pub(super) fn demote_host(&mut self, key: &Key, snapshot: &StoredSnapshot) -> Result<(), String> {
+    pub(super) fn demote_host(
+        &mut self,
+        key: &Key,
+        snapshot: &StoredSnapshot,
+    ) -> Result<(), String> {
         let SnapshotLocation::Host(block) = &snapshot.location else {
             return Err("not a host snapshot".into());
         };
@@ -512,7 +516,12 @@ impl DiskTier {
 
     /// Write `snapshot`'s header and the payload `src` as the file of `key`
     /// and index it.
-    fn store(&mut self, key: &Key, snapshot: &StoredSnapshot, src: Payload<'_>) -> Result<(), String> {
+    fn store(
+        &mut self,
+        key: &Key,
+        snapshot: &StoredSnapshot,
+        src: Payload<'_>,
+    ) -> Result<(), String> {
         let header = encode_header(key, snapshot);
         let offset = payload_offset(header.len() as u64);
         let file_bytes = offset + snapshot.bytes;

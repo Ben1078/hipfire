@@ -1726,7 +1726,7 @@ impl SessionCache {
     /// host memory when the host budget holds it ([`Self::demote_to_host`]),
     /// else demoted to disk or dropped ([`Self::evict_to_disk`]).
     fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot, growth: u64) {
-        if let Err((key, snapshot)) = self.demote_to_host(gpu, key, snapshot) {
+        if let Some((key, snapshot)) = self.demote_to_host(gpu, key, snapshot) {
             self.evict_to_disk(gpu, key, snapshot, growth, false);
         }
     }
@@ -1828,13 +1828,13 @@ impl SessionCache {
         gpu: &mut Gpu,
         key: Key,
         snapshot: StoredSnapshot,
-    ) -> Result<(), (Key, StoredSnapshot)> {
+    ) -> Option<(Key, StoredSnapshot)> {
         let block = match snapshot.location {
             SnapshotLocation::Device(_) => self.reserve_host_block(gpu, &key, snapshot.bytes),
             SnapshotLocation::Host(_) | SnapshotLocation::Disk { .. } => None,
         };
         let Some(block) = block else {
-            return Err((key, snapshot));
+            return Some((key, snapshot));
         };
         let copied = match &snapshot.location {
             SnapshotLocation::Device(buf) => copy_to_host(gpu, buf, &block, snapshot.bytes),
@@ -1847,12 +1847,12 @@ impl SessionCache {
                 "  session cache: demoting a {}-token snapshot to the host failed: {error}",
                 key.1
             );
-            return Err((key, snapshot));
+            return Some((key, snapshot));
         }
         if let Some(buf) = self.adopt_demoted(key, snapshot, block) {
             free_device(gpu, buf);
         }
-        Ok(())
+        None
     }
 
     /// Bookkeeping of a demotion, no GPU: publish `block` (a drained copy of
@@ -1919,7 +1919,7 @@ impl SessionCache {
             .filter(|key| self.pool.contains(&key.0, key.1, key.2))
             .cloned()
             .collect();
-        keys.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
+        keys.sort_by_key(|key| std::cmp::Reverse((key.1, key.2)));
         keys
     }
 
@@ -8518,7 +8518,12 @@ mod tests {
 
     /// Publish a device snapshot of `hist[..p]` under `parent`, linked the
     /// way `at_boundary` links a capture to its parent.
-    fn publish_device(cache: &mut SessionCache, hist: &[u32], p: usize, parent: Option<Key>) -> Key {
+    fn publish_device(
+        cache: &mut SessionCache,
+        hist: &[u32],
+        p: usize,
+        parent: Option<Key>,
+    ) -> Key {
         let key = cut_key(cache, hist, p);
         if let Some(parent) = &parent {
             cache.link(parent);
@@ -8544,7 +8549,10 @@ mod tests {
     /// Bookkeeping of `demote_to_host` / `demote_pinned_device` minus the GPU
     /// copy: take `key` out of the device pool and adopt a host block for it.
     fn demote(cache: &mut SessionCache, key: &Key, drops: &Arc<AtomicUsize>) {
-        let snapshot = cache.pool.evict(&key.0, key.1, key.2).expect("on the device");
+        let snapshot = cache
+            .pool
+            .evict(&key.0, key.1, key.2)
+            .expect("on the device");
         let bytes = snapshot.bytes;
         assert!(cache.host_demotable(key, bytes));
         let freed = cache.adopt_demoted(key.clone(), snapshot, host_block(bytes as usize, drops));
@@ -8556,7 +8564,10 @@ mod tests {
         let drops = counter();
         let hist = prompt(1, 8);
         let mut cache = SessionCache::new(domain(), 1 << 20).with_host_demotion(1 << 20);
-        assert!(cache.quarantine.is_some(), "a host tier arms the quarantine");
+        assert!(
+            cache.quarantine.is_some(),
+            "a host tier arms the quarantine"
+        );
         let root = publish_device(&mut cache, &hist, 2, None);
         let mid = publish_device(&mut cache, &hist, 3, Some(root.clone()));
         let leaf = publish_device(&mut cache, &hist, 4, Some(mid.clone()));
@@ -8602,7 +8613,10 @@ mod tests {
         let (evicted, fits) = cache.evict_host_for((1 << 20) - 4096);
         assert!(fits);
         assert_eq!(
-            evicted.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+            evicted
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
             vec![leaf.clone(), mid.clone()]
         );
         drop(evicted);
