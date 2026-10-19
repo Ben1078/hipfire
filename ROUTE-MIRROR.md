@@ -619,7 +619,7 @@ Qwen4's generic VMM graph relocation explicitly refuses captured hipGraph resour
 
 PM bundle binding is `crates/rdna-compute/src/kernels.rs:4243-4244` (`kernels/qsa_gather_pm_gfx1201.hxaco`); score/select bundle `:4258-4260`, BF16 score `:4381-4385`. Do not reuse gfx1201 hxaco on gfx942; new arch-specific bundle/contracts/pins required. Only PM gather **converter** reads FP8 cache, gather attend reads derived F16; score/topk read index state, not FP8 KV.
 
-gfx1100 gathered attention (not a gfx942 input): `kernels/qsa_gather_pm_gfx1100.hxaco` carries the attention only (`indexed_attention_gathered_wmma_f16_pm_gfx1100`); the Q8 cache is converted by the hipcc `indexed_attention_kv_f16vb_q8`. `qsa_gathered_wmma_enabled` admits it only with the `has_qsa_gather_q8_attend_pm` capability (exact gfx1100) and `HIPFIRE_FN_QSA_GATHER_GFX1100=1` (default off while qualified), and `qsa_gathered_wmma_applies` only for Q8, head_dim 256, 24 query / 2 KV heads, rows >= 512, outside recording/capture; `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` still kills it.
+gfx1100 gathered attention (not a gfx942 input): `kernels/qsa_gather_pm_gfx1100.hxaco` carries the attention only (`indexed_attention_gathered_wmma_f16_pm_gfx1100`); the Q8 cache is converted by the hipcc `indexed_attention_kv_f16vb_q8`. `qsa_gathered_wmma_enabled` admits it only with the `has_qsa_gather_q8_attend_pm` capability (exact gfx1100) and the opt-in switch `HIPFIRE_FN_QSA_GATHER_GFX1100=1` (default OFF until S1 qualification; `=0` kills), and `qsa_gathered_wmma_applies` only for Q8, head_dim 256, 24 query / 2 KV heads, rows >= 512, outside recording/capture; `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` still kills it.
 
 
 #### Dense native

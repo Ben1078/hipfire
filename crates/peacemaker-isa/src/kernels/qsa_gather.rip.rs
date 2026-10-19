@@ -4,9 +4,9 @@
 
 //! Builder-emitted QSA gathered F16 WMMA prefill attention (the gfx1151 /
 //! gfx1201 default `HIPFIRE_QWEN4_QSA_WMMA_GATHER` route, default on;
-//! `HIPFIRE_QWEN4_QSA_PM=0` opts out), and the gfx1100 production opt-in
-//! attention (Q8 cache, 24/2 heads; `HIPFIRE_FN_QSA_GATHER_GFX1100=1`, default
-//! off while qualified). Two symbols per gfx1151 / gfx1201 module, the
+//! `HIPFIRE_QWEN4_QSA_PM=0` opts out), and the gfx1100 attention
+//! (Q8 cache, 24/2 heads; opt-in, default OFF until S1 qualification:
+//! `HIPFIRE_FN_QSA_GATHER_GFX1100=1` enables it, `=0` kills it). Two symbols per gfx1151 / gfx1201 module, the
 //! attention alone in the gfx1100 module, with the ABI, grid, block, LDS layout
 //! and output bytes of the hipcc twins in
 //! `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`

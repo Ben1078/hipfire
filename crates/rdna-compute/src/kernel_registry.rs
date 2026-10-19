@@ -393,7 +393,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
             ["kv_cache_write_asym3_q8_pair_gfx1100"]
         );
-        // gfx1100 gathered QSA attention (opt-in HIPFIRE_FN_QSA_GATHER_GFX1100): the hipcc
+        // gfx1100 gathered QSA attention (opt-in, default OFF until S1 qualification: HIPFIRE_FN_QSA_GATHER_GFX1100=1 enables, =0 kills): the hipcc
         // Q8 converter and the hipcc oracle attend (HIPFIRE_QWEN4_QSA_PM=0) that
         // tensor_ops.rs qsa_gathered_wmma_launch_with ensures by this module name and
         // source. The certified PM attend is embedded in the binary (no pack entry).
