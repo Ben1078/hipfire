@@ -407,6 +407,8 @@ LOAD_FRONT = "qwen4 slowlink load: placement=slowlink-profile resident layers=9 
 LOAD_SET = ("qwen4 slowlink load: placement=slowlink-profile resident layers=9 resident_layer_set=[0, 3, 7, 15, 19, 23, "
             "27, 39, 43] host-mapped tensors=80 slowlink profile=true\n")
 QSA_LINE = "  qwen4 QSA gather workspace: 192 MiB reserved for 16897 context tokens, 192 MiB committed\n"
+QSA_PACK_LINE = ("  indexed_attention_gathered_wmma: indexed package verified: /s/bin/kernels/compiled/gfx1100/"
+                 "indexed_attention_gathered_wmma.hsaco\n")
 
 
 class RouteEvidence(unittest.TestCase):
@@ -440,14 +442,20 @@ class RouteEvidence(unittest.TestCase):
         c[0]["prefill"]["receipts"][0]["moe_iu4"]["tiles"]["aggregate_wmma"] = 3
         self.assertFalse(qc.route_evidence("iu4", c, LOAD_FRONT, [])["iu4"]["ok"])
 
-    def test_qsa_needs_workspace_line_and_off_arm_must_not_have_it(self):
-        kc = ["kcache/x/indexed_attention_gathered_wmma.hsaco"]
-        ok = qc.route_evidence("qsa", cells(), LOAD_FRONT + QSA_LINE, kc)
+    def test_qsa_needs_workspace_and_a_resolved_gather_module_and_off_arm_must_have_neither(self):
+        ok = qc.route_evidence("qsa", cells(), LOAD_FRONT + QSA_LINE + QSA_PACK_LINE, [])   # pack hit: kcache stays empty
         self.assertTrue(ok["qsa"]["ok"], ok["qsa"])
-        self.assertEqual(ok["qsa"]["strength"], "workspace+module")
+        self.assertIn("first-gather-launch", ok["qsa"]["strength"])
+        kc = qc.route_evidence("qsa", cells(), LOAD_FRONT + QSA_LINE, ["kcache/x/indexed_attention_gathered_wmma.hsaco"])
+        self.assertTrue(kc["qsa"]["ok"], kc["qsa"])                                         # pack miss: kcache witness
+        ws_only = qc.route_evidence("qsa", cells(), LOAD_FRONT + QSA_LINE, [])              # load-time config only
+        self.assertFalse(ws_only["qsa"]["ok"])
+        self.assertIn("NOT proof of dispatch", ws_only["qsa"]["strength"])
         none = qc.route_evidence("qsa", cells(), LOAD_FRONT, [])
         self.assertFalse(none["qsa"]["ok"])
-        leaked = qc.route_evidence("off", cells(), LOAD_FRONT + QSA_LINE, kc)
+        leaked = qc.route_evidence("off", cells(), LOAD_FRONT + QSA_LINE + QSA_PACK_LINE, [])
+        self.assertFalse(leaked["qsa"]["ok"])
+        leaked = qc.route_evidence("off", cells(), LOAD_FRONT + QSA_PACK_LINE, [])
         self.assertFalse(leaked["qsa"]["ok"])
 
     def test_common_route_problems(self):
@@ -459,7 +467,7 @@ class RouteEvidence(unittest.TestCase):
 
     def test_stack_all_three(self):
         c = cells(iu4=True, place=qc.PLACE_LAYERS)
-        ev = qc.route_evidence("stack", c, LOAD_SET + QSA_LINE, ["k/indexed_attention_gathered_wmma.hsaco"])
+        ev = qc.route_evidence("stack", c, LOAD_SET + QSA_LINE + QSA_PACK_LINE, [])
         self.assertTrue(ev["ok"], ev)
 
 

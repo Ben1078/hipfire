@@ -1154,6 +1154,7 @@ RE_QSA_RESERVED = re.compile(r"qwen4 QSA gather workspace: (\d+) MiB reserved fo
 RE_QSA_MAPPED = re.compile(r"qwen4 QSA context mapped for (\d+) tokens: .*?, (\d+) MiB gather workspace")
 RE_QSA_PROFILE = re.compile(r"QSA workspace (\d+) KiB")
 QSA_MODULE = "indexed_attention_gathered_wmma"
+RE_QSA_MODULE_LINE = re.compile(r"^\s*indexed_attention_gathered_wmma: indexed package verified: (\S+)", re.M)
 IU4_ROUTE = "aggregate-sym-iu4"
 
 
@@ -1246,27 +1247,39 @@ def route_evidence(arm, cells, stderr_text, kcache_files):
     ev["iu4"] = {"on_expected": "iu4" in on, "window_routes": sorted(str(x) for x in routes), "tile_totals": agg,
                  "ok": not iu_problems, "problems": iu_problems}
 
-    # QSA: no per-call dispatch counter exists in the runtime. Measured evidence = the loader/forward log's gather
-    # workspace reservation lines (reserved only when the gathered format is enabled) plus the lazily-built
-    # gathered-WMMA module in the PRIVATE per-process kernel cache.
+    # QSA: no per-call dispatch counter exists. Source-grounded evidence (gfx1100 Q8, QSA=1):
+    #  * workspace line `qwen4 QSA gather workspace: N MiB reserved ...` is LOAD-TIME config (gathered format enabled),
+    #    not a dispatch;
+    #  * `<module>: indexed package verified: <pack>/indexed_attention_gathered_wmma.hsaco` is printed by
+    #    compile_for_symbol the first time `qsa_gathered_wmma_launch_with` calls ensure_kernel (lazy, first gathered
+    #    launch; no walked route plan exists for gfx1100 so there is no generic prewarm). A pack hit writes NOTHING to
+    #    the kernel cache, so a kcache file appears only on a pack miss (hipcc fallback) and is a secondary witness.
+    # Neither counts launches nor proves every tile took the route; the strength label says so.
     reserved = [(int(a), int(b)) for a, b in RE_QSA_RESERVED.findall(stderr_text)]
     mapped = [(int(a), int(b)) for a, b in RE_QSA_MAPPED.findall(stderr_text)]
     profile_kib = [int(x) for x in RE_QSA_PROFILE.findall(stderr_text)]
     reserved_pos = [x for x in reserved if x[0] > 0] + [x for x in mapped if x[1] > 0]
+    module_lines = RE_QSA_MODULE_LINE.findall(stderr_text)
     module_files = [f for f in kcache_files if QSA_MODULE in f]
+    resolved = bool(module_lines or module_files)
     qsa_problems = []
     if "qsa" in on:
         if not reserved_pos and not any(k > 0 for k in profile_kib):
             qsa_problems.append("no positive QSA gather workspace line in the log")
+        if not resolved:
+            qsa_problems.append("gathered-WMMA module was never resolved (no `indexed package verified` line, no "
+                                "kcache object): the gather launch path was not entered")
     else:
         if reserved_pos:
             qsa_problems.append("QSA gather workspace reserved on a non-QSA arm: %r" % reserved_pos[:3])
-        if module_files:
-            qsa_problems.append("gathered-WMMA module present in the kernel cache on a non-QSA arm")
+        if resolved:
+            qsa_problems.append("gathered-WMMA module resolved on a non-QSA arm")
     ev["qsa"] = {"on_expected": "qsa" in on, "workspace_reserved_lines": reserved[:8], "context_mapped_lines": mapped[:8],
-                 "profile_qsa_workspace_kib": profile_kib[:4], "gathered_module_in_private_kcache": module_files[:8],
-                 "strength": ("workspace+module" if (reserved_pos and module_files) else
-                              "workspace-only (no per-call counter exists)" if reserved_pos else "none"),
+                 "profile_qsa_workspace_kib": profile_kib[:4], "gathered_module_pack_lines": module_lines[:4],
+                 "gathered_module_in_private_kcache": module_files[:8],
+                 "strength": ("first-gather-launch module resolution + workspace (no per-call counter exists)"
+                              if (reserved_pos and resolved) else
+                              "workspace-only: load-time config, NOT proof of dispatch" if reserved_pos else "none"),
                  "ok": not qsa_problems, "problems": qsa_problems}
     ev["ok"] = all(ev[k]["ok"] for k in ("common", "place", "iu4", "qsa"))
     return ev
