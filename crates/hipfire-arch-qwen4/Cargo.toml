@@ -62,6 +62,11 @@ required-features = ["lab"]
 name = "qwen4_greedy_ids"
 required-features = ["lab"]
 
+# S1 production-route quality probe (Q1): baseline / s1a / s1b / beta-f32 / s1-f32 phases.
+[[example]]
+name = "qwen4_slowlink_quality"
+required-features = ["lab"]
+
 [[example]]
 name = "qwen4_g2_replay_gate"
 required-features = ["lab"]
