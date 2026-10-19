@@ -755,11 +755,19 @@ fn project_rotated(
             gpu.gemm_mq2g256v2(weight.buf, x, output, weight.m, weight.k, rows)
         }
         (DType::Q8_0, false) => gpu.gemv_q8_0(weight.buf, x, output, weight.m, weight.k),
-        // Default: preserve the decode GEMV's F32 arithmetic in <=64-row chunks.
-        // The opt-in long-prefill route rounds activations/weights to F16 and
-        // accumulates in F32; short rows, capture and recording stay exact.
+        // `gemm_q8_0_batched` is capped at MAX_BATCH=64 (it asserts), so a
+        // prefill wider than that fails outright. The F32-preserving chunked
+        // entry sub-batches at 64 and calls that SAME kernel per sub-batch, so
+        // the arithmetic the Q8 trunk already had is unchanged.
+        //
+        // Deliberately not `gemm_q8_0_batched_chunked`: on gfx11/gfx1151 that
+        // routes to the WMMA kernel, which rounds the activations and the
+        // dequantised weights to F16. The trunk is Q8 precisely because these
+        // projections write straight into the residual stream, and decode reads
+        // them with the F32 `gemv_q8_0` — an F16-rounded prefill would also
+        // disagree with decode.
         (DType::Q8_0, true) => {
-            gpu.gemm_q8_0_trunk_prefill(weight.buf, x, output, weight.m, weight.k, rows)
+            gpu.gemm_q8_0_batched_f32_chunked(weight.buf, x, output, weight.m, weight.k, rows)
         }
         (DType::MFP4G32E8SOA, false) => {
             gpu.gemv_mfp4g32_e8_soa_prerotated(weight.buf, x, output, weight.m, weight.k)
