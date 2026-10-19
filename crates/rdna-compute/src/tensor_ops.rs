@@ -439,7 +439,10 @@ impl GdnStateKernarg {
         if residual.is_some() != format.has_residual() {
             return Err(HipError::new(
                 0,
-                &format!("GDN state format {} residual pointer mismatch", format.name()),
+                &format!(
+                    "GDN state format {} residual pointer mismatch",
+                    format.name()
+                ),
             ));
         }
         Ok(Self {
@@ -765,9 +768,8 @@ fn gated_delta_step_launch(
         },
     });
     args.pad_to(16);
-    let frame_binding = frame_offset.map(|offset| {
-        [crate::replay::ReplayKernargBinding::PositionPlusU32 { offset, addend: 0 }]
-    });
+    let frame_binding = frame_offset
+        .map(|offset| [crate::replay::ReplayKernargBinding::PositionPlusU32 { offset, addend: 0 }]);
     gpu.launch_blob_recorded(
         kernel,
         [value_heads_grid, value_dim_grid, 1],
@@ -842,11 +844,7 @@ struct GdnBatchedSelect {
 
 impl GdnBatchedSelect {
     /// Whether the policy is consulted at all (see [`Self::policy`]).
-    const fn reads_policy(
-        captured: bool,
-        format: GdnStateFormat,
-        qwen4_scope: bool,
-    ) -> bool {
+    const fn reads_policy(captured: bool, format: GdnStateFormat, qwen4_scope: bool) -> bool {
         !captured && qwen4_scope && matches!(format, GdnStateFormat::Q8 | GdnStateFormat::Q8Ef)
     }
 }
@@ -1605,7 +1603,16 @@ pub(crate) fn gdn_state_from_f32(
     value_heads: usize,
     frame: u32,
 ) -> HipResult<()> {
-    gdn_state_convert(gpu, format, false, slot, residual, f32_src, value_heads, frame)
+    gdn_state_convert(
+        gpu,
+        format,
+        false,
+        slot,
+        residual,
+        f32_src,
+        value_heads,
+        frame,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8839,7 +8846,9 @@ fn qsa_decode_attention_policy_with(
         && (arch_caps.is_gfx1151() || arch_caps.is_gfx1100())
         && qsa_decode_splitkv_q8_geometry_fits(format, head_dim, n_heads, n_kv_heads);
     if split_kv_q8 {
-        QsaDecodeAttentionPolicy::SplitKvQ8 { splits: QSA_DECODE_SPLITK_SPLITS }
+        QsaDecodeAttentionPolicy::SplitKvQ8 {
+            splits: QSA_DECODE_SPLITK_SPLITS,
+        }
     } else {
         QsaDecodeAttentionPolicy::PerHead
     }
@@ -9323,7 +9332,12 @@ fn qsa_decode_splitkv_q8_launch(
     // The kernels index with 32-bit ints: row * capacity (selected), and
     // (row * heads) * splits (workspace record).
     checked_product(p.rows, p.capacity, "QSA q8 split-KV selected rows")?;
-    checked_product3(p.rows, p.n_heads, splits, "QSA q8 split-KV workspace records")?;
+    checked_product3(
+        p.rows,
+        p.n_heads,
+        splits,
+        "QSA q8 split-KV workspace records",
+    )?;
     let rows = checked_i32(p.rows, "QSA q8 split-KV rows")?;
     let position_start = checked_i32(p.position_start, "QSA q8 split-KV position")?;
     let n_heads = checked_i32(p.n_heads, "QSA q8 split-KV heads")?;
@@ -9358,7 +9372,10 @@ fn qsa_decode_splitkv_q8_launch(
             .ok_or_else(|| HipError::new(0, "QSA q8 split-KV workspace size overflows"))
     };
     let workspace_bytes = record_bytes(p.rows, splits)?;
-    let reserve_bytes = record_bytes(QSA_DECODE_SPLITK_RESERVE_ROWS, QSA_DECODE_SPLITKV_Q8_MAX_SPLITS)?;
+    let reserve_bytes = record_bytes(
+        QSA_DECODE_SPLITK_RESERVE_ROWS,
+        QSA_DECODE_SPLITKV_Q8_MAX_SPLITS,
+    )?;
     let workspace = gpu.qsa_gather_scratch(workspace_bytes, reserve_bytes)?;
     let mut partial = KernargBlob::new();
     for ptr in [
@@ -9425,7 +9442,10 @@ fn qsa_decode_splitkv_q8_validate(
 ) -> HipResult<()> {
     let wrong_shape = || HipError::new(0, &ComputeError::WrongShape.to_string());
     if !gpu.arch_caps.has_gfx11_plus_simt() {
-        return Err(HipError::new(0, "QSA q8 split-KV decode needs a gfx11 or gfx12 wave32 device"));
+        return Err(HipError::new(
+            0,
+            "QSA q8 split-KV decode needs a gfx11 or gfx12 wave32 device",
+        ));
     }
     if !qsa_decode_splitk_eager(gpu) {
         return Err(HipError::new(0, "QSA q8 split-KV decode is eager-only"));
@@ -9441,15 +9461,21 @@ fn qsa_decode_splitkv_q8_validate(
     for tensor in [p.q_with_gate, p.output] {
         ensure_f32(tensor)?;
     }
-    check_qsa_format(gpu, p.format, p.n_kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
-    if p.selected.dtype != DType::Raw
-        || p.compress == 0
-        || p.capacity == 0
-        || p.full_capacity == 0
+    check_qsa_format(
+        gpu,
+        p.format,
+        p.n_kv_heads,
+        p.head_dim,
+        [p.full_keys, p.full_values],
+    )?;
+    if p.selected.dtype != DType::Raw || p.compress == 0 || p.capacity == 0 || p.full_capacity == 0
     {
         return Err(wrong_shape());
     }
-    let end_position = p.position_start.checked_add(p.rows).ok_or_else(wrong_shape)?;
+    let end_position = p
+        .position_start
+        .checked_add(p.rows)
+        .ok_or_else(wrong_shape)?;
     if end_position > i32::MAX as usize || end_position > p.full_capacity {
         return Err(wrong_shape());
     }
@@ -9478,17 +9504,23 @@ fn qsa_decode_splitkv_q8_validate(
         || p.full_keys.numel() < kv_elements
         || p.full_values.numel() < kv_elements
         || p.selected.numel() < selected_bytes
-        || p.q_with_gate.buf.size() < checked_product(q_rows, f32_bytes, "QSA q8 split-KV query bytes")?
-        || p.output.buf.size() < checked_product(output_rows, f32_bytes, "QSA q8 split-KV output bytes")?
+        || p.q_with_gate.buf.size()
+            < checked_product(q_rows, f32_bytes, "QSA q8 split-KV query bytes")?
+        || p.output.buf.size()
+            < checked_product(output_rows, f32_bytes, "QSA q8 split-KV output bytes")?
         || p.full_keys.buf.size() < kv_bytes
         || p.full_values.buf.size() < kv_bytes
         || p.selected.buf.size() < selected_bytes
     {
         return Err(wrong_shape());
     }
-    let selected_bound = checked_product(p.budget_blocks, p.compress, "QSA q8 split-KV selected bound")?
-        .checked_add(p.compress - 1)
-        .ok_or_else(wrong_shape)?;
+    let selected_bound = checked_product(
+        p.budget_blocks,
+        p.compress,
+        "QSA q8 split-KV selected bound",
+    )?
+    .checked_add(p.compress - 1)
+    .ok_or_else(wrong_shape)?;
     let max_selected = end_position.min(p.capacity).min(selected_bound);
     if p.shape_selected < max_selected {
         return Err(HipError::new(
@@ -9925,7 +9957,10 @@ fn qsa_gathered_wmma_launch_with(
     // keeps the hipcc gfx1151-source attend (the PM/hipcc oracle relationship).
     let pm_gfx1100 = gpu.arch_caps.has_qsa_gather_q8_attend_pm();
     if pm_gfx1100 && p.format != QsaKvFormat::Q8 {
-        return Err(HipError::new(0, "gfx1100 QSA gathered route requires a Q8 cache"));
+        return Err(HipError::new(
+            0,
+            "gfx1100 QSA gathered route requires a Q8 cache",
+        ));
     }
     let attend = if pm && pm_gfx1100 {
         built(
@@ -10561,43 +10596,104 @@ mod tests {
     /// geometry or architecture) stays per-head. Row counts are not an input.
     #[test]
     fn qsa_decode_attention_policy_routes_f32_split_k_and_q8_split_kv() {
-        let policy = |arch: &str, switch: bool, format, heads: usize, kv_heads: usize, head_dim: usize, eager: bool| {
+        let policy = |arch: &str,
+                      switch: bool,
+                      format,
+                      heads: usize,
+                      kv_heads: usize,
+                      head_dim: usize,
+                      eager: bool| {
             let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
             flags.qwen4_qsa_decode_splitk = switch;
             let flags = std::sync::Arc::new(flags);
             let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
-            qsa_decode_attention_policy_with(&flags, &caps, format, head_dim, heads, kv_heads, 2051, eager)
+            qsa_decode_attention_policy_with(
+                &flags, &caps, format, head_dim, heads, kv_heads, 2051, eager,
+            )
         };
-        let q8 = QsaDecodeAttentionPolicy::SplitKvQ8 { splits: QSA_DECODE_SPLITK_SPLITS };
+        let q8 = QsaDecodeAttentionPolicy::SplitKvQ8 {
+            splits: QSA_DECODE_SPLITK_SPLITS,
+        };
         let f32_split_k = QsaDecodeAttentionPolicy::SplitK {
             splits: QSA_DECODE_SPLITK_SPLITS,
             layout: QSA_DECODE_SPLITK_SCORING_LAYOUT,
         };
         let per_head = QsaDecodeAttentionPolicy::PerHead;
         // q8: exact gfx1151, eager, 24 / 2 / 256.
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, true), q8);
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, true),
+            q8
+        );
         // Recorded or captured launch.
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, false), per_head);
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, false),
+            per_head
+        );
         // Kill switch.
-        assert_eq!(policy("gfx1151", false, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        assert_eq!(
+            policy("gfx1151", false, QsaKvFormat::Q8, 24, 2, 256, true),
+            per_head
+        );
         // Wrong head geometry.
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 12, 1, 256, true), per_head);
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 4, 256, true), per_head);
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 128, true), per_head);
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::Q8, 12, 1, 256, true),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::Q8, 24, 4, 256, true),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 128, true),
+            per_head
+        );
         // Another architecture.
-        assert_eq!(policy("gfx1201", true, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        assert_eq!(
+            policy("gfx1201", true, QsaKvFormat::Q8, 24, 2, 256, true),
+            per_head
+        );
         // gfx1100 takes q8 split-KV (eager, flag on) but never the F32 split-K.
-        assert_eq!(policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, true), q8);
-        assert_eq!(policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, false), per_head);
-        assert_eq!(policy("gfx1100", false, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
-        assert_eq!(policy("gfx1100", true, QsaKvFormat::Q8, 12, 1, 256, true), per_head);
-        assert_eq!(policy("gfx1100", true, QsaKvFormat::F32, 24, 2, 256, true), per_head);
-        assert_eq!(policy("gfx1101", true, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        assert_eq!(
+            policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, true),
+            q8
+        );
+        assert_eq!(
+            policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, false),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1100", false, QsaKvFormat::Q8, 24, 2, 256, true),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1100", true, QsaKvFormat::Q8, 12, 1, 256, true),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1100", true, QsaKvFormat::F32, 24, 2, 256, true),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1101", true, QsaKvFormat::Q8, 24, 2, 256, true),
+            per_head
+        );
         // F32 K/V is unchanged: split-K, never split-KV.
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, true), f32_split_k);
-        assert_eq!(policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, false), per_head);
-        assert_eq!(policy("gfx1151", false, QsaKvFormat::F32, 24, 2, 256, true), per_head);
-        assert_eq!(policy("gfx1201", true, QsaKvFormat::F32, 24, 2, 256, true), per_head);
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, true),
+            f32_split_k
+        );
+        assert_eq!(
+            policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, false),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1151", false, QsaKvFormat::F32, 24, 2, 256, true),
+            per_head
+        );
+        assert_eq!(
+            policy("gfx1201", true, QsaKvFormat::F32, 24, 2, 256, true),
+            per_head
+        );
         // The q8 split-KV LDS is fixed: a selected list far past the F32 slice
         // limit still takes it.
         let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1151");
@@ -10605,11 +10701,29 @@ mod tests {
         let flags = std::sync::Arc::new(flags);
         let caps = crate::arch_caps::ArchCaps::new("gfx1151", flags.clone());
         assert_eq!(
-            qsa_decode_attention_policy_with(&flags, &caps, QsaKvFormat::Q8, 256, 24, 2, usize::MAX / 4, true),
+            qsa_decode_attention_policy_with(
+                &flags,
+                &caps,
+                QsaKvFormat::Q8,
+                256,
+                24,
+                2,
+                usize::MAX / 4,
+                true
+            ),
             q8
         );
         assert_eq!(
-            qsa_decode_attention_policy_with(&flags, &caps, QsaKvFormat::F32, 256, 24, 2, usize::MAX / 4, true),
+            qsa_decode_attention_policy_with(
+                &flags,
+                &caps,
+                QsaKvFormat::F32,
+                256,
+                24,
+                2,
+                usize::MAX / 4,
+                true
+            ),
             per_head
         );
     }
@@ -10626,7 +10740,7 @@ mod tests {
             let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
             qsa_gathered_format_enabled(&caps, &flags, format)
         };
-        use QsaKvFormat::{Fp8, Fp8Fnuz, Q8, F32};
+        use QsaKvFormat::{Fp8, Fp8Fnuz, F32, Q8};
         assert_eq!(
             enabled("gfx1100", None, Q8),
             crate::feature_flags::FN_QSA_GATHER_GFX1100_DEFAULT
@@ -10654,7 +10768,7 @@ mod tests {
 
     #[test]
     fn qsa_gathered_gfx1100_shape_is_q8_24_2_256_only() {
-        use QsaKvFormat::{Fp8, Q8, F32};
+        use QsaKvFormat::{Fp8, F32, Q8};
         assert!(qsa_gathered_gfx1100_shape(Q8, 256, 24, 2));
         assert!(!qsa_gathered_gfx1100_shape(Q8, 256, 24, 4));
         assert!(!qsa_gathered_gfx1100_shape(Q8, 256, 32, 2));
@@ -15253,15 +15367,194 @@ mod tests {
         }
     }
 
-    /// State formats the gathered route serves on this device.
+    /// State formats the gathered route serves on this device. gfx1100 joins
+    /// Q8 only through the existing `has_qsa_gather_q8_attend_pm` capability
+    /// (the certified PM attention behind the hipcc Q8 converter); every other
+    /// arch keeps its incumbent formats.
     fn gathered_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
         if gpu.arch_caps.is_gfx1151() {
             vec![QsaKvFormat::F32, QsaKvFormat::Q8]
         } else if gpu.arch_caps.is_gfx1201() {
             vec![QsaKvFormat::Fp8]
+        } else if gpu.arch_caps.has_qsa_gather_q8_attend_pm() {
+            vec![QsaKvFormat::Q8]
         } else {
             Vec::new()
         }
+    }
+
+    /// Host Q8_0 row dequantization of the same `GatheredCase` buffers the GPU
+    /// converter reads: Q8 f16-scale-times-int8-code per element, matching
+    /// `indexed_attention_kv_f16vb_q8` before its F16 rounding.
+    fn gathered_q8_host_dequant(kv_bytes: &[u8], tokens: usize, kv_heads: usize) -> Vec<f32> {
+        dequantize_qsa_rows(QsaKvFormat::Q8, kv_bytes, tokens, kv_heads, 256)
+    }
+
+    /// Host F32-to-F16 round-to-nearest-even bits for one value, through the
+    /// existing `half` conversion used by the crate's CPU references.
+    fn f32_to_f16_rne_bits(value: f32) -> u16 {
+        half::f16::from_f32(value).to_bits()
+    }
+
+    /// Expected converter bytes of the same `GatheredCase` Q8 K/V: dequantize
+    /// each element, round to F16 RNE, and lay out K row-major with V
+    /// block-transposed (`[token/4][width][token%4]`), the same layout the
+    /// `indexed_attention_kv_f16vb_q8` converter writes into the route's own
+    /// scratch prefix. Covers only valid tokens; padding past the token count
+    /// is never compared as data.
+    fn gathered_q8_expected_converter_bytes(
+        k_bytes: &[u8],
+        v_bytes: &[u8],
+        tokens: usize,
+        kv_heads: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let width = kv_heads * 256;
+        let k_f32 = gathered_q8_host_dequant(k_bytes, tokens, kv_heads);
+        let v_f32 = gathered_q8_host_dequant(v_bytes, tokens, kv_heads);
+        let mut k16 = vec![0u8; tokens * width * 2];
+        let vb_extent = qsa_vb16_extent(tokens, width);
+        let mut vb16 = vec![0u8; vb_extent];
+        for token in 0..tokens {
+            for c in 0..width {
+                let k_bits = f32_to_f16_rne_bits(k_f32[token * width + c]);
+                let at = (token * width + c) * 2;
+                k16[at..at + 2].copy_from_slice(&k_bits.to_le_bytes());
+                let v_bits = f32_to_f16_rne_bits(v_f32[token * width + c]);
+                let at = ((token / 4 * width + c) * 4 + token % 4) * 2;
+                vb16[at..at + 2].copy_from_slice(&v_bits.to_le_bytes());
+            }
+        }
+        (k16, vb16)
+    }
+    /// Bounded output diagnostics: count, non-finite count, max absolute
+    /// value, RMS and rel-L2-vs-reference summaries printed before an
+    /// assertion, so a failed hold names the stage (reference, hipcc or PM).
+    /// Tolerances unchanged; text only, no new pass/fail rule.
+    fn gathered_output_summary(tag: &str, name: &str, values: &[f32], reference: Option<&[f32]>) {
+        let mut nonfinite = 0usize;
+        let mut max_abs = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for v in values {
+            if !v.is_finite() {
+                nonfinite += 1;
+            } else {
+                max_abs = max_abs.max(v.abs() as f64);
+                sum_sq += (*v as f64) * (*v as f64);
+            }
+        }
+        let rms = (sum_sq / values.len().max(1) as f64).sqrt();
+        let rel = reference.map(|r| rel_l2(r, values));
+        match rel {
+            Some(rel) => eprintln!(
+                "gathered output {tag} ({name}): n={} nonfinite={} max_abs={:.6e} rms={:.6e} \
+                 rel_L2={:.6e}",
+                values.len(),
+                nonfinite,
+                max_abs,
+                rms,
+                rel
+            ),
+            None => eprintln!(
+                "gathered output {tag} ({name}): n={} nonfinite={} max_abs={:.6e} rms={:.6e}",
+                values.len(),
+                nonfinite,
+                max_abs,
+                rms
+            ),
+        }
+    }
+
+    /// First mismatching output element (row/head/channel with both values
+    /// and bits) printed before an equality assertion, so a failed hold
+    /// names the stage's first divergence. Text only.
+    fn gathered_first_output_mismatch(
+        tag: &str,
+        name: &str,
+        got: &[f32],
+        want: &[f32],
+        rows: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) {
+        assert_eq!(got.len(), want.len(), "output length mismatch ({name})");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            if g.to_bits() != w.to_bits() {
+                let row = i / (n_heads * head_dim);
+                let head = (i / head_dim) % n_heads;
+                let channel = i % head_dim;
+                eprintln!(
+                    "gathered first {tag} mismatch ({name}): elem={i} row={row} head={head} \
+                     channel={channel} got={g:e} want={w:e} got_bits={:#010x} want_bits={:#010x}",
+                    g.to_bits(),
+                    w.to_bits()
+                );
+                return;
+            }
+        }
+        eprintln!("gathered first {tag} mismatch ({name}): none (byte presentation differs)");
+    }
+
+    /// First mismatching converter byte (token/channel with both u16 code
+    /// points) printed before an equality assertion, so a failed hold names
+    /// the stage's first divergence. Text only.
+    fn gathered_first_byte_mismatch(
+        tag: &str,
+        name: &str,
+        got: &[u8],
+        want: &[u8],
+        tokens: usize,
+        width: usize,
+        block_transposed_v: bool,
+    ) {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            if g != w {
+                let elem = i / 2;
+                let (token, channel) = if block_transposed_v {
+                    let block = elem / (width * 4);
+                    let inner = elem % (width * 4);
+                    (block * 4 + inner % 4, inner / 4)
+                } else {
+                    (elem / width, elem % width)
+                };
+                let at = elem * 2;
+                let got_bits = u16::from_le_bytes([got[at], got[at + 1]]);
+                let want_bits = u16::from_le_bytes([want[at], want[at + 1]]);
+                eprintln!(
+                    "gathered first {tag} mismatch ({name}): byte={i} elem={elem} token={token} \
+                     channel={channel} valid_tokens={tokens} got={:#06x} want={:#06x}",
+                    got_bits, want_bits
+                );
+                return;
+            }
+        }
+        eprintln!(
+            "gathered {tag} ({name}): lengths differ (got={} want={})",
+            got.len(),
+            want.len()
+        );
+    }
+
+    /// Converter bytes the device just wrote, read from the route's own
+    /// scratch prefix after the case's gathered launch: K rows `[0, tokens)`
+    /// then the block-transposed V extent (`qsa_vb16_extent`), the same
+    /// prefix every attend launch reads. Uses the existing
+    /// `qsa_gather_scratch` mapping and the existing
+    /// `memcpy_dtoh` readback, so no new allocator, observer or env knob.
+    /// The caller runs a poisoned prefix check for unwritten padding
+    /// separately (never read as valid data).
+    fn gathered_converter_scratch_bytes(gpu: &mut Gpu, kv_heads: usize, tokens: usize) -> Vec<u8> {
+        let bytes = qsa_gathered_wmma_scratch_bytes(kv_heads, tokens).expect("scratch size");
+        let ptr = gpu
+            .qsa_gather_scratch(bytes, bytes)
+            .expect("scratch mapping");
+        gpu.hip.device_synchronize().expect("sync");
+        // SAFETY: non-owning view of the mapped scratch prefix, read once.
+        let view = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, bytes) };
+        let mut out = vec![0u8; bytes];
+        gpu.hip
+            .memcpy_dtoh(&mut out, &view)
+            .expect("scratch download");
+        out
     }
 
     /// The gathered F16 WMMA route must match the exact per-head kernel of
@@ -15275,7 +15568,7 @@ mod tests {
         };
         let formats = gathered_formats(&gpu);
         if formats.is_empty() {
-            eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
+            eprintln!("skip: the gathered route is gfx1151 / gfx1201 / gfx1100-Q8 only");
             return;
         }
         for format in formats {
@@ -15289,16 +15582,184 @@ mod tests {
             let gathered = gpu.download_f32(&case.output).expect("gathered download");
             let rel = rel_l2(&reference, &gathered);
             eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
-            // F16 operands and probabilities: ~1e-4 here; a wrong entry, head,
-            // dim or key/value pairing lands near 1e-1 or above.
-            assert!(
-                rel < 5e-3,
-                "gathered QSA WMMA ({}) rel L2 {rel:.3e}",
-                format.name()
-            );
+            if rel >= 5e-3 {
+                gathered_output_summary("reference", format.name(), &reference, None);
+                gathered_output_summary(
+                    "hipcc-gathered",
+                    format.name(),
+                    &gathered,
+                    Some(&reference),
+                );
+                gathered_first_output_mismatch(
+                    "reference-vs-hipcc",
+                    format.name(),
+                    &gathered,
+                    &reference,
+                    p.rows,
+                    p.n_heads,
+                    p.head_dim,
+                );
+            }
             assert!(rel > 0.0, "gathered QSA WMMA route did not run");
-            let hip = case.gathered(&mut gpu, false);
+            let hip;
+            if format == QsaKvFormat::Q8 {
+                // Poison the route's own scratch prefix out to the full
+                // capacity before the case's gathered launch, so bytes the
+                // converter never writes keep their poison.
+                let full_prefix = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, p.full_capacity)
+                    .expect("scratch size");
+                let full_ptr = gpu
+                    .qsa_gather_scratch(full_prefix, full_prefix)
+                    .expect("scratch mapping");
+                // SAFETY: non-owning view of the mapped scratch prefix, written once.
+                let full_view =
+                    unsafe { hip_bridge::DeviceBuffer::from_raw(full_ptr, full_prefix) };
+                gpu.hip
+                    .memset(&full_view, 0x7f, full_prefix)
+                    .expect("poison prefix");
+                drop(full_view);
+                hip = case.gathered(&mut gpu, false);
+                // Converter-only oracle on the same case buffers: the `hip`
+                // gathered launch above converted the case's Q8 K/V through the
+                // existing hipcc `indexed_attention_kv_f16vb_q8` launch, so
+                // compare that prefix against the CPU Q8-dequantize + F16-RNE
+                // expectation for every valid token and channel. K is
+                // row-major, V is 4-token block-transposed, the layout the
+                // converter writes. The launch converts rows `[0, end)` only,
+                // so padding past the exact written extent must keep its
+                // poison: it is detected separately and never compared as data.
+                let end = p.position_start + p.rows;
+                let width = p.n_kv_heads * 256;
+                let k_src = download_bytes(&gpu, &case.k);
+                let v_src = download_bytes(&gpu, &case.v);
+                let row_bytes = format.kv_row_bytes(p.n_kv_heads, 256);
+                let (k_want, v_want) = gathered_q8_expected_converter_bytes(
+                    &k_src[..end * row_bytes],
+                    &v_src[..end * row_bytes],
+                    end,
+                    p.n_kv_heads,
+                );
+                let scratch = gathered_converter_scratch_bytes(&mut gpu, p.n_kv_heads, end);
+                let k_end = end * width * 2;
+                let v_end = qsa_vb16_extent(end, width);
+                let written = k_end + v_end;
+                assert!(
+                    scratch.len() >= written,
+                    "scratch prefix shorter than the written K/V extent"
+                );
+                if scratch[..k_end] != k_want {
+                    gathered_first_byte_mismatch(
+                        "K16",
+                        format.name(),
+                        &scratch[..k_end],
+                        &k_want,
+                        end,
+                        width,
+                        false,
+                    );
+                }
+                assert!(
+                    scratch[..k_end] == k_want,
+                    "Q8 converter K16 bytes differ ({} valid tokens)",
+                    end
+                );
+                if scratch[k_end..k_end + v_end] != v_want {
+                    gathered_first_byte_mismatch(
+                        "VB16",
+                        format.name(),
+                        &scratch[k_end..k_end + v_end],
+                        &v_want,
+                        end,
+                        width,
+                        true,
+                    );
+                }
+                assert!(
+                    scratch[k_end..k_end + v_end] == v_want,
+                    "Q8 converter VB16 bytes differ ({} valid tokens)",
+                    end
+                );
+                // Unwritten-padding oracle on the same prefix: the launch
+                // converts rows `[0, end)` only, so every byte past the exact
+                // written extent out to the poisoned full capacity must keep
+                // its poison, and is never mistaken for valid converted data.
+                let after =
+                    gathered_converter_scratch_bytes(&mut gpu, p.n_kv_heads, p.full_capacity);
+                assert!(
+                    after.len() >= full_prefix,
+                    "scratch prefix shorter than the poisoned full capacity"
+                );
+                if after[written..full_prefix].iter().any(|b| *b != 0x7f) {
+                    let dirty = after[written..full_prefix]
+                        .iter()
+                        .position(|b| *b != 0x7f)
+                        .expect("dirty padding byte");
+                    let at = written + dirty;
+                    eprintln!(
+                        "gathered first padding mismatch ({}): byte={at} of poisoned prefix \
+                         {full_prefix} got={:#04x} (0x7f keeps pass)",
+                        format.name(),
+                        after[at]
+                    );
+                }
+                assert!(
+                    after[written..full_prefix].iter().all(|b| *b == 0x7f),
+                    "converter wrote padding past the exact K/V extent"
+                );
+            } else {
+                hip = case.gathered(&mut gpu, false);
+            }
             let pm = case.gathered(&mut gpu, true);
+            if hip != pm {
+                // Output tensors are F32 (`GpuTensor::zeros(.., DType::F32)`):
+                // decode bytes to f32 lanes for the same bounded summary and
+                // first-mismatch element as the reference-vs-hipcc gate. Text
+                // only; the byte equality rule below is unchanged.
+                let lanes = |bytes: &[u8]| -> Vec<f32> {
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                };
+                let hip_f32 = lanes(&hip);
+                let pm_f32 = lanes(&pm);
+                gathered_output_summary("hipcc-output", format.name(), &hip_f32, Some(&reference));
+                gathered_output_summary("pm-output", format.name(), &pm_f32, Some(&reference));
+                gathered_first_output_mismatch(
+                    "pm-vs-hipcc",
+                    format.name(),
+                    &pm_f32,
+                    &hip_f32,
+                    p.rows,
+                    p.n_heads,
+                    p.head_dim,
+                );
+                if hip.len() == pm.len() {
+                    let first = hip
+                        .iter()
+                        .zip(pm.iter())
+                        .position(|(h, m)| h != m)
+                        .expect("differing byte");
+                    let elem = first / 4;
+                    eprintln!(
+                        "gathered first pm-vs-hipcc byte mismatch ({}): byte={first} elem={elem} \
+                         row={} head={} channel={} hip={:#04x} pm={:#04x}",
+                        format.name(),
+                        elem / (p.n_heads * p.head_dim),
+                        (elem / p.head_dim) % p.n_heads,
+                        elem % p.head_dim,
+                        hip[first],
+                        pm[first]
+                    );
+                } else {
+                    eprintln!(
+                        "gathered pm-vs-hipcc ({}): lengths differ (hip={} pm={})",
+                        format.name(),
+                        hip.len(),
+                        pm.len()
+                    );
+                }
+            }
             assert!(
                 hip == pm,
                 "PM vs hipcc gathered bytes differ ({})",
@@ -15323,7 +15784,7 @@ mod tests {
             return;
         };
         let Some(&format) = gathered_formats(&gpu).first() else {
-            eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
+            eprintln!("skip: no gathered format on this device");
             return;
         };
         if !qsa_gathered_wmma_enabled(&gpu, format) {
@@ -18247,7 +18708,12 @@ mod gdn_q8ef_tests {
 
     fn residual_tensor(address: usize) -> GpuTensor {
         let units = EF.residual_units(HEADS, 128, 128);
-        tensor(address, &[units], DType::F16, EF.residual_bytes(HEADS, 128, 128))
+        tensor(
+            address,
+            &[units],
+            DType::F16,
+            EF.residual_bytes(HEADS, 128, 128),
+        )
     }
 
     fn ring_tensor(format: GdnStateFormat, rows: usize) -> GpuTensor {
@@ -18585,7 +19051,10 @@ mod gdn_q8ef_tests {
         assert!(!F32.has_frame_kernarg());
         // Converters.
         assert_eq!(gdn_convert_kernel(Q8, true).unwrap(), "gdn_state_q8_to_f32");
-        assert_eq!(gdn_convert_kernel(Q8, false).unwrap(), "gdn_state_f32_to_q8");
+        assert_eq!(
+            gdn_convert_kernel(Q8, false).unwrap(),
+            "gdn_state_f32_to_q8"
+        );
         assert_eq!(
             gdn_convert_kernel(EF, true).unwrap(),
             "gdn_state_q8ef_to_f32"
@@ -18598,7 +19067,13 @@ mod gdn_q8ef_tests {
         assert!(gdn_convert_kernel(F32, false).is_err());
         // Chunk kernels and modules (registry names).
         let table = [
-            (Q8, true, false, "gated_delta_chunk_q8_wmma", "gated_delta_chunk_gate_q8_wmma"),
+            (
+                Q8,
+                true,
+                false,
+                "gated_delta_chunk_q8_wmma",
+                "gated_delta_chunk_gate_q8_wmma",
+            ),
             (
                 Q8,
                 true,
@@ -18639,12 +19114,24 @@ mod gdn_q8ef_tests {
             assert_eq!(gdn_chunk_source(format, inline, arena), source);
         }
         for format in FORMATS {
-            assert_eq!(gdn_chunk_source(format, false, false), GATED_DELTA_CHUNK_WMMA_SRC);
-            assert_eq!(gdn_chunk_source(format, false, true), npu_arena::CHUNK_ARENA_SRC);
+            assert_eq!(
+                gdn_chunk_source(format, false, false),
+                GATED_DELTA_CHUNK_WMMA_SRC
+            );
+            assert_eq!(
+                gdn_chunk_source(format, false, true),
+                npu_arena::CHUNK_ARENA_SRC
+            );
         }
         for source in [GATED_DELTA_CHUNK_Q8_WMMA_SRC, npu_arena::CHUNK_Q8_ARENA_SRC] {
-            assert!(!source.contains("q8ef"), "the plain Q8 source must not carry the EF entry");
-            assert!(!source.contains("ef_row"), "the plain Q8 source must not carry EF code");
+            assert!(
+                !source.contains("q8ef"),
+                "the plain Q8 source must not carry the EF entry"
+            );
+            assert!(
+                !source.contains("ef_row"),
+                "the plain Q8 source must not carry EF code"
+            );
         }
         // Inline format predicate: only plain Q8 without a residual; Q8Ef has no inline kernel.
         for (format, has_residual, want) in [
@@ -18696,11 +19183,23 @@ mod gdn_q8ef_tests {
             frame,
         };
         let head = |tail: &[Arg]| {
-            let mut spec = vec![Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+            let mut spec = vec![
+                Arg::P(0x10),
+                Arg::P(0x20),
+                Arg::P(0x30),
+                Arg::P(0x40),
+                Arg::P(0x50),
+            ];
             spec.extend_from_slice(tail);
             spec
         };
-        let dims = [Arg::I(16), Arg::I(48), Arg::I(128), Arg::I(128), Arg::F(0.0883883)];
+        let dims = [
+            Arg::I(16),
+            Arg::I(48),
+            Arg::I(128),
+            Arg::I(128),
+            Arg::F(0.0883883),
+        ];
         let recurrent = GdnStepOutput::Recurrent { output: ptr(0x60) };
 
         // Plain Q8: state, output, dims, trailing frame (+ replay offset).
@@ -18751,7 +19250,13 @@ mod gdn_q8ef_tests {
         let (blob, frame_offset) = gdn_step_kernargs(&base(q8, gated, 9));
         let mut spec = head(&[Arg::P(0x70), Arg::P(0x90), Arg::P(0xa0), Arg::P(0xb0)]);
         spec.extend_from_slice(&dims);
-        spec.extend_from_slice(&[Arg::P(0xc0), Arg::P(0xd0), Arg::P(0xe0), Arg::P(0xf0), Arg::U(9)]);
+        spec.extend_from_slice(&[
+            Arg::P(0xc0),
+            Arg::P(0xd0),
+            Arg::P(0xe0),
+            Arg::P(0xf0),
+            Arg::U(9),
+        ]);
         assert_eq!(blob.as_bytes(), expected(&spec));
         assert_eq!(frame_offset, Some(blob.len() - 4));
     }
@@ -18790,17 +19295,39 @@ mod gdn_q8ef_tests {
             let ring_arg: Vec<Arg> = ring.iter().map(|_| Arg::P(0x60)).collect();
             // Plain Q8: ..., state, output, [ring], dims, frame.
             let blob = gdn_batched_kernargs(&make(q8, ring));
-            let mut spec = vec![Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+            let mut spec = vec![
+                Arg::P(0x10),
+                Arg::P(0x20),
+                Arg::P(0x30),
+                Arg::P(0x40),
+                Arg::P(0x50),
+            ];
             spec.extend_from_slice(&ring_arg);
             spec.extend_from_slice(&dims);
             spec.push(Arg::U(77));
-            assert_eq!(blob.as_bytes(), expected(&spec), "Q8 ring={}", ring.is_some());
+            assert_eq!(
+                blob.as_bytes(),
+                expected(&spec),
+                "Q8 ring={}",
+                ring.is_some()
+            );
             // F32: no frame.
             let blob = gdn_batched_kernargs(&make(f32_state, ring));
-            let mut spec = vec![Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+            let mut spec = vec![
+                Arg::P(0x10),
+                Arg::P(0x20),
+                Arg::P(0x30),
+                Arg::P(0x40),
+                Arg::P(0x50),
+            ];
             spec.extend_from_slice(&ring_arg);
             spec.extend_from_slice(&dims);
-            assert_eq!(blob.as_bytes(), expected(&spec), "F32 ring={}", ring.is_some());
+            assert_eq!(
+                blob.as_bytes(),
+                expected(&spec),
+                "F32 ring={}",
+                ring.is_some()
+            );
             // Q8Ef: ef right after state (before output / ring), no frame.
             let blob = gdn_batched_kernargs(&make(ef, ring));
             let mut spec = vec![
@@ -18813,7 +19340,12 @@ mod gdn_q8ef_tests {
             ];
             spec.extend_from_slice(&ring_arg);
             spec.extend_from_slice(&dims);
-            assert_eq!(blob.as_bytes(), expected(&spec), "Q8Ef ring={}", ring.is_some());
+            assert_eq!(
+                blob.as_bytes(),
+                expected(&spec),
+                "Q8Ef ring={}",
+                ring.is_some()
+            );
         }
     }
 
@@ -18836,7 +19368,13 @@ mod gdn_q8ef_tests {
             query_scale: 0.0883883,
             output_bf16: 1,
         };
-        let head = [Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+        let head = [
+            Arg::P(0x10),
+            Arg::P(0x20),
+            Arg::P(0x30),
+            Arg::P(0x40),
+            Arg::P(0x50),
+        ];
         let tail = [Arg::P(0x70), Arg::P(0x80), Arg::P(0x90)];
         let dims = [
             Arg::I(512),
@@ -18862,7 +19400,10 @@ mod gdn_q8ef_tests {
             state: ptr(0x60),
             frame: 531,
         }));
-        assert_eq!(blob.as_bytes(), build(&[Arg::P(0x60)], &[Arg::I(1), Arg::U(531)]));
+        assert_eq!(
+            blob.as_bytes(),
+            build(&[Arg::P(0x60)], &[Arg::I(1), Arg::U(531)])
+        );
     }
 
     #[test]
