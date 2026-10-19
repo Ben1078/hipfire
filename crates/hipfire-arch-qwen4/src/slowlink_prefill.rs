@@ -53,7 +53,7 @@ use crate::bundle::{PromptTxn, Qwen4Bundle, SlowlinkFailPoint};
 use crate::config::Qwen4Config;
 use crate::gpu_forward::panel_stage::{
     ExpertGroupPlan, ExpertPanelRing, OverlapSummary, PanelBindingParts, PanelSchedule, PanelStats,
-    PanelTicket,
+    PanelTicket, PanelTimeline, PhaseKind, TimelineTrace,
 };
 use crate::gpu_forward::{
     f32_view, invalid, layer_desc, layer_scratch, matrix_view, program_dims, router_columns,
@@ -787,6 +787,315 @@ impl WindowReport {
     }
 }
 
+// ── raw attribution trace (HIPFIRE_QWEN4_SLOWLINK_TRACE) ─────────────
+
+/// One group's touched-expert census of one layer.
+#[derive(Clone, Debug)]
+struct GroupTouch {
+    layer: usize,
+    group: u32,
+    expert_lo: usize,
+    /// Exclusive.
+    expert_hi: usize,
+    experts: usize,
+    extent_bytes: u64,
+    touched: usize,
+    touched_bytes: u64,
+    /// Maximal runs of consecutive expert ids among the group's touched experts.
+    touched_runs: usize,
+}
+
+impl GroupTouch {
+    /// `touched` is the layer's sorted, deduplicated touched expert ids.
+    fn new(
+        schedule: &PanelSchedule,
+        layer: usize,
+        group: &ExpertGroupPlan,
+        touched: &[usize],
+    ) -> Self {
+        let extent = |expert: usize| {
+            schedule
+                .expert_extent_bytes(layer, expert)
+                .unwrap_or(0) as u64
+        };
+        let extent_bytes: u64 = group.experts.iter().map(|&expert| extent(expert)).sum();
+        let (mut count, mut bytes, mut runs) = (0usize, 0u64, 0usize);
+        let mut previous: Option<usize> = None;
+        for &expert in touched
+            .iter()
+            .filter(|expert| group.experts.binary_search(expert).is_ok())
+        {
+            count += 1;
+            bytes += extent(expert);
+            if previous.map_or(true, |p| p + 1 != expert) {
+                runs += 1;
+            }
+            previous = Some(expert);
+        }
+        Self {
+            layer,
+            group: group.group,
+            expert_lo: group.experts.first().copied().unwrap_or(0),
+            expert_hi: group.experts.last().map_or(0, |last| last + 1),
+            experts: group.experts.len(),
+            extent_bytes,
+            touched: count,
+            touched_bytes: bytes,
+            touched_runs: runs,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "layer": self.layer,
+            "group": self.group,
+            "expert_lo": self.expert_lo,
+            "expert_hi": self.expert_hi,
+            "experts": self.experts,
+            "extent_bytes": self.extent_bytes,
+            "touched": self.touched,
+            "touched_bytes": self.touched_bytes,
+            "touched_runs": self.touched_runs,
+        })
+    }
+}
+
+/// One host layer's routing census.
+#[derive(Clone, Debug)]
+struct LayerTouch {
+    layer: usize,
+    touched_experts: Vec<u16>,
+    k1_experts: usize,
+    barrier_sync_ms: f64,
+}
+
+impl LayerTouch {
+    fn to_json(&self) -> Value {
+        json!({
+            "layer": self.layer,
+            "touched_experts": self.touched_experts,
+            "k1_experts": self.k1_experts,
+            "barrier_sync_ms": self.barrier_sync_ms,
+        })
+    }
+}
+
+/// What one window's trace collects outside the ring (cleared per window).
+#[derive(Debug, Default)]
+struct WindowTraceAcc {
+    groups: Vec<GroupTouch>,
+    layers: Vec<LayerTouch>,
+    /// `(name, ms since the request's t0)`.
+    host: Vec<(&'static str, f64)>,
+}
+
+impl WindowTraceAcc {
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.layers.clear();
+        self.host.clear();
+    }
+}
+
+/// The window facts the trace JSON reports beside the timeline.
+struct WindowTraceShape<'a> {
+    window: usize,
+    rows: usize,
+    tile_rows: usize,
+    tiles: usize,
+    host_layer: &'a [bool],
+}
+
+fn phase_kind_name(kind: PhaseKind) -> &'static str {
+    match kind {
+        PhaseKind::MixerEnd => "mixer_end",
+        PhaseKind::SweepBegin => "sweep_begin",
+        PhaseKind::SweepEnd => "sweep_end",
+    }
+}
+
+/// The `hipfire.qwen4.slowlink_trace.v1` object of one window. Unobserved
+/// values are `null`, never 0.
+fn window_trace_json(
+    shape: &WindowTraceShape<'_>,
+    report: &WindowReport,
+    timeline: &PanelTimeline,
+    trace: &TimelineTrace,
+    acc: &WindowTraceAcc,
+) -> Value {
+    let stats = &timeline.stats;
+    let overlap = &timeline.overlap;
+    let waits: Vec<f64> = timeline
+        .spans
+        .iter()
+        .zip(&trace.spans)
+        .filter_map(|(span, observed)| Some(span.compute?.0 - observed.wait_begin?))
+        .collect();
+    let ready_wait_ms = (!waits.is_empty()).then(|| waits.iter().sum::<f64>());
+    let first_copy_start = timeline
+        .spans
+        .iter()
+        .map(|span| span.copy_start)
+        .fold(None, |best: Option<f64>, v| Some(best.map_or(v, |b| b.min(v))));
+    let last_copy_end = timeline
+        .spans
+        .iter()
+        .map(|span| span.copy_end)
+        .fold(None, |best: Option<f64>, v| Some(best.map_or(v, |b| b.max(v))));
+    let last_layer_end = timeline
+        .layers
+        .iter()
+        .map(|layer| layer.end)
+        .fold(None, |best: Option<f64>, v| Some(best.map_or(v, |b| b.max(v))));
+    let spans: Vec<Value> = timeline
+        .spans
+        .iter()
+        .zip(&trace.spans)
+        .enumerate()
+        .map(|(rec, (span, observed))| {
+            json!({
+                "rec": rec,
+                "layer": span.layer,
+                "group": span.group,
+                "bytes": span.bytes,
+                "copy_start": span.copy_start,
+                "copy_end": span.copy_end,
+                "wait_begin": observed.wait_begin,
+                "compute_begin": span.compute.map(|c| c.0),
+                "compute_end": span.compute.map(|c| c.1),
+                "host_enqueue_begin": observed.host_enqueue.map(|h| h.0),
+                "host_enqueue_end": observed.host_enqueue.map(|h| h.1),
+                "host_acquire": observed.host_acquire,
+            })
+        })
+        .collect();
+    let layers: Vec<Value> = timeline
+        .layers
+        .iter()
+        .zip(&trace.layers)
+        .map(|(layer, observed)| {
+            json!({
+                "layer": layer.layer,
+                "host": shape.host_layer.get(layer.layer).copied(),
+                "begin": layer.begin,
+                "end": layer.end,
+                "host_begin": observed.host_begin,
+                "host_end": observed.host_end,
+            })
+        })
+        .collect();
+    let phases: Vec<Value> = trace
+        .phases
+        .iter()
+        .map(|phase| {
+            json!({
+                "layer": phase.layer,
+                "kind": phase_kind_name(phase.kind),
+                "t": phase.t,
+                "host_ms": phase.host_ms,
+            })
+        })
+        .collect();
+    let host_marks: Vec<Value> = acc
+        .host
+        .iter()
+        .map(|(name, ms)| json!({ "name": name, "ms": ms }))
+        .collect();
+    json!({
+        "schema": "hipfire.qwen4.slowlink_trace.v1",
+        "window": shape.window,
+        "rows": shape.rows,
+        "tile_rows": shape.tile_rows,
+        "tiles": shape.tiles,
+        "host_layer": shape.host_layer,
+        "wall_ms": report.wall_ms,
+        "summary": {
+            "panel_envelope_ms": overlap.compute_busy_ms,
+            "copy_envelope_ms": overlap.copy_busy_ms,
+            "copy_idle_between_ms": overlap.copy_idle_ms,
+            "ready_wait_ms": ready_wait_ms,
+            "first_copy_start_ms": first_copy_start,
+            "last_copy_end_ms": last_copy_end,
+            "last_layer_end_ms": last_layer_end,
+        },
+        "stats": {
+            "enqueued": stats.enqueued,
+            "acquired": stats.acquired,
+            "retired": stats.retired,
+            "discarded": stats.discarded,
+            "submitted_payload_bytes": stats.submitted_payload_bytes,
+            "extent_bytes": stats.extent_bytes,
+            "table_bytes": stats.table_bytes,
+            "acquired_payload_bytes": stats.acquired_payload_bytes,
+            "discarded_payload_bytes": stats.discarded_payload_bytes,
+            "page_full_stalls": stats.page_full_stalls,
+            "copy_starved_stalls": stats.copy_starved_stalls,
+            "timeline_overflow": stats.timeline_overflow,
+            "layer_mark_overflow": stats.layer_mark_overflow,
+        },
+        "spans": spans,
+        "layers": layers,
+        "phases": phases,
+        "groups": acc.groups.iter().map(GroupTouch::to_json).collect::<Vec<_>>(),
+        "layer_routes": acc.layers.iter().map(LayerTouch::to_json).collect::<Vec<_>>(),
+        "host_marks": host_marks,
+        "units": "GPU times ms since the window base event (copy stream); host times ms since request_t0 except span/layer/phase host fields which are ms since the ring host_base taken immediately before the base event",
+    })
+}
+
+const SLOWLINK_TRACE_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_TRACE";
+
+/// `HIPFIRE_QWEN4_SLOWLINK_TRACE`: an absolute existing directory turns the
+/// raw attribution trace on. Unset or empty is off; any other value keeps the
+/// trace off with one warning (never a load failure).
+fn slowlink_trace_dir() -> Option<std::path::PathBuf> {
+    let raw = hipfire_config::developer_var(SLOWLINK_TRACE_ENV).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(&raw);
+    if !path.is_absolute() {
+        eprintln!("qwen4 slow-link trace: {SLOWLINK_TRACE_ENV}={raw:?} is not an absolute path; trace stays off");
+        return None;
+    }
+    if !path.is_dir() {
+        eprintln!("qwen4 slow-link trace: {SLOWLINK_TRACE_ENV}={raw:?} is not an existing directory; trace stays off");
+        return None;
+    }
+    Some(path)
+}
+
+/// Write the receipt (with its trace) to `<dir>/slowlink-trace-<pid>-<seq>.json`
+/// through a temp name + rename. Failure is a warning, never a request failure.
+fn write_trace_receipt(dir: &std::path::Path, seq: u64, receipt: &Value) {
+    let started = Instant::now();
+    let name = format!("slowlink-trace-{}-{seq:04}.json", std::process::id());
+    let path = dir.join(&name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let written = serde_json::to_vec(receipt)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            std::fs::write(&tmp, &bytes)
+                .and_then(|()| std::fs::rename(&tmp, &path))
+                .map(|()| bytes.len())
+                .map_err(|error| error.to_string())
+        });
+    match written {
+        Ok(bytes) => eprintln!(
+            "qwen4 slow-link trace: wrote {} ({bytes} B, {:.1} ms)",
+            path.display(),
+            started.elapsed().as_secs_f64() * 1e3
+        ),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!(
+                "qwen4 slow-link trace: could not write {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Everything the layer-major receipt reports.
 pub(crate) struct ReceiptInputs<'a> {
     pub(crate) mode: SlowlinkMode,
@@ -1050,6 +1359,11 @@ struct SlowlinkRuntime {
     host_layers: usize,
     resident_layers: usize,
     tile_scratch_bytes: u64,
+    /// `HIPFIRE_QWEN4_SLOWLINK_TRACE` directory, resolved once at load; the
+    /// ring was built with its trace events iff this is `Some`.
+    trace_dir: Option<std::path::PathBuf>,
+    /// Trace files written so far (the `<seq>` of the next file name).
+    trace_seq: u64,
 }
 
 impl SlowlinkRuntime {
@@ -1327,6 +1641,7 @@ struct HipLoadBinder<'a> {
     ring: Option<ExpertPanelRing>,
     route_region: Option<GpuTensor>,
     streams: Option<GpuTensor>,
+    trace_dir: Option<std::path::PathBuf>,
 }
 
 impl LoadBinder for HipLoadBinder<'_> {
@@ -1339,7 +1654,7 @@ impl LoadBinder for HipLoadBinder<'_> {
                     .take()
                     .ok_or_else(|| "the page pool spec was already consumed".to_string())?;
                 self.ring = Some(
-                    ExpertPanelRing::new(&mut *self.gpu, spec)
+                    ExpertPanelRing::new(&mut *self.gpu, spec, self.trace_dir.is_some())
                         .map_err(|error| format!("expert page ring allocation failed: {error}"))?,
                 );
             }
@@ -1433,6 +1748,7 @@ impl HipLoadBinder<'_> {
             ring,
             route_region,
             streams,
+            trace_dir,
             ..
         } = self;
         match (ring, plan.schedule, route_region, streams) {
@@ -1446,6 +1762,8 @@ impl HipLoadBinder<'_> {
                     host_layers: plan.host_layers,
                     resident_layers: plan.resident_layers,
                     tile_scratch_bytes: forward.slowlink_tile_scratch_bytes(),
+                    trace_dir,
+                    trace_seq: 0,
                 })
             }
             _ => Err("a bound slow-link owner is missing".to_string()),
@@ -1542,6 +1860,7 @@ pub(crate) fn bind_at_load(
             ring: None,
             route_region: None,
             streams: None,
+            trace_dir: slowlink_trace_dir(),
         };
         bind_load_owners(&mut binder)?;
         binder.into_runtime()?
@@ -2408,11 +2727,21 @@ struct Run<'a, 'o> {
     tokens: &'a [u32],
     output: &'a mut PromptOutput<'o>,
     ple: PleCursor,
+    /// `Some` iff the runtime's `trace_dir` is set; cleared per window.
+    trace: Option<WindowTraceAcc>,
+    /// One trace object per finished window of the request.
+    trace_out: Vec<Value>,
+    /// Taken first thing in `try_run_prompt`.
+    request_t0: Instant,
 }
 
 impl Run<'_, '_> {
     /// One window: transaction, layer-major walk, commit (or abort).
     fn window(&mut self, window: &WindowPlan, last_window: bool) -> R<WindowReport> {
+        if let Some(acc) = self.trace.as_mut() {
+            acc.clear();
+        }
+        self.trace_mark("window_entry");
         let (plan, tokens) = (self.plan, self.tokens);
         let window_tokens = &tokens[window.prompt_row..window.prompt_row + window.rows];
         let w = WinCtx {
@@ -2439,17 +2768,61 @@ impl Run<'_, '_> {
             .bundle
             .prompt_txn_begin(&mut *self.gpu, window_tokens)
             .map_err(bundle_err("begin"))?;
+        self.trace_mark("txn_begin");
         let mut progress = Progress {
             txn_open: true,
             ring_primed: false,
         };
-        match self.window_body(&w, &mut txn, &mut progress) {
-            Ok(report) => self
-                .bundle
-                .prompt_txn_commit(&mut *self.gpu, txn, window_tokens)
-                .map(|()| report)
-                .map_err(bundle_err("commit")),
+        let body = self.window_body(&w, &mut txn, &mut progress);
+        let body_returned = self.trace_now_ms();
+        match body {
+            Ok(report) => {
+                let committed = self
+                    .bundle
+                    .prompt_txn_commit(&mut *self.gpu, txn, window_tokens)
+                    .map(|()| report)
+                    .map_err(bundle_err("commit"));
+                let committed_at = self.trace_now_ms();
+                self.append_tail_marks(&[
+                    ("window_body_return", body_returned),
+                    ("txn_commit", committed_at),
+                ]);
+                committed
+            }
             Err(error) => Err(self.fail_window(txn, progress, error)),
+        }
+    }
+
+    /// ms since the request's t0, only while tracing.
+    fn trace_now_ms(&self) -> Option<f64> {
+        self.trace
+            .as_ref()
+            .map(|_| self.request_t0.elapsed().as_secs_f64() * 1e3)
+    }
+
+    fn trace_mark(&mut self, name: &'static str) {
+        if let Some(ms) = self.trace_now_ms() {
+            if let Some(acc) = self.trace.as_mut() {
+                acc.host.push((name, ms));
+            }
+        }
+    }
+
+    /// Marks taken after `window_body` already serialized its trace object:
+    /// appended to that window's `host_marks`.
+    fn append_tail_marks(&mut self, marks: &[(&'static str, Option<f64>)]) {
+        let Some(list) = self
+            .trace_out
+            .last_mut()
+            .and_then(|entry| entry.get_mut("host_marks"))
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        for (name, ms) in marks {
+            if let Some(ms) = ms {
+                list.push(json!({ "name": name, "ms": ms }));
+            }
         }
     }
 
@@ -2519,6 +2892,7 @@ impl Run<'_, '_> {
             ));
         }
         let wall = Instant::now();
+        self.trace_mark("wall_start");
         let layout = window_route_layout(
             &self.profile,
             w.window.rows,
@@ -2530,6 +2904,7 @@ impl Run<'_, '_> {
         let mut report = WindowReport::default();
         progress.ring_primed = true;
         self.rt.ring.prime(&*self.gpu, &mut self.rt.schedule)?;
+        self.trace_mark("primed");
         for layer in geo.band.clone() {
             self.rt.ring.mark_layer_begin(&*self.gpu, layer)?;
             if self.rt.host_layer[layer] {
@@ -2546,7 +2921,9 @@ impl Run<'_, '_> {
                 return Err(invalid("injected slow-link failure after the first layer"));
             }
         }
+        self.trace_mark("layers_done");
         self.rt.ring.drain(&*self.gpu)?;
+        self.trace_mark("ring_drained");
         progress.ring_primed = false;
         let timeline = self.rt.ring.timeline(&*self.gpu)?;
         let stats = timeline.stats;
@@ -2579,6 +2956,29 @@ impl Run<'_, '_> {
             .filter_map(|span| span.compute.map(|(begin, end)| (end - begin).max(0.0)))
             .sum();
         report.nonexpert_ms = (timeline.overlap.compute_busy_ms - panel_busy).max(0.0);
+        if self.trace.is_some() {
+            let trace = timeline
+                .trace
+                .as_ref()
+                .ok_or_else(|| invalid("slow-link trace is on but the ring recorded none"))?;
+            if trace.overflow > 0 {
+                return Err(invalid(format!(
+                    "slow-link trace overflowed ({} phase marks): the trace would be incomplete",
+                    trace.overflow
+                )));
+            }
+            if let Some(acc) = self.trace.as_ref() {
+                let shape = WindowTraceShape {
+                    window: w.window.index,
+                    rows: w.window.rows,
+                    tile_rows: self.profile.tile_rows,
+                    tiles: w.tiles.len(),
+                    host_layer: &self.rt.host_layer,
+                };
+                let value = window_trace_json(&shape, &report, &timeline, trace, acc);
+                self.trace_out.push(value);
+            }
+        }
         Ok(report)
     }
 
@@ -2622,10 +3022,19 @@ impl Run<'_, '_> {
             self.cut_if(txn, tile, layer)?;
             self.rt.ring.pump(&*self.gpu, &mut self.rt.schedule)?;
         }
+        self.rt
+            .ring
+            .mark_phase(&*self.gpu, layer, PhaseKind::MixerEnd)?;
         let route_plan = dsp::finish_route_plan(&mut *self.gpu, routes, dsp::PanelLimits::S1)
             .map_err(dsp_err("route plan"))?;
+        self.rt
+            .ring
+            .mark_phase(&*self.gpu, layer, PhaseKind::SweepBegin)?;
         report.route_barrier_ms += route_plan.barrier.sync_ms;
         self.sweep_panels(w, layer, routes, &route_plan, report)?;
+        self.rt
+            .ring
+            .mark_phase(&*self.gpu, layer, PhaseKind::SweepEnd)?;
         for ti in 0..w.tiles.len() {
             self.tile_tail(w, ti, layer, routes)?;
             if layer == geo.last_layer {
@@ -2672,6 +3081,25 @@ impl Run<'_, '_> {
             .collect();
         touched.sort_unstable();
         touched.dedup();
+        if self.trace.is_some() {
+            let group_touches: Vec<GroupTouch> = groups
+                .iter()
+                .map(|group| GroupTouch::new(&self.rt.schedule, layer, group, &touched))
+                .collect();
+            let layer_touch = LayerTouch {
+                layer,
+                touched_experts: touched
+                    .iter()
+                    .map(|&expert| u16::try_from(expert).unwrap_or(u16::MAX))
+                    .collect(),
+                k1_experts: route_plan.k1_experts.len(),
+                barrier_sync_ms: route_plan.barrier.sync_ms,
+            };
+            if let Some(acc) = self.trace.as_mut() {
+                acc.groups.extend(group_touches);
+                acc.layers.push(layer_touch);
+            }
+        }
         for expert in touched {
             report.useful_bytes += self
                 .rt
@@ -3229,6 +3657,7 @@ pub(crate) fn try_run_prompt(
     tokens: &[u32],
     mut output: PromptOutput<'_>,
 ) -> R<bool> {
+    let request_t0 = Instant::now();
     let mode = SlowlinkMode::from_env();
     let selection = match select(forward, bundle, gpu, tokens, &output, mode) {
         Ok(selection) => selection,
@@ -3246,13 +3675,20 @@ pub(crate) fn try_run_prompt(
         .runtime
         .take()
         .ok_or_else(|| invalid("slow-link runtime disappeared after selection"))?;
+    // The trace sink of this request: the directory and this request's file
+    // sequence number, taken once so a failed request still consumes its slot.
+    let trace_sink = runtime.trace_dir.clone().map(|dir| {
+        let seq = runtime.trace_seq;
+        runtime.trace_seq += 1;
+        (dir, seq)
+    });
     let (resident_layers, host_layers, tile_scratch_bytes) = (
         runtime.resident_layers,
         runtime.host_layers,
         runtime.tile_scratch_bytes,
     );
     let mut reports: Vec<WindowReport> = Vec::with_capacity(plan.windows.len());
-    let outcome = {
+    let (outcome, trace_out) = {
         let mut run = Run {
             forward: &mut *forward,
             bundle: &mut *bundle,
@@ -3267,6 +3703,9 @@ pub(crate) fn try_run_prompt(
                 retained: ple_retained,
                 histories: Vec::new(),
             },
+            trace: trace_sink.as_ref().map(|_| WindowTraceAcc::default()),
+            trace_out: Vec::new(),
+            request_t0,
         };
         let mut outcome = Ok(());
         for window in &plan.windows {
@@ -3279,7 +3718,7 @@ pub(crate) fn try_run_prompt(
                 }
             }
         }
-        outcome
+        (outcome, std::mem::take(&mut run.trace_out))
     };
     forward.slowlink.runtime = Some(runtime);
     // ONE `hipMemGetInfo` (total - free) sample after the request, outside every
@@ -3301,16 +3740,21 @@ pub(crate) fn try_run_prompt(
             status,
         })
     };
-    match outcome {
-        Ok(()) => {
-            bundle.slowlink_set_receipt(receipt("ok".to_string()));
-            Ok(true)
-        }
-        Err(error) => {
-            bundle.slowlink_set_receipt(receipt(format!("aborted: {error}")));
-            Err(error)
+    let (mut stored, result) = match outcome {
+        Ok(()) => (receipt("ok".to_string()), Ok(true)),
+        Err(error) => (receipt(format!("aborted: {error}")), Err(error)),
+    };
+    if let Some((dir, seq)) = trace_sink {
+        match stored.as_object_mut() {
+            Some(object) => {
+                object.insert("slowlink_trace".to_string(), Value::Array(trace_out));
+                write_trace_receipt(&dir, seq, &stored);
+            }
+            None => eprintln!("qwen4 slow-link trace: the receipt is not an object; trace dropped"),
         }
     }
+    bundle.slowlink_set_receipt(stored);
+    result
 }
 
 // ── production-primitive self-test ───────────────────────────────────

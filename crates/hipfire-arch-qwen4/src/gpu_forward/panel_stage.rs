@@ -705,6 +705,11 @@ pub(crate) enum TimelineEvent {
     ComputeEnd(usize),
     LayerBegin(usize),
     LayerEnd(usize),
+    /// Compute stream, recorded just before waiting a record's `ready` event
+    /// (trace only).
+    AcquireWait(usize),
+    /// Compute stream phase mark (trace only).
+    Phase(usize),
 }
 
 /// One group's intervals in ms since the window base event.
@@ -746,6 +751,44 @@ pub(crate) struct PanelTimeline {
     pub(crate) layers: Vec<LayerSpanMs>,
     pub(crate) overlap: OverlapSummary,
     pub(crate) stats: PanelStats,
+    /// Raw attribution trace; `Some` only when the ring was built with trace on.
+    pub(crate) trace: Option<TimelineTrace>,
+}
+
+/// Per-record host/GPU observations of the raw attribution trace. GPU times
+/// are ms since the window base event; host times are ms since the ring's host
+/// base taken immediately before the base event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpanTrace {
+    /// Compute-stream point just before the `ready` wait; only for records
+    /// that were waited, acquired and released.
+    pub(crate) wait_begin: Option<f64>,
+    pub(crate) host_enqueue: Option<(f64, f64)>,
+    pub(crate) host_acquire: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LayerTrace {
+    pub(crate) host_begin: Option<f64>,
+    pub(crate) host_end: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PhaseSpan {
+    pub(crate) layer: usize,
+    pub(crate) kind: PhaseKind,
+    pub(crate) t: f64,
+    pub(crate) host_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TimelineTrace {
+    /// Same order/length as [`PanelTimeline::spans`].
+    pub(crate) spans: Vec<SpanTrace>,
+    /// Same order/length as [`PanelTimeline::layers`].
+    pub(crate) layers: Vec<LayerTrace>,
+    pub(crate) phases: Vec<PhaseSpan>,
+    pub(crate) overflow: u64,
 }
 
 fn union_ms(mut intervals: Vec<(f64, f64)>) -> f64 {
@@ -877,6 +920,16 @@ pub(crate) trait PanelBackend {
     fn compute_release(&mut self, ctx: &Self::Ctx, slot: usize, rec: Option<usize>) -> R<()>;
     fn mark_base(&mut self, ctx: &Self::Ctx) -> R<()>;
     fn mark_layer(&mut self, ctx: &Self::Ctx, mark: usize, end: bool) -> R<()>;
+    /// Compute stream: record the point just before the `ready` wait of record
+    /// `rec`. Trace only; never called when the ring's trace is off.
+    fn mark_acquire_wait(&mut self, _ctx: &Self::Ctx, _rec: usize) -> R<()> {
+        Ok(())
+    }
+    /// Compute stream: record phase mark `index`. Trace only; never called
+    /// when the ring's trace is off.
+    fn mark_phase(&mut self, _ctx: &Self::Ctx, _index: usize) -> R<()> {
+        Ok(())
+    }
     /// Synchronize the copy and compute streams.
     fn drain(&mut self, ctx: &Self::Ctx) -> R<()>;
     fn elapsed_ms(&self, ctx: &Self::Ctx, from: TimelineEvent, to: TimelineEvent) -> R<f64>;
@@ -953,6 +1006,71 @@ struct LayerMark {
     ended: bool,
 }
 
+/// Phase marks the trace keeps per window layer (mixer end, sweep begin,
+/// sweep end).
+const TRACE_PHASES_PER_LAYER: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseKind {
+    MixerEnd,
+    SweepBegin,
+    SweepEnd,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PhaseMark {
+    pub(crate) layer: usize,
+    pub(crate) kind: PhaseKind,
+    pub(crate) host_ms: f64,
+}
+
+/// Host-side half of the raw attribution trace. All vectors are preallocated
+/// by [`RingCore::enable_trace`] and cleared (never reallocated) per window.
+struct RingTrace {
+    /// Set in `begin_window` right before `mark_base`.
+    host_base: Option<std::time::Instant>,
+    /// Per record: host ms before/after `fill()`.
+    enqueue_host: Vec<(f64, f64)>,
+    /// Per record: host ms at `acquire()`.
+    acquire_host: Vec<Option<f64>>,
+    /// Per record: an `AcquireWait` event was recorded.
+    waited: Vec<bool>,
+    phases: Vec<PhaseMark>,
+    /// Per layer mark: host ms at begin/end.
+    mark_host: Vec<(Option<f64>, Option<f64>)>,
+    overflow: u64,
+}
+
+impl RingTrace {
+    fn new(spec: &PanelPoolSpec) -> Self {
+        Self {
+            host_base: None,
+            enqueue_host: Vec::with_capacity(spec.timeline_records),
+            acquire_host: Vec::with_capacity(spec.timeline_records),
+            waited: Vec::with_capacity(spec.timeline_records),
+            phases: Vec::with_capacity(TRACE_PHASES_PER_LAYER * spec.timeline_layers),
+            mark_host: Vec::with_capacity(spec.timeline_layers),
+            overflow: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.host_base = None;
+        self.enqueue_host.clear();
+        self.acquire_host.clear();
+        self.waited.clear();
+        self.phases.clear();
+        self.mark_host.clear();
+        self.overflow = 0;
+    }
+
+    /// Host ms since `host_base` (0.0 before any window started).
+    fn now_ms(&self) -> f64 {
+        self.host_base
+            .map_or(0.0, |base| base.elapsed().as_secs_f64() * 1000.0)
+    }
+}
+
 pub(crate) struct RingCore<B: PanelBackend> {
     spec: PanelPoolSpec,
     pages: Vec<Page>,
@@ -968,6 +1086,8 @@ pub(crate) struct RingCore<B: PanelBackend> {
     stats: PanelStats,
     records: Vec<SpanRec>,
     marks: Vec<LayerMark>,
+    /// Raw attribution trace; `None` (the default) adds no device calls.
+    trace: Option<RingTrace>,
     /// Never dropped implicitly while device work may be queued: see the
     /// `Drop` impl.
     backend: std::mem::ManuallyDrop<B>,
@@ -1032,10 +1152,17 @@ impl<B: PanelBackend> RingCore<B> {
             stats: PanelStats::default(),
             records: Vec::with_capacity(spec.timeline_records),
             marks: Vec::with_capacity(spec.timeline_layers),
+            trace: None,
             backend: std::mem::ManuallyDrop::new(backend),
             dirty: false,
             backend_taken: false,
         })
+    }
+
+    /// Turn the raw attribution trace on. The backend must have been built
+    /// with its timing events (`HipPanelBackend::new(.., trace = true)`).
+    pub(crate) fn enable_trace(&mut self) {
+        self.trace = Some(RingTrace::new(&self.spec));
     }
 
     pub(crate) fn stats(&self) -> PanelStats {
@@ -1071,6 +1198,10 @@ impl<B: PanelBackend> RingCore<B> {
         self.stats = PanelStats::default();
         self.records.clear();
         self.marks.clear();
+        if let Some(trace) = self.trace.as_mut() {
+            trace.clear();
+            trace.host_base = Some(std::time::Instant::now());
+        }
         self.run(|core| core.backend.mark_base(ctx))
     }
 
@@ -1273,7 +1404,23 @@ impl<B: PanelBackend> RingCore<B> {
             self.stats.timeline_overflow += 1;
             None
         };
+        let traced_rec = match (self.trace.as_mut(), rec) {
+            (Some(trace), Some(r)) => {
+                let t0 = trace.now_ms();
+                trace.enqueue_host.push((t0, t0));
+                trace.acquire_host.push(None);
+                trace.waited.push(false);
+                Some(r)
+            }
+            _ => None,
+        };
         self.run(|core| core.fill(ctx, slot, epoch, group, sources, &layout, rec))?;
+        if let (Some(r), Some(trace)) = (traced_rec, self.trace.as_mut()) {
+            let t1 = trace.now_ms();
+            if let Some(entry) = trace.enqueue_host.get_mut(r) {
+                entry.1 = t1;
+            }
+        }
         match self
             .cursors
             .iter_mut()
@@ -1405,7 +1552,22 @@ impl<B: PanelBackend> RingCore<B> {
         self.check_live()?;
         let slot = self.checked_slot(ticket, &[PageState::Ready])?;
         let rec = self.pages[slot].rec;
+        let wait_host = match (self.trace.as_ref(), rec) {
+            (Some(trace), Some(r)) => Some((r, trace.now_ms())),
+            _ => None,
+        };
+        if let Some((r, _)) = wait_host {
+            self.run(|core| core.backend.mark_acquire_wait(ctx, r))?;
+        }
         let starved = self.run(|core| core.backend.compute_acquire(ctx, slot, rec))?;
+        if let (Some((r, host_ms)), Some(trace)) = (wait_host, self.trace.as_mut()) {
+            if let Some(flag) = trace.waited.get_mut(r) {
+                *flag = true;
+            }
+            if let Some(at) = trace.acquire_host.get_mut(r) {
+                *at = Some(host_ms);
+            }
+        }
         if starved {
             self.stats.copy_starved_stalls += 1;
         }
@@ -1495,6 +1657,10 @@ impl<B: PanelBackend> RingCore<B> {
             layer,
             ended: false,
         });
+        if let Some(trace) = self.trace.as_mut() {
+            let host_ms = trace.now_ms();
+            trace.mark_host.push((Some(host_ms), None));
+        }
         self.run(|core| core.backend.mark_layer(ctx, mark, false))
     }
 
@@ -1514,7 +1680,41 @@ impl<B: PanelBackend> RingCore<B> {
             return Err(invalid(format!("layer {layer} has no open compute mark")));
         };
         self.marks[mark].ended = true;
+        if let Some(trace) = self.trace.as_mut() {
+            let host_ms = trace.now_ms();
+            if let Some(entry) = trace.mark_host.get_mut(mark) {
+                entry.1 = Some(host_ms);
+            }
+        }
         self.run(|core| core.backend.mark_layer(ctx, mark, true))
+    }
+
+    /// Record a compute-stream phase mark of `layer` (trace only). No-op when
+    /// the trace is off; a mark beyond the preallocated capacity is counted in
+    /// the trace's `overflow` and recorded nowhere.
+    pub(crate) fn mark_phase(
+        &mut self,
+        ctx: &B::Ctx,
+        layer: usize,
+        kind: PhaseKind,
+    ) -> R<()> {
+        self.check_live()?;
+        let capacity = TRACE_PHASES_PER_LAYER * self.spec.timeline_layers;
+        let Some(trace) = self.trace.as_mut() else {
+            return Ok(());
+        };
+        if trace.phases.len() >= capacity {
+            trace.overflow += 1;
+            return Ok(());
+        }
+        let index = trace.phases.len();
+        let host_ms = trace.now_ms();
+        trace.phases.push(PhaseMark {
+            layer,
+            kind,
+            host_ms,
+        });
+        self.run(|core| core.backend.mark_phase(ctx, index))
     }
 
     /// Intervals and receipt numbers of this window. Call after [`Self::drain`]
@@ -1552,11 +1752,58 @@ impl<B: PanelBackend> RingCore<B> {
             });
         }
         let overlap = summarize_overlap(&spans, &layers, &self.stats);
+        let trace = match self.trace.as_ref() {
+            None => None,
+            Some(trace) => {
+                let mut span_traces = Vec::with_capacity(self.records.len());
+                for (index, record) in self.records.iter().enumerate() {
+                    let waited = trace.waited.get(index).copied().unwrap_or(false);
+                    let wait_begin = if waited && record.acquired && record.released {
+                        Some(ms(TimelineEvent::Base, TimelineEvent::AcquireWait(index))?)
+                    } else {
+                        None
+                    };
+                    span_traces.push(SpanTrace {
+                        wait_begin,
+                        host_enqueue: trace.enqueue_host.get(index).copied(),
+                        host_acquire: trace.acquire_host.get(index).copied().flatten(),
+                    });
+                }
+                let mut layer_traces = Vec::with_capacity(layers.len());
+                for (index, mark) in self.marks.iter().enumerate() {
+                    if !mark.ended {
+                        continue;
+                    }
+                    let (host_begin, host_end) =
+                        trace.mark_host.get(index).copied().unwrap_or((None, None));
+                    layer_traces.push(LayerTrace {
+                        host_begin,
+                        host_end,
+                    });
+                }
+                let mut phases = Vec::with_capacity(trace.phases.len());
+                for (index, mark) in trace.phases.iter().enumerate() {
+                    phases.push(PhaseSpan {
+                        layer: mark.layer,
+                        kind: mark.kind,
+                        t: ms(TimelineEvent::Base, TimelineEvent::Phase(index))?,
+                        host_ms: mark.host_ms,
+                    });
+                }
+                Some(TimelineTrace {
+                    spans: span_traces,
+                    layers: layer_traces,
+                    phases,
+                    overflow: trace.overflow,
+                })
+            }
+        };
         Ok(PanelTimeline {
             spans,
             layers,
             overlap,
             stats: self.stats,
+            trace,
         })
     }
 }
@@ -1801,6 +2048,10 @@ pub(crate) struct HipPanelBackend {
     timing: Vec<hip_bridge::Event>,
     /// Two per layer mark: begin/end.
     layer_timing: Vec<hip_bridge::Event>,
+    /// One per record (trace only): compute stream, just before the `ready` wait.
+    wait_timing: Vec<hip_bridge::Event>,
+    /// `TRACE_PHASES_PER_LAYER` per layer mark (trace only).
+    phase_timing: Vec<hip_bridge::Event>,
 }
 
 fn compute_stream(gpu: &Gpu) -> R<&hip_bridge::Stream> {
@@ -1810,7 +2061,7 @@ fn compute_stream(gpu: &Gpu) -> R<&hip_bridge::Stream> {
 }
 
 impl HipPanelBackend {
-    fn new(gpu: &mut Gpu, spec: &PanelPoolSpec) -> R<Self> {
+    fn new(gpu: &mut Gpu, spec: &PanelPoolSpec, trace: bool) -> R<Self> {
         let reserve = spec
             .reserve()
             .ok_or_else(|| invalid("panel pool byte size overflows"))?;
@@ -1829,8 +2080,10 @@ impl HipPanelBackend {
             base: None,
             timing: Vec::new(),
             layer_timing: Vec::new(),
+            wait_timing: Vec::new(),
+            phase_timing: Vec::new(),
         };
-        if let Err(error) = backend.populate(gpu, spec, &reserve) {
+        if let Err(error) = backend.populate(gpu, spec, &reserve, trace) {
             let _ = backend.release(gpu);
             return Err(error);
         }
@@ -1842,6 +2095,7 @@ impl HipPanelBackend {
         gpu: &mut Gpu,
         spec: &PanelPoolSpec,
         reserve: &PanelPoolReserve,
+        trace: bool,
     ) -> R<()> {
         let table_bytes = spec.num_experts * std::mem::size_of::<u64>();
         for _ in 0..reserve.pages {
@@ -1870,6 +2124,14 @@ impl HipPanelBackend {
         for _ in 0..2 * spec.timeline_layers {
             self.layer_timing.push(gpu.hip.event_create()?);
         }
+        if trace {
+            for _ in 0..spec.timeline_records {
+                self.wait_timing.push(gpu.hip.event_create()?);
+            }
+            for _ in 0..TRACE_PHASES_PER_LAYER * spec.timeline_layers {
+                self.phase_timing.push(gpu.hip.event_create()?);
+            }
+        }
         Ok(())
     }
 
@@ -1896,6 +2158,8 @@ impl HipPanelBackend {
             .chain(self.base.take())
             .chain(self.timing.drain(..))
             .chain(self.layer_timing.drain(..))
+            .chain(self.wait_timing.drain(..))
+            .chain(self.phase_timing.drain(..))
         {
             note(gpu.hip.event_destroy(event));
         }
@@ -1916,6 +2180,8 @@ impl HipPanelBackend {
             TimelineEvent::ComputeEnd(r) => self.timing.get(4 * r + 3).ok_or_else(missing),
             TimelineEvent::LayerBegin(m) => self.layer_timing.get(2 * m).ok_or_else(missing),
             TimelineEvent::LayerEnd(m) => self.layer_timing.get(2 * m + 1).ok_or_else(missing),
+            TimelineEvent::AcquireWait(r) => self.wait_timing.get(r).ok_or_else(missing),
+            TimelineEvent::Phase(p) => self.phase_timing.get(p).ok_or_else(missing),
         }
     }
 }
@@ -2053,6 +2319,18 @@ impl PanelBackend for HipPanelBackend {
         Ok(())
     }
 
+    fn mark_acquire_wait(&mut self, gpu: &Gpu, rec: usize) -> R<()> {
+        let event = self.timeline_event(TimelineEvent::AcquireWait(rec))?;
+        gpu.hip.event_record(event, Some(compute_stream(gpu)?))?;
+        Ok(())
+    }
+
+    fn mark_phase(&mut self, gpu: &Gpu, index: usize) -> R<()> {
+        let event = self.timeline_event(TimelineEvent::Phase(index))?;
+        gpu.hip.event_record(event, Some(compute_stream(gpu)?))?;
+        Ok(())
+    }
+
     fn drain(&mut self, gpu: &Gpu) -> R<()> {
         gpu.hip.stream_synchronize(&self.copy)?;
         gpu.hip.stream_synchronize(compute_stream(gpu)?)?;
@@ -2130,12 +2408,14 @@ pub(crate) struct ExpertPanelRing {
 
 impl ExpertPanelRing {
     /// Allocate the pool (charged by [`PanelPoolSpec::reserve`]).
-    pub(crate) fn new(gpu: &mut Gpu, spec: PanelPoolSpec) -> R<Self> {
+    pub(crate) fn new(gpu: &mut Gpu, spec: PanelPoolSpec, trace: bool) -> R<Self> {
         spec.validate()?;
-        let backend = HipPanelBackend::new(gpu, &spec)?;
-        Ok(Self {
-            core: RingCore::new(spec, backend)?,
-        })
+        let backend = HipPanelBackend::new(gpu, &spec, trace)?;
+        let mut core = RingCore::new(spec, backend)?;
+        if trace {
+            core.enable_trace();
+        }
+        Ok(Self { core })
     }
 
     pub(crate) fn spec(&self) -> &PanelPoolSpec {
@@ -2224,6 +2504,11 @@ impl ExpertPanelRing {
 
     pub(crate) fn mark_layer_end(&mut self, gpu: &Gpu, layer: usize) -> R<()> {
         self.core.mark_layer_end(gpu, layer)
+    }
+
+    /// Compute-stream phase mark of `layer` (trace only; no-op when off).
+    pub(crate) fn mark_phase(&mut self, gpu: &Gpu, layer: usize, kind: PhaseKind) -> R<()> {
+        self.core.mark_phase(gpu, layer, kind)
     }
 
     pub(crate) fn stats(&self) -> PanelStats {
@@ -3443,6 +3728,8 @@ mod slowlink_ring {
         /// Fail the nth (0-based) op.
         fail_at: Option<usize>,
         fail_drain: bool,
+        wait_marks: usize,
+        phase_marks: usize,
         /// Counts backend drops: a leaked backend never increments it.
         dropped: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -3466,6 +3753,8 @@ mod slowlink_ring {
                 starved: false,
                 fail_at: None,
                 fail_drain: false,
+                wait_marks: 0,
+                phase_marks: 0,
                 dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
@@ -3560,6 +3849,18 @@ mod slowlink_ring {
             } else {
                 TimelineEvent::LayerBegin(mark)
             });
+            Ok(())
+        }
+        fn mark_acquire_wait(&mut self, _: &(), rec: usize) -> R<()> {
+            self.clock += 1.0;
+            self.wait_marks += 1;
+            self.stamp(TimelineEvent::AcquireWait(rec));
+            Ok(())
+        }
+        fn mark_phase(&mut self, _: &(), index: usize) -> R<()> {
+            self.clock += 1.0;
+            self.phase_marks += 1;
+            self.stamp(TimelineEvent::Phase(index));
             Ok(())
         }
         fn drain(&mut self, _: &()) -> R<()> {
@@ -4811,5 +5112,93 @@ mod slowlink_ring {
         assert_eq!(timeline.stats.timeline_overflow, 1);
         // Closing a layer that was never marked is an error (no invented data).
         assert!(ring.mark_layer_end(&(), 9).is_err());
+    }
+
+    /// One window's worth of traffic through a ring: two layers, three phase
+    /// marks, every record acquired and retired.
+    fn run_traced_window(ring: &mut RingCore<Mock>) -> PanelTimeline {
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(1), Some(2)).unwrap();
+        let (l1, l2) = (sources(1), sources(2));
+        ring.mark_layer_begin(&(), 1).unwrap();
+        let a = ring.enqueue(&(), &group(&l1, 0), &l1).unwrap();
+        let b = ring.enqueue(&(), &group(&l2, 0), &l2).unwrap();
+        ring.acquire(&(), a).unwrap();
+        ring.mark_phase(&(), 1, PhaseKind::MixerEnd).unwrap();
+        ring.mark_phase(&(), 1, PhaseKind::SweepBegin).unwrap();
+        ring.retire(&(), a).unwrap();
+        ring.mark_phase(&(), 1, PhaseKind::SweepEnd).unwrap();
+        ring.mark_layer_end(&(), 1).unwrap();
+        ring.set_layers(Some(2), None).unwrap();
+        ring.acquire(&(), b).unwrap();
+        ring.retire(&(), b).unwrap();
+        ring.drain(&()).unwrap();
+        ring.timeline(&()).unwrap()
+    }
+
+    #[test]
+    fn slowlink_ring_trace_on_records_waits_host_enqueues_and_phases_in_order() {
+        let mut ring = core(1, 1);
+        ring.enable_trace();
+        let timeline = run_traced_window(&mut ring);
+        let trace = timeline.trace.as_ref().expect("trace is on");
+        assert_eq!(trace.spans.len(), timeline.spans.len());
+        assert_eq!(trace.layers.len(), timeline.layers.len());
+        assert_eq!(timeline.spans.len(), 2);
+        for (span, observed) in timeline.spans.iter().zip(&trace.spans) {
+            let compute = span.compute.expect("acquired and released");
+            let wait = observed.wait_begin.expect("waited record");
+            assert!(wait <= compute.0, "wait {wait} after compute begin {}", compute.0);
+            let (begin, end) = observed.host_enqueue.expect("host enqueue observed");
+            assert!(begin <= end);
+            assert!(observed.host_acquire.is_some());
+        }
+        assert!(trace.layers[0].host_begin.is_some());
+        assert!(trace.layers[0].host_end.is_some());
+        let kinds: Vec<(usize, PhaseKind)> =
+            trace.phases.iter().map(|p| (p.layer, p.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (1, PhaseKind::MixerEnd),
+                (1, PhaseKind::SweepBegin),
+                (1, PhaseKind::SweepEnd),
+            ]
+        );
+        assert!(trace.phases.windows(2).all(|w| w[0].t < w[1].t));
+        assert_eq!(trace.overflow, 0);
+        let backend = ring.take_backend().unwrap();
+        assert_eq!(backend.wait_marks, 2);
+        assert_eq!(backend.phase_marks, 3);
+    }
+
+    #[test]
+    fn slowlink_ring_trace_off_has_no_trace_and_issues_no_marks() {
+        let mut ring = core(1, 1);
+        let timeline = run_traced_window(&mut ring);
+        assert!(timeline.trace.is_none());
+        let backend = ring.take_backend().unwrap();
+        assert_eq!(backend.wait_marks, 0);
+        assert_eq!(backend.phase_marks, 0);
+    }
+
+    #[test]
+    fn slowlink_ring_trace_phase_overflow_counts_and_records_nothing() {
+        let mut small = spec(1, 1);
+        small.timeline_layers = 1;
+        let mut ring = RingCore::new(small, Mock::new(2)).unwrap();
+        ring.enable_trace();
+        ring.begin_window(&()).unwrap();
+        for kind in [PhaseKind::MixerEnd, PhaseKind::SweepBegin, PhaseKind::SweepEnd] {
+            ring.mark_phase(&(), 0, kind).unwrap();
+        }
+        ring.mark_phase(&(), 0, PhaseKind::MixerEnd).unwrap();
+        ring.drain(&()).unwrap();
+        let timeline = ring.timeline(&()).unwrap();
+        let trace = timeline.trace.expect("trace is on");
+        assert_eq!(trace.overflow, 1);
+        assert_eq!(trace.phases.len(), 3);
+        let backend = ring.take_backend().unwrap();
+        assert_eq!(backend.phase_marks, 3, "the 4th mark reached no backend");
     }
 }
