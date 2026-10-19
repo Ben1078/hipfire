@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import quality_campaign as qc  # noqa: E402
@@ -37,7 +38,7 @@ def base_plan():
 
 def fake_camp(root="/r"):
     camp = {"schema": qc.CAMPAIGN_SCHEMA, "label": "t", "root": root,
-            "harness": {"quality_campaign_sha256": "1" * 64},
+            "harness": qc.harness_hashes(qc.HERE),
             "source_pin": {"commit": "a" * 40, "example_sha256": "b" * 64},
             "exe": {"path": "/x/bin/qwen4_slowlink_quality", "sha256": "c" * 64, "size": 5},
             "pack": {"digest": "d" * 64}, "config": {"path": "/c.toml", "sha256": "e" * 64},
@@ -53,6 +54,45 @@ def fake_camp(root="/r"):
         camp["arms"][arm] = {"levers_on": list(qc.ARMS[arm]), "lever_env": qc.lever_env(arm),
                              "plan": {"path": "/pl/%s.json" % arm, "sha256": "f" * 64}, "runs": runs}
     return camp
+
+class HistoricalCampaign(unittest.TestCase):
+    def test_source_binding_and_report_only_override(self):
+        with tempfile.TemporaryDirectory() as root:
+            camp = fake_camp(root)
+            camp["harness"] = qc.harness_hashes(qc.HERE)
+            data = json.dumps(camp).encode()
+            qc.write_new(os.path.join(root, "campaign.json"), data)
+            sha = qc.sha256_bytes(data)
+            self.assertEqual(qc.load_campaign(root, sha), camp)
+            with self.assertRaises(qc.Refusal):
+                qc.load_campaign(root, "0" * 64)
+            with self.assertRaises(qc.Refusal):
+                qc.load_campaign(root, sha, recorded_harness_dir=qc.HERE)
+            recorded = dict(camp["harness"], quality_campaign_sha256="2" * 64)
+            with mock.patch.object(qc, "harness_hashes", return_value=recorded):
+                with self.assertRaises(qc.Refusal):
+                    qc.load_campaign(root, sha)
+                with self.assertRaises(qc.Refusal):
+                    qc.load_campaign(root, sha, recorded_harness_dir=qc.HERE, report_only=True)
+            with mock.patch.object(qc, "harness_hashes", side_effect=lambda d: camp["harness"] if d == root else recorded):
+                self.assertEqual(qc.load_campaign(root, sha, recorded_harness_dir=root, report_only=True), camp)
+                with self.assertRaises(qc.Refusal):
+                    qc.load_campaign(root, sha)
+
+    def test_historical_options_are_only_accepted_by_report(self):
+        parser = qc.build_parser()
+        args = parser.parse_args(["report", "--root", "/r", "--expect-campaign-sha256", "a" * 64,
+                                 "--recorded-harness-dir", "/old", "--out-dir", "/fresh"])
+        self.assertEqual(args.recorded_harness_dir, "/old")
+        for command, extra in (("launch", ["--arm", "off", "--phase", "s1a", "--max-secs", "1800", "--priority", "P1"]),
+                               ("run-phase", ["--arm", "off", "--phase", "s1a"]),
+                               ("score", ["--arm", "off"]), ("check-plans", [])):
+            with self.subTest(command=command), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                parser.parse_args([command, "--root", "/r", "--expect-campaign-sha256", "a" * 64]
+                                  + extra + ["--recorded-harness-dir", "/old"])
+        with self.assertRaises(qc.Refusal):
+            qc.report(type("A", (), {"recorded_harness_dir": "/old", "out_dir": None})())
+
 
 
 class LeverEnv(unittest.TestCase):
@@ -470,14 +510,43 @@ class RouteEvidence(unittest.TestCase):
         ev = qc.route_evidence("stack", c, LOAD_SET + QSA_LINE + QSA_PACK_LINE, [])
         self.assertTrue(ev["ok"], ev)
 
+    def test_s1b_all_native_det_cases_and_eligible_routes_required(self):
+        cases = base_plan()["determinism"]["case_ids"]
+        rows = [512, 1536, 1537, 8192, 4100, 3400, 594]
+        cs = [{"cell": "det-" + cid, "prefill": {"calls": [{"rows": n}],
+               "receipts": [receipt() if n >= 1537 else {"route": "incumbent"}]}}
+              for cid, n in zip(cases, rows)]
+        ev = qc.route_evidence("off", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)
+        self.assertTrue(ev["ok"], ev)
+        self.assertFalse(qc.route_evidence("off", cs, LOAD_FRONT, [], phase="s1a",
+                                           expected_cases=cases)["common"]["ok"])
+        for index in range(len(cs)):
+            with self.subTest(missing=cases[index]):
+                self.assertFalse(qc.route_evidence("off", cs[:index] + cs[index + 1:], LOAD_FRONT, [],
+                                                   phase="s1b", expected_cases=cases)["ok"])
+        for index in (2, 3, 4, 5):
+            bad = copy.deepcopy(cs)
+            bad[index]["prefill"]["receipts"][0] = {"route": "incumbent"}
+            self.assertFalse(qc.route_evidence("off", bad, LOAD_FRONT, [], phase="s1b",
+                                               expected_cases=cases)["ok"])
+        bad = copy.deepcopy(cs)
+        bad[2]["prefill"]["receipts"][0]["status"] = "aborted"
+        self.assertFalse(qc.route_evidence("off", bad, LOAD_FRONT, [], phase="s1b",
+                                           expected_cases=cases)["ok"])
+        self.assertFalse(qc.route_evidence("off", cs, LOAD_FRONT, [], phase="s1b")["ok"])
+        self.assertFalse(qc.route_evidence("place", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)["ok"])
+        self.assertFalse(qc.route_evidence("iu4", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)["ok"])
+        self.assertFalse(qc.route_evidence("qsa", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)["ok"])
+
 
 class Determinism(unittest.TestCase):
     CASES = ["p512", "p1536"]
 
     def det(self, **over):
-        d = {"all_identical": True, "cases": []}
+        d = {"schema": "hipfire.qwen4.slowlink_quality.determinism.v1", "all_identical": True, "cases": []}
         for cid in self.CASES:
-            d["cases"].append({"case": cid, "identical": True, "token_ids_equal": True, "finish_equal": True,
+            d["cases"].append({"case": cid, "cell": "det-" + cid, "identical": True, "token_ids_equal": True,
+                               "finish_reason": ["length", "length"], "rows": [33, 33],
                                "first_differing_row": None, "stream_sha256": [cid + "a", cid + "a"]})
         for k, v in over.items():
             d["cases"][0][k] = v
@@ -516,6 +585,31 @@ class Determinism(unittest.TestCase):
         r = qc.determinism_report(self.det(), self.CASES, a, b)
         self.assertFalse(r["route_signature_equal"])
         self.assertFalse(r["ok"])
+
+    def test_finish_pair_fails_closed_on_malformed_or_different_values(self):
+        a, b = self.cells()
+        for value in (None, [], ["length"], ["length", "length", "length"], "length",
+                      [None, None], [1, 1], ["length", "stop"]):
+            with self.subTest(value=value):
+                r = qc.determinism_report(self.det(finish_reason=value), self.CASES, a, b)
+                self.assertFalse(r["ok"])
+                self.assertFalse(r["cases"][0]["finish_equal"])
+        for finish in ("length", "stop"):
+            self.assertTrue(qc.determinism_report(self.det(finish_reason=[finish, finish]), self.CASES, a, b)["ok"])
+        legacy = self.det()
+        del legacy["cases"][0]["finish_reason"]
+        legacy["cases"][0]["finish_equal"] = True
+        self.assertFalse(qc.determinism_report(legacy, self.CASES, a, b)["ok"])
+
+    def test_native_schema_and_duplicate_cases_fail_closed(self):
+        a, b = self.cells()
+        for value in (None, "invented"):
+            det = self.det()
+            det["schema"] = value
+            self.assertFalse(qc.determinism_report(det, self.CASES, a, b)["ok"])
+        det = self.det()
+        det["cases"].append(det["cases"][0])
+        self.assertFalse(qc.determinism_report(det, self.CASES, a, b)["ok"])
 
 
 class TextEvidence(unittest.TestCase):

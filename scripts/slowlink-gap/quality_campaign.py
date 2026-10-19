@@ -675,7 +675,17 @@ def prepare(args):
     return 0
 
 
-def load_campaign(root, expect_sha):
+def harness_hashes(directory):
+    """Identity of the Python harness and its native source, never the runtime binary."""
+    need_abs(directory, "harness directory")
+    return {
+        "quality_campaign_sha256": sha256_file(os.path.join(directory, "quality_campaign.py")),
+        "quality_scorer_sha256": sha256_file(os.path.join(directory, "quality_scorer.py")),
+        "example_sha256": sha256_file(os.path.join(os.path.dirname(os.path.dirname(directory)), EXAMPLE_REL)),
+    }
+
+
+def load_campaign(root, expect_sha, *, recorded_harness_dir=None, report_only=False):
     need_abs(root, "--root")
     need_hex64(expect_sha, "--expect-campaign-sha256")
     path = os.path.join(root, "campaign.json")
@@ -688,6 +698,11 @@ def load_campaign(root, expect_sha):
     camp = json.loads(data)
     if camp.get("schema") != CAMPAIGN_SCHEMA or camp.get("root") != root:
         raise Refusal("campaign schema/root mismatch")
+    if recorded_harness_dir is not None and not report_only:
+        raise Refusal("--recorded-harness-dir is restricted to CPU report")
+    directory = recorded_harness_dir if recorded_harness_dir is not None else HERE
+    if harness_hashes(directory) != camp.get("harness"):
+        raise Refusal("harness source hashes differ from the sealed campaign (%s)" % directory)
     return camp
 
 
@@ -1167,10 +1182,12 @@ def layer_major_receipts(cells):
     return out
 
 
-def route_evidence(arm, cells, stderr_text, kcache_files):
+def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expected_cases=()):
     """ACTUAL route evidence of one phase from raw receipts, the loader log and the private kernel cache.
     Never inferred from the requested env. Returns {lever: {on_expected, ok, ...}, common: ...}."""
     on = ARMS[arm]
+    if phase not in PHASES:
+        raise Refusal("unknown route-evidence phase %r" % phase)
     recs = layer_major_receipts(cells)
     ev = {"layer_major_receipts": len(recs)}
     common = []
@@ -1183,10 +1200,33 @@ def route_evidence(arm, cells, stderr_text, kcache_files):
                 or r.get("retained_scratch_rows") != S1_TILE_ROWS:
             common.append("%s: resident/tile %r/%r/%r" % (cell, r.get("resident_layers"), r.get("tile_rows"),
                                                           r.get("retained_scratch_rows")))
-    primary = {c for c, _r in recs}
-    for need in ("primary-ctx16k-teacher", "primary-ctx4k-teacher"):
-        if need not in primary:
+    present = {c for c, _r in recs}
+    required = ("primary-ctx16k-teacher", "primary-ctx4k-teacher") if phase == "s1a" else ()
+    for need in required:
+        if need not in present:
             common.append("%s has no layer-major receipt" % need)
+    if phase == "s1b" and not expected_cases:
+        common.append("s1b requires the plan's determinism case ids")
+    for cid in expected_cases:
+        name = "det-" + cid
+        matches = [c for c in cells if c.get("cell") == name]
+        if len(matches) != 1:
+            common.append("%s: expected exactly one determinism cell" % name)
+            continue
+        prefill = matches[0].get("prefill") or {}
+        calls, receipts = prefill.get("calls"), prefill.get("receipts")
+        if not isinstance(calls, list) or not calls or not isinstance(receipts, list) or len(calls) != len(receipts):
+            common.append("%s: missing or mismatched calls/receipts" % name)
+            continue
+        for call, receipt in zip(calls, receipts):
+            rows = call.get("rows")
+            if type(rows) is not int or rows <= 0:
+                common.append("%s: invalid call rows" % name)
+                continue
+            want_route = "layer-major" if rows >= 1537 else "incumbent"
+            if receipt.get("route") != want_route:
+                common.append("%s: %d-row call route %r != %s" % (name, rows, receipt.get("route"), want_route))
+    ev["phase"] = phase
     ev["common"] = {"ok": not common, "problems": common}
 
     # PLACE: the actual set (receipts derive it from the per-layer mappings) and the loader line.
@@ -1303,7 +1343,18 @@ def receipt_signature(cells):
 def determinism_report(det, expected_cases, cells_a, cells_b):
     """det = native determinism.json (s1a vs s1b). Token equality and bit identity reported separately."""
     probs = []
-    cases = {c.get("case"): c for c in det.get("cases", []) if isinstance(c, dict)}
+    if det.get("schema") != "hipfire.qwen4.slowlink_quality.determinism.v1":
+        probs.append("invalid native determinism schema")
+    if det.get("all_identical") is not True:
+        probs.append("native all_identical is not true")
+    native_cases = det.get("cases")
+    if not isinstance(native_cases, list) or any(not isinstance(c, dict) or not isinstance(c.get("case"), str)
+                                                 for c in native_cases):
+        native_cases = []
+        probs.append("invalid native cases array")
+    cases = {c["case"]: c for c in native_cases}
+    if len(cases) != len(native_cases):
+        probs.append("duplicate native determinism cases")
     if sorted(cases) != sorted(expected_cases):
         probs.append("determinism cases %r != plan cases %r" % (sorted(cases), sorted(expected_cases)))
     out = []
@@ -1311,15 +1362,21 @@ def determinism_report(det, expected_cases, cells_a, cells_b):
     by_b = {c["cell"]: c for c in cells_b}
     for cid in expected_cases:
         c = cases.get(cid, {})
-        row = {"case": cid, "token_ids_equal": c.get("token_ids_equal"), "finish_equal": c.get("finish_equal"),
-               "bit_identical": c.get("identical"), "first_differing_row": c.get("first_differing_row")}
-        if c.get("token_ids_equal") is not True or c.get("finish_equal") is not True:
-            probs.append("%s: token ids/finish differ between s1a and s1b" % cid)
+        finish = c.get("finish_reason")
+        finish_equal = (isinstance(finish, list) and len(finish) == 2
+                        and all(isinstance(x, str) for x in finish) and finish[0] == finish[1])
+        row = {"case": cid, "token_ids_equal": c.get("token_ids_equal"), "finish_reason": finish,
+               "finish_equal": finish_equal, "bit_identical": c.get("identical"),
+               "first_differing_row": c.get("first_differing_row")}
+        if c.get("token_ids_equal") is not True or not finish_equal:
+            probs.append("%s: token ids/finish differ or native finish_reason is not a two-string pair" % cid)
         if c.get("identical") is not True:
             probs.append("%s: logits not bit identical (reported; stricter than token equality)" % cid)
         cell = "det-" + cid
-        hs = c.get("stream_sha256") or [None, None]
-        if by_a.get(cell, {}).get("stream_sha256") != hs[0] or by_b.get(cell, {}).get("stream_sha256") != hs[1]:
+        hs = c.get("stream_sha256")
+        if not isinstance(hs, list) or len(hs) != 2 or not all(isinstance(x, str) for x in hs):
+            probs.append("%s: invalid native stream_sha256 pair" % cid)
+        elif by_a.get(cell, {}).get("stream_sha256") != hs[0] or by_b.get(cell, {}).get("stream_sha256") != hs[1]:
             probs.append("%s: determinism.json stream hashes differ from the phase summaries" % cid)
         if by_a.get(cell, {}).get("text") != by_b.get(cell, {}).get("text"):
             probs.append("%s: decoded text differs between s1a and s1b" % cid)
@@ -1372,9 +1429,12 @@ def load_cells(out_dir):
 
 
 def report(args):
-    camp = load_campaign(args.root, args.expect_campaign_sha256)
+    recorded = args.recorded_harness_dir
+    if recorded is not None and args.out_dir is None:
+        raise Refusal("historical CPU report requires a fresh explicit --out-dir")
+    camp = load_campaign(args.root, args.expect_campaign_sha256, recorded_harness_dir=recorded, report_only=True)
     root = camp["root"]
-    outdir = os.path.join(root, "report")
+    outdir = need_abs(args.out_dir, "--out-dir") if args.out_dir else os.path.join(root, "report")
     if os.path.exists(outdir):
         raise Refusal("refusing existing %s" % outdir)
     arms = [a for a in args.arms.split(",")] if args.arms else list(camp["arms"])
@@ -1411,7 +1471,8 @@ def report(args):
         ev = {}
         for ph, cells in (("s1a", cells_a), ("s1b", cells_b)):
             stderr = open(os.path.join(a["runs"][ph]["run_dir"], "stderr.log"), "r", errors="replace").read()
-            ev[ph] = route_evidence(arm, cells, stderr, rr[ph].get("kcache_files", []))
+            ev[ph] = route_evidence(arm, cells, stderr, rr[ph].get("kcache_files", []),
+                                    phase=ph, expected_cases=expected_cases)
             ev[ph]["run_status"] = rr[ph]["status"]
             if rr[ph]["status"] != "OK":
                 probs.append("%s run-record status %s" % (ph, rr[ph]["status"]))
@@ -1439,6 +1500,11 @@ def report(args):
         per_arm[arm] = entry
         write_new(os.path.join(outdir, arm, "arm-report.json"), pretty(entry))
     summary = {"schema": "hipfire.qwen4.slowlink_quality_campaign.report.v1", "campaign_sha256": args.expect_campaign_sha256,
+               "reporter": {"harness_dir": HERE, "hashes": harness_hashes(HERE),
+                            "source_commit": subprocess.check_output(["git", "-C", HERE, "rev-parse", "HEAD"], text=True).strip(),
+                            "source_tree": subprocess.check_output(["git", "-C", HERE, "rev-parse", "HEAD^{tree}"], text=True).strip()},
+               "recorded_harness": {"directory": recorded or HERE, "hashes": camp["harness"],
+                                    "source_pin": camp["source_pin"], "historical_cpu_report_only": recorded is not None},
                "reference": {"identity_ok": identity_ok, "error": identity_err, "evidence": identity,
                              "beta_dir": camp["beta"]["dir"], "beta_binary_sha256": camp["beta"]["binary_sha256"],
                              "declaration": camp["reference_declaration"],
@@ -1606,6 +1672,9 @@ def build_parser():
     p = sub.add_parser("report")
     common(p)
     p.add_argument("--arms", help="comma list (default: every arm of the campaign)")
+    p.add_argument("--recorded-harness-dir",
+                   help="CPU report only: directory containing the original sealed harness sources")
+    p.add_argument("--out-dir", help="fresh absolute report output directory; required for historical reports")
     p = sub.add_parser("serial")
     common(p)
     p.add_argument("--priority", required=True)

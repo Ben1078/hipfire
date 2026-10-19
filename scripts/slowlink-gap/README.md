@@ -39,3 +39,29 @@ per-process medians, applied env per cell, route lines, stage identity, and the 
 
 Receipts: each run lives in a fresh directory (`runs/<name>`), the job writes `cells/MANIFEST.sha256` and makes `cells/`
 read-only. Cell failure: no automatic rerun. Original gap2000 artifacts are untouched.
+
+## Native quality reports
+
+`quality_campaign.py` seals its Python sources and the native example source in each campaign. All campaign-loading
+commands verify those hashes; launch, run-phase and scoring cannot substitute another harness. Determinism consumes
+the native `hipfire.qwen4.slowlink_quality.determinism.v1` schema: `finish_reason` must be a two-string equal pair
+(there is no native `finish_equal` field). Token equality and logit bit identity remain separately reported.
+Route evidence is phase-aware: s1a still requires both primary teacher layer-major receipts; s1b requires all plan
+determinism cases and validates their eligible layer-major calls and short incumbent calls, plus PLACE/IU4/QSA evidence.
+
+For an explicitly versioned, CPU-only correction of historical reports, retain the original campaign and harness
+checkout unchanged and use the new reporter with:
+
+```
+python3 -B $NEW_H/quality_campaign.py report --root $OLD_CAMPAIGN \
+  --expect-campaign-sha256 $OLD_SHA --arms off --recorded-harness-dir $OLD_H \
+  --out-dir $OLD_CAMPAIGN/report-corrected-$FIX_COMMIT
+```
+
+`OLD_H` is the directory containing the original `quality_campaign.py` and `quality_scorer.py`, in its original
+repository layout (the native example is also hashed). Its hashes must match the old sealed campaign. The summary
+records old source pins and hashes separately from the new reporter's commit, tree and hashes. Historical override
+is accepted only by `report`, requires an explicit fresh absolute output directory and does not change any original
+campaign, phase, score or report. `--out-dir` also permits fresh per-arm reports for new campaigns. Manual decoded-text
+review remains required; a mechanical report is not final qualification. Prepare remaining GPU arms as a new campaign
+under the fixed harness, declaring the unchanged binary-build commit separately from the harness commit.
