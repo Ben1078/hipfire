@@ -80,6 +80,7 @@ use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
@@ -238,13 +239,28 @@ fn run(
     tokens: &[u32],
     reused: usize,
 ) -> (Vec<[u8; 32]>, Vec<u8>, Vec<u32>) {
+    run_timed(bundle, gpu, logits, tokens, reused).0
+}
+
+/// [`run`], plus the wall time of the prefill alone (the restore of the
+/// `reused` tokens included), drained.
+fn run_timed(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    tokens: &[u32],
+    reused: usize,
+) -> ((Vec<[u8; 32]>, Vec<u8>, Vec<u32>), Duration) {
+    gpu.hip.device_synchronize().expect("sync");
+    let started = Instant::now();
     bundle
         .prefill_final(gpu, tokens, reused, logits)
         .expect("prefill");
+    gpu.hip.device_synchronize().expect("sync");
+    let prefill = started.elapsed();
     let digests = state_digests(bundle, gpu, SessionRoute::Ar, tokens.len());
     bundle.session_commit();
     let mut bytes = vec![0u8; logits.byte_size()];
-    gpu.hip.device_synchronize().expect("sync");
     gpu.hip
         .memcpy_dtoh(&mut bytes, &logits.buf)
         .expect("download logits");
@@ -255,7 +271,7 @@ fn run(
                 .expect("decode")
         })
         .collect();
-    (digests, bytes, ids)
+    ((digests, bytes, ids), prefill)
 }
 
 /// Native MTP prefill of `tokens` reusing `reused` cached tokens, then
@@ -291,6 +307,12 @@ fn stored_bytes(bundle: &Qwen4Bundle) -> u64 {
         .stored_bytes()
 }
 
+/// Published pool snapshots in device or pinned host memory.
+fn held_bytes(bundle: &Qwen4Bundle) -> u64 {
+    let usage = bundle.session_cache().expect("session cache").usage();
+    usage.pool_bytes + usage.host_pool_bytes
+}
+
 /// Four snapshots (A's three links and B's one) of one chunk each: a full
 /// copy of B's two chunks would exceed four chunk-sized snapshots.
 fn assert_four_deltas(route: &str, stored: u64, one: u64) {
@@ -299,6 +321,10 @@ fn assert_four_deltas(route: &str, stored: u64, one: u64) {
         stored > 3 * one && stored <= 4 * one,
         "{route}: expected four one-chunk snapshots ({stored} bytes, {one} each)"
     );
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
 }
 
 /// The Flash-Next host lock fabric takes with `--hostmem-lock` (shared for
@@ -773,7 +799,10 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .expect("forward");
     assert_resolved_gdn_state(&bundle, state_request, state_format);
-    let cache = SessionCache::new(domain, budget);
+    // The production tiers: the device pool, and pinned host memory for the
+    // snapshots the device evicts (`memory.session_cache_host_bytes`).
+    let cache = SessionCache::new(domain, budget)
+        .with_host_demotion(hipfire_config::memory::session_cache_host_bytes());
     bundle.attach_session_cache(match disk {
         Some(dir) => cache.with_disk(dir, 1 << 40),
         None => cache,
@@ -788,6 +817,13 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     }
 }
 
+/// The user-visible contract of the session cache with an unlimited budget:
+/// every prefix snapshot published on AR and on native MTP stays a prefix hit
+/// (served from device memory, or from pinned host memory once the device
+/// evicts it), and every restore matches the cold prefill byte for byte. AR
+/// is re-checked after the MTP head and its snapshots took the device memory
+/// (on a 24 GB card with host-mapped trunk layers that evicts the AR
+/// snapshots), with the prefill time of each cold and warm run.
 #[test]
 #[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
 fn restored_prefill_matches_cold_on_flash_next() {
@@ -813,36 +849,60 @@ fn restored_prefill_matches_cold_on_flash_next() {
         session_snapshot_bytes(&bundle.config, state_format, mtp, chunk).expect("snapshot bytes")
     };
     let (one_ar, one_mtp) = (one(false), one(true));
+    let usage = |bundle: &Qwen4Bundle| bundle.session_cache().expect("session cache").usage();
 
-    let cold_a = run(&mut bundle, &mut gpu, &logits, &a, 0);
-    let cold_b = run(&mut bundle, &mut gpu, &logits, &b, 0);
-    assert_four_deltas("AR", stored_bytes(&bundle), one_ar);
-    for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
-        let reused = bundle.session_plan(tokens, SessionRoute::Ar);
-        assert_eq!(
-            reused,
-            links * chunk,
-            "plan must offer {name}'s {links}-chunk snapshot"
-        );
-        let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, tokens, reused);
-        println!(
-            "AR {name} cold ids {:?}\nAR {name} warm ids {warm_ids:?}",
-            cold.2
-        );
-        assert_same_state(&format!("AR {name}"), &cold.0, &digests);
-        assert!(
-            warm_logits == cold.1,
-            "AR {name}: restored final logits differ from cold"
-        );
-        assert_eq!(warm_ids, cold.2, "AR {name}");
-    }
+    let (cold_a, cold_a_ms) = run_timed(&mut bundle, &mut gpu, &logits, &a, 0);
+    let (cold_b, cold_b_ms) = run_timed(&mut bundle, &mut gpu, &logits, &b, 0);
+    assert_four_deltas("AR", held_bytes(&bundle), one_ar);
+    let ar_cases = [
+        ("A", &a, &cold_a, cold_a_ms, 3),
+        ("B", &b, &cold_b, cold_b_ms, 2),
+    ];
+    // The AR snapshots are checked twice: right after capture, and after
+    // the MTP leg has taken the device memory.
+    let check_ar = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu, leg: &str| {
+        for &(name, tokens, cold, cold_ms, links) in &ar_cases {
+            let reused = bundle.session_plan(tokens, SessionRoute::Ar);
+            assert_eq!(
+                reused,
+                links * chunk,
+                "{leg}: plan must offer {name}'s {links}-chunk snapshot"
+            );
+            let host_before = usage(bundle).host_restores_total;
+            let ((digests, warm_logits, warm_ids), warm_ms) =
+                run_timed(bundle, gpu, &logits, tokens, reused);
+            let tier = if usage(bundle).host_restores_total > host_before {
+                "host"
+            } else {
+                "device"
+            };
+            println!(
+                "{leg} AR {name}: prefill cold {:.1} ms ({} tokens), warm {:.1} ms (restored {reused} from {tier}, prefilled {})",
+                ms(cold_ms),
+                tokens.len(),
+                ms(warm_ms),
+                tokens.len() - reused
+            );
+            println!(
+                "{leg} AR {name} cold ids {:?}\n{leg} AR {name} warm ids {warm_ids:?}",
+                cold.2
+            );
+            assert_same_state(&format!("{leg} AR {name}"), &cold.0, &digests);
+            assert!(
+                warm_logits == cold.1,
+                "{leg} AR {name}: restored final logits differ from cold"
+            );
+            assert_eq!(warm_ids, cold.2, "{leg} AR {name}");
+        }
+    };
+    check_ar(&mut bundle, &mut gpu, "fresh");
 
     bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
     let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
-    let before = stored_bytes(&bundle);
+    let before = held_bytes(&bundle);
     let cold_a = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a, 0);
     let cold_b = run_mtp(&mut bundle, &mut gpu, &mut drafter, &b, 0);
-    assert_four_deltas("MTP", stored_bytes(&bundle) - before, one_mtp);
+    assert_four_deltas("MTP", held_bytes(&bundle) - before, one_mtp);
     for (name, tokens, cold, links) in [("A", &a, &cold_a, 3), ("B", &b, &cold_b, 2)] {
         let reused = bundle.session_plan(tokens, SessionRoute::Mtp);
         assert_eq!(
@@ -855,6 +915,17 @@ fn restored_prefill_matches_cold_on_flash_next() {
         assert_same_state(&format!("MTP {name}"), &cold.0, &digests);
         assert_eq!(seed, cold.1, "MTP {name} seed");
     }
+
+    let after_mtp = usage(&bundle);
+    println!(
+        "after MTP: {} device + {} host bytes held, {} demoted to host, {} evicted, {} host restores",
+        after_mtp.pool_bytes,
+        after_mtp.host_pool_bytes,
+        after_mtp.host_demotions_total,
+        after_mtp.evictions_total,
+        after_mtp.host_restores_total
+    );
+    check_ar(&mut bundle, &mut gpu, "after MTP");
 
     gpu.free_tensor(logits).expect("free logits");
     bundle.free_gpu(&mut gpu).expect("free bundle");

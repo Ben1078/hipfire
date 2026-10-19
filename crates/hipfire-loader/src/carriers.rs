@@ -3229,8 +3229,16 @@ fn load_qwen4_rank_scoped(
             chunk,
         )
         .unwrap_or(0);
+        // A PP band keeps its snapshots on its own device: one host budget
+        // per band would multiply the pinned memory the setting names.
+        let host_bytes = if band.is_some() {
+            0
+        } else {
+            hipfire_config::memory::session_cache_host_bytes()
+        };
         let cache =
-            hipfire_runtime::session_cache::SessionCache::new(session_domain, session_budget);
+            hipfire_runtime::session_cache::SessionCache::new(session_domain, session_budget)
+                .with_host_demotion(host_bytes);
         // A PP band never attaches the disk tier (admission refuses it).
         let cache = match qwen4_session_disk_tier(
             band.is_some(),
@@ -3245,9 +3253,10 @@ fn load_qwen4_rank_scoped(
             format!(" (PP band layers {:?})", scope.band)
         });
         eprintln!(
-            "  qwen4 session cache{band_tag}: {} MiB budget, {} MiB per {chunk}-token snapshot; snapshots yield to context growth",
+            "  qwen4 session cache{band_tag}: {} MiB budget, {} MiB per {chunk}-token snapshot, {} MiB pinned host for evicted snapshots; snapshots yield to context growth",
             session_budget >> 20,
-            one >> 20
+            one >> 20,
+            host_bytes >> 20
         );
         bundle.set_turn_end_token(seed.tokenizer.special_token_id("<|im_end|>"));
         if bundle.turn_snapshots_active() {

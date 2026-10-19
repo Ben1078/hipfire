@@ -50,11 +50,20 @@
 //! parked history restores them byte-exact and continues in place.
 //!
 //! An optional disk tier ([`SessionCache::with_disk`]) keeps snapshots the
-//! device tier evicts (and every published snapshot at [`SessionCache::clear`])
+//! memory tiers evict (and every published snapshot at [`SessionCache::clear`])
 //! under its own byte budget, across restarts of the same build; a restore
-//! promotes them back. The parent of a device or pending snapshot is always
-//! on the device (I1); the parent of a disk snapshot is on the device or on
-//! disk (I2), so a chain's disk links are a suffix.
+//! promotes them back. The parent of a device or pending snapshot is on the
+//! device or on the host (I1); the parent of a disk snapshot is on the device
+//! or on disk (I2), so a chain's disk links are a suffix.
+//!
+//! With a pinned-host budget ([`SessionCache::with_host_demotion`]) a device
+//! snapshot the device tier evicts (memory guard, capacity, context growth)
+//! is first copied to pinned host memory under the same key: its parent link
+//! and its children stay, so the prefix hit survives at the cost of a
+//! host-to-device restore. When every device snapshot still has children, the
+//! deepest one moves to the host instead of nothing being freed. Host
+//! snapshots the host budget evicts go to the disk tier when one is attached
+//! (and I2 allows), else they are dropped.
 //!
 //! Under [`SessionCache::enable_pressure_host_snapshots`] (opt-in, off by
 //! default) a capture chooses its tier by pressure: device memory only when
@@ -63,11 +72,10 @@
 //! ([`PressureHostSnapshotPolicy`]). A host snapshot is captured straight
 //! from the borrowed live parts into its final allocation (never through a
 //! device clone) and restored straight back into the live parts. The host
-//! budget bounds every pinned owner (published, pending, resident, deferred,
-//! parked), published host snapshots are evicted normally (dropped, never
-//! demoted), and a device snapshot whose parent lives on the host is never
-//! demoted to disk (the disk tier's parent invariant, I2, names the device
-//! and disk tiers only).
+//! budget (the policy's, replacing the demotion budget) bounds every pinned
+//! owner (published, pending, resident, deferred, parked), and a device
+//! snapshot whose parent lives on the host is never demoted to disk (the
+//! disk tier's parent invariant, I2, names the device and disk tiers only).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -315,6 +323,19 @@ impl HostBlock {
             #[cfg(test)]
             HostMem::Fake(fake) => fake.bytes.as_ptr() as *mut u8,
         }
+    }
+
+    /// The block's bytes for a CPU reader; `None` while a transfer on it may
+    /// still be in flight.
+    fn drained_bytes(&self) -> Option<&[u8]> {
+        if self.undrained.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: `ptr` starts a live allocation of `bytes` bytes; every
+        // transfer that touched it was drained (the block is not flagged
+        // undrained), so no GPU access is outstanding, and nothing writes it
+        // from the host while it is borrowed.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr(), self.bytes) })
     }
 
     /// A transfer on this block may still be in flight: never free it.
@@ -651,10 +672,11 @@ pub struct SessionCacheUsage {
     pub parked_bytes: u64,
     /// Device snapshots that left the pool through the cache's eviction path
     /// (`evict_device`: capacity, memory guard, context growth, clear),
-    /// whether demoted to disk or dropped. Counts actual removals, never
-    /// policy decisions.
+    /// whether demoted to the host, to disk or dropped. Counts actual
+    /// removals, never policy decisions.
     pub evictions_total: u64,
-    /// The pressure policy's host budget; 0 without the policy.
+    /// The pinned-host budget: the pressure policy's, else the demotion
+    /// budget; 0 without either.
     pub host_budget_bytes: u64,
     /// Published pinned-host pool snapshots.
     pub host_pool_bytes: u64,
@@ -670,8 +692,11 @@ pub struct SessionCacheUsage {
     pub host_captures_total: u64,
     /// Restores that read at least one host-held source.
     pub host_restores_total: u64,
-    /// Published host snapshots dropped by the host eviction path.
+    /// Published host snapshots dropped (or demoted to disk) by the host
+    /// eviction path.
     pub host_evictions_total: u64,
+    /// Device snapshots the device tier evicted into the host pool.
+    pub host_demotions_total: u64,
     /// Captures the policy refused or failed to hold on either tier.
     pub host_skips_total: u64,
 }
@@ -747,6 +772,10 @@ pub struct SessionCache {
     host_restores_total: u64,
     host_evictions_total: u64,
     host_skips_total: u64,
+    host_demotions_total: u64,
+    /// Pinned-host budget of demoted device snapshots
+    /// ([`Self::with_host_demotion`]); 0 = evicted snapshots skip the host.
+    host_demotion_bytes: u64,
     /// Physical allocation unit of a device buffer (a capability query,
     /// cached on first need under the pressure policy): every device owner
     /// consumes its payload rounded up to it. `None` until known; then, or
@@ -1132,6 +1161,28 @@ fn host_transfer(gpu: &mut Gpu, dir: Dir, moves: &[HostMove<'_>]) -> Result<(), 
     )
 }
 
+/// Copy the first `bytes` of the device buffer `src` into `block` as one
+/// drained transfer ([`host_transfer`]).
+fn copy_to_host(
+    gpu: &mut Gpu,
+    src: &DeviceBuffer,
+    block: &HostBlock,
+    bytes: u64,
+) -> Result<(), String> {
+    let bytes = usize::try_from(bytes).map_err(|e| e.to_string())?;
+    host_transfer(
+        gpu,
+        Dir::ToStore,
+        &[HostMove {
+            live: src,
+            live_offset: 0,
+            host: block,
+            host_offset: 0,
+            bytes,
+        }],
+    )
+}
+
 /// The live-state buffer of copy part `part` (fixed parts first, then row
 /// streams).
 fn live_buf<'a>(live: &StateLayout<'a>, part: usize) -> &'a DeviceBuffer {
@@ -1428,6 +1479,28 @@ fn host_staging_fits(gpu: &Gpu, bytes: u64, growth: u64) -> bool {
     })
 }
 
+/// Host RAM and GTT a demotion into pinned host memory leaves untouched.
+const PINNED_HEADROOM: u64 = 1 << 30;
+
+/// Whether `bytes` more pinned host memory leave [`PINNED_HEADROOM`] of host
+/// RAM (`MemAvailable` less the CMA region) and, when pinned memory is
+/// GTT-backed, of TTM's GTT limit beside what amdgpu devices hold: a demotion
+/// never starves the host or a later GTT allocation. An unreadable
+/// `MemAvailable` refuses.
+fn pinned_host_fits(bytes: u64) -> bool {
+    let ram = rdna_compute::uma_memory::mem_available_bytes()
+        .is_some_and(|available| fits_with_headroom(available, bytes, 0, PINNED_HEADROOM));
+    let gtt = crate::offload::gtt_budget().is_none_or(|gtt| {
+        fits_with_headroom(
+            gtt.limit_bytes.saturating_sub(gtt.used_bytes),
+            bytes,
+            0,
+            PINNED_HEADROOM,
+        )
+    });
+    ram && gtt
+}
+
 impl SessionCache {
     pub fn new(domain: CacheDomain, budget_bytes: u64) -> Self {
         Self {
@@ -1452,6 +1525,8 @@ impl SessionCache {
             host_restores_total: 0,
             host_evictions_total: 0,
             host_skips_total: 0,
+            host_demotions_total: 0,
+            host_demotion_bytes: 0,
             backing_granule: None,
             quarantine: None,
             host_index: Vec::new(),
@@ -1487,6 +1562,21 @@ impl SessionCache {
                 self.disk = Some(tier);
             }
             Err(reason) => eprintln!("  session cache disk tier off: {reason}"),
+        }
+        self
+    }
+
+    /// Demote snapshots the device tier evicts (memory guard, capacity,
+    /// context growth) to pinned host memory under `budget_bytes` (0 = off)
+    /// before the disk tier or a drop: a later restore copies them straight
+    /// from the host into the live state. Host snapshots this budget evicts
+    /// go to the disk tier when one is attached. Under
+    /// [`Self::enable_pressure_host_snapshots`] the policy's host budget
+    /// bounds every pinned owner instead.
+    pub fn with_host_demotion(mut self, budget_bytes: u64) -> Self {
+        self.host_demotion_bytes = budget_bytes;
+        if budget_bytes > 0 && self.quarantine.is_none() {
+            self.quarantine = Some(Arc::new(Quarantine::default()));
         }
         self
     }
@@ -1632,14 +1722,32 @@ impl SessionCache {
         self.evictions_total = self.evictions_total.saturating_add(1);
     }
 
-    /// A published device snapshot leaves the device tier: demote it to disk
-    /// when there is a disk tier (or drop its disk descendants when that
-    /// fails), then free it.
+    /// A published device snapshot leaves the device tier: moved to pinned
+    /// host memory when the host budget holds it ([`Self::demote_to_host`]),
+    /// else demoted to disk or dropped ([`Self::evict_to_disk`]).
     fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot, growth: u64) {
+        if let Err((key, snapshot)) = self.demote_to_host(gpu, key, snapshot) {
+            self.evict_to_disk(gpu, key, snapshot, growth, false);
+        }
+    }
+
+    /// A published device snapshot leaves memory: demote it to disk when
+    /// there is a disk tier (or drop its disk descendants when that fails),
+    /// then free it. `unloading`: [`Self::clear`] empties both memory tiers
+    /// leaves first, so a host parent follows its child to disk (or drops
+    /// its disk descendants) before the clear returns.
+    fn evict_to_disk(
+        &mut self,
+        gpu: &mut Gpu,
+        key: Key,
+        snapshot: StoredSnapshot,
+        growth: u64,
+        unloading: bool,
+    ) {
         self.note_device_eviction(&snapshot);
         // The disk tier's parents are on the device or on disk (I2): a child
-        // of a host snapshot cannot be demoted.
-        let host_parent = !self.demotable(&snapshot);
+        // of a host snapshot cannot be demoted while its parent stays.
+        let host_parent = !unloading && !self.demotable(&snapshot);
         if let Some(disk) = &mut self.disk {
             let demoted = if host_parent {
                 Err("its parent is on the host tier".to_string())
@@ -1655,6 +1763,200 @@ impl SessionCache {
             }
         }
         free_buffer(gpu, snapshot);
+    }
+
+    /// Pinned-host byte budget bounding every host owner: the pressure
+    /// policy's when armed, else the demotion budget; 0 = no host tier.
+    fn host_budget(&self) -> u64 {
+        self.pressure
+            .map_or(self.host_demotion_bytes, |policy| policy.host_budget_bytes)
+    }
+
+    /// Whether the host tier can take the `bytes`-byte device snapshot at
+    /// `key`: there is a host budget, the snapshot has no disk children (the
+    /// disk tier's parents are on the device or on disk, I2), and the pinned
+    /// owners the host pool cannot evict leave room for it.
+    fn host_demotable(&self, key: &Key, bytes: u64) -> bool {
+        let budget = self.host_budget();
+        if budget == 0 || bytes == 0 {
+            return false;
+        }
+        if self.disk.as_ref().is_some_and(|disk| disk.has_kids(key)) {
+            return false;
+        }
+        let owned = self.owned();
+        owned
+            .host
+            .saturating_sub(owned.host_pool)
+            .checked_add(bytes)
+            .is_some_and(|total| total <= budget)
+    }
+
+    /// A pinned host block for demoting the `bytes`-byte device snapshot at
+    /// `key` ([`Self::host_demotable`]), with room made in the host budget;
+    /// `None` when it is not demotable, on unified memory (the device pool
+    /// is host RAM already, so a demotion frees nothing), when host RAM or
+    /// GTT is short ([`pinned_host_fits`]) or the allocation fails.
+    fn reserve_host_block(&mut self, gpu: &mut Gpu, key: &Key, bytes: u64) -> Option<HostBlock> {
+        if !self.host_demotable(key, bytes) || gpu.is_uma() {
+            return None;
+        }
+        let size = usize::try_from(bytes).ok()?;
+        self.make_host_room(bytes).ok()?;
+        // Checked after the host evictions, which free pinned memory.
+        if !pinned_host_fits(bytes) {
+            return None;
+        }
+        match alloc_host(gpu, size, self.quarantine.as_ref()) {
+            Ok(block) => Some(block),
+            Err(error) => {
+                eprintln!(
+                    "  session cache: no pinned host memory for a {}-token snapshot ({error})",
+                    key.1
+                );
+                None
+            }
+        }
+    }
+
+    /// Move the published device `snapshot` at `key` (already out of the
+    /// pool) to the host pool ([`Self::adopt_demoted`]). Handed back
+    /// unchanged when the host tier cannot take it
+    /// ([`Self::reserve_host_block`]) or the copy fails.
+    fn demote_to_host(
+        &mut self,
+        gpu: &mut Gpu,
+        key: Key,
+        snapshot: StoredSnapshot,
+    ) -> Result<(), (Key, StoredSnapshot)> {
+        let block = match snapshot.location {
+            SnapshotLocation::Device(_) => self.reserve_host_block(gpu, &key, snapshot.bytes),
+            SnapshotLocation::Host(_) | SnapshotLocation::Disk { .. } => None,
+        };
+        let Some(block) = block else {
+            return Err((key, snapshot));
+        };
+        let copied = match &snapshot.location {
+            SnapshotLocation::Device(buf) => copy_to_host(gpu, buf, &block, snapshot.bytes),
+            SnapshotLocation::Host(_) | SnapshotLocation::Disk { .. } => {
+                Err("not a device snapshot".to_string())
+            }
+        };
+        if let Err(error) = copied {
+            eprintln!(
+                "  session cache: demoting a {}-token snapshot to the host failed: {error}",
+                key.1
+            );
+            return Err((key, snapshot));
+        }
+        if let Some(buf) = self.adopt_demoted(key, snapshot, block) {
+            free_device(gpu, buf);
+        }
+        Ok(())
+    }
+
+    /// Bookkeeping of a demotion, no GPU: publish `block` (a drained copy of
+    /// the device `snapshot`) in the host pool under `key` and hand back the
+    /// device buffer to free. The parent link stays (the host snapshot still
+    /// descends from it) and the key keeps its pin while it has children.
+    fn adopt_demoted(
+        &mut self,
+        key: Key,
+        snapshot: StoredSnapshot,
+        block: HostBlock,
+    ) -> Option<DeviceBuffer> {
+        let StoredSnapshot {
+            location,
+            parent,
+            fixed_bytes,
+            segments,
+            meta,
+            bytes,
+        } = snapshot;
+        let device = match location {
+            SnapshotLocation::Device(buf) => Some(buf),
+            SnapshotLocation::Host(_) | SnapshotLocation::Disk { .. } => None,
+        };
+        let host = StoredSnapshot {
+            location: SnapshotLocation::Host(block),
+            parent,
+            fixed_bytes,
+            segments,
+            meta,
+            bytes,
+        };
+        let (domain, p, fp) = key.clone();
+        // The host pool's own ceiling is `u64::MAX`: an insert displaces only
+        // an entry of the same key.
+        let (_, displaced) = self.host_pool.insert_unaligned(domain, p, fp, host);
+        for snapshot in displaced {
+            self.retire(snapshot);
+        }
+        if !self.host_index.contains(&key) {
+            self.host_index.push(key.clone());
+        }
+        if self.children.contains_key(&key) {
+            self.host_pool.pin(&key.0, key.1, key.2);
+        }
+        self.evictions_total = self.evictions_total.saturating_add(1);
+        self.host_demotions_total = self.host_demotions_total.saturating_add(1);
+        if hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false) {
+            eprintln!(
+                "  session cache: demoted {}-token snapshot ({} MiB) to pinned host memory",
+                key.1,
+                bytes >> 20
+            );
+        }
+        device
+    }
+
+    /// Published device snapshots that still have children, deepest first:
+    /// the order [`Self::demote_pinned_device`] tries them in.
+    fn pinned_device_keys(&self) -> Vec<Key> {
+        let mut keys: Vec<Key> = self
+            .children
+            .keys()
+            .filter(|key| self.pool.contains(&key.0, key.1, key.2))
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)));
+        keys
+    }
+
+    /// Every published device snapshot is pinned (each still has children)
+    /// and the device needs room: move the deepest one that fits to the host
+    /// pool. Its children keep naming it wherever it lives, so no prefix is
+    /// lost. Returns the device bytes freed; `None` when none could move.
+    fn demote_pinned_device(&mut self, gpu: &mut Gpu) -> Option<u64> {
+        for key in self.pinned_device_keys() {
+            let bytes = match self.pool.peek(&key.0, key.1, key.2) {
+                Some(snapshot) => snapshot.bytes,
+                None => continue,
+            };
+            let Some(block) = self.reserve_host_block(gpu, &key, bytes) else {
+                continue;
+            };
+            let copied = match self.pool.peek(&key.0, key.1, key.2).map(|s| &s.location) {
+                Some(SnapshotLocation::Device(buf)) => copy_to_host(gpu, buf, &block, bytes),
+                _ => Err("not a device snapshot".to_string()),
+            };
+            if let Err(error) = copied {
+                eprintln!(
+                    "  session cache: demoting a {}-token snapshot to the host failed: {error}",
+                    key.1
+                );
+                continue;
+            }
+            let snapshot = self
+                .pool
+                .evict(&key.0, key.1, key.2)
+                .expect("peeked in the device pool");
+            if let Some(buf) = self.adopt_demoted(key, snapshot, block) {
+                free_device(gpu, buf);
+            }
+            return Some(bytes);
+        }
+        None
     }
 
     /// Evict device snapshots until `bytes` more fit the budget (counting
@@ -1683,11 +1985,14 @@ impl SessionCache {
             match self.pool.pop_lru() {
                 Some((key, evicted)) => self.evict_device(gpu, key, evicted, growth),
                 None => {
+                    if self.demote_pinned_device(gpu).is_some() {
+                        continue;
+                    }
                     return Err(if over_budget {
                         "budget"
                     } else {
                         "memory guard"
-                    })
+                    });
                 }
             }
         }
@@ -1877,7 +2182,7 @@ impl SessionCache {
         let physical = self.physical_need(need);
         let tier = self.pick_tier(need, pooled, || self.device_fits(gpu, physical, growth))?;
         if tier == Tier::Host {
-            self.make_host_room(gpu, need)?;
+            self.make_host_room(need)?;
         }
         Ok(tier)
     }
@@ -1892,10 +2197,10 @@ impl SessionCache {
 
     /// Pure bookkeeping of host eviction: pop the least recently used
     /// unpinned host snapshots until `need` more pinned bytes fit the host
-    /// budget beside every other owner. Returns what left the pool (to free)
-    /// and whether `need` now fits.
-    fn evict_host_for(&mut self, need: u64) -> (Vec<Store>, bool) {
-        let budget = self.pressure.map_or(0, |policy| policy.host_budget_bytes);
+    /// budget beside every other owner. Returns what left the pool (to
+    /// demote to disk or free) and whether `need` now fits.
+    fn evict_host_for(&mut self, need: u64) -> (Vec<(Key, StoredSnapshot)>, bool) {
+        let budget = self.host_budget();
         let mut evicted = Vec::new();
         loop {
             if self.owned().host.saturating_add(need) <= budget {
@@ -1905,11 +2210,35 @@ impl SessionCache {
                 Some((key, snapshot)) => {
                     self.host_index.retain(|k| *k != key);
                     self.note_host_eviction(&snapshot);
-                    evicted.extend(snapshot.into_store());
+                    evicted.push((key, snapshot));
                 }
                 None => return (evicted, false),
             }
         }
+    }
+
+    /// A published host snapshot leaves the host tier: demoted to disk when
+    /// there is a disk tier and its parent is not on the host (I2; or the
+    /// cache is `unloading`, see [`Self::evict_to_disk`]), else dropped with
+    /// its disk descendants; then its pinned memory is freed (no GPU call:
+    /// every transfer on it was drained).
+    fn evict_host_to_disk(&mut self, key: Key, snapshot: StoredSnapshot, unloading: bool) {
+        let demotable = unloading || self.demotable(&snapshot);
+        if let Some(disk) = &mut self.disk {
+            let demoted = if demotable {
+                disk.demote_host(&key, &snapshot)
+            } else {
+                Err("its parent is on the host tier".to_string())
+            };
+            if let Err(reason) = demoted {
+                eprintln!(
+                    "  session cache: dropped {}-token host snapshot instead of demoting it ({reason})",
+                    key.1
+                );
+                disk.drop_descendants(&key);
+            }
+        }
+        drop(snapshot);
     }
 
     /// Whether `parent`'s ancestor chain (through published or pending
@@ -1978,11 +2307,12 @@ impl SessionCache {
         }
     }
 
-    /// Evict published host snapshots until `need` more pinned bytes fit.
-    fn make_host_room(&mut self, gpu: &mut Gpu, need: u64) -> Result<(), &'static str> {
+    /// Evict published host snapshots until `need` more pinned bytes fit;
+    /// each leaves for the disk tier when one is attached.
+    fn make_host_room(&mut self, need: u64) -> Result<(), &'static str> {
         let (evicted, fits) = self.evict_host_for(need);
-        for store in evicted {
-            free_store(gpu, store);
+        for (key, snapshot) in evicted {
+            self.evict_host_to_disk(key, snapshot, false);
         }
         if fits {
             Ok(())
@@ -2358,8 +2688,34 @@ impl SessionCache {
                 }
             }
         }
+        // `HIPFIRE_QWEN_CACHE_TRACE=1`: time the restore alone, drained on
+        // both ends (device links copy asynchronously).
+        let trace = hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false);
+        let traced = trace.then(|| {
+            let _ = gpu.hip.device_synchronize();
+            let bytes: u64 = keys
+                .iter()
+                .filter_map(|key| self.entry(key).map(|snapshot| snapshot.bytes))
+                .sum();
+            (std::time::Instant::now(), bytes, self.host_restores_total)
+        });
         let mut temps = Vec::new();
         let result = self.restore_chain(gpu, state, route, &keys, growth, &missing, &mut temps);
+        if let (Some((started, bytes, host_before)), Ok(())) = (traced, &result) {
+            let _ = gpu.hip.device_synchronize();
+            eprintln!(
+                "  session cache: restored {}-token prefix ({} links, {} MiB in memory, {}) in {:.1} ms",
+                prefix.len(),
+                keys.len(),
+                bytes >> 20,
+                if self.host_restores_total > host_before {
+                    "host links"
+                } else {
+                    "device links"
+                },
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if !temps.is_empty() {
             let _ = gpu.hip.device_synchronize();
             for (_, buf) in temps {
@@ -2954,7 +3310,7 @@ impl SessionCache {
             ResidentPlan::Allocate(tier) => {
                 // The previous capture stays owned (and counted) until the
                 // new one exists, so a refusal leaves it in place.
-                if tier == Tier::Host && self.make_host_room(gpu, total as u64).is_err() {
+                if tier == Tier::Host && self.make_host_room(total as u64).is_err() {
                     skip(self, "host budget");
                     return Ok(());
                 }
@@ -3084,7 +3440,7 @@ impl SessionCache {
                 ])
             }),
             evictions_total: self.evictions_total,
-            host_budget_bytes: self.pressure.map_or(0, |policy| policy.host_budget_bytes),
+            host_budget_bytes: self.host_budget(),
             host_pool_bytes: self.host_pool.total_bytes(),
             host_pending_bytes: saturating_total(
                 self.pending
@@ -3110,12 +3466,13 @@ impl SessionCache {
             host_captures_total: self.host_captures_total,
             host_restores_total: self.host_restores_total,
             host_evictions_total: self.host_evictions_total,
+            host_demotions_total: self.host_demotions_total,
             host_skips_total: self.host_skips_total,
         }
     }
 
     /// Free every snapshot; with a disk tier attached, published snapshots
-    /// are demoted to disk instead of dropped.
+    /// (device and host) are demoted to disk instead of dropped.
     pub fn clear(&mut self, gpu: &mut Gpu) {
         if self.disk.is_some() {
             for snapshot in std::mem::take(&mut self.release) {
@@ -3124,9 +3481,18 @@ impl SessionCache {
             for (_, snapshot) in std::mem::take(&mut self.pending) {
                 self.drop_snapshot(gpu, snapshot);
             }
-            // Leaves first: each demotion unpins its parent.
-            while let Some((key, snapshot)) = self.pool.pop_lru() {
-                self.evict_device(gpu, key, snapshot, 0);
+            // Leaves first: each demotion unpins its parent, which follows
+            // its children to disk (or drops their files) in this loop.
+            loop {
+                if let Some((key, snapshot)) = self.pool.pop_lru() {
+                    self.evict_to_disk(gpu, key, snapshot, 0, true);
+                } else if let Some((key, snapshot)) = self.host_pool.pop_lru() {
+                    self.host_index.retain(|k| *k != key);
+                    self.note_host_eviction(&snapshot);
+                    self.evict_host_to_disk(key, snapshot, true);
+                } else {
+                    break;
+                }
             }
         }
         for store in self.take_all_stores() {
@@ -3207,20 +3573,29 @@ impl SessionCache {
                         self.evict_device(gpu, key, snapshot, need);
                         continue;
                     }
-                    None => match self.take_device_blocker() {
-                        // A host descendant pins every releasable device
-                        // owner: drop it (its memory is host, never counted
-                        // as VRAM freed) and retry the device victims.
-                        Some(store) => {
-                            free_store(gpu, store);
+                    None => {
+                        // Every device snapshot has children: move the
+                        // deepest to the host, keeping its whole lineage.
+                        if let Some(bytes) = self.demote_pinned_device(gpu) {
+                            freed += bytes;
                             continue;
                         }
-                        None => self
-                            .pending
-                            .iter()
-                            .rposition(|entry| device_bytes(&entry.1) > 0)
-                            .map(|i| self.pending.remove(i).1),
-                    },
+                        match self.take_device_blocker() {
+                            // A host descendant pins every releasable device
+                            // owner: drop it (its memory is host, never
+                            // counted as VRAM freed) and retry the device
+                            // victims.
+                            Some(store) => {
+                                free_store(gpu, store);
+                                continue;
+                            }
+                            None => self
+                                .pending
+                                .iter()
+                                .rposition(|entry| device_bytes(&entry.1) > 0)
+                                .map(|i| self.pending.remove(i).1),
+                        }
+                    }
                 },
             };
             let Some(snapshot) = snapshot else {
@@ -6816,6 +7191,7 @@ mod tests {
                 host_captures_total: 0,
                 host_restores_total: 0,
                 host_evictions_total: 0,
+                host_demotions_total: 0,
                 host_skips_total: 0,
             }
         );
@@ -8138,6 +8514,136 @@ mod tests {
         // keeps its old demotion rule.
         let plain = SessionCache::new(domain(), 1 << 20);
         assert!(plain.demotable(&child(Some(cut_key(&plain, &hist, 2)))));
+    }
+
+    /// Publish a device snapshot of `hist[..p]` under `parent`, linked the
+    /// way `at_boundary` links a capture to its parent.
+    fn publish_device(cache: &mut SessionCache, hist: &[u32], p: usize, parent: Option<Key>) -> Key {
+        let key = cut_key(cache, hist, p);
+        if let Some(parent) = &parent {
+            cache.link(parent);
+        }
+        cache.pending.push((
+            key.clone(),
+            StoredSnapshot {
+                parent,
+                ..fake_snapshot(p)
+            },
+        ));
+        cache.commit();
+        key
+    }
+
+    fn host_block(bytes: usize, drops: &Arc<AtomicUsize>) -> HostBlock {
+        match host_store(bytes, drops) {
+            Store::Host(block) => block,
+            Store::Device(_) => unreachable!("a host store"),
+        }
+    }
+
+    /// Bookkeeping of `demote_to_host` / `demote_pinned_device` minus the GPU
+    /// copy: take `key` out of the device pool and adopt a host block for it.
+    fn demote(cache: &mut SessionCache, key: &Key, drops: &Arc<AtomicUsize>) {
+        let snapshot = cache.pool.evict(&key.0, key.1, key.2).expect("on the device");
+        let bytes = snapshot.bytes;
+        assert!(cache.host_demotable(key, bytes));
+        let freed = cache.adopt_demoted(key.clone(), snapshot, host_block(bytes as usize, drops));
+        assert_eq!(freed.map(|buf| buf.size() as u64), Some(bytes));
+    }
+
+    #[test]
+    fn demotion_moves_device_snapshots_to_the_host_keeping_lineage_and_pins() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        let mut cache = SessionCache::new(domain(), 1 << 20).with_host_demotion(1 << 20);
+        assert!(cache.quarantine.is_some(), "a host tier arms the quarantine");
+        let root = publish_device(&mut cache, &hist, 2, None);
+        let mid = publish_device(&mut cache, &hist, 3, Some(root.clone()));
+        let leaf = publish_device(&mut cache, &hist, 4, Some(mid.clone()));
+        assert_eq!(cache.usage().host_budget_bytes, 1 << 20);
+        assert_eq!(cache.pinned_device_keys(), vec![mid.clone(), root.clone()]);
+
+        // The unpinned leaf moves under its key and keeps its parent link, so
+        // its parent stays pinned on the device and the chain still resolves.
+        demote(&mut cache, &leaf, &drops);
+        assert!(!cache.pool.contains(&leaf.0, leaf.1, leaf.2));
+        assert!(cache.host_pool.contains(&leaf.0, leaf.1, leaf.2));
+        assert_eq!(cache.host_index, vec![leaf.clone()]);
+        assert_eq!(cache.entry(&leaf).unwrap().parent, Some(mid.clone()));
+        assert_eq!(cache.children[&mid], 1);
+        assert!(cache.pool.is_pinned(&mid.0, mid.1, mid.2));
+        assert!(cache.present(&leaf.0, leaf.1, leaf.2));
+        assert_eq!(
+            cache.chain_keys(&leaf.0, &hist[..4]),
+            Some(vec![root.clone(), mid.clone(), leaf.clone()])
+        );
+
+        // Every device snapshot left is pinned: the deepest moves next, its
+        // pin with it, then the root.
+        assert_eq!(cache.pinned_device_keys()[0], mid);
+        demote(&mut cache, &mid, &drops);
+        assert!(cache.host_pool.is_pinned(&mid.0, mid.1, mid.2));
+        demote(&mut cache, &root, &drops);
+        assert!(cache.host_pool.is_pinned(&root.0, root.1, root.2));
+        assert!(cache.pinned_device_keys().is_empty());
+        assert_eq!(
+            cache.chain_keys(&leaf.0, &hist[..4]),
+            Some(vec![root.clone(), mid.clone(), leaf.clone()])
+        );
+        let usage = cache.usage();
+        assert_eq!(usage.pool_bytes, 0);
+        assert_eq!(usage.host_pool_bytes, 3 * 4096);
+        assert_eq!(usage.host_demotions_total, 3);
+        assert_eq!(usage.evictions_total, 3);
+        assert_eq!(released(&drops), 0);
+
+        // Host eviction still removes leaves only: the leaf first, after
+        // which its parent is a leaf too.
+        let (evicted, fits) = cache.evict_host_for((1 << 20) - 4096);
+        assert!(fits);
+        assert_eq!(
+            evicted.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+            vec![leaf.clone(), mid.clone()]
+        );
+        drop(evicted);
+        assert_eq!(released(&drops), 2);
+        assert!(!cache.host_pool.is_pinned(&root.0, root.1, root.2));
+        assert_eq!(cache.host_index, vec![root]);
+    }
+
+    #[test]
+    fn host_demotion_needs_a_budget_and_room_beside_unevictable_host_owners() {
+        let drops = counter();
+        let hist = prompt(1, 8);
+        // No host budget: nothing is demotable, and no host memory is armed.
+        let mut plain = SessionCache::new(domain(), 1 << 20);
+        let key = publish_device(&mut plain, &hist, 2, None);
+        assert!(!plain.host_demotable(&key, 4096));
+        assert!(plain.quarantine.is_none());
+        assert_eq!(plain.usage().host_budget_bytes, 0);
+
+        let mut cache = SessionCache::new(domain(), 1 << 20).with_host_demotion(10_000);
+        let key = publish_device(&mut cache, &hist, 2, None);
+        assert!(cache.host_demotable(&key, 10_000));
+        assert!(!cache.host_demotable(&key, 10_001));
+        assert!(!cache.host_demotable(&key, 0));
+        // Published host snapshots are evictable: they never block a demotion.
+        let other = publish_device(&mut cache, &hist, 3, None);
+        demote(&mut cache, &other, &drops);
+        assert!(cache.host_demotable(&key, 10_000));
+        // Pinned host owners outside the pool are not: 6000 leave 4000.
+        cache.release_bufs.push(host_store(6000, &drops));
+        assert!(cache.host_demotable(&key, 4000));
+        assert!(!cache.host_demotable(&key, 4001));
+
+        // The pressure policy's host budget bounds every owner instead.
+        cache.enable_pressure_host_snapshots(PressureHostSnapshotPolicy {
+            host_budget_bytes: 7000,
+            device_budget_bytes: 0,
+        });
+        assert_eq!(cache.usage().host_budget_bytes, 7000);
+        assert!(cache.host_demotable(&key, 1000));
+        assert!(!cache.host_demotable(&key, 1001));
     }
 
     /// `n` back-to-back moves of `bytes` between `live` and `host`.

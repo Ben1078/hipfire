@@ -260,13 +260,15 @@ fn mtime(path: &Path) -> SystemTime {
 /// Snapshots on disk, one file each, under one byte budget for the whole
 /// directory (every build's files count).
 ///
-/// Invariants, with the device tier in [`super::SessionCache`]:
-/// - I1: the parent of every device or pending snapshot is on the device.
-///   The device tier pins any key with device or pending children, and
-///   capture picks parents only among device and pending snapshots.
+/// Invariants, with the memory tiers in [`super::SessionCache`]:
+/// - I1: the parent of every device, host or pending snapshot is on the
+///   device or on the host. The memory tiers pin any key with device, host or
+///   pending children (moving a key between them keeps its pin), and capture
+///   picks parents only among memory and pending snapshots.
 /// - I2: the parent of every disk snapshot is on the device or on disk. A
 ///   disk key is pinned in [`Self::pool`] exactly when it has disk kids (or
-///   a restore holds it); by I1 a disk key never has device children.
+///   a restore holds it); by I1 a disk key never has memory children, and a
+///   key with disk kids never moves to the host.
 pub(super) struct DiskTier {
     dir: PathBuf,
     /// `flock` on `dir/lock`, held for the tier's lifetime.
@@ -410,6 +412,11 @@ impl DiskTier {
         self.foreign.len()
     }
 
+    /// Whether `key` (on any tier) has children on disk.
+    pub(super) fn has_kids(&self, key: &Key) -> bool {
+        self.kids.contains_key(key)
+    }
+
     fn add_kid(&mut self, parent: &Key, child: Key) {
         self.kids.entry(parent.clone()).or_default().push(child);
         self.pool.pin(&parent.0, parent.1, parent.2);
@@ -487,13 +494,31 @@ impl DiskTier {
         let SnapshotLocation::Device(buf) = &snapshot.location else {
             return Err("not a device snapshot".into());
         };
+        self.reserve_staging(gpu, growth)?;
+        self.store(key, snapshot, Payload::Device(gpu, buf))
+    }
+
+    /// Write the pinned-host `snapshot` at `key` to disk, straight from its
+    /// drained host memory (no GPU, no staging).
+    pub(super) fn demote_host(&mut self, key: &Key, snapshot: &StoredSnapshot) -> Result<(), String> {
+        let SnapshotLocation::Host(block) = &snapshot.location else {
+            return Err("not a host snapshot".into());
+        };
+        let payload = block
+            .drained_bytes()
+            .ok_or("a host transfer may still be in flight")?;
+        self.store(key, snapshot, Payload::Host(payload))
+    }
+
+    /// Write `snapshot`'s header and the payload `src` as the file of `key`
+    /// and index it.
+    fn store(&mut self, key: &Key, snapshot: &StoredSnapshot, src: Payload<'_>) -> Result<(), String> {
         let header = encode_header(key, snapshot);
         let offset = payload_offset(header.len() as u64);
         let file_bytes = offset + snapshot.bytes;
         if file_bytes > self.budget {
             return Err("exceeds disk budget".into());
         }
-        self.reserve_staging(gpu, growth)?;
         if !self.make_room(file_bytes) {
             return Err("disk budget pinned".into());
         }
@@ -507,11 +532,10 @@ impl DiskTier {
         prefix.extend_from_slice(&header);
         prefix.resize(offset as usize, 0);
         let written = write_file(
-            gpu,
             &mut self.staging,
             &tmp,
             &prefix,
-            buf,
+            src,
             snapshot.bytes as usize,
         )
         .and_then(|()| fs::rename(&tmp, &path).map_err(|e| e.to_string()))
@@ -621,30 +645,48 @@ fn unreserved() -> String {
     "host staging buffer not reserved".into()
 }
 
+/// Where a demoted snapshot's payload is read from.
+enum Payload<'a> {
+    /// Device memory, through the staging buffer.
+    Device(&'a mut Gpu, &'a DeviceBuffer),
+    /// Drained pinned host memory, written directly.
+    Host(&'a [u8]),
+}
+
 /// `prefix`, then `bytes` of `src`, into a new file at `path`, synced.
 fn write_file(
-    gpu: &mut Gpu,
-    staging_buf: &mut Vec<u8>,
+    staging_buf: &mut [u8],
     path: &Path,
     prefix: &[u8],
-    src: &DeviceBuffer,
+    src: Payload<'_>,
     bytes: usize,
 ) -> Result<(), String> {
     let fail = |e: std::io::Error| format!("{}: {e}", path.display());
+    let (gpu, src) = match src {
+        Payload::Host(host) => {
+            let payload = host
+                .get(..bytes)
+                .ok_or("host snapshot shorter than its payload")?;
+            let mut file = File::create(path).map_err(fail)?;
+            file.write_all(prefix).map_err(fail)?;
+            file.write_all(payload).map_err(fail)?;
+            return file.sync_all().map_err(fail);
+        }
+        Payload::Device(gpu, src) => (gpu, src),
+    };
     gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
     let mut file = File::create(path).map_err(fail)?;
     file.write_all(prefix).map_err(fail)?;
     if staging_buf.is_empty() {
         return Err(unreserved());
     }
-    let staging = &mut staging_buf[..];
     let mut off = 0;
     while off < bytes {
         let n = (bytes - off).min(DISK_STAGING);
         gpu.hip
-            .memcpy_dtoh_at(&mut staging[..n], src, off)
+            .memcpy_dtoh_at(&mut staging_buf[..n], src, off)
             .map_err(|e| e.to_string())?;
-        file.write_all(&staging[..n]).map_err(fail)?;
+        file.write_all(&staging_buf[..n]).map_err(fail)?;
         off += n;
     }
     file.sync_all().map_err(fail)
@@ -929,6 +971,62 @@ mod tests {
         assert!(decode_header(&header).is_some());
         drop(write_header(&path, &BUILD, &header));
         assert!(scan(&path, &BUILD).is_none());
+    }
+
+    /// A pinned-host snapshot of `snapshot(parent)`'s geometry whose payload
+    /// is `fill` repeated.
+    fn host_snapshot(parent: Option<Key>, fill: u8) -> StoredSnapshot {
+        use super::super::{FakeHost, HostBlock, HostMem};
+        let mut stored = snapshot(parent);
+        let bytes = stored.bytes as usize;
+        let mem = HostMem::Fake(FakeHost {
+            bytes: vec![fill; bytes],
+            drops: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        stored.location = SnapshotLocation::Host(HostBlock::new(mem, bytes, None));
+        stored
+    }
+
+    #[test]
+    fn host_snapshots_are_written_from_host_memory_and_reopen_as_a_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, child) = (key(128), key(256));
+        let root_snapshot = host_snapshot(None, 0xA5);
+        let child_snapshot = host_snapshot(Some(root.clone()), 0x3C);
+        let mut tier = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        tier.demote_host(&root, &root_snapshot).unwrap();
+        tier.demote_host(&child, &child_snapshot).unwrap();
+        assert!(tier.has_kids(&root));
+        assert!(!tier.has_kids(&child));
+        for (key, stored, fill) in [
+            (&root, &root_snapshot, 0xA5u8),
+            (&child, &child_snapshot, 0x3C),
+        ] {
+            let SnapshotLocation::Disk { path, file_bytes } = &tier.peek(key).unwrap().location
+            else {
+                panic!("demoted to disk");
+            };
+            let raw = fs::read(path).unwrap();
+            assert_eq!(raw.len() as u64, *file_bytes);
+            let payload = &raw[raw.len() - stored.bytes as usize..];
+            assert!(payload.iter().all(|&byte| byte == fill));
+        }
+
+        // Only a drained host snapshot is read; other tiers are refused.
+        let undrained = host_snapshot(None, 1);
+        if let SnapshotLocation::Host(block) = &undrained.location {
+            block.mark_undrained();
+        }
+        assert!(tier.demote_host(&key(512), &undrained).is_err());
+        assert!(tier.demote_host(&key(512), &snapshot(None)).is_err());
+        assert!(!tier.contains(&key(512)));
+
+        // A restart indexes both files, still one chain.
+        drop(tier);
+        let tier = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        assert_snapshot_eq(tier.peek(&root).unwrap(), &root_snapshot);
+        assert_snapshot_eq(tier.peek(&child).unwrap(), &child_snapshot);
+        assert_eq!(tier.kids.get(&root), Some(&vec![child]));
     }
 
     #[test]
