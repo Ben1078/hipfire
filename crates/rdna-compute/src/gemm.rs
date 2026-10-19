@@ -311,6 +311,11 @@ static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> =
 static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
 });
+/// Qwen4 Q8_0 trunk projections on the Q8_0 WMMA GEMM (F16 rounded activations
+/// and dequantized weights, F32 accumulate) in wide eager prefill on gfx11;
+/// developer switch, default OFF, read once.
+static QWEN4_Q8_TRUNK_WMMA: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_Q8_TRUNK_WMMA", false));
 /// `HIPFIRE_QWEN4_MQ6_X4_PM` (on unless `0`) runs gfx1201's MQ6 F32 overwrite
 /// trunk GEMM from the certified builder module (`kernels::QWEN4_MQ6_X4_PM_GFX1201`,
 /// same arguments and output bytes as `gemm_mq6g256v2_wmma_gfx12_bt8_x4`, its own
@@ -456,6 +461,39 @@ pub fn qwen4_f16_wmma_applies_for(
         && k % 64 == 0
         && route_open
         && f16_wmma_enabled
+}
+
+/// Whether [`Gpu::gemm_q8_0_trunk_prefill`] takes the Q8_0 WMMA GEMM instead of
+/// the F32 chunked incumbent, over explicit facts so a CPU test pins it:
+/// the developer switch is on (`enabled`), gfx11 wave32 WMMA and not RDNA4,
+/// `K % 32 == 0`, the ACTUAL row count and the routing row count
+/// (`route_rows`, canonical under the prefill-invariant scope) both reach
+/// [`QWEN4_F16_WMMA_MIN_TOKENS`] (short fills and tails stay exact), the
+/// routing rows exceed the few-row/verify limit, both operands are F32 (the
+/// WMMA kernels write F32 and convert F32 activations to F16) and no recorder
+/// or capture is active (`route_open`).
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_q8_trunk_wmma_applies_for(
+    enabled: bool,
+    caps: &crate::arch_caps::ArchCaps,
+    m: usize,
+    k: usize,
+    rows: usize,
+    route_rows: usize,
+    few_row_limit: usize,
+    f32_operands: bool,
+    route_open: bool,
+) -> bool {
+    enabled
+        && caps.has_wmma()
+        && !caps.is_rdna4()
+        && m > 0
+        && k % 32 == 0
+        && rows >= QWEN4_F16_WMMA_MIN_TOKENS
+        && route_rows >= QWEN4_F16_WMMA_MIN_TOKENS
+        && route_rows > few_row_limit
+        && f32_operands
+        && route_open
 }
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
@@ -26537,6 +26575,45 @@ impl Gpu {
         Ok(())
     }
 
+    /// Qwen4 Q8_0 trunk-projection GEMM for the prefill route: `Y[rows, m] =
+    /// X[rows, k] @ A_q8[m, k]^T`, F32 output.
+    ///
+    /// With `HIPFIRE_QWEN4_Q8_TRUNK_WMMA=1` (developer, default OFF, read
+    /// once) on a gfx11 WMMA part (not RDNA4) and a wide eager prefill call
+    /// ([`qwen4_q8_trunk_wmma_applies_for`]) it runs the existing Q8_0 WMMA
+    /// GEMM: the 4-warp 64x64 tile when `m % 64 == 0 && rows % 64 == 0`, else
+    /// the single-warp tile. Activations round to F16 and the Q8_0 weights
+    /// dequantize to F16; accumulation is F32. Every other call (flag unset,
+    /// other arch, short/tail/verify rows, recorder, graph capture) takes
+    /// exactly [`Self::gemm_q8_0_batched_f32_chunked`].
+    pub fn gemm_q8_0_trunk_prefill(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        if qwen4_q8_trunk_wmma_applies_for(
+            *QWEN4_Q8_TRUNK_WMMA,
+            &self.arch_caps,
+            m,
+            k,
+            rows,
+            self.route_rows(rows),
+            self.few_row_limit(),
+            x.dtype == DType::F32 && y.dtype == DType::F32,
+            !self.replay.is_recording() && !self.graphs.capture_mode,
+        ) {
+            if m % 64 == 0 && rows % 64 == 0 {
+                return self.gemm_q8_0_wmma_4w(a, x, y, m, k, rows);
+            }
+            return self.gemm_q8_0_wmma(a, x, y, m, k, rows);
+        }
+        self.gemm_q8_0_batched_f32_chunked(a, x, y, m, k, rows)
+    }
+
     /// Resolve and dispatch the Q8_0 dense prefill GEMM (`Y[N,M] = X[N,K] @
     /// A_q8[M,K]^T`). Picks the i8-MMQ / f16-WMMA / scalar-chunked kernel from
     /// arch caps, feature flags, and shape — so arch forward passes carry no
@@ -50376,6 +50453,43 @@ mod tests {
         // Field-wise saturating: a reversed window never wraps.
         assert_eq!(earlier.since(later), zero);
         assert_eq!(zero.since(earlier), zero);
+    }
+
+    #[test]
+    fn qwen4_q8_trunk_wmma_predicate_gates_arch_rows_and_scope() {
+        use crate::prefill_invariant::QWEN4_PREFILL_CANON_ROWS as CANON;
+        let caps = |arch: &str| {
+            crate::arch_caps::ArchCaps::new(
+                arch,
+                std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test(arch)),
+            )
+        };
+        let gfx1151 = caps("gfx1151");
+        let on = |enabled, caps: &crate::arch_caps::ArchCaps, rows, route_rows, open| {
+            qwen4_q8_trunk_wmma_applies_for(
+                enabled, caps, 2560, 2560, rows, route_rows, 8, true, open,
+            )
+        };
+        assert!(on(true, &gfx1151, 512, 512, true));
+        assert!(on(true, &caps("gfx1100"), 768, 768, true));
+        assert!(!on(true, &caps("gfx1100"), 768, 256, true));
+        assert!(!on(true, &caps("gfx942"), 768, 768, true));
+        assert!(!on(false, &gfx1151, 4096, 4096, true));
+        assert!(!on(true, &gfx1151, 511, 511, true));
+        // Invariant scope: canonical routing rows, short actual rows stay exact.
+        assert!(!on(true, &gfx1151, 256, CANON, true));
+        assert!(on(true, &gfx1151, 4096, CANON, true));
+        assert!(!on(true, &gfx1151, 4096, 4096, false));
+        assert!(!on(true, &caps("gfx1201"), 4096, 4096, true));
+        assert!(!qwen4_q8_trunk_wmma_applies_for(
+            true, &gfx1151, 2560, 2560, 4096, 4096, 8, false, true
+        ));
+        assert!(!qwen4_q8_trunk_wmma_applies_for(
+            true, &gfx1151, 2560, 2530, 4096, 4096, 8, true, true
+        ));
+        assert!(!qwen4_q8_trunk_wmma_applies_for(
+            true, &gfx1151, 2560, 2560, 4096, 4096, 4096, true, true
+        ));
     }
 
     #[test]

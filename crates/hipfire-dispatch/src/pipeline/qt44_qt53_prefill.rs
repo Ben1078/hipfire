@@ -485,9 +485,9 @@ fn batch_projection(
             hip(gpu.gemm_mq4g128v2_batched(weight.buf, x, y, weight.m, weight.k, batch_size))
         }
         // Qwen4's few-row decode copies: rows within `Gpu::few_row_limit` run
-        // the decode GEMV per row.
+        // the decode GEMV per row; long prefill may opt into F16-rounded WMMA.
         DType::Q8_0 => {
-            hip(gpu.gemm_q8_0_batched_f32_chunked(weight.buf, x, y, weight.m, weight.k, batch_size))
+            hip(gpu.gemm_q8_0_trunk_prefill(weight.buf, x, y, weight.m, weight.k, batch_size))
         }
         _ => Err(DispatchError::UnsupportedVariant {
             family: "moe",
