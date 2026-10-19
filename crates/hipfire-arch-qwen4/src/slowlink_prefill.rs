@@ -1103,6 +1103,9 @@ pub(crate) struct ReceiptInputs<'a> {
     pub(crate) mode: SlowlinkMode,
     pub(crate) plan: &'a Qwen4PromptPlan,
     pub(crate) resident_layers: usize,
+    /// Ascending band layers whose routed experts are device-resident, derived
+    /// from the actual per-layer mappings (never from the count).
+    pub(crate) resident_layer_set: &'a [usize],
     pub(crate) host_layers: usize,
     pub(crate) tile_scratch_bytes: u64,
     pub(crate) reports: &'a [WindowReport],
@@ -1147,6 +1150,7 @@ pub(crate) fn layer_major_receipt(inputs: &ReceiptInputs<'_>) -> Value {
         "retained_scratch_rows": census.tile_rows,
         "sweeps": inputs.reports.len(),
         "resident_layers": inputs.resident_layers,
+        "resident_layer_set": inputs.resident_layer_set,
         "host_layers": inputs.host_layers,
         "host_expert_bytes_total": host_expert_bytes_total,
         "submitted_bytes": sum_u(&|r| r.stats.submitted_payload_bytes),
@@ -3798,6 +3802,23 @@ impl Run<'_, '_> {
     }
 }
 
+/// The band's device-resident routed-expert layers, ascending: the layers
+/// [`plan_runtime`] counted as resident (an expert runtime that is not
+/// host-mapped), read from the actual per-layer mappings so any placement
+/// shape (prefix, suffix or arbitrary set) reports exactly what ran.
+fn resident_layer_set(forward: &Qwen4GpuForward) -> Vec<usize> {
+    forward
+        .band_layers()
+        .filter(|&layer| {
+            forward
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .is_some_and(|runtime| !runtime.s1_host_mapped())
+        })
+        .collect()
+}
+
 // ── entry ────────────────────────────────────────────────────────────
 
 /// Run `tokens` (the request's rows after its entry position) layer-major when
@@ -3876,6 +3897,7 @@ pub(crate) fn try_run_prompt(
         (outcome, std::mem::take(&mut run.trace_out))
     };
     forward.slowlink.runtime = Some(runtime);
+    let resident_layer_set = resident_layer_set(forward);
     // ONE `hipMemGetInfo` (total - free) sample after the request, outside every
     // overlap loop: the device's used bytes at that moment, not a continuous
     // peak. `None` (a null in the receipt) when the query fails.
@@ -3901,6 +3923,7 @@ pub(crate) fn try_run_prompt(
             mode,
             plan: &plan,
             resident_layers,
+            resident_layer_set: &resident_layer_set,
             host_layers,
             tile_scratch_bytes,
             reports: &reports,
@@ -4908,6 +4931,7 @@ mod slowlink_prompt {
             mode: SlowlinkMode::Force,
             plan: &plan,
             resident_layers: 10,
+            resident_layer_set: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
             host_layers: 38,
             tile_scratch_bytes: 1 << 30,
             reports: &reports,
@@ -5789,6 +5813,7 @@ mod slowlink_prompt {
             mode: SlowlinkMode::Force,
             plan: &plan,
             resident_layers: 10,
+            resident_layer_set: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
             host_layers: 38,
             tile_scratch_bytes: 5 << 30,
             reports: &[report],
@@ -5810,6 +5835,7 @@ mod slowlink_prompt {
             "retained_scratch_rows",
             "sweeps",
             "resident_layers",
+            "resident_layer_set",
             "host_layers",
             "host_expert_bytes_total",
             "submitted_bytes",
@@ -5839,6 +5865,24 @@ mod slowlink_prompt {
         assert!(receipt["retained_scratch_rows"].as_u64().unwrap() <= 1536);
         assert!(receipt["tile_rows"].as_u64().unwrap() <= 1536);
         assert_eq!(receipt["submitted_bytes"], 50_803_507_200u64);
+        assert_eq!(
+            receipt["resident_layer_set"],
+            json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        );
+        // A non-prefix placement passes through verbatim, ascending.
+        let interleaved = layer_major_receipt(&ReceiptInputs {
+            mode: SlowlinkMode::Force,
+            plan: &plan,
+            resident_layers: 5,
+            resident_layer_set: &[1, 3, 4, 20, 47],
+            host_layers: 43,
+            tile_scratch_bytes: 0,
+            reports: &[],
+            peak_vram_bytes: None,
+            status: "ok".to_string(),
+        });
+        assert_eq!(interleaved["resident_layer_set"], json!([1, 3, 4, 20, 47]));
+        assert_eq!(interleaved["resident_layers"], 5);
         for key in ["tile", "arena", "ring", "lookahead", "tables", "total"] {
             assert!(receipt["reserve"].get(key).is_some(), "reserve lacks {key}");
         }
@@ -5873,6 +5917,7 @@ mod slowlink_prompt {
                 mode: SlowlinkMode::Force,
                 plan: &plan,
                 resident_layers: 10,
+                resident_layer_set: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
                 host_layers: 38,
                 tile_scratch_bytes: 0,
                 reports,

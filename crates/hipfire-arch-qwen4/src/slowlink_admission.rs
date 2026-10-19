@@ -99,6 +99,96 @@ pub const S1_MIN_AUTO_REQUEST_ROWS: usize = 16384;
 /// zero) or more; no kernel or correctness gate needs this many.
 pub const S1_PREFERRED_RESIDENT_LAYERS: usize = 10;
 
+/// Developer switch (`developer.qwen4_slowlink_resident_layers`, read through
+/// the config snapshot) choosing WHICH trunk layers are resident on an S1
+/// load; the COUNT stays [`admit`]'s decision. Unset or `front` is the
+/// leading layers `0..N` (the incumbent placement); `spread` is the
+/// evenly-spaced set of [`s1_resident_layer_set`]; otherwise a comma list of
+/// exactly `N` distinct layer indices below the trunk layer count.
+pub const S1_RESIDENT_LAYERS_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS";
+
+/// The `N` resident trunk layers of a `T`-layer model under
+/// [`S1_RESIDENT_LAYERS_ENV`], sorted ascending. `spread` puts the `k`-th of
+/// `N` at `floor(k*T/N) + floor(T/(2N)) + 1`, clamped to `T-1` (T=48, N=9 gives
+/// 3, 8, 13, 19, 24, 29, 35, 40, 45); `N == T` is every layer. Any invalid
+/// value, or `N > T`, is an `Err` naming the switch.
+pub fn s1_resident_layer_set(
+    num_hidden_layers: usize,
+    resident: usize,
+) -> Result<Vec<usize>, String> {
+    let raw = hipfire_config::developer_var(S1_RESIDENT_LAYERS_ENV).ok();
+    resolve_resident_layer_set(raw.as_deref(), num_hidden_layers, resident)
+}
+
+/// Pure body of [`s1_resident_layer_set`] for unit tests.
+fn resolve_resident_layer_set(
+    raw: Option<&str>,
+    total: usize,
+    resident: usize,
+) -> Result<Vec<usize>, String> {
+    let invalid = |why: String| format!("{S1_RESIDENT_LAYERS_ENV}: {why}");
+    if resident > total {
+        return Err(invalid(format!(
+            "{resident} resident layers exceed the {total} trunk layers"
+        )));
+    }
+    let Some(value) = raw.map(str::trim) else {
+        return Ok((0..resident).collect());
+    };
+    if value.eq_ignore_ascii_case("front") {
+        return Ok((0..resident).collect());
+    }
+    if value.eq_ignore_ascii_case("spread") {
+        if resident == total {
+            return Ok((0..total).collect());
+        }
+        let offset = if resident == 0 { 0 } else { total / (2 * resident) + 1 };
+        let set: Vec<usize> = (0..resident)
+            .map(|k| (k * total / resident + offset).min(total - 1))
+            .collect();
+        if set.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid(format!(
+                "spread of {resident} layers over {total} is not strictly ascending: {set:?}"
+            )));
+        }
+        return Ok(set);
+    }
+    let mut set = Vec::with_capacity(resident);
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        let layer: usize = entry.parse().map_err(|_| {
+            invalid(format!(
+                "entry {entry:?} of {value:?} is not a layer index (expected `front`, `spread` or a comma list of {resident} layer indices)"
+            ))
+        })?;
+        if layer >= total {
+            return Err(invalid(format!(
+                "layer {layer} is not below the {total} trunk layers"
+            )));
+        }
+        set.push(layer);
+    }
+    if set.len() != resident {
+        return Err(invalid(format!(
+            "{value:?} lists {} layers but the admitted resident count is {resident}",
+            set.len()
+        )));
+    }
+    set.sort_unstable();
+    if let Some(pair) = set.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(invalid(format!("layer {} is listed twice in {value:?}", pair[0])));
+    }
+    Ok(set)
+}
+
+/// Whether a [`S1_RESIDENT_LAYERS_ENV`] value is anything but the incumbent
+/// leading-layers placement (unset or `front`, after trimming). An empty or
+/// whitespace value is an override, and [`s1_resident_layer_set`] rejects it.
+pub fn resident_layer_switch_is_override(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|value| !value.eq_ignore_ascii_case("front"))
+}
+
 /// Whether an unset selector may choose S1. `false` until every promotion
 /// gate has passed; the kill switch and the lab force work either way.
 pub const S1_AUTO_QUALIFIED: bool = false;
@@ -2177,7 +2267,27 @@ pub fn select_profile(
                 _ => Ok(profile),
             }) {
             Ok(profile) => {
-                eprintln!("  qwen4 {}", profile.describe());
+                // A non-front switch value names WHICH layers are resident;
+                // resolve it now so an invalid value fails the load before
+                // placement. Unset or `front` is the incumbent line.
+                let set = if resident_layer_switch_is_override(
+                    hipfire_config::developer_var(S1_RESIDENT_LAYERS_ENV)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    Some(s1_resident_layer_set(
+                        profile.placement.trunk_layers,
+                        profile.resident_layers,
+                    )?)
+                } else {
+                    None
+                };
+                match set {
+                    Some(set) => {
+                        eprintln!("  qwen4 {} resident_layer_set={set:?}", profile.describe())
+                    }
+                    None => eprintln!("  qwen4 {}", profile.describe()),
+                }
                 return Ok(Some(profile));
             }
             Err(decline) => decline,
@@ -6960,5 +7070,87 @@ mod tests {
             assert_eq!(admit(&resolved).unwrap(), admit(&incumbent).unwrap());
             assert_eq!(census_of(&resolved).unwrap().2.a4_sidecars, 0);
         }
+    }
+
+    #[test]
+    fn s1_resident_layer_set_front_is_the_leading_layers() {
+        for raw in [None, Some("front"), Some(" front "), Some("FRONT")] {
+            assert_eq!(resolve_resident_layer_set(raw, 48, 9), Ok((0..9).collect::<Vec<_>>()), "{raw:?}");
+            assert_eq!(resolve_resident_layer_set(raw, 48, 0), Ok(Vec::new()), "{raw:?}");
+            assert_eq!(resolve_resident_layer_set(raw, 48, 48), Ok((0..48).collect::<Vec<_>>()), "{raw:?}");
+        }
+        assert_eq!(S1_RESIDENT_LAYERS_ENV, "HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS");
+        for raw in [None, Some("front"), Some(" Front ")] {
+            assert!(!resident_layer_switch_is_override(raw), "{raw:?}");
+        }
+        for raw in [Some("spread"), Some("1,2"), Some("bogus"), Some(""), Some("  ")] {
+            assert!(resident_layer_switch_is_override(raw), "{raw:?}");
+        }
+        // The environment entry point reads the same table; with the switch
+        // unset in the test process it is the front set.
+        if hipfire_config::developer_var(S1_RESIDENT_LAYERS_ENV).is_err() {
+            assert_eq!(s1_resident_layer_set(48, 3), Ok(vec![0, 1, 2]));
+        }
+    }
+
+    #[test]
+    fn s1_resident_layer_set_spread_matches_the_pinned_formula() {
+        let spread = |total, count| resolve_resident_layer_set(Some("spread"), total, count);
+        assert_eq!(spread(48, 9), Ok(vec![3, 8, 13, 19, 24, 29, 35, 40, 45]));
+        assert_eq!(
+            resolve_resident_layer_set(Some(" Spread "), 48, 9),
+            spread(48, 9)
+        );
+        assert_eq!(spread(48, 0), Ok(Vec::new()));
+        assert_eq!(spread(48, 1), Ok(vec![25]));
+        // Dense: every layer resident, never a clamp collision.
+        assert_eq!(spread(48, 48), Ok((0..48).collect::<Vec<_>>()));
+        assert_eq!(spread(1, 1), Ok(vec![0]));
+        // Strictly ascending, distinct and in range for every legal (T, N).
+        for total in 1..=64usize {
+            for count in 0..=total {
+                let set = spread(total, count).unwrap_or_else(|e| panic!("T{total} N{count}: {e}"));
+                assert_eq!(set.len(), count, "T{total} N{count}");
+                assert!(set.windows(2).all(|w| w[0] < w[1]), "T{total} N{count}: {set:?}");
+                assert!(set.iter().all(|&layer| layer < total), "T{total} N{count}: {set:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn s1_resident_layer_set_explicit_list_is_sorted_and_exact() {
+        let list = |raw: &str, total, count| resolve_resident_layer_set(Some(raw), total, count);
+        assert_eq!(list("45,3,20", 48, 3), Ok(vec![3, 20, 45]));
+        assert_eq!(list(" 7 , 0 ,47", 48, 3), Ok(vec![0, 7, 47]));
+        assert_eq!(list("5", 48, 1), Ok(vec![5]));
+        assert_eq!(list("2,1,0", 3, 3), Ok(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn s1_resident_layer_set_rejects_invalid_values_naming_the_switch() {
+        let named = |result: Result<Vec<usize>, String>, what: &str| {
+            let error = result.expect_err(what);
+            assert!(error.contains(S1_RESIDENT_LAYERS_ENV), "{what}: {error}");
+        };
+        // Wrong entry count (too few, too many, any list at N = 0).
+        named(resolve_resident_layer_set(Some("1,2"), 48, 3), "short list");
+        named(resolve_resident_layer_set(Some("1,2,3,4"), 48, 3), "long list");
+        named(resolve_resident_layer_set(Some("1"), 48, 0), "list at N=0");
+        // Out of range, duplicates, malformed entries.
+        named(resolve_resident_layer_set(Some("1,2,48"), 48, 3), "layer == T");
+        named(resolve_resident_layer_set(Some("1,2,99"), 48, 3), "layer > T");
+        named(resolve_resident_layer_set(Some("1,2,2"), 48, 3), "duplicate");
+        named(resolve_resident_layer_set(Some("1,,2"), 48, 3), "empty entry");
+        named(resolve_resident_layer_set(Some(""), 48, 3), "empty value");
+        named(resolve_resident_layer_set(Some("  "), 48, 3), "blank value");
+        named(resolve_resident_layer_set(Some(""), 48, 0), "empty value at N=0");
+        named(resolve_resident_layer_set(Some("1,2,"), 48, 3), "trailing comma");
+        named(resolve_resident_layer_set(Some("1,-2,3"), 48, 3), "negative");
+        named(resolve_resident_layer_set(Some("1,x,3"), 48, 3), "non-numeric");
+        named(resolve_resident_layer_set(Some("middle"), 48, 3), "unknown word");
+        // More resident layers than trunk layers is impossible for any form.
+        named(resolve_resident_layer_set(None, 4, 5), "front N>T");
+        named(resolve_resident_layer_set(Some("spread"), 4, 5), "spread N>T");
+        named(resolve_resident_layer_set(Some("0,1,2,3,4"), 4, 5), "list N>T");
     }
 }

@@ -2679,6 +2679,29 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
     moved
 }
 
+/// [`place_routed_experts`] for an arbitrary resident set: the routed-expert
+/// entries of trunk layers listed in `resident` stay as they are and every
+/// other [`WeightResidency::Resident`] routed entry, the MTP layer's always
+/// included, becomes [`WeightResidency::HostMapped`]. Same skips as the
+/// count-based form (non-routed or already-placed entries are untouched, an
+/// entry with no layer is host), and `resident == [0, .., n)` is identical to
+/// `place_routed_experts(weights, n)`. Returns the number of entries moved.
+pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize]) -> usize {
+    let mut moved = 0;
+    for entry in weights.iter_mut() {
+        if entry.residency != WeightResidency::Resident || !is_routed_expert(&entry.name) {
+            continue;
+        }
+        let trunk_resident = !entry.name.starts_with("mtp.")
+            && entry.layer.is_some_and(|layer| resident.contains(&layer));
+        if !trunk_resident {
+            entry.residency = WeightResidency::HostMapped;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 /// Pinned host bytes the [`WeightResidency::HostMapped`] entries will take.
 pub fn host_mapped_bytes(
     weights: &[WeightEntry],
@@ -3461,6 +3484,60 @@ mod tests {
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
         );
+    }
+
+    #[test]
+    fn place_routed_experts_set_keeps_exactly_the_listed_trunk_layers() {
+        let manifest = || {
+            let mut weights = vec![
+                entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+                entry("model.language_model.layers.1.mlp.experts.down_proj", 1),
+                entry(
+                    "model.language_model.layers.1.mlp.shared_expert.down_proj.weight",
+                    1,
+                ),
+                entry("model.language_model.layers.2.mlp.experts.gate_up_proj", 2),
+                entry("model.language_model.layers.3.mlp.experts.down_proj", 3),
+                // The MTP layer is host whatever its layer index says.
+                entry("mtp.layers.0.mlp.experts.down_proj", 0),
+                entry("mtp.layers.2.mlp.experts.down_proj", 2),
+                entry("model.language_model.layers.2.mlp.experts.up_proj", 2),
+            ];
+            // Already host-mapped entries are skipped, not counted again.
+            weights[7].residency = WeightResidency::HostMapped;
+            weights
+        };
+        let mut weights = manifest();
+        assert_eq!(place_routed_experts_set(&mut weights, &[3, 0]), 4);
+        let residency: Vec<_> = weights.iter().map(|entry| entry.residency).collect();
+        assert_eq!(
+            residency,
+            [
+                WeightResidency::Resident,
+                WeightResidency::HostMapped,
+                WeightResidency::Resident,
+                WeightResidency::HostMapped,
+                WeightResidency::Resident,
+                WeightResidency::HostMapped,
+                WeightResidency::HostMapped,
+                WeightResidency::HostMapped,
+            ]
+        );
+        // A leading set is exactly the count-based placement.
+        let mut by_count = manifest();
+        let mut by_set = manifest();
+        assert_eq!(
+            place_routed_experts_set(&mut by_set, &[0, 1, 2]),
+            place_routed_experts(&mut by_count, 3)
+        );
+        assert_eq!(
+            by_set.iter().map(|entry| entry.residency).collect::<Vec<_>>(),
+            by_count.iter().map(|entry| entry.residency).collect::<Vec<_>>()
+        );
+        // The empty set host-maps every routed expert.
+        let mut none = manifest();
+        assert_eq!(place_routed_experts_set(&mut none, &[]), 6);
+        assert_eq!(none[2].residency, WeightResidency::Resident);
     }
 
     #[test]

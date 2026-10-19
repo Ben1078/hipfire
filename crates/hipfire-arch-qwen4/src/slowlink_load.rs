@@ -228,6 +228,7 @@ fn load_inner(
     let mut weights = receipt.manifest.weights.clone();
     let explicit = residency::expert_vram_layers_from_env()?;
     let mut weight_arenas = None;
+    let mut resident_layer_set = None;
     let (resident_layers, placement, profile) = if !product_fallback
         && (unified || matches!(explicit, Some(residency::ExpertVramLayers::Layers(_))))
     {
@@ -333,7 +334,19 @@ fn load_inner(
                 .unwrap_or(load.config.num_hidden_layers)
             }
         };
-        residency::place_routed_experts(&mut weights, layers);
+        if profile.is_some()
+            && s1::resident_layer_switch_is_override(
+                hipfire_config::developer_var(s1::S1_RESIDENT_LAYERS_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        {
+            let resident = s1::s1_resident_layer_set(receipt.config.num_hidden_layers, layers)?;
+            residency::place_routed_experts_set(&mut weights, &resident);
+            resident_layer_set = Some(resident);
+        } else {
+            residency::place_routed_experts(&mut weights, layers);
+        }
         let placement = if profile.is_some() {
             "slowlink-profile"
         } else {
@@ -423,10 +436,18 @@ fn load_inner(
         );
         bundle.attach_session_cache(cache);
     }
-    eprintln!(
-        "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
-         host-mapped tensors={host_mapped_tensors} slowlink profile={slowlink_profile}"
-    );
+    if let Some(resident) = &resident_layer_set {
+        eprintln!(
+            "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
+             resident_layer_set={resident:?} host-mapped tensors={host_mapped_tensors} \
+             slowlink profile={slowlink_profile}"
+        );
+    } else {
+        eprintln!(
+            "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
+             host-mapped tensors={host_mapped_tensors} slowlink profile={slowlink_profile}"
+        );
+    }
     Ok(Some(SlowlinkLoaded {
         bundle,
         vocab,
