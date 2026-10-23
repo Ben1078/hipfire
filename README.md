@@ -1,3 +1,7 @@
+> **Fork branch `rdna3-mtp-decode-v8.2`:** hipfire at upstream `fde06275` (2026-09-23) plus RDNA3 (RX 7900 XTX) MTP decode work for Qwen3.8-27B (~100 tok/s).
+> This is not an official hipfire release and not a drop-in replacement for current [warpfront/hipfire](https://github.com/warpfront/hipfire).
+> See [RDNA3_MTP_DECODE.md](RDNA3_MTP_DECODE.md) for what changed, measured results, upstream status and caveats.
+
 <p align="center">
   <img width="1774" height="887" alt="hipfire — local LLM inference for AMD GPUs" src="https://github.com/user-attachments/assets/2013c1ae-6011-477c-a8de-5e90751bed74" />
 </p>
