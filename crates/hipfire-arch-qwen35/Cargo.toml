@@ -50,6 +50,12 @@ path = "examples/test_qwen35_state_multi.rs"
 required-features = ["deltanet"]
 
 [[example]]
+# CPU-only: builds/checks the committed MTP draft-vocab subset (src/draft_vocab.rs).
+name = "mtp_draft_vocab"
+path = "examples/mtp_draft_vocab.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "mtp_head_smoke"
 path = "examples/mtp_head_smoke.rs"
 required-features = ["deltanet"]

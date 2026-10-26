@@ -86,6 +86,8 @@ pub mod dflash_verify_pm4;
 /// A5 verify emissions -> authored `WindowPlanParts` with rebased patches,
 /// copy/fill nodes and exact-artifact facts).
 pub mod dflash_window_build;
+/// Compressed MTP draft vocabulary sliced from the trunk lm_head (exact gfx1100 default).
+pub mod draft_vocab;
 /// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
 /// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
 /// modification of it — see the module doc for why), routing attention
